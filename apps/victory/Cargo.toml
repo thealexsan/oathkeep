@@ -1,11 +1,15 @@
 [package]
 name = "victory"
-description = "Command-line front end: inspect, census, convert, run."
+description = "Oathkeep command-line front end: inspect, census, convert, run."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[[bin]]
+name = "oathkeep"
+path = "src/main.rs"
 
 [dependencies]
 victory-core.workspace = true

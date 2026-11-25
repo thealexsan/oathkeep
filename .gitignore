@@ -13,6 +13,17 @@
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml
+/oathkeep.toml
+
+# Local DirectX 12 Agility SDK binaries (downloaded via scripts/setup-agility-sdk.ps1)
+D3D12/
+/.agility-sdk/
+
+# Crash dumps and local run logs
+*.dmp
+*.crash.log
+*.log
+*.ttpf
 
 # Places people tend to drop data into. Keep data outside the repo instead.
 /game/

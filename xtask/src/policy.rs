@@ -167,12 +167,43 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     }
     if content.contains(&0) {
         problems.push("binary content (NUL bytes)".to_owned());
-    } else if let Some(run) = longest_encoded_run(content)
-        && run > MAX_ENCODED_RUN
-    {
-        problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
+    } else {
+        if let Some(run) = longest_encoded_run(content)
+            && run > MAX_ENCODED_RUN
+        {
+            problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
+        }
+        if path != "xtask/src/policy.rs"
+            && let Some(term) = forbidden_trademark(content)
+        {
+            problems.push(format!(
+                "contains prohibited commercial title/publisher identifier ({term}); keep repository clean-room"
+            ));
+        }
     }
     problems
+}
+
+/// Prohibits naming specific commercial titles or publishers in the repository.
+/// Tokens are assembled from fragments so this check does not trigger on itself.
+fn forbidden_trademark(content: &[u8]) -> Option<&'static str> {
+    let lower = String::from_utf8_lossy(content).to_ascii_lowercase();
+    let rules: &[(&str, &str, &str)] = &[
+        ("grand ", "theft", "franchise name"),
+        ("gta", "6", "title shorthand"),
+        ("gta", " vi", "title shorthand"),
+        ("gta", "_vi", "title shorthand"),
+        ("rock", "star games", "publisher name"),
+        ("take-", "two", "publisher name"),
+        ("leo", "nida", "prohibited project/region name"),
+    ];
+    for &(a, b, label) in rules {
+        let needle = format!("{a}{b}");
+        if lower.contains(&needle) {
+            return Some(label);
+        }
+    }
+    None
 }
 
 /// Longest run of characters that could be hex or base64 payload.
@@ -219,5 +250,11 @@ mod tests {
     fn rejects_data_smuggled_into_text() {
         let blob = format!("const DATA: &str = \"{}\";", "A1".repeat(400));
         assert!(!check("src/blob.rs", blob.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn rejects_commercial_title_names() {
+        let sample = format!("Support for {}6 builds\n", "GTA");
+        assert!(!check("README.md", sample.as_bytes()).is_empty());
     }
 }

@@ -1,4 +1,4 @@
-//! `victory`: the command-line front end.
+//! `oathkeep`: the command-line front end.
 //!
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
@@ -14,11 +14,33 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+// DirectX 12 Agility SDK opt-in for Windows 10 (build 19041+).
+// Matches Microsoft.Direct3D.D3D12 1.620.x placed in `.\D3D12\D3D12Core.dll`
+// next to `oathkeep.exe`. When the folder is absent (e.g. Windows 11), the
+// Windows D3D12 loader falls back transparently to the inbox runtime.
+#[cfg(windows)]
+#[repr(transparent)]
+pub struct AgilitySdkPath(*const u8);
+
+#[cfg(windows)]
+// SAFETY: Points to a static NUL-terminated ASCII string literal.
+unsafe impl Sync for AgilitySdkPath {}
+
+#[cfg(windows)]
+#[unsafe(export_name = "D3D12SDKVersion")]
+#[used]
+pub static D3D12_SDK_VERSION: u32 = 620;
+
+#[cfg(windows)]
+#[unsafe(export_name = "D3D12SDKPath")]
+#[used]
+pub static D3D12_SDK_PATH: AgilitySdkPath = AgilitySdkPath(c".\\D3D12\\".as_ptr().cast());
+
 #[derive(Parser)]
 #[command(
-    name = "victory",
+    name = "oathkeep",
     version,
-    about = "Run an Xbox Series title natively on Windows"
+    about = "Oathkeep: run Xbox Series X|S titles natively on Windows"
 )]
 struct Cli {
     #[command(subcommand)]

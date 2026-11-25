@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Asset & Clean-Room Policy (Read First)
+    url: https://github.com/thealexsan/oathkeep/blob/main/docs/asset-policy.md
+    about: Zero-tolerance rules on copyrighted files, dumps, keys, and naming.

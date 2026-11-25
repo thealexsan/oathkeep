@@ -1,0 +1,33 @@
+name: Bug Report
+description: Report a crash, rendering defect, or compatibility bug (clean-room logs only)
+labels: ["bug"]
+body:
+  - type: checkboxes
+    id: policy
+    attributes:
+      label: Clean-Room Compliance (Mandatory)
+      description: Reports containing copyrighted files, dumps, keys, or commercial title names will be closed and deleted.
+      options:
+        - label: I confirm this report contains NO copyrighted binaries, assets, shaders, memory dumps, keys, or commercial title/publisher names.
+          required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: System & GPU
+      placeholder: "e.g. Windows 10 19045 + Agility SDK 1.620.2, RTX 3070 8 GB, 16 GB RAM"
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Oathkeep Commit / Build Profile
+      placeholder: "e.g. main (abc1234), diag profile, -Profile safe"
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What Happened
+      description: Describe the issue, HRESULT/exception code, or anonymized shader hash.
+    validations:
+      required: true
