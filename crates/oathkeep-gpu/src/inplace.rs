@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -46,6 +46,67 @@ fn most() -> u64 {
     })
 }
 
+fn sections_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("OATHKEEP_INPLACE_SECTIONS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| mb << 20)
+            .unwrap_or_else(|| most().min(2048 << 20))
+    })
+}
+
+fn min_bytes() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        if let Some(kb) = std::env::var("OATHKEEP_INPLACE_MIN_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            return kb << 10;
+        }
+        std::env::var("OATHKEEP_INPLACE_MIN_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            << 20
+    })
+}
+
+fn try_reserve_budget(
+    target: &AtomicU64,
+    other: &AtomicU64,
+    delta: u64,
+    target_cap: u64,
+    total_cap: u64,
+) -> bool {
+    if delta == 0 {
+        return true;
+    }
+    let mut cur = target.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = cur.checked_add(delta) else {
+            return false;
+        };
+        if next > target_cap || next.saturating_add(other.load(Ordering::Relaxed)) > total_cap {
+            return false;
+        }
+        match target.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+fn commit_allows(delta: u64) -> bool {
+    let headroom = crate::resource::commit_headroom();
+    if headroom == 0 {
+        return true;
+    }
+    crate::host::available_commit().is_none_or(|avail| avail >= headroom.saturating_add(delta))
+}
+
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 pub(crate) struct SectionHeap {
@@ -56,7 +117,7 @@ pub(crate) struct SectionHeap {
 
 impl Drop for SectionHeap {
     fn drop(&mut self) {
-        SECTION_BYTES.fetch_sub(self.size, Ordering::Relaxed);
+        SECTION_BYTES.fetch_sub(self.size, Ordering::AcqRel);
         if let Ok(mut guard) = SECTION_HEAPS.lock()
             && let Some(map) = guard.as_mut()
             && let Some(SectionEntry::Open(weak)) = map.get(&self.section)
@@ -68,18 +129,35 @@ impl Drop for SectionHeap {
     }
 }
 
+pub(crate) struct PartHeap {
+    bytes: u64,
+    heap: ID3D12Heap,
+}
+
+impl Drop for PartHeap {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            PART_BYTES.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+        crate::host::retire(self.heap.clone());
+    }
+}
+
 enum SectionEntry {
     Refused,
+    Opening,
     Open(Weak<SectionHeap>),
 }
 
 static SECTION_HEAPS: Mutex<Option<std::collections::HashMap<usize, SectionEntry>>> =
     Mutex::new(None);
+static SECTION_OPENED: Condvar = Condvar::new();
 static SECTION_BYTES: AtomicU64 = AtomicU64::new(0);
+static PART_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[allow(dead_code)]
 pub(crate) enum PlaceHeap {
-    Part(ID3D12Heap),
+    Part(PartHeap),
     Section(Arc<SectionHeap>),
 }
 
@@ -90,12 +168,9 @@ pub(crate) struct Placed {
     pub(crate) bias: u64,
 }
 
+#[cfg(test)]
 fn section_info(section: usize) -> Option<(u64, bool)> {
-    views_read()
-        .sections
-        .iter()
-        .find(|s| s.0 == section)
-        .map(|s| (s.1, s.2))
+    views_read().sections.get(&section).copied()
 }
 
 pub(crate) fn section_run_in_place(start: u64, len: u64) -> bool {
@@ -104,10 +179,12 @@ pub(crate) fn section_run_in_place(start: u64, len: u64) -> bool {
     }
     let at = start & !(K64 as u64 - 1);
     let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
-    match cover(at as usize, bytes as usize) {
-        Cover::Run(section, off) => {
-            section_info(section).is_some_and(|(size, committed)| committed && off + bytes <= size)
-        }
+    let v = views_read();
+    match cover_in(&v.views, at as usize, bytes as usize) {
+        Cover::Run(section, off) => v
+            .sections
+            .get(&section)
+            .is_some_and(|&(size, committed)| committed && off.checked_add(bytes).is_some_and(|e| e <= size)),
         _ => false,
     }
 }
@@ -131,11 +208,7 @@ pub(crate) fn section_run_around(
         .range(..=at)
         .next_back()
         .filter(|(base, view)| *base + view.0 > at)?;
-    let (sec_size, committed) = v
-        .sections
-        .iter()
-        .find(|s| s.0 == section)
-        .map(|s| (s.1, s.2))?;
+    let (sec_size, committed) = v.sections.get(&section).copied()?;
     if !committed {
         return None;
     }
@@ -193,55 +266,67 @@ pub(crate) fn section_run_around(
 fn section_heap(
     host: &crate::host::Host,
     section: usize,
+    size: u64,
 ) -> Result<Arc<SectionHeap>, Option<windows::core::Error>> {
-    let Some((size, true)) = section_info(section) else {
-        return Err(None);
-    };
     {
-        let heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = heaps.as_ref().and_then(|m| m.get(&section)) {
-            match entry {
-                SectionEntry::Open(weak) => {
+        let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match heaps.as_ref().and_then(|m| m.get(&section)) {
+                Some(SectionEntry::Open(weak)) => {
                     if let Some(existing) = weak.upgrade() {
                         return Ok(existing);
                     }
+                    break;
                 }
-                SectionEntry::Refused => return Err(None),
+                Some(SectionEntry::Refused) => return Err(None),
+                Some(SectionEntry::Opening) => {
+                    heaps = SECTION_OPENED
+                        .wait(heaps)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+                None => break,
             }
         }
-    }
-    const SHARED_HEADROOM: u64 = 1024 << 20;
-    if SECTION_BYTES.load(Ordering::Relaxed).saturating_add(size) > most() {
-        STATS[6].fetch_add(1, Ordering::Relaxed);
-        return Err(None);
-    }
-    if let Some([_, _, shared_budget, shared_usage]) = host.video_memory()
-        && shared_usage
-            .saturating_add(size)
-            .saturating_add(SHARED_HEADROOM)
-            > shared_budget
-    {
-        STATS[6].fetch_add(1, Ordering::Relaxed);
-        return Err(None);
+        const SHARED_HEADROOM: u64 = 1024 << 20;
+        if !commit_allows(size) {
+            STATS[6].fetch_add(1, Ordering::Relaxed);
+            return Err(None);
+        }
+        if let Some([_, _, shared_budget, shared_usage]) = host.video_memory()
+            && shared_usage
+                .saturating_add(size)
+                .saturating_add(SHARED_HEADROOM)
+                > shared_budget
+        {
+            STATS[6].fetch_add(1, Ordering::Relaxed);
+            return Err(None);
+        }
+        if !try_reserve_budget(&SECTION_BYTES, &PART_BYTES, size, sections_most(), most()) {
+            STATS[6].fetch_add(1, Ordering::Relaxed);
+            return Err(None);
+        }
+        heaps
+            .get_or_insert_with(Default::default)
+            .insert(section, SectionEntry::Opening);
     }
     let opened = match open(&host.device, From::Section(section)) {
         Ok(heap) => heap,
         Err(e) => {
+            SECTION_BYTES.fetch_sub(size, Ordering::AcqRel);
             let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-            heaps
-                .get_or_insert_with(Default::default)
-                .insert(section, SectionEntry::Refused);
+            let map = heaps.get_or_insert_with(Default::default);
+            // Transient OOM may clear after sweeps/reclaim; only permanently
+            // mark non-OOM refusals (e.g. unsupported/reserved sections).
+            if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+                map.remove(&section);
+            } else {
+                map.insert(section, SectionEntry::Refused);
+            }
+            SECTION_OPENED.notify_all();
             return Err(Some(e));
         }
     };
-    let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let map = heaps.get_or_insert_with(Default::default);
-    if let Some(SectionEntry::Open(weak)) = map.get(&section)
-        && let Some(existing) = weak.upgrade()
-    {
-        return Ok(existing);
-    }
-    let total = SECTION_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+    let total = SECTION_BYTES.load(Ordering::Relaxed);
     tracing::debug!(
         section = format_args!("{section:#x}"),
         kb = size >> 10,
@@ -253,25 +338,29 @@ fn section_heap(
         size,
         heap: opened,
     });
-    map.insert(section, SectionEntry::Open(Arc::downgrade(&arc)));
+    {
+        let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .get_or_insert_with(Default::default)
+            .insert(section, SectionEntry::Open(Arc::downgrade(&arc)));
+        SECTION_OPENED.notify_all();
+    }
     Ok(arc)
 }
 
 fn place_section(
     host: &crate::host::Host,
     section: usize,
+    sec_size: u64,
     section_off: u64,
     start: u64,
     at: u64,
     bytes: u64,
 ) -> Result<Placed, Option<windows::core::Error>> {
-    let Some((size, true)) = section_info(section) else {
-        return Err(None);
-    };
-    if section_off.checked_add(bytes).is_none_or(|end| end > size) {
+    if section_off.checked_add(bytes).is_none_or(|end| end > sec_size) {
         return Err(None);
     }
-    let section_heap = section_heap(host, section)?;
+    let section_heap = section_heap(host, section, sec_size)?;
     let buffer = place(&host.device, &section_heap.heap, section_off, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
@@ -299,7 +388,7 @@ pub(crate) fn place_part(
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
     Ok(Placed {
         buffer,
-        heap: PlaceHeap::Part(heap),
+        heap: PlaceHeap::Part(PartHeap { bytes: 0, heap }),
         gpu,
         bias: start - at,
     })
@@ -310,13 +399,26 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if lvl < if window { 1 } else { 2 } {
         return None;
     }
+    let floor = min_bytes();
+    if floor > 0 && len < floor {
+        return None;
+    }
     let at = start & !(K64 as u64 - 1);
     let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
     let host = crate::host::host()?;
-    let placed = match cover(at as usize, bytes as usize) {
+    let (covered, sec_info) = {
+        let v = views_read();
+        let covered = cover_in(&v.views, at as usize, bytes as usize);
+        let info = match covered {
+            Cover::Run(section, _) if lvl >= 3 => v.sections.get(&section).copied(),
+            _ => None,
+        };
+        (covered, info)
+    };
+    let placed = match covered {
         Cover::None => {
             const SHARED_HEADROOM: u64 = 2048 << 20;
-            if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+            if !commit_allows(bytes) {
                 STATS[6].fetch_add(1, Ordering::Relaxed);
                 return None;
             }
@@ -329,11 +431,29 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
                 STATS[6].fetch_add(1, Ordering::Relaxed);
                 return None;
             }
-            place_part(&host.device, start, len)
+            if !try_reserve_budget(&PART_BYTES, &SECTION_BYTES, bytes, most(), most()) {
+                STATS[6].fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            match place_part(&host.device, start, len) {
+                Ok(mut placed) => {
+                    if let PlaceHeap::Part(part) = &mut placed.heap {
+                        part.bytes = bytes;
+                    }
+                    Ok(placed)
+                }
+                Err(e) => {
+                    PART_BYTES.fetch_sub(bytes, Ordering::AcqRel);
+                    Err(e)
+                }
+            }
         }
-        Cover::Run(section, section_off) if lvl >= 3 => {
-            place_section(host, section, section_off, start, at, bytes)
-        }
+        Cover::Run(section, section_off) if lvl >= 3 => match sec_info {
+            Some((sec_size, true)) => {
+                place_section(host, section, sec_size, section_off, start, at, bytes)
+            }
+            _ => Err(None),
+        },
         _ => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
             return None;
@@ -395,15 +515,19 @@ fn say() {
                 .count()
         });
     let section_mb = SECTION_BYTES.load(Ordering::Relaxed) >> 20;
+    let part_mb = PART_BYTES.load(Ordering::Relaxed) >> 20;
     tracing::info!(
-        "title memory in place: {} windows {} MB, {} title buffers {} MB ({} open sections {} MB) (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
-         {} refused by the host, {} over OATHKEEP_INPLACE_MB; {} let go because their memory changed",
+        "title memory in place: {} windows {} MB, {} title buffers {} MB ({} open sections {} MB, private heaps {} MB, caps {} / {} MB) (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
+         {} refused by the host, {} over budget/headroom; {} let go because their memory changed",
         s[0],
         s[1] >> 20,
         s[2],
         s[3] >> 20,
         open_sections,
         section_mb,
+        part_mb,
+        sections_most() >> 20,
+        most() >> 20,
         s[4],
         s[5],
         s[6],
@@ -521,13 +645,13 @@ impl ShownPages {
 struct Views {
     views: BTreeMap<usize, (usize, usize, u64)>,
     pages: BTreeMap<(usize, u64), ShownPages>,
-    sections: Vec<(usize, u64, bool)>,
+    sections: BTreeMap<usize, (u64, bool)>,
 }
 
 static VIEWS: RwLock<Views> = RwLock::new(Views {
     views: BTreeMap::new(),
     pages: BTreeMap::new(),
-    sections: Vec::new(),
+    sections: BTreeMap::new(),
 });
 
 fn views() -> std::sync::RwLockWriteGuard<'static, Views> {
@@ -539,13 +663,17 @@ fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
 }
 
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views();
-    v.sections.retain(|s| s.0 != section);
-    v.sections.push((section, bytes, committed));
+    views().sections.insert(section, (bytes, committed));
+    if let Ok(mut guard) = SECTION_HEAPS.lock()
+        && let Some(map) = guard.as_mut()
+        && matches!(map.get(&section), Some(SectionEntry::Refused))
+    {
+        map.remove(&section);
+    }
 }
 
 pub fn title_memory_section_closing(section: usize) {
-    views().sections.retain(|s| s.0 != section);
+    views().sections.remove(&section);
     if let Ok(mut guard) = SECTION_HEAPS.lock()
         && let Some(map) = guard.as_mut()
     {
@@ -556,7 +684,17 @@ pub fn title_memory_section_closing(section: usize) {
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     {
         let mut v = views();
-        v.views.insert(at, (len, section, offset));
+        if let Some((old_bytes, old_section, old_offset)) = v.views.insert(at, (len, section, offset))
+        {
+            for k in 0..old_bytes.div_ceil(K64) {
+                let key = (old_section, old_offset + (k * K64) as u64);
+                if let Some(pages) = v.pages.get_mut(&key)
+                    && pages.remove(at + k * K64)
+                {
+                    v.pages.remove(&key);
+                }
+            }
+        }
         for k in 0..len.div_ceil(K64) {
             let key = (section, offset + (k * K64) as u64);
             let addr = at + k * K64;
@@ -1495,7 +1633,7 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    for &(bytes, committed) in v.sections.values() {
         lines.push(format!(
             "census, a section of {} MB, {}",
             bytes >> 20,
@@ -1817,5 +1955,92 @@ mod tests {
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn budget_reservation_enforces_both_target_and_total_caps() {
+        let sections = AtomicU64::new(0);
+        let parts = AtomicU64::new(0);
+        let sec_cap = 2048 << 20;
+        let total_cap = 3072 << 20;
+        assert!(try_reserve_budget(
+            &sections,
+            &parts,
+            1024 << 20,
+            sec_cap,
+            total_cap
+        ));
+        assert_eq!(sections.load(Ordering::Relaxed), 1024 << 20);
+        assert!(try_reserve_budget(
+            &sections,
+            &parts,
+            1024 << 20,
+            sec_cap,
+            total_cap
+        ));
+        assert!(
+            !try_reserve_budget(&sections, &parts, 64 << 20, sec_cap, total_cap),
+            "exceeds section-specific cap"
+        );
+        assert!(try_reserve_budget(
+            &parts,
+            &sections,
+            1024 << 20,
+            total_cap,
+            total_cap
+        ));
+        assert!(
+            !try_reserve_budget(&parts, &sections, 64 << 20, total_cap, total_cap),
+            "exceeds combined total cap"
+        );
+        sections.fetch_sub(1024 << 20, Ordering::AcqRel);
+        assert!(try_reserve_budget(
+            &parts,
+            &sections,
+            1024 << 20,
+            total_cap,
+            total_cap
+        ));
+        assert_eq!(parts.load(Ordering::Relaxed), 2048 << 20);
+    }
+
+    #[test]
+    fn section_registry_updates_and_clears_refused_handle_reuse() {
+        let handle = 0xfeed_faceusize;
+        title_memory_section(handle, 4 * K64 as u64, false);
+        assert_eq!(section_info(handle), Some((4 * K64 as u64, false)));
+        {
+            let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            heaps
+                .get_or_insert_with(Default::default)
+                .insert(handle, SectionEntry::Refused);
+        }
+        // Re-registering the same handle value clears a stale Refused entry.
+        title_memory_section(handle, 8 * K64 as u64, true);
+        assert_eq!(section_info(handle), Some((8 * K64 as u64, true)));
+        {
+            let heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(heaps.as_ref().is_none_or(|m| !m.contains_key(&handle)));
+        }
+        title_memory_section_closing(handle);
+        assert_eq!(section_info(handle), None);
+    }
+
+    #[test]
+    fn overwriting_a_view_cleans_stale_page_entries() {
+        let at = 0x7_6000_0000usize;
+        let sec_a = 0xdead_0001usize;
+        let sec_b = 0xdead_0002usize;
+        title_memory_view(at, 2 * K64, sec_a, 0);
+        assert_eq!(views_of_section(sec_a, 0, 2 * K64), [(at, 2 * K64)]);
+        // Overwrite the same base with a smaller view into a different section.
+        title_memory_view(at, K64, sec_b, 0);
+        assert!(
+            views_of_section(sec_a, 0, 2 * K64).is_empty(),
+            "overwritten view must not leak stale page entries"
+        );
+        assert_eq!(views_of_section(sec_b, 0, K64), [(at, K64)]);
+        views_gone(at, K64);
+        assert!(views_of_section(sec_b, 0, K64).is_empty());
     }
 }
