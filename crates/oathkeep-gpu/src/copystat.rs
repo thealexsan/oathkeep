@@ -73,8 +73,17 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    PrepAskOnceUs,
+    PrepRunDeferredUs,
+    PrepPreludeUs,
+    PrepBatchFlushUs,
+    PrepSnapshotsUs,
+    PrepCardPrepareWriteUs,
+    PrepCardFillUploadUs,
+    PrepCardRecordUs,
+    PrepOtherUs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1101,6 +1110,20 @@ pub(crate) fn log(frames: f64) {
         c[C::HostLists as usize],
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
+    );
+    tracing::info!(
+        "preparing breakdown per frame: ask_once {:.1} ms, run_deferred {:.1} ms, prelude {:.1} ms, \
+         batch_flush {:.1} ms, snapshots {:.1} ms, card_prepare_write {:.1} ms, \
+         card_fill_upload {:.1} ms, card_record {:.1} ms, other {:.1} ms",
+        ms(c[C::PrepAskOnceUs as usize]),
+        ms(c[C::PrepRunDeferredUs as usize]),
+        ms(c[C::PrepPreludeUs as usize]),
+        ms(c[C::PrepBatchFlushUs as usize]),
+        ms(c[C::PrepSnapshotsUs as usize]),
+        ms(c[C::PrepCardPrepareWriteUs as usize]),
+        ms(c[C::PrepCardFillUploadUs as usize]),
+        ms(c[C::PrepCardRecordUs as usize]),
+        ms(c[C::PrepOtherUs as usize]),
     );
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut whole: Vec<_> = whole.into_iter().flatten().collect();
