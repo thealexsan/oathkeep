@@ -275,6 +275,42 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
+pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        return Some((
+            j.ahead_asked,
+            j.written
+                .range(first..last)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
+        ));
+    }
+    #[cfg(feature = "diagnostics")]
+    let guarding = std::time::Instant::now();
+    let written = guard(first * PAGE, last * PAGE);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::GuardUs,
+        guarding.elapsed().as_micros() as u64,
+    );
+    let guarded = written?;
+    j.asked += 1;
+    let now = j.asked;
+    for page in guarded {
+        j.written.insert(page, now);
+    }
+    Some((
+        now,
+        j.written
+            .range(first..last)
+            .map(|(&p, &w)| (p, w))
+            .collect(),
+    ))
+}
+
 const BLOCK: usize = PAGE;
 
 struct Guards {

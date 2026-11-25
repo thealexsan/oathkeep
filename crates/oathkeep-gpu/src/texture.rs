@@ -32,6 +32,7 @@ pub(crate) struct Staging {
     on_demand: bool,
     detiled: std::sync::atomic::AtomicU32,
     zeroed_mips: std::sync::atomic::AtomicU32,
+    watch_mode: std::sync::atomic::AtomicU8,
     judged: [std::sync::atomic::AtomicU64; 2],
     waiting: std::sync::atomic::AtomicU64,
 }
@@ -848,40 +849,59 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false))
-        {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
-                return 0;
+        use std::sync::atomic::Ordering::Relaxed;
+        let mode = self.watch_mode.load(Relaxed);
+        if mode == 0 || mode == 1 {
+            if let Some((now, written)) =
+                waited(1, || crate::watch::writes(start, start + size, false))
+            {
+                if mode == 0 {
+                    self.watch_mode.store(1, Relaxed);
+                }
+                if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                    return 0;
+                }
+                last.asked = now;
+                with_read(size, |read| {
+                    crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                    self.detile(read);
+                });
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+                return size;
             }
-            last.asked = now;
-            with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
-            });
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
+            if mode == 1 {
+                self.watch_mode.store(0, Relaxed);
+            }
         }
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *GUARD
-            .get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) =
-                waited(1, || crate::watch::writes(start, start + size, true))
+        if (mode == 0 || mode == 2)
+            && *GUARD
+                .get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_GUARD").is_none_or(|v| v != "0"))
         {
-            static HASH_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            let hash_every = *HASH_EVERY.get_or_init(|| {
-                std::env::var("OATHKEEP_TEXTURE_HASH_EVERY")
-                    .ok()
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-                    .map_or(32, |n| n.max(1))
-            });
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
-            last.asked = now;
-            let turn = crate::frame::current()
-                .wrapping_add((start >> 16) as u64)
-                .is_multiple_of(hash_every);
-            if unwritten && !turn {
-                return 0;
+            if let Some((now, written)) =
+                waited(1, || crate::watch::writes_guarded(start, start + size))
+            {
+                if mode == 0 {
+                    self.watch_mode.store(2, Relaxed);
+                }
+                static HASH_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let hash_every = *HASH_EVERY.get_or_init(|| {
+                    std::env::var("OATHKEEP_TEXTURE_HASH_EVERY")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .map_or(32, |n| n.max(1))
+                });
+                let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+                last.asked = now;
+                let turn = crate::frame::current()
+                    .wrapping_add((start >> 16) as u64)
+                    .is_multiple_of(hash_every);
+                if unwritten && !turn {
+                    return 0;
+                }
+            } else if mode == 0 {
+                self.watch_mode.store(3, Relaxed);
             }
         }
         let _mapped = if no_wait() {
@@ -1312,6 +1332,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
         zeroed_mips: std::sync::atomic::AtomicU32::new(if fresh { u32::MAX } else { 0 }),
+        watch_mode: std::sync::atomic::AtomicU8::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
     });

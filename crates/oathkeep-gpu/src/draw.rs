@@ -1116,7 +1116,14 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        static REBUILD_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let rebuild_every = *REBUILD_EVERY.get_or_init(|| {
+            std::env::var("OATHKEEP_HEAP_REBUILD_FRAMES")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(64, |n| n.max(1))
+        });
+        let slots = if *passes % rebuild_every == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
