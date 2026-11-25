@@ -1162,10 +1162,29 @@ pub(crate) fn host_made<'a>(
 }
 
 #[cfg(windows)]
+fn commit_headroom() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("OATHKEEP_COMMIT_HEADROOM_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(2048)
+            << 20
+    })
+}
+
+#[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
+    let headroom = commit_headroom();
+    if headroom > 0
+        && let Some(avail) = crate::host::available_commit()
+        && avail < headroom
+    {
+        return false;
+    }
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("OATHKEEP_TEXTURE_BUDGET_MB").ok()?;
@@ -1453,7 +1472,8 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()))
+        .min(crate::host::commit_idle_ms(crate::host::available_commit()));
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
     for &at in all.iter() {

@@ -110,7 +110,9 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
-    let Some(list) = host_list(this) else { return };
+    let Some(list) = record_host(this) else {
+        return;
+    };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
@@ -147,6 +149,20 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 }
 
 #[cfg(windows)]
+fn record_host<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes one of our lists, recorded by one thread at a
+    // time and not submitted while it records.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    if list.host.is_none() {
+        list.host = fresh_list();
+    }
+    list.host.as_ref()
+}
+
+#[cfg(windows)]
 pub(crate) struct Detached {
     host: crate::host::HostList,
     _uploads: Vec<Vec<u8>>,
@@ -172,7 +188,17 @@ unsafe impl Send for Idle {}
 static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
 
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (128, 256 << 20);
+const IDLE_MOST: (usize, u64) = (32, 64 << 20);
+
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    while idle.0.len() > 8 {
+        if let Some(Idle(_, bytes)) = idle.0.pop() {
+            idle.1 = idle.1.saturating_sub(bytes);
+        }
+    }
+}
 
 #[cfg(windows)]
 fn pools() -> bool {
@@ -236,6 +262,7 @@ fn cut(this: This, wait: ValueWait) {
     // thread at a time and is not submitted while it records.
     let list = unsafe { &mut *this.cast_mut().cast::<List>() };
     let Some(current) = list.host.as_ref() else {
+        list.gate.push(wait);
         return;
     };
     if current.untouched() {
@@ -306,15 +333,21 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
-            continue;
+        let host = match list.host.take() {
+            Some(host) => host,
+            None => {
+                if list.gate.is_empty() && list.earlier.is_empty() {
+                    continue;
+                }
+                let Some(fresh) = fresh_list() else {
+                    continue;
+                };
+                fresh.close();
+                fresh
+            }
         };
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
@@ -372,15 +405,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = (*list).host.take() else {
                 continue;
             };
             let uploads =
@@ -478,13 +507,7 @@ fn new_list(
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        host: None,
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
@@ -547,12 +570,14 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        if let Some(host) = list.host.as_ref() {
+            host.reset();
+        }
+        list.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset(pipeline);
     }
-    #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
-        state.reset(pipeline);
-    });
     #[cfg(not(windows))]
     let _ = (this, pipeline);
     S_OK
@@ -626,7 +651,7 @@ const UAV_BARRIER: Barrier = Barrier {
 
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = record_host(this)
         && !barriers.is_null()
     {
         // SAFETY: the title passes `count` barriers.
@@ -701,7 +726,7 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = record_host(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
@@ -800,7 +825,7 @@ fn unlike(dst: This, src: This) -> bool {
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
-        let Some(list) = host_list(this) else {
+        let Some(list) = record_host(this) else {
             return;
         };
         if let (Some(to), Some(from)) = (
@@ -862,7 +887,7 @@ extern "system" fn copy_texture_region(
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
         let (Some(list), Some(&dst), Some(&src)) =
-            (host_list(this), unsafe { dst.as_ref() }, unsafe {
+            (record_host(this), unsafe { dst.as_ref() }, unsafe {
                 src.as_ref()
             })
         else {
@@ -1114,7 +1139,7 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = record_host(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -1192,7 +1217,7 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
+        let (Some(list), Some(record)) = (record_host(this), crate::descriptor::rtv_record(handle))
         else {
             return;
         };
@@ -1241,7 +1266,7 @@ extern "system" fn clear_dsv(
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
+        let (Some(list), Some(record)) = (record_host(this), crate::descriptor::dsv_record(handle))
         else {
             return;
         };
@@ -1279,7 +1304,7 @@ extern "system" fn clear_dsv(
 
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = record_host(this)
         && dst != 0
         && src != 0
     {
@@ -1842,7 +1867,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     }
     #[cfg(windows)]
     if count > 0
-        && let Some(list) = host_list(this)
+        && let Some(list) = record_host(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
@@ -1924,7 +1949,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
         return;
     }
     #[cfg(windows)]
-    if let Some(list) = host_list(this) {
+    if let Some(list) = record_host(this) {
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }

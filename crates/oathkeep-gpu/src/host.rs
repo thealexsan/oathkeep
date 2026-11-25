@@ -83,6 +83,36 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+pub(crate) fn available_commit() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    ok.then_some(m.ullAvailPageFile)
+}
+
+pub(crate) fn commit_idle_ms(avail_commit: Option<u64>) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const NORMAL_MS: u64 = 5_000;
+    const MODERATE_MS: u64 = 2_500;
+    const HIGH_MS: u64 = 1_000;
+    const CRITICAL_MS: u64 = 500;
+    let Some(avail) = avail_commit else {
+        return NORMAL_MS;
+    };
+    if avail < 2 * GIB {
+        CRITICAL_MS
+    } else if avail < 3 * GIB {
+        HIGH_MS
+    } else if avail < 4 * GIB {
+        MODERATE_MS
+    } else {
+        NORMAL_MS
+    }
+}
+
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
     const NORMAL_MS: u64 = 5_000;
     const MODERATE_MS: u64 = 2_500;
@@ -153,6 +183,13 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    if available_commit().is_some_and(|c| c < (3u64 << 30)) {
+        crate::list::trim_idle();
+        PRELUDE_POOL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .truncate(4);
+    }
 }
 
 pub(crate) fn retire<T: 'static>(object: T) {
@@ -694,7 +731,7 @@ impl Drop for PooledPrelude {
     fn drop(&mut self) {
         if let Some(prelude) = self.0.take() {
             let mut pool = PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner());
-            if pool.len() < 64 {
+            if pool.len() < 16 {
                 pool.push(PooledPrelude(Some(prelude)));
             }
         }

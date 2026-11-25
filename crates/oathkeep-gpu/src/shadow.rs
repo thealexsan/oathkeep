@@ -1681,7 +1681,14 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        let avail = match (
+            crate::host::available_physical_ram(),
+            crate::host::available_commit(),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let idle_ms = crate::host::ram_idle_ms(avail);
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
@@ -3113,6 +3120,13 @@ fn tail_of(address: u64, end: u64) -> (u64, u64) {
     (start, cell + len - start)
 }
 
+fn inplace_unsized_fallback(address: u64, end: u64) -> (u64, u64) {
+    let start = address & !(TAIL_STEP - 1);
+    let min_end = end.max(address.saturating_add(TAIL_STEP));
+    let len = (min_end - start).next_multiple_of(TAIL_STEP);
+    (start, len)
+}
+
 fn holder(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u64) -> Option<(u64, u64)> {
     windows
         .filter(|&(start, bytes)| start <= address && start + bytes >= end)
@@ -3169,14 +3183,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             {
                 (rs, rl)
             } else if !unsized_ask {
-                let page = window_of(address, end, 64 << 10);
-                if page != grid && crate::inplace::section_run_in_place(page.0, page.1) {
-                    page
-                } else {
-                    grid
-                }
+                window_of(address, end, 64 << 10)
             } else {
-                grid
+                inplace_unsized_fallback(address, end)
             }
         } else {
             grid
@@ -3194,12 +3203,6 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 .map(|(key, _)| *key);
             if let Some(found) = holder(there, address, end) {
                 return found;
-            }
-            if tails() && !crate::inplace::section_run_in_place(named.0, named.1) {
-                let there = map
-                    .range((cell, 0)..=(address, u64::MAX))
-                    .map(|(key, _)| *key);
-                return longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end));
             }
             named
         } else if unsized_ask && tails() {
@@ -3287,7 +3290,25 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{
+        TAIL_STEP, WINDOW, cover, grid, holder, inplace_unsized_fallback, longest_tail, tail_of,
+        window_of,
+    };
+
+    #[test]
+    fn inplace_unsized_fallback_keeps_headroom_without_spanning_whole_window() {
+        let addr = 0xd_120c_1234u64; // near end of a 1 MiB section
+        let (start, len) = inplace_unsized_fallback(addr, addr + 1);
+        assert_eq!(start, 0xd_120c_0000);
+        assert_eq!(len, 2 * TAIL_STEP);
+        assert!(start <= addr);
+        assert!(start + len >= addr + TAIL_STEP);
+        assert!(len <= 2 * TAIL_STEP);
+
+        let aligned = 0xd_120c_0000u64;
+        let (start2, len2) = inplace_unsized_fallback(aligned, aligned + 1);
+        assert_eq!((start2, len2), (aligned, TAIL_STEP));
+    }
 
     #[test]
     fn an_ask_takes_the_longest_window_that_holds_it() {
