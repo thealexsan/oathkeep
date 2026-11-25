@@ -95,7 +95,7 @@ fn early_budgets() -> (u64, u64) {
         };
         (
             ms("OATHKEEP_EARLY_TEXTURES_MS", texture_stage_ms()),
-            ms("OATHKEEP_BAKE_TEXTURES_MS", 8),
+            ms("OATHKEEP_BAKE_TEXTURES_MS", 32),
         )
     })
 }
@@ -296,6 +296,7 @@ type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 #[cfg(feature = "diagnostics")]
 pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
+static HEAP_BUFFER_LAST_FRAME: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURE_MICROS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES: AtomicU64 = AtomicU64::new(0);
@@ -409,6 +410,7 @@ struct ShadowSlots<T> {
 struct BufferSpanCache<T> {
     passes: u64,
     slot_owner: std::collections::HashMap<u32, usize>,
+    slot_keys: std::collections::HashMap<u32, u64>,
     shadows: std::collections::HashMap<usize, ShadowSlots<T>>,
     dirty_keys: Vec<usize>,
     bytes: u64,
@@ -420,6 +422,7 @@ impl<T> Default for BufferSpanCache<T> {
         Self {
             passes: 0,
             slot_owner: std::collections::HashMap::new(),
+            slot_keys: std::collections::HashMap::new(),
             shadows: std::collections::HashMap::new(),
             dirty_keys: Vec::new(),
             bytes: 0,
@@ -430,12 +433,43 @@ impl<T> Default for BufferSpanCache<T> {
 
 impl<T> BufferSpanCache<T> {
     fn clear(&mut self) {
-        if !self.slot_owner.is_empty() || !self.shadows.is_empty() || !self.dirty_keys.is_empty() {
+        if !self.slot_owner.is_empty()
+            || !self.slot_keys.is_empty()
+            || !self.shadows.is_empty()
+            || !self.dirty_keys.is_empty()
+        {
             self.slot_owner.clear();
+            self.slot_keys.clear();
             self.shadows.clear();
             self.dirty_keys.clear();
             self.bytes = 0;
         }
+    }
+
+    fn slot_key(&self, index: u32) -> Option<u64> {
+        self.slot_keys.get(&index).copied()
+    }
+
+    fn set_slot_key(&mut self, index: u32, key: u64) {
+        if key == 0 {
+            self.slot_keys.remove(&index);
+        } else {
+            self.slot_keys.insert(index, key);
+        }
+    }
+
+    fn retain_slots(&mut self, keep: &std::collections::HashSet<u32>, key_of: impl Fn(&T) -> usize) {
+        let stale: Vec<u32> = self
+            .slot_owner
+            .keys()
+            .copied()
+            .filter(|idx| !keep.contains(idx))
+            .collect();
+        for index in stale {
+            self.set(index, None, &key_of);
+            self.slot_keys.remove(&index);
+        }
+        self.slot_keys.retain(|idx, _| keep.contains(idx));
     }
 
     fn slot_count(&self) -> usize {
@@ -1525,6 +1559,7 @@ impl State {
         if FRAME.load(Ordering::Relaxed) == frame || FRAME.swap(frame, Ordering::Relaxed) == frame {
             return Some(gpu);
         }
+        HEAP_BUFFER_LAST_FRAME.store(frame, Ordering::Relaxed);
         let started = std::time::Instant::now();
         type Cache = BufferSpanCache<std::sync::Arc<crate::shadow::Shadow>>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, Cache>>> =
@@ -1543,19 +1578,24 @@ impl State {
                 .map_or(64, |n| n.max(1))
         });
         let evicted = crate::shadow::take_in_place_evicted();
-        let mut slots = if cache.passes % rebuild_every == 0 {
-            cache.clear();
+        let key_of = |s: &std::sync::Arc<crate::shadow::Shadow>| std::sync::Arc::as_ptr(s) as usize;
+        let full_rebuild = cache.passes % rebuild_every == 0;
+        let mut slots = if full_rebuild {
             let all = host.buffer_slots();
             if !evicted.is_empty() {
+                cache.clear();
                 for &index in &all {
                     host.unmake_slot(index);
                 }
+            } else if cache.slot_count() > 0 {
+                let keep: std::collections::HashSet<u32> = all.iter().copied().collect();
+                cache.retain_slots(&keep, key_of);
             }
             all
         } else {
             changed
         };
-        if !evicted.is_empty() && cache.passes % rebuild_every != 0 {
+        if !evicted.is_empty() && !full_rebuild {
             let stale = cache.collect_stale_slots(
                 |shadow| shadow.is_in_place(),
                 |from, to| {
@@ -1566,16 +1606,22 @@ impl State {
             );
             for index in stale {
                 host.unmake_slot(index);
+                cache.set_slot_key(index, 0);
                 slots.push(index);
             }
         }
         cache.passes += 1;
-        let key_of = |s: &std::sync::Arc<crate::shadow::Shadow>| std::sync::Arc::as_ptr(s) as usize;
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive =
             !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         let mirror_started = std::time::Instant::now();
         for (n, &index) in slots.iter().enumerate() {
+            if let Some(handle) = heap.handle(index)
+                && let Some(key) = host.unchanged_slot_key(index, handle)
+                && cache.slot_key(index) == Some(key)
+            {
+                continue;
+            }
             let resolved = heap.handle(index).and_then(|handle| {
                 let mirrored = host.mirror_buffer(index, handle)?;
                 if alive
@@ -1606,7 +1652,9 @@ impl State {
                 }
                 Some((shadow, address, address + len))
             });
+            let resolved_ok = resolved.is_some();
             cache.set(index, resolved, key_of);
+            cache.set_slot_key(index, if resolved_ok { host.made_key(index) } else { 0 });
         }
         let mirror_us = mirror_started.elapsed().as_micros() as u64;
         let views = cache.slot_count() as u32;
@@ -1709,7 +1757,7 @@ impl State {
         static BAKED_PASSES: AtomicU64 = AtomicU64::new(0);
         static IN_FLIGHT: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
-        const MAX_BAKE_PASSES_PER_FRAME: u64 = 2;
+        const MAX_BAKE_PASSES_PER_FRAME: u64 = 16;
         let frame = crate::frame::current();
         let first = FRAME.load(Ordering::Relaxed) != frame
             && FRAME.swap(frame, Ordering::Relaxed) != frame;
@@ -1725,6 +1773,13 @@ impl State {
             && p.stages
                 .iter()
                 .any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+        let loading_2d = HEAP_BUFFER_PASSES.load(Ordering::Relaxed) == 0
+            || frame.saturating_sub(HEAP_BUFFER_LAST_FRAME.load(Ordering::Relaxed)) > 2;
+        let eff_early_ms = if loading_2d && early_ms > 0 {
+            early_ms.max(20)
+        } else {
+            early_ms
+        };
         let budget = if bake {
             PassBudget {
                 ms: left_us.div_ceil(1000),
@@ -1732,12 +1787,12 @@ impl State {
                 bake: true,
             }
         } else if first
-            && early_ms > 0
-            && FRAME_TEX_BUDGET.remaining_us(frame, early_ms.saturating_mul(1000)) > 0
+            && eff_early_ms > 0
+            && FRAME_TEX_BUDGET.remaining_us(frame, eff_early_ms.saturating_mul(1000)) > 0
         {
             PassBudget {
-                ms: early_ms,
-                bytes: 64 << 20,
+                ms: eff_early_ms,
+                bytes: if loading_2d { 128 << 20 } else { 64 << 20 },
                 bake: false,
             }
         } else {

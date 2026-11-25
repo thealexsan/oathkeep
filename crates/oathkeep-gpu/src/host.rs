@@ -29,6 +29,8 @@ pub(crate) struct Host {
     queue: ID3D12CommandQueue,
     copy_queue: Option<ID3D12CommandQueue>,
     copy_fence: Option<ID3D12Fence>,
+    copy_wait_queue: Option<ID3D12CommandQueue>,
+    copy_wait_fence: Option<ID3D12Fence>,
     fence: ID3D12Fence,
     submitted: Mutex<u64>,
     event: HANDLE,
@@ -633,7 +635,7 @@ fn create() -> windows::core::Result<Host> {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
         })?;
-        let (copy_queue, copy_fence) =
+        let (copy_queue, copy_fence, copy_wait_queue, copy_wait_fence) =
             if std::env::var_os("OATHKEEP_RELAY_COPY_QUEUE").is_none_or(|v| v != "0") {
                 match (
                     device.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
@@ -642,11 +644,25 @@ fn create() -> windows::core::Result<Host> {
                     }),
                     device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE),
                 ) {
-                    (Ok(q), Ok(f)) => (Some(q), Some(f)),
-                    _ => (None, None),
+                    (Ok(q), Ok(f)) => {
+                        let (wq, wf) = match (
+                            device.CreateCommandQueue::<ID3D12CommandQueue>(
+                                &D3D12_COMMAND_QUEUE_DESC {
+                                    Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                                    ..Default::default()
+                                },
+                            ),
+                            device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE),
+                        ) {
+                            (Ok(wq), Ok(wf)) => (Some(wq), Some(wf)),
+                            _ => (None, None),
+                        };
+                        (Some(q), Some(f), wq, wf)
+                    }
+                    _ => (None, None, None, None),
                 }
             } else {
-                (None, None)
+                (None, None, None, None)
             };
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
@@ -673,6 +689,8 @@ fn create() -> windows::core::Result<Host> {
             queue,
             copy_queue,
             copy_fence,
+            copy_wait_queue,
+            copy_wait_fence,
             fence,
             submitted: Mutex::new(0),
             event,
@@ -1680,7 +1698,10 @@ struct QueueSync {
     last_3d_write: std::collections::HashMap<usize, (u64, u64)>,
     /// Latest `copy_fence` value submitted on `self.copy_queue` that reads each card shadow.
     last_copy_read: std::collections::HashMap<usize, u64>,
+    /// Latest `copy_wait_fence` value submitted on `self.copy_wait_queue` that reads each card shadow.
+    last_copy_wait_read: std::collections::HashMap<usize, u64>,
     copy_sent: u64,
+    copy_wait_sent: u64,
 }
 
 impl QueueSync {
@@ -1689,7 +1710,9 @@ impl QueueSync {
             order: 0,
             last_3d_write: std::collections::HashMap::new(),
             last_copy_read: std::collections::HashMap::new(),
+            last_copy_wait_read: std::collections::HashMap::new(),
             copy_sent: 0,
+            copy_wait_sent: 0,
         }
     }
 
@@ -1722,10 +1745,33 @@ impl QueueSync {
         }
     }
 
+    fn record_copy_wait_reads(
+        &mut self,
+        shadows: &[usize],
+        copy_wait_sent: u64,
+        completed_copy_wait: u64,
+    ) {
+        for &ptr in shadows {
+            self.last_copy_wait_read.insert(ptr, copy_wait_sent);
+        }
+        if self.last_copy_wait_read.len() > 128 {
+            self.last_copy_wait_read
+                .retain(|_, &mut f| f > completed_copy_wait);
+        }
+    }
+
     fn max_copy_read_for(&self, shadows: &[usize]) -> u64 {
         shadows
             .iter()
             .filter_map(|ptr| self.last_copy_read.get(ptr).copied())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn max_copy_wait_read_for(&self, shadows: &[usize]) -> u64 {
+        shadows
+            .iter()
+            .filter_map(|ptr| self.last_copy_wait_read.get(ptr).copied())
             .max()
             .unwrap_or(0)
     }
@@ -2791,7 +2837,7 @@ fn relay_worker() {
                     let _ = ResetEvent(event);
                     let ok_3d = host.fence.SetEventOnCompletion(target, event).is_ok();
                     let ok_copy = copy_wake
-                        .zip(host.copy_fence.as_ref())
+                        .zip(host.copy_wait_fence.as_ref().or(host.copy_fence.as_ref()))
                         .is_some_and(|(ev, cf)| {
                             let _ = ResetEvent(ev);
                             cf.SetEventOnCompletion(oldest_copy, ev).is_ok()
@@ -2812,7 +2858,9 @@ fn relay_worker() {
                 let copy_wake = fetch.as_ref().map(|f| f.copy_wake_event);
                 // SAFETY: the host's copy fence and this thread's copy wake event.
                 unsafe {
-                    if let Some((ev, cf)) = copy_wake.zip(host.copy_fence.as_ref()) {
+                    if let Some((ev, cf)) =
+                        copy_wake.zip(host.copy_wait_fence.as_ref().or(host.copy_fence.as_ref()))
+                    {
                         let _ = ResetEvent(ev);
                         if cf.SetEventOnCompletion(oldest_copy, ev).is_ok() {
                             WaitForSingleObject(ev, 2);
@@ -3992,19 +4040,28 @@ impl Host {
     }
 
     fn wait_copy_queue_on_3d(&self, shadows: &[usize]) -> windows::core::Result<()> {
-        let Some(copy_fence) = &self.copy_fence else {
-            return Ok(());
-        };
-        if shadows.is_empty() {
+        if shadows.is_empty() || (self.copy_fence.is_none() && self.copy_wait_fence.is_none()) {
             return Ok(());
         }
-        let need_copy = with_queue_sync(|sync| sync.max_copy_read_for(shadows));
-        if need_copy > 0 {
-            // SAFETY: plain fence query and cross-queue GPU wait on live host queues.
-            unsafe {
-                if copy_fence.GetCompletedValue() < need_copy {
-                    self.queue.Wait(copy_fence, need_copy)?;
-                }
+        let (need_copy, need_copy_wait) = with_queue_sync(|sync| {
+            (
+                sync.max_copy_read_for(shadows),
+                sync.max_copy_wait_read_for(shadows),
+            )
+        });
+        // SAFETY: plain fence queries and cross-queue GPU waits on live host queues.
+        unsafe {
+            if need_copy > 0
+                && let Some(copy_fence) = &self.copy_fence
+                && copy_fence.GetCompletedValue() < need_copy
+            {
+                self.queue.Wait(copy_fence, need_copy)?;
+            }
+            if need_copy_wait > 0
+                && let Some(copy_wait_fence) = &self.copy_wait_fence
+                && copy_wait_fence.GetCompletedValue() < need_copy_wait
+            {
+                self.queue.Wait(copy_wait_fence, need_copy_wait)?;
             }
         }
         Ok(())
@@ -4067,7 +4124,7 @@ impl Host {
     }
 
     fn finish_pending_slot(&self, f: &mut RelayFetch, slot_idx: usize, wait_blocking: bool) -> bool {
-        let Some(copy_fence) = &self.copy_fence else {
+        let Some(copy_fence) = self.copy_wait_fence.as_ref().or(self.copy_fence.as_ref()) else {
             return false;
         };
         let Some(copy_sent) = f.copy_wait_slots[slot_idx]
@@ -4544,10 +4601,21 @@ impl Host {
 
         let submit_copy_batch = |batch: &[(Arc<crate::shadow::Shadow>, usize, usize, u64)],
                                  prelude: &Prelude,
-                                 dst_buf: &ID3D12Resource|
+                                 dst_buf: &ID3D12Resource,
+                                 use_wait_queue: bool|
          -> (u64, Vec<usize>, std::collections::HashMap<usize, u64>) {
-            let copy_queue = self.copy_queue.as_ref().unwrap();
-            let copy_fence = self.copy_fence.as_ref().unwrap();
+            let isolated_wait =
+                use_wait_queue && self.copy_wait_queue.is_some() && self.copy_wait_fence.is_some();
+            let copy_queue = if isolated_wait {
+                self.copy_wait_queue.as_ref().unwrap()
+            } else {
+                self.copy_queue.as_ref().unwrap()
+            };
+            let copy_fence = if isolated_wait {
+                self.copy_wait_fence.as_ref().unwrap()
+            } else {
+                self.copy_fence.as_ref().unwrap()
+            };
             let (allocator, list) = prelude;
             let (copy_regions, shadow_ptrs) = build_copy_regions(batch);
             // SAFETY: this copy list's previous run was awaited; buffers decay to COMMON
@@ -4579,10 +4647,19 @@ impl Host {
                         copy_queue.Wait(&self.fence, wait_fence)?;
                     }
                     copy_queue.ExecuteCommandLists(&lists);
-                    sync.copy_sent += 1;
-                    let copy_sent = sync.copy_sent;
-                    copy_queue.Signal(copy_fence, copy_sent)?;
-                    sync.record_copy_reads(&shadow_ptrs, copy_sent, completed_copy);
+                    let copy_sent = if isolated_wait {
+                        sync.copy_wait_sent += 1;
+                        let sent = sync.copy_wait_sent;
+                        copy_queue.Signal(copy_fence, sent)?;
+                        sync.record_copy_wait_reads(&shadow_ptrs, sent, completed_copy);
+                        sent
+                    } else {
+                        sync.copy_sent += 1;
+                        let sent = sync.copy_sent;
+                        copy_queue.Signal(copy_fence, sent)?;
+                        sync.record_copy_reads(&shadow_ptrs, sent, completed_copy);
+                        sent
+                    };
                     Ok((copy_sent, shadow_ptrs, after_by_shadow))
                 })()
             };
@@ -4598,13 +4675,13 @@ impl Host {
         let mut wait_us_total = 0u64;
         let mut total_written = 0usize;
 
-        // Submit BOTH `fast_now` (immediate, no 3D wait) and `fast_wait` (pipelined on
-        // `copy_queue` behind the specific busy 3D fence) before waiting on `fast_now` so
-        // `fast_wait` progresses asynchronously while we merge `fast_now` on CPU!
+        // Submit BOTH `fast_now` (immediate, on `copy_queue` with no 3D wait) and `fast_wait`
+        // (pipelined on isolated `copy_wait_queue` behind the specific busy 3D fence so it never
+        // head-of-line blocks `fast_now`) before waiting on `fast_now`!
         let fast_now_submitted = if !fast_now.is_empty() {
             let (dst_buf, dst_data) = fast_now_buf.as_ref().unwrap();
             let (copy_sent, _, after_by_shadow) =
-                submit_copy_batch(&fast_now, f.copy_list.as_ref().unwrap(), dst_buf);
+                submit_copy_batch(&fast_now, f.copy_list.as_ref().unwrap(), dst_buf, false);
             Some((copy_sent, *dst_data, after_by_shadow))
         } else {
             None
@@ -4616,6 +4693,7 @@ impl Host {
                 &fast_wait,
                 &f.copy_wait_slots[slot_idx].prelude,
                 dst_buf,
+                true,
             );
             let min_after = after_by_shadow
                 .values()
@@ -5635,15 +5713,23 @@ impl Host {
                 let completed_3d = self.fence.GetCompletedValue();
                 let mut sync_guard = queue_sync();
                 let sync = sync_guard.get_or_insert_with(QueueSync::new);
-                let wait_res = if let Some(c) = &card
-                    && let Some(copy_fence) = &self.copy_fence
-                {
-                    let need_copy = sync.max_copy_read_for(&c.written_shadows);
-                    if need_copy > 0 && copy_fence.GetCompletedValue() < need_copy {
-                        self.queue.Wait(copy_fence, need_copy)
-                    } else {
-                        Ok(())
+                let wait_res = if let Some(c) = &card {
+                    let mut res = Ok(());
+                    if let Some(copy_fence) = &self.copy_fence {
+                        let need_copy = sync.max_copy_read_for(&c.written_shadows);
+                        if need_copy > 0 && copy_fence.GetCompletedValue() < need_copy {
+                            res = self.queue.Wait(copy_fence, need_copy);
+                        }
                     }
+                    if res.is_ok()
+                        && let Some(copy_wait_fence) = &self.copy_wait_fence
+                    {
+                        let need_wait = sync.max_copy_wait_read_for(&c.written_shadows);
+                        if need_wait > 0 && copy_wait_fence.GetCompletedValue() < need_wait {
+                            res = self.queue.Wait(copy_wait_fence, need_wait);
+                        }
+                    }
+                    res
                 } else {
                     Ok(())
                 };

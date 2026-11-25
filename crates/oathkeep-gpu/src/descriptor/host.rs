@@ -2443,6 +2443,29 @@ impl HostHeap {
             .map(|(view, ..)| view)
     }
 
+    pub(crate) fn made_key(&self, index: u32) -> u64 {
+        self.made_keys
+            .get(index as usize)
+            .map_or(0, |k| k.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    pub(crate) fn unchanged_slot_key(&self, index: u32, handle: u64) -> Option<u64> {
+        if index >= self.count {
+            return None;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        if tag == VIEW_TAG
+            && key != 0
+            && self.made_keys[index as usize].load(std::sync::atomic::Ordering::Acquire) == key
+        {
+            Some(key)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn mirror_buffer(&self, index: u32, handle: u64) -> Option<MirroredBuffer> {
         let (view, made_shadow, _, kept_raw, freshly_made) = self.mirror_inner(index, handle, true)?;
         let copy = buffer_copy_with_hint(&view, made_shadow);
