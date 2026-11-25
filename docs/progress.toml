@@ -3,12 +3,12 @@ updated = "2026-11-25"
 commit = "perf/commit-reduction"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "5.8 fps (timing)"
-current_frame_ms = "172 ms (timing)"
-current_gpu_ms = "27.7 ms base + 135 ms ML"
-current_preparing_ms = "59.7 ms (ask_once 4.5 ms)"
+current_fps = "3.7 fps (timing, cold PSOs)"
+current_frame_ms = "270.7 ms (timing, GPU 33% busy)"
+current_gpu_ms = "35.2 ms total timed (17.0 ms dispatch, all 9 ML <=0.63 ms)"
+current_preparing_ms = "103.3 ms (cold) / 59.7 ms (warm)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~1-1.5 hours (verify VRAM ML fix + crush 174 MB buffer re-copy + cache warm)"
+eta = "~45-75 min (crush CPU preparing/heap_buffers/copy_back + warm PSO cache)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -48,8 +48,8 @@ note = "2561af95 verified 0.36 ms/frame (down from 297 ms TDR); zero TDR"
 
 [[subsystems]]
 name = "DP4A / ML Compute"
-cells = [4, 4, 4, 4, 4, 4, 3, 3, 2, 0]
-note = "Root cause found: 20 MB ML UAV was in L0 RAM (OATHKEEP_INPLACE_BIG); VRAM micro-bench 0.13-0.20 ms (38x-175x faster)"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 4, 3]
+note = "VERIFIED in diag-run61: all 9 ML shaders 0.15-0.63 ms in VRAM (155.3 -> 17.0 ms dispatch, 4.8x total GPU speedup)"
 
 [[subsystems]]
 name = "Pipeline Cache & Queue"
@@ -103,9 +103,9 @@ detail = "59.7 ms -> <15 ms"
 
 [[milestones]]
 label = "All 9 ML DP4A shaders fast"
-state = "active"
-level = 3
-detail = "VRAM fix landed; benching"
+state = "done"
+level = 4
+detail = "0.15-0.63 ms (VRAM verified)"
 
 [[milestones]]
 label = "1:1 console visuals verified"
@@ -157,9 +157,18 @@ status = "Zero TDR; 2561af95 0.36 ms/frame; ask_once 4.5 ms"
 
 [[runs]]
 label = "diag-run60"
-commit = "perf/commit-reduction"
+commit = "4a14eaa"
 fps = 2.7
 frame_ms = 376.1
-gpu_ms = "135.6 ms (9 ML)"
-preparing_ms = "108 ms (cold)"
+gpu_ms = "168.7 ms (135.6 ms ML)"
+preparing_ms = "108.2 ms (cold)"
 status = "Zero TDR; all 9/9 ML shaders dumped for DP4A diff"
+
+[[runs]]
+label = "diag-run61"
+commit = "15e6154"
+fps = 3.7
+frame_ms = 270.7
+gpu_ms = "35.2 ms timed (ML <=0.63 ms)"
+preparing_ms = "103.3 ms (cold)"
+status = "ML VRAM fix verified (4.8x GPU speedup, GPU 33% busy); CPU-bound now"

@@ -5,7 +5,7 @@
   <rect x="0.5" y="0.5" width="879" height="411" rx="8" fill="#0d1117" stroke="#30363d"/>
   <text x="24" y="32" fill="#f0f6fc" font-size="16" font-weight="600">Oathkeep Progress Matrix</text>
   <text x="24" y="52" fill="#8b949e" font-size="12">Clean-room Xbox Series X|S (GDK) compatibility &amp; RDNA 2-to-DXIL layer</text>
-  <text x="856" y="32" text-anchor="end" fill="#39d353" font-size="16" font-weight="700" class="mono">92%</text>
+  <text x="856" y="32" text-anchor="end" fill="#39d353" font-size="16" font-weight="700" class="mono">94%</text>
   <text x="856" y="52" text-anchor="end" fill="#8b949e" font-size="11" class="mono">perf/commit-reduction (perf/commit-reduction) • 2026-11-25</text>
   <line x1="24" y1="66" x2="856" y2="66" stroke="#21262d"/>
   <text x="24" y="80" fill="#c9d1d9" font-size="11" font-weight="600">SUBSYSTEM CAPABILITY MATRIX</text>
@@ -100,11 +100,11 @@
   <rect x="251" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
   <rect x="268" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
   <rect x="285" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="302" y="250" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="319" y="250" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="336" y="250" width="13" height="13" rx="2.5" fill="#006d32" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="353" y="250" width="13" height="13" rx="2.5" fill="#161b22" stroke="#21262d" stroke-width="0.75"/>
-  <text x="382" y="260" fill="#8b949e" font-size="11" class="mono"> 80%</text>
+  <rect x="302" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
+  <rect x="319" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
+  <rect x="336" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
+  <rect x="353" y="250" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
+  <text x="382" y="260" fill="#8b949e" font-size="11" class="mono"> 98%</text>
   <text x="24" y="282" fill="#c9d1d9" font-size="12">Pipeline Cache &amp; Queue</text>
   <rect x="200" y="272" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
   <rect x="217" y="272" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
@@ -170,9 +170,9 @@
   <rect x="474" y="192" width="13" height="13" rx="2.5" fill="#26a641" stroke="#39d353" stroke-width="1"/>
   <text x="495" y="202" fill="#39d353" font-size="12" font-weight="500">CPU preparing &lt;15 ms</text>
   <text x="856" y="202" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">59.7 ms -&gt; &lt;15 ms</text>
-  <rect x="474" y="216" width="13" height="13" rx="2.5" fill="#26a641" stroke="#39d353" stroke-width="1"/>
-  <text x="495" y="226" fill="#39d353" font-size="12" font-weight="500">All 9 ML DP4A shaders fast</text>
-  <text x="856" y="226" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">VRAM fix landed; benching</text>
+  <rect x="474" y="216" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="1"/>
+  <text x="495" y="226" fill="#f0f6fc" font-size="12" font-weight="500">All 9 ML DP4A shaders fast</text>
+  <text x="856" y="226" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">0.15-0.63 ms (VRAM verified)</text>
   <rect x="474" y="240" width="13" height="13" rx="2.5" fill="#0e4429" stroke="#21262d" stroke-width="1"/>
   <text x="495" y="250" fill="#8b949e" font-size="12" font-weight="500">1:1 console visuals verified</text>
   <text x="856" y="250" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">next</text>
@@ -182,13 +182,13 @@
   <rect x="474" y="296" width="382" height="62" rx="6" fill="#161b22" stroke="#30363d"/>
   <text x="486" y="314" fill="#8b949e" font-size="10.5" font-weight="600">LATEST WORLD TELEMETRY (RTX 3070 8 GB, 1080P)</text>
   <text x="486" y="330" fill="#8b949e" font-size="10" class="mono">FPS</text>
-  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">5.8 fps (timing)</text>
+  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">3.7 fps (timing, cold PSOs)</text>
   <text x="575" y="330" fill="#8b949e" font-size="10" class="mono">FRAME</text>
-  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">172 ms (timing)</text>
+  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">270.7 ms (timing, GPU 33% busy)</text>
   <text x="664" y="330" fill="#8b949e" font-size="10" class="mono">GPU</text>
-  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">27.7 ms base + 135 ms ML</text>
+  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">35.2 ms total timed (17.0 ms dispatch, all 9 ML &lt;=0.63 ms)</text>
   <text x="753" y="330" fill="#8b949e" font-size="10" class="mono">PREP</text>
-  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">59.7 ms (ask_once 4.5 ms)</text>
+  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">103.3 ms (cold) / 59.7 ms (warm)</text>
   <line x1="24" y1="374" x2="856" y2="374" stroke="#21262d"/>
   <text x="24" y="390" fill="#8b949e" font-size="11">Target: 20-30+ FPS (1:1 visuals) • Clean-room Xbox Series X|S (GDK) layer</text>
   <text x="704" y="390" text-anchor="end" fill="#8b949e" font-size="11">Less</text>
