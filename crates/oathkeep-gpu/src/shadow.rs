@@ -1790,6 +1790,10 @@ impl Shadow {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
     }
 
+    pub(crate) fn is_in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
         crate::host::name(&placed.buffer, || {
             format!("title memory {start:#x}+{len:#x} in place")
@@ -1797,6 +1801,7 @@ impl Shadow {
         let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
+        *shadow.copied.get_mut().unwrap_or_else(|e| e.into_inner()) = Vec::new();
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
@@ -1804,6 +1809,10 @@ impl Shadow {
     }
 
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.place.is_some() {
+            list.keep(&self.buffer);
+            return;
+        }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
@@ -2836,6 +2845,13 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
         .map(|(k, e)| (k.0, e.end - k.0))
 }
 
+static INPLACE_EVICTED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+pub(crate) fn take_in_place_evicted() -> Vec<(u64, u64)> {
+    let mut list = INPLACE_EVICTED.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *list)
+}
+
 pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
@@ -2857,6 +2873,12 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    if !gone.is_empty() {
+        let mut evicted = INPLACE_EVICTED.lock().unwrap_or_else(|e| e.into_inner());
+        for shadow in &gone {
+            evicted.push((shadow.start, shadow.start.saturating_add(shadow.len)));
+        }
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }
@@ -3077,14 +3099,29 @@ static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
-    let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+    let named = {
+        let grid = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+        if !unsized_ask && crate::inplace::level() >= 3 {
+            let page = window_of(address, end, 64 << 10);
+            if page != grid
+                && !crate::inplace::section_run_in_place(grid.0, grid.1)
+                && crate::inplace::section_run_in_place(page.0, page.1)
+            {
+                page
+            } else {
+                grid
+            }
+        } else {
+            grid
+        }
+    };
     let pick = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| {
         if unsized_ask && tails() {
             let there = map
                 .range((cell, 0)..=(address, u64::MAX))
                 .map(|(key, _)| *key);
             longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-        } else if any && fine() && !unsized_ask {
+        } else if any && (fine() || crate::inplace::level() >= 3) && !unsized_ask {
             let there = map
                 .range((cell, 0)..=(address, u64::MAX))
                 .map(|(key, _)| *key);

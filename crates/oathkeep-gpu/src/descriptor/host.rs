@@ -1145,6 +1145,11 @@ impl HostHeap {
         true
     }
 
+    pub(crate) fn unmake_slot(&self, index: u32) {
+        let _made_guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.unmake(index);
+    }
+
     fn unmake(&self, index: u32) {
         let Some(slot) = self.made_keys.get(index as usize) else {
             return;

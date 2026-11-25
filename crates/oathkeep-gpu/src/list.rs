@@ -706,7 +706,7 @@ extern "system" fn copy_buffer_region(
         }
         static DIRECT_BUF_COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let direct = *DIRECT_BUF_COPY
-            .get_or_init(|| std::env::var_os("OATHKEEP_DIRECT_BUF_COPY").is_none_or(|v| v != "0"));
+            .get_or_init(|| std::env::var_os("OATHKEEP_DIRECT_BUF_COPY").is_some_and(|v| v == "1"));
         if direct {
             let (from_u64, to_u64) = (from as u64, to as u64);
             let (from_u, to_u, len_u) = (from as usize, to as usize, len as usize);
@@ -910,8 +910,9 @@ extern "system" fn copy_texture_region(
                 return;
             };
             static DIRECT_TEX_COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let direct = *DIRECT_TEX_COPY
-                .get_or_init(|| std::env::var_os("OATHKEEP_DIRECT_TEX_COPY").is_none_or(|v| v != "0"));
+            let direct = *DIRECT_TEX_COPY.get_or_init(|| {
+                std::env::var_os("OATHKEEP_DIRECT_TEX_COPY").is_some_and(|v| v == "1")
+            });
             if direct
                 && let Some(shadow) = crate::shadow::find(data as u64, bytes)
                 && let off = shadow.offset(data as u64)

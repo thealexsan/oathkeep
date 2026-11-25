@@ -48,11 +48,117 @@ fn most() -> u64 {
 
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
+static SECTION_HEAPS: Mutex<Option<std::collections::HashMap<usize, Option<(ID3D12Heap, u64)>>>> =
+    Mutex::new(None);
+static SECTION_BYTES: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) struct Placed {
     pub(crate) buffer: ID3D12Resource,
     pub(crate) heap: ID3D12Heap,
     pub(crate) gpu: u64,
     pub(crate) bias: u64,
+}
+
+fn section_info(section: usize) -> Option<(u64, bool)> {
+    views()
+        .sections
+        .iter()
+        .find(|s| s.0 == section)
+        .map(|s| (s.1, s.2))
+}
+
+pub(crate) fn section_run_in_place(start: u64, len: u64) -> bool {
+    if level() < 3 {
+        return false;
+    }
+    let at = start & !(K64 as u64 - 1);
+    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    match cover(at as usize, bytes as usize) {
+        Cover::Run(section, off) => {
+            section_info(section).is_some_and(|(size, committed)| committed && off + bytes <= size)
+        }
+        _ => false,
+    }
+}
+
+fn section_heap(
+    host: &crate::host::Host,
+    section: usize,
+) -> Result<ID3D12Heap, Option<windows::core::Error>> {
+    let Some((size, true)) = section_info(section) else {
+        return Err(None);
+    };
+    {
+        let heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = heaps.as_ref().and_then(|m| m.get(&section)) {
+            return match entry {
+                Some((heap, _)) => Ok(heap.clone()),
+                None => Err(None),
+            };
+        }
+    }
+    const SHARED_HEADROOM: u64 = 1536 << 20;
+    if SECTION_BYTES.load(Ordering::Relaxed).saturating_add(size) > most() {
+        STATS[6].fetch_add(1, Ordering::Relaxed);
+        return Err(None);
+    }
+    if let Some([_, _, shared_budget, shared_usage]) = host.video_memory()
+        && shared_usage
+            .saturating_add(size)
+            .saturating_add(SHARED_HEADROOM)
+            > shared_budget
+    {
+        STATS[6].fetch_add(1, Ordering::Relaxed);
+        return Err(None);
+    }
+    let opened = match open(&host.device, From::Section(section)) {
+        Ok(heap) => heap,
+        Err(e) => {
+            let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            heaps.get_or_insert_with(Default::default).insert(section, None);
+            return Err(Some(e));
+        }
+    };
+    let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = heaps.get_or_insert_with(Default::default);
+    if let Some(Some((existing, _))) = map.get(&section) {
+        return Ok(existing.clone());
+    }
+    let total = SECTION_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+    tracing::info!(
+        section = format_args!("{section:#x}"),
+        mb = size >> 20,
+        total_mb = total >> 20,
+        "title page-pool section opened in place as one host heap"
+    );
+    map.insert(section, Some((opened.clone(), size)));
+    Ok(opened)
+}
+
+fn place_section(
+    host: &crate::host::Host,
+    section: usize,
+    section_off: u64,
+    start: u64,
+    at: u64,
+    bytes: u64,
+) -> Result<Placed, Option<windows::core::Error>> {
+    let Some((size, true)) = section_info(section) else {
+        return Err(None);
+    };
+    if section_off.checked_add(bytes).is_none_or(|end| end > size) {
+        return Err(None);
+    }
+    let heap = section_heap(host, section)?;
+    let buffer = place(&host.device, &heap, section_off, bytes).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+    Ok(Placed {
+        buffer,
+        heap,
+        gpu,
+        bias: start - at,
+    })
 }
 
 pub(crate) fn place_part(
@@ -78,19 +184,30 @@ pub(crate) fn place_part(
 }
 
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if level() < if window { 1 } else { 2 } {
+    let lvl = level();
+    if lvl < if window { 1 } else { 2 } {
         return None;
     }
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
-        STATS[6].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
+    let at = start & !(K64 as u64 - 1);
+    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
     let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
+    let placed = match cover(at as usize, bytes as usize) {
+        Cover::None => {
+            if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+                STATS[6].fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            place_part(&host.device, start, len)
+        }
+        Cover::Run(section, section_off) if lvl >= 3 => {
+            place_section(host, section, section_off, start, at, bytes)
+        }
+        _ => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    match placed {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
@@ -234,6 +351,20 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let mut v = views();
     v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
+}
+
+pub fn title_memory_section_closing(section: usize) {
+    views().sections.retain(|s| s.0 != section);
+    let removed = SECTION_HEAPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|m| m.remove(&section))
+        .flatten();
+    if let Some((heap, size)) = removed {
+        SECTION_BYTES.fetch_sub(size, Ordering::Relaxed);
+        crate::host::retire(heap);
+    }
 }
 
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {

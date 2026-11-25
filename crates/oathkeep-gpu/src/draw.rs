@@ -269,7 +269,7 @@ pub(crate) fn dispatched() -> u64 {
 
 fn direct_cbv() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OATHKEEP_DIRECT_CBV").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_DIRECT_CBV").is_some_and(|v| v == "1"))
 }
 
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
@@ -1128,12 +1128,34 @@ impl State {
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .map_or(64, |n| n.max(1))
         });
-        let slots = if *passes % rebuild_every == 0 {
+        let evicted = crate::shadow::take_in_place_evicted();
+        let mut slots = if *passes % rebuild_every == 0 {
             ranges.clear();
+            if !evicted.is_empty() {
+                for &index in &host.buffer_slots() {
+                    host.unmake_slot(index);
+                }
+            }
             host.buffer_slots()
         } else {
             changed
         };
+        if !evicted.is_empty() && *passes % rebuild_every != 0 {
+            let stale: Vec<u32> = ranges
+                .iter()
+                .filter(|(_, (shadow, from, to))| {
+                    shadow.is_in_place()
+                        && evicted
+                            .iter()
+                            .any(|&(ev_start, ev_end)| *from < ev_end && *to > ev_start)
+                })
+                .map(|(&index, _)| index)
+                .collect();
+            for index in stale {
+                host.unmake_slot(index);
+                slots.push(index);
+            }
+        }
         *passes += 1;
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive =
@@ -1195,6 +1217,10 @@ impl State {
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
         for (shadow, from, to) in spans.values() {
+            if shadow.is_in_place() {
+                list.keep(&shadow.buffer);
+                continue;
+            }
             if shadow.unwatched() {
                 let key = shadow.id() as usize;
                 static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();

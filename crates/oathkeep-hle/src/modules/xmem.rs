@@ -285,9 +285,23 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        oathkeep_gpu::title_memory_section_closing(self.0 as usize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
+}
+
+fn inplace_sections() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if let Some(v) = std::env::var_os("OATHKEEP_INPLACE_SECTIONS") {
+            return v == "1";
+        }
+        std::env::var("OATHKEEP_INPLACE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .is_some_and(|level| level >= 3)
+    })
 }
 
 #[derive(Clone)]
@@ -331,46 +345,76 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n == 0 || n.checked_mul(PAGE).is_none() {
         return 0;
+    }
+    let commit = on_wine() || inplace_sections();
+    // D3D12's OpenExistingHeapFromFileMapping rejects sections >= 4 GiB with
+    // E_INVALIDARG, and each opened section counts against WDDM's shared GPU
+    // memory budget. Chunk committed sections (default 32 MiB) so only chunks
+    // backing GPU buffers are opened as host heaps.
+    static CHUNK_PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let chunk_pages = if inplace_sections() {
+        *CHUNK_PAGES.get_or_init(|| {
+            let mb = std::env::var("OATHKEEP_INPLACE_SECTION_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(32)
+                .clamp(4, 512);
+            (mb << 20) / PAGE
+        })
+    } else {
+        n
     };
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    let mut chunks: Vec<(Arc<Section>, usize)> = Vec::new();
+    let mut left = n;
+    while left > 0 {
+        let take = left.min(chunk_pages);
+        let chunk_bytes = take * PAGE;
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | if commit { SEC_COMMIT } else { SEC_RESERVE },
+                (chunk_bytes as u64 >> 32) as u32,
+                chunk_bytes as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, take, %error, "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+        oathkeep_gpu::title_memory_section(handle as usize, chunk_bytes as u64, commit);
+        chunks.push((Arc::new(Section(handle)), take));
+        left -= take;
     }
     tracing::debug!(
         n,
+        chunks = chunks.len(),
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    oathkeep_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    let mut out = 0usize;
+    for (section, take) in chunks {
+        for index in 0..take {
+            let slice = Slice {
+                section: section.clone(),
+                index,
+            };
+            let number = first + out * FRAMES;
+            physical.pages.insert(number, slice);
+            // SAFETY: the title passes room for `n` page numbers.
+            unsafe { pages.add(out).write(number) };
+            out += 1;
+        }
     }
     1
 }
