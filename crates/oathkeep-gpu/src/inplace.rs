@@ -63,7 +63,7 @@ fn parse_min_bytes(level: u8, min_kb: Option<&str>, min_mb: Option<&str>) -> u64
     if let Some(mb) = min_mb.and_then(|v| v.trim().parse::<u64>().ok()) {
         return mb << 20;
     }
-    if level >= 2 { 1 << 20 } else { 0 }
+    if level >= 2 { 64 << 10 } else { 0 }
 }
 
 fn min_bytes() -> u64 {
@@ -98,20 +98,28 @@ fn section_allows_len(len: u64, min_bytes: u64) -> bool {
     min_bytes == 0 || len >= min_bytes
 }
 
-fn parse_commit_private_max_bytes(flag: Option<&str>, max_mb: Option<&str>) -> u64 {
+fn parse_commit_private_max_bytes(level: u8, flag: Option<&str>, max_mb: Option<&str>) -> u64 {
     if let Some(mb) = max_mb.and_then(|v| v.trim().parse::<u64>().ok()) {
         return mb << 20;
     }
-    if flag.is_some_and(|v| v.trim() == "1") {
-        return 64 << 20;
+    match flag.map(str::trim) {
+        Some("0") => 0,
+        Some("1") => 64 << 20,
+        _ => {
+            if level >= 2 {
+                4 << 20
+            } else {
+                0
+            }
+        }
     }
-    0
 }
 
 fn commit_private_max_bytes() -> u64 {
     static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
         parse_commit_private_max_bytes(
+            level(),
             std::env::var("OATHKEEP_INPLACE_COMMIT_PRIVATE")
                 .ok()
                 .as_deref(),
@@ -2187,8 +2195,8 @@ mod tests {
         assert_eq!(parse_level(Some("3")), 3);
         assert_eq!(parse_level(Some("invalid")), 2);
 
-        assert_eq!(parse_min_bytes(2, None, None), 1 << 20);
-        assert_eq!(parse_min_bytes(3, None, None), 1 << 20);
+        assert_eq!(parse_min_bytes(2, None, None), 64 << 10);
+        assert_eq!(parse_min_bytes(3, None, None), 64 << 10);
         assert_eq!(parse_min_bytes(1, None, None), 0);
         assert_eq!(parse_min_bytes(0, None, None), 0);
         assert_eq!(parse_min_bytes(2, None, Some("0")), 0);
@@ -2214,12 +2222,15 @@ mod tests {
     }
 
     #[test]
-    fn commit_private_max_bytes_defaults_off_and_honors_overrides() {
-        assert_eq!(parse_commit_private_max_bytes(None, None), 0);
-        assert_eq!(parse_commit_private_max_bytes(Some("0"), None), 0);
-        assert_eq!(parse_commit_private_max_bytes(Some("1"), None), 64 << 20);
-        assert_eq!(parse_commit_private_max_bytes(Some("1"), Some("0")), 0);
-        assert_eq!(parse_commit_private_max_bytes(None, Some("48")), 48 << 20);
+    fn commit_private_max_bytes_defaults_and_honors_overrides() {
+        assert_eq!(parse_commit_private_max_bytes(2, None, None), 4 << 20);
+        assert_eq!(parse_commit_private_max_bytes(3, None, None), 4 << 20);
+        assert_eq!(parse_commit_private_max_bytes(1, None, None), 0);
+        assert_eq!(parse_commit_private_max_bytes(0, None, None), 0);
+        assert_eq!(parse_commit_private_max_bytes(2, Some("0"), None), 0);
+        assert_eq!(parse_commit_private_max_bytes(2, Some("1"), None), 64 << 20);
+        assert_eq!(parse_commit_private_max_bytes(2, Some("1"), Some("0")), 0);
+        assert_eq!(parse_commit_private_max_bytes(2, None, Some("48")), 48 << 20);
     }
 
     #[test]

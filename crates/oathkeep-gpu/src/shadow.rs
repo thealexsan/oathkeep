@@ -18,6 +18,7 @@ pub(crate) struct Shadow {
     copied: Mutex<CopiedState>,
     uncopied: AtomicU64,
     synced_at: AtomicU64,
+    clean_guard_epochs: [AtomicU64; 2],
     ever_written: AtomicBool,
     watched: AtomicU8,
     pending: Mutex<Vec<(usize, usize)>>,
@@ -176,6 +177,8 @@ struct CopiedState {
     chunk_floor: Vec<u64>,
     /// Lazily allocated per-64 KiB page quiet tracking for non-card `copy_hot` cooling.
     hot_quiet: Vec<HotPageQuiet>,
+    /// Single-shard subrange clean-guard cache: `(shard, epoch, merged_page_spans)`.
+    clean_sub: (usize, u64, Vec<(usize, usize)>),
 }
 
 impl CopiedState {
@@ -187,6 +190,7 @@ impl CopiedState {
             chunk_min_nz: vec![u64::MAX; chunks],
             chunk_floor: vec![0; chunks],
             hot_quiet: Vec::new(),
+            clean_sub: (0, 0, Vec::new()),
         }
     }
 
@@ -196,6 +200,59 @@ impl CopiedState {
         self.chunk_min_nz.clear();
         self.chunk_floor.clear();
         self.hot_quiet.clear();
+        self.clean_sub = (0, 0, Vec::new());
+    }
+
+    fn clean_covers_single_shard(&self, shard: usize, lo: usize, hi: usize, since: u64) -> bool {
+        if lo >= hi || self.clean_sub.1 == 0 || self.clean_sub.0 != shard {
+            return false;
+        }
+        if !crate::watch::guarded_single_shard_epoch_matches(shard, self.clean_sub.1, since) {
+            return false;
+        }
+        self.clean_sub
+            .2
+            .iter()
+            .any(|&(a, b)| a <= lo && hi <= b)
+    }
+
+    fn record_clean_single_shard(&mut self, shard: usize, epoch: u64, lo: usize, hi: usize) {
+        if lo >= hi || epoch == 0 {
+            return;
+        }
+        if self.clean_sub.0 != shard || self.clean_sub.1 != epoch {
+            self.clean_sub.0 = shard;
+            self.clean_sub.1 = epoch;
+            self.clean_sub.2.clear();
+            self.clean_sub.2.push((lo, hi));
+            return;
+        }
+        let spans = &mut self.clean_sub.2;
+        if spans.len() >= 64 {
+            spans.clear();
+        }
+        let mut new_lo = lo;
+        let mut new_hi = hi;
+        let mut merged = Vec::with_capacity(spans.len() + 1);
+        let mut inserted = false;
+        for &(a, b) in spans.iter() {
+            if b < new_lo {
+                merged.push((a, b));
+            } else if new_hi < a {
+                if !inserted {
+                    merged.push((new_lo, new_hi));
+                    inserted = true;
+                }
+                merged.push((a, b));
+            } else {
+                new_lo = new_lo.min(a);
+                new_hi = new_hi.max(b);
+            }
+        }
+        if !inserted {
+            merged.push((new_lo, new_hi));
+        }
+        *spans = merged;
     }
 
     fn record_hot_quiet(
@@ -3236,6 +3293,16 @@ impl Shadow {
             .any(|&(a, e)| a < end && e > address)
     }
 
+    pub(crate) fn is_gpu_active(&self, list: &HostList, address: u64, len: u64) -> bool {
+        if !self.ever_written() || len == 0 {
+            return false;
+        }
+        let (at, n) = (address as usize, len as usize);
+        self.pending_touches(at, n)
+            || list.touches_gpu_write(at, n)
+            || crate::host::written_in_flight(at, n)
+    }
+
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
@@ -3301,6 +3368,7 @@ impl Shadow {
             copied: Mutex::new(CopiedState::new(pages as usize)),
             uncopied: AtomicU64::new(pages),
             synced_at: AtomicU64::new(0),
+            clean_guard_epochs: [AtomicU64::new(0), AtomicU64::new(0)],
             ever_written: AtomicBool::new(false),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
@@ -3940,19 +4008,55 @@ impl Shadow {
             } else {
                 0
             };
+            let lo_page = (from / PAGE).saturating_sub(base);
+            let hi_page = to.div_ceil(PAGE).saturating_sub(base);
+            let sub_shard = if mode == WATCHED_GUARDED && !full {
+                crate::watch::single_shard_for_range(from, to)
+            } else {
+                None
+            };
+            let mut sub_clean_hit = false;
             let (all_copied, since) = if uncopied_zero && full {
                 (true, global_synced)
             } else if mode == WATCHED_GUARDED {
-                let lo = (from / PAGE).saturating_sub(base);
-                let hi = to.div_ceil(PAGE).saturating_sub(base);
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                copied.range_since(lo, hi, global_synced)
+                let (all, s) = copied.range_since(lo_page, hi_page, global_synced);
+                if all
+                    && s != 0
+                    && let Some(shard) = sub_shard
+                {
+                    sub_clean_hit = copied.clean_covers_single_shard(shard, lo_page, hi_page, s);
+                }
+                (all, s)
             } else {
                 (uncopied_zero, 0)
             };
-            let found = match mode {
-                WATCHED_GUARDED => crate::watch::writes_guarded_since(from, to, since),
-                WATCHED_KERNEL => crate::watch::writes(from, to, true),
+            if mode == WATCHED_GUARDED && all_copied && since != 0 {
+                let full_epochs = [
+                    self.clean_guard_epochs[0].load(Ordering::Acquire),
+                    self.clean_guard_epochs[1].load(Ordering::Acquire),
+                ];
+                if sub_clean_hit
+                    || crate::watch::guarded_clean_epochs_match(start, end, full_epochs, since)
+                {
+                    self.refresh_check(from, to);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use crate::copystat::{C, add};
+                        add(C::Checked, (to - from) as u64);
+                        add(C::Unchanged, (to - from) as u64);
+                    }
+                    return 0;
+                }
+            }
+            let (found, clean_epochs) = match mode {
+                WATCHED_GUARDED => match crate::watch::writes_guarded_since_with_clean(
+                    from, to, since,
+                ) {
+                    Some((now, written, epochs)) => (Some((now, written)), epochs),
+                    None => (None, None),
+                },
+                WATCHED_KERNEL => (crate::watch::writes(from, to, true), None),
                 _ => match crate::watch::writes_kind(from, to, true) {
                     Some((now, written, kind)) => {
                         self.watched.store(
@@ -3962,13 +4066,25 @@ impl Shadow {
                             },
                             Ordering::Relaxed,
                         );
-                        Some((now, written))
+                        (Some((now, written)), None)
                     }
-                    None => None,
+                    None => (None, None),
                 },
             };
             if let Some((now, written)) = found {
                 let copied = self.copy_stale(from, to, now, &written, all_copied, since);
+                if let Some(ep) = clean_epochs {
+                    if full {
+                        self.clean_guard_epochs[0].store(0, Ordering::Release);
+                        self.clean_guard_epochs[1].store(ep[1], Ordering::Release);
+                        self.clean_guard_epochs[0].store(ep[0], Ordering::Release);
+                    } else if let Some(shard) = sub_shard {
+                        self.copied
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .record_clean_single_shard(shard, ep[0], lo_page, hi_page);
+                    }
+                }
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {

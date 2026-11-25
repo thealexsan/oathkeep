@@ -673,6 +673,14 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    if shadow.is_gpu_active(list, address, len) {
+        shadow.refresh(list, address, len);
+        if let Some((_, _, scratch_gpu)) =
+            list.gpu_copy_scratch(&shadow.buffer, shadow.offset(address), len, 256)
+        {
+            return Some(scratch_gpu);
+        }
+    }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
@@ -3063,18 +3071,39 @@ impl State {
                     .find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        if direct_cbv()
-                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                        let size_u64 = u64::from(size);
+                        let existing = crate::shadow::find_existing(address, size_u64);
+                        let gpu_active = existing
+                            .as_ref()
+                            .is_some_and(|s| s.is_gpu_active(list, address, size_u64));
+                        if (direct_cbv() || gpu_active)
+                            && let Some(shadow) =
+                                existing.or_else(|| crate::shadow::find(address, size_u64))
                         {
                             let gpu = shadow.gpu(address);
                             let aligned = size.next_multiple_of(256);
                             if gpu % 256 == 0 && shadow.left(address) >= u64::from(aligned) {
-                                shadow.refresh(list, address, u64::from(size));
+                                shadow.refresh(list, address, size_u64);
+                                if gpu_active {
+                                    list.uav_barrier_if_dirty();
+                                }
                                 host.constant_at_kept(index, gpu, size, shadow.buffer.clone());
                                 continue;
                             }
+                            if gpu_active && shadow.left(address) >= size_u64 {
+                                shadow.refresh(list, address, size_u64);
+                                if let Some((scratch, _, scratch_gpu)) = list.gpu_copy_scratch(
+                                    &shadow.buffer,
+                                    shadow.offset(address),
+                                    size_u64,
+                                    256,
+                                ) {
+                                    host.constant_at_kept(index, scratch_gpu, size, scratch);
+                                    continue;
+                                }
+                            }
                         }
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                        let Some((gpu, to)) = list.scratch(size_u64) else {
                             host.make_null(index);
                             continue;
                         };

@@ -1149,23 +1149,17 @@ extern "system" fn copy_buffer_region(
     {
         static DIRECT_BUF_COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let direct = *DIRECT_BUF_COPY
-            .get_or_init(|| std::env::var_os("OATHKEEP_DIRECT_BUF_COPY").is_some_and(|v| v == "1"));
+            .get_or_init(|| std::env::var_os("OATHKEEP_DIRECT_BUF_COPY").is_none_or(|v| v != "0"));
         if direct {
             let (from_u64, to_u64) = (from as u64, to as u64);
-            let (from_u, to_u, len_u) = (from as usize, to as usize, len as usize);
             let src_existing = crate::shadow::find_existing(from_u64, len);
             let dst_existing = crate::shadow::find_existing(to_u64, len);
-            let gpu_active = src_existing.as_ref().is_some_and(|s| {
-                s.ever_written()
-                    && (s.pending_touches(from_u, len_u)
-                        || list.touches_gpu_write(from_u, len_u)
-                        || crate::host::written_in_flight(from_u, len_u))
-            }) || dst_existing.as_ref().is_some_and(|s| {
-                s.ever_written()
-                    && (s.pending_touches(to_u, len_u)
-                        || list.touches_gpu_write(to_u, len_u)
-                        || crate::host::written_in_flight(to_u, len_u))
-            });
+            let gpu_active = src_existing
+                .as_ref()
+                .is_some_and(|s| s.is_gpu_active(list, from_u64, len))
+                || dst_existing
+                    .as_ref()
+                    .is_some_and(|s| s.is_gpu_active(list, to_u64, len));
             if gpu_active
                 && let Some(src_shadow) = src_existing.or_else(|| crate::shadow::find(from_u64, len))
                 && let Some(dst_shadow) = dst_existing.or_else(|| crate::shadow::find(to_u64, len))
@@ -1362,42 +1356,50 @@ extern "system" fn copy_texture_region(
             let direct = *DIRECT_TEX_COPY.get_or_init(|| {
                 std::env::var_os("OATHKEEP_DIRECT_TEX_COPY").is_some_and(|v| v == "1")
             });
-            if direct
-                && let Some(shadow) = crate::shadow::find(data as u64, bytes)
-                && let off = shadow.offset(data as u64)
-                && off % 512 == 0
+            let data_u64 = data as u64;
+            let existing = crate::shadow::find_existing(data_u64, bytes);
+            let gpu_active = existing
+                .as_ref()
+                .is_some_and(|s| s.is_gpu_active(list, data_u64, bytes));
+            let mut handled_direct = false;
+            let mut scratch_keep = None;
+            if (direct || gpu_active)
                 && from.footprint.row_pitch % 256 == 0
-                && shadow.left(data as u64) >= bytes
+                && let Some(shadow) = existing.or_else(|| crate::shadow::find(data_u64, bytes))
+                && shadow.left(data_u64) >= bytes
             {
-                shadow.refresh(list, data as u64, bytes);
-                list.keep(&shadow.buffer);
-                // SAFETY: an open list; ensures any prior shader UAV write in this
-                // list is visible before CopyTextureRegion reads `shadow.buffer`.
-                if list.take_uav_dirty() {
-                    unsafe {
-                        use windows::Win32::Graphics::Direct3D12::{
-                            D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
-                            D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                            D3D12_RESOURCE_UAV_BARRIER,
-                        };
-                        list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                                    pResource: std::mem::ManuallyDrop::new(None),
-                                }),
-                            },
-                        }]);
+                let off = shadow.offset(data_u64);
+                if off % 512 == 0 {
+                    shadow.refresh(list, data_u64, bytes);
+                    list.keep(&shadow.buffer);
+                    list.uav_barrier_if_dirty();
+                    from.resource = shadow.buffer.as_raw().cast_const().cast();
+                    from.footprint.offset = off;
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        read = Some((shadow.gpu(data_u64), bytes));
+                    }
+                    handled_direct = true;
+                } else if gpu_active {
+                    shadow.refresh(list, data_u64, bytes);
+                    if let Some((scratch, scratch_off, scratch_gpu)) =
+                        list.gpu_copy_scratch(&shadow.buffer, off, bytes, 512)
+                    {
+                        from.resource = scratch.as_raw().cast_const().cast();
+                        from.footprint.offset = scratch_off;
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            read = Some((scratch_gpu, bytes));
+                        }
+                        #[cfg(not(feature = "diagnostics"))]
+                        let _ = scratch_gpu;
+                        scratch_keep = Some(scratch);
+                        handled_direct = true;
                     }
                 }
-                from.resource = shadow.buffer.as_raw().cast_const().cast();
-                from.footprint.offset = off;
-                #[cfg(feature = "diagnostics")]
-                {
-                    read = Some((shadow.gpu(data as u64), bytes));
-                }
-                _upload = None;
+            }
+            if handled_direct {
+                _upload = scratch_keep;
             } else {
                 let Some((buffer, staging)) = list.upload(host, bytes) else {
                     return;

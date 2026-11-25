@@ -826,6 +826,15 @@ struct IndirectPool {
     in_indirect: bool,
 }
 
+#[derive(Default)]
+struct GpuScratchPool {
+    buffer: Option<ID3D12Resource>,
+    gpu: u64,
+    cap: u64,
+    used: u64,
+    in_read: bool,
+}
+
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
@@ -836,6 +845,7 @@ pub(crate) struct HostList {
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     budget: OnceLock<Option<ID3D12Resource>>,
     indirect_pool: Mutex<IndirectPool>,
+    gpu_scratch_pool: Mutex<GpuScratchPool>,
     uav_dirty: std::sync::atomic::AtomicBool,
     indirect_uav_dirty: std::sync::atomic::AtomicBool,
     indirect_epoch: std::sync::atomic::AtomicU64,
@@ -2409,7 +2419,21 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 &Step::Fill(_, src, len) => {
                     if touches(written, src, src + len) {
                         if count {
-                            LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            let hit = LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            if hit < 8 {
+                                let existing = crate::shadow::find_existing(src as u64, len as u64);
+                                tracing::info!(
+                                    hit,
+                                    src = format_args!("{src:#x}"),
+                                    len,
+                                    has_shadow = existing.is_some(),
+                                    ever_written = existing.as_ref().is_some_and(|s| s.ever_written()),
+                                    "WHY_READ Step::Fill stall"
+                                );
+                            }
+                            #[cfg(not(feature = "diagnostics"))]
+                            let _ = hit;
                         }
                         return Some(WHY_READ);
                     }
@@ -3508,6 +3532,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_pool: Mutex::default(),
+                gpu_scratch_pool: Mutex::default(),
                 uav_dirty: std::sync::atomic::AtomicBool::new(true),
                 indirect_uav_dirty: std::sync::atomic::AtomicBool::new(true),
                 indirect_epoch: std::sync::atomic::AtomicU64::new(1),
@@ -6344,6 +6369,97 @@ impl HostList {
         self.indirect_uav_dirty.swap(false, Ordering::Relaxed)
     }
 
+    pub(crate) fn uav_barrier_if_dirty(&self) {
+        if !self.take_uav_dirty() {
+            return;
+        }
+        // SAFETY: an open direct command list; all-resource UAV barrier ensures prior
+        // shader UAV writes in this list are visible to subsequent reads/copies.
+        unsafe {
+            self.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            }]);
+        }
+    }
+
+    pub(crate) fn gpu_copy_scratch(
+        &self,
+        src: &ID3D12Resource,
+        src_offset: u64,
+        len: u64,
+        align: u64,
+    ) -> Option<(ID3D12Resource, u64, u64)> {
+        let align = align.max(256);
+        let alloc_bytes = len.max(align).next_multiple_of(align);
+        let (scratch, dst_off, gpu_va, was_in_read, old_buf) = {
+            let mut pool = self
+                .gpu_scratch_pool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let start = pool.used.next_multiple_of(align);
+            if let Some(buf) = pool.buffer.clone()
+                && start.saturating_add(alloc_bytes) <= pool.cap
+            {
+                let was_in_read = pool.in_read;
+                pool.used = start + alloc_bytes;
+                if len > 0 {
+                    pool.in_read = true;
+                }
+                (buf, start, pool.gpu + start, was_in_read, None)
+            } else {
+                let new_cap = pool
+                    .cap
+                    .saturating_mul(2)
+                    .max(alloc_bytes)
+                    .max(64 << 10)
+                    .next_multiple_of(64 << 10);
+                let buffer = host()?.uav_buffer(new_cap)?;
+                name(&buffer, || format!("gpu scratch {new_cap:#x}"));
+                // SAFETY: a live DEFAULT-heap buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                let old_buf = pool.buffer.replace(buffer.clone());
+                pool.gpu = gpu;
+                pool.cap = new_cap;
+                pool.used = alloc_bytes;
+                pool.in_read = len > 0;
+                (buffer, 0, gpu, false, old_buf)
+            }
+        };
+        if let Some(old_buf) = old_buf {
+            self.keep(&old_buf);
+        }
+        self.keep(src);
+        self.uav_barrier_if_dirty();
+        if len > 0 {
+            // SAFETY: an open direct command list; `scratch` is a live DEFAULT-heap buffer
+            // (starting in COMMON on first use, or in GENERIC_READ after a prior copy), and
+            // `src` is a live shadow buffer kept alive for this submission.
+            unsafe {
+                if was_in_read {
+                    self.list.ResourceBarrier(&[transition(
+                        &scratch,
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                }
+                self.list
+                    .CopyBufferRegion(&scratch, dst_off, src, src_offset, len);
+                self.list.ResourceBarrier(&[transition(
+                    &scratch,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                )]);
+            }
+        }
+        Some((scratch, dst_off, gpu_va))
+    }
+
     pub(crate) fn reset(&self) {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -6355,6 +6471,14 @@ impl HostList {
             let mut pool = self.indirect_pool.lock().unwrap_or_else(|e| e.into_inner());
             pool.used = 0;
             pool.in_indirect = false;
+        }
+        {
+            let mut pool = self
+                .gpu_scratch_pool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            pool.used = 0;
+            pool.in_read = false;
         }
         let old_deferred = std::mem::take(&mut *self.deferred());
         let old_states =
