@@ -638,12 +638,20 @@ struct HotHashes {
     quiet: Vec<HotPageQuiet>,
 }
 
+pub(crate) struct CardMasked {
+    pub(crate) offset: usize,
+    pub(crate) data: Vec<u8>,
+    pub(crate) mask: Arc<Vec<u8>>,
+}
+
 struct Card {
     before: Mutex<Option<ID3D12Resource>>,
     old: Mutex<BTreeMap<usize, Vec<u8>>>,
     has_old: AtomicBool,
     dirty: Mutex<Vec<(usize, usize)>>,
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    masked: Mutex<Vec<CardMasked>>,
+    sent_masked: Mutex<Vec<(usize, Arc<Vec<u8>>, u64)>>,
     /// Contiguous per-4 KiB sub-block hashes (`0` = cleared/unhashed, `h | 1` = hashed)
     /// plus per-64 KiB page quiet tracking for adaptive hot-page cooling.
     /// Lazily allocated on first hot/rewrite/unwatched check.
@@ -1480,15 +1488,21 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     buffer
 }
 
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+pub(crate) fn card_dirty(
+    sent_as: u64,
+) -> (
+    Vec<(Arc<Shadow>, Vec<(usize, usize)>)>,
+    Vec<(Arc<Shadow>, Vec<CardMasked>)>,
+) {
     let mut out = Vec::new();
+    let mut masked_out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
     carded.retain(|weak| {
         let Some(shadow) = weak.upgrade() else {
             return false;
         };
-        let ranges = shadow
+        let (ranges, masked) = shadow
             .card
             .as_ref()
             .map(|c| {
@@ -1499,15 +1513,30 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
                     sent.retain(|s| s.2 > fetched);
                     sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
                 }
-                ranges
+                drop(dirty);
+                let mut m_lock = c.masked.lock().unwrap_or_else(|e| e.into_inner());
+                let masked = std::mem::take(&mut *m_lock);
+                if relay() {
+                    let mut sent_m = c.sent_masked.lock().unwrap_or_else(|e| e.into_inner());
+                    sent_m.retain(|s| s.2 > fetched);
+                    sent_m.extend(
+                        masked
+                            .iter()
+                            .map(|m| (m.offset, m.mask.clone(), sent_as)),
+                    );
+                }
+                (ranges, masked)
             })
             .unwrap_or_default();
         if !ranges.is_empty() {
-            out.push((shadow, joined(ranges)));
+            out.push((shadow.clone(), joined(ranges)));
+        }
+        if !masked.is_empty() {
+            masked_out.push((shadow, masked));
         }
         true
     });
-    out
+    (out, masked_out)
 }
 
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
@@ -2745,6 +2774,106 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+enum MergeDiff {
+    Empty,
+    Runs(Vec<(usize, usize)>),
+    Masked {
+        offset: usize,
+        data: Vec<u8>,
+        mask: Vec<u8>,
+        changed_runs: usize,
+        changed_bytes: usize,
+        first_off: usize,
+        last_end: usize,
+    },
+}
+
+/// Compares `title` against `held` (at buffer-relative offset `at` inside a card buffer of
+/// 4-byte aligned `buf_len` bytes) and updates `held` in place for all changed bytes.
+/// When at most `max_runs` contiguous byte runs differ, returns `MergeDiff::Runs`; otherwise
+/// produces a 4-byte aligned `(data, mask)` payload for GPU `CARD_MASKED_MERGE` so dense
+/// CPU writes under pending shader writes never fail with `runs_limit` or flood `CopyBufferRegion`.
+fn diff_runs_or_masked(
+    at: usize,
+    buf_len: usize,
+    title: &[u8],
+    held: &mut [u8],
+    max_runs: usize,
+) -> MergeDiff {
+    let n = title.len().min(held.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        while i + 8 <= n && title[i..i + 8] == held[i..i + 8] {
+            i += 8;
+        }
+        while i < n && title[i] == held[i] {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let first = i;
+        while i < n && title[i] != held[i] {
+            i += 1;
+        }
+        if runs.len() < max_runs {
+            runs.push((first, i - first));
+            continue;
+        }
+        // Dense diff (> max_runs): switch to a single 4-byte aligned GPU masked merge.
+        let first_diff = runs.first().map_or(first, |r| r.0);
+        let last_diff = last_difference(&title[first_diff..n], &held[first_diff..n])
+            .map_or(i - 1, |off| first_diff + off);
+        let abs_lo = (at + first_diff) & !3;
+        let abs_hi = (at + last_diff + 1).next_multiple_of(4).min(buf_len);
+        let payload_len = abs_hi.saturating_sub(abs_lo);
+        let mut data = vec![0u8; payload_len];
+        let mut mask = vec![0u8; payload_len];
+        let mut changed_runs = 0usize;
+        let mut changed_bytes = 0usize;
+        let mut cur = first_diff;
+        while cur <= last_diff {
+            while cur + 8 <= last_diff + 1 && title[cur..cur + 8] == held[cur..cur + 8] {
+                cur += 8;
+            }
+            while cur <= last_diff && title[cur] == held[cur] {
+                cur += 1;
+            }
+            if cur > last_diff {
+                break;
+            }
+            let r_start = cur;
+            while cur <= last_diff && title[cur] != held[cur] {
+                cur += 1;
+            }
+            let r_len = cur - r_start;
+            held[r_start..cur].copy_from_slice(&title[r_start..cur]);
+            let dst_off = (at + r_start) - abs_lo;
+            data[dst_off..dst_off + r_len].copy_from_slice(&title[r_start..cur]);
+            mask[dst_off..dst_off + r_len].fill(0xFF);
+            changed_runs += 1;
+            changed_bytes += r_len;
+        }
+        return MergeDiff::Masked {
+            offset: abs_lo,
+            data,
+            mask,
+            changed_runs,
+            changed_bytes,
+            first_off: at + first_diff,
+            last_end: at + last_diff + 1,
+        };
+    }
+    if runs.is_empty() {
+        return MergeDiff::Empty;
+    }
+    for &(r, m) in &runs {
+        held[r..r + m].copy_from_slice(&title[r..r + m]);
+    }
+    MergeDiff::Runs(runs)
+}
+
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
@@ -3945,8 +4074,8 @@ impl Shadow {
                 if let Some(card) = &self.card {
                     let p = self.pieces(at, at + n).start;
                     let (p_lo, _) = self.piece(p);
-                    let mut changed = Vec::new();
-                    {
+                    let max_runs = (*runs_left).min(16);
+                    let diff = {
                         let mut old = card.old.lock().unwrap_or_else(|e| e.into_inner());
                         let Some(piece_buf) = old.get_mut(&p) else {
                             #[cfg(feature = "diagnostics")]
@@ -3954,23 +4083,34 @@ impl Shadow {
                             return true;
                         };
                         let held = &mut piece_buf[at - p_lo..at - p_lo + n];
-                        let runs = changed_runs(title, held);
-                        if runs.len() > *runs_left {
-                            #[cfg(feature = "diagnostics")]
-                            Self::log_why_stale("runs_limit", self, runs.len(), lo, hi);
-                            return true;
+                        diff_runs_or_masked(at, card.size as usize, title, held, max_runs)
+                    };
+                    match diff {
+                        MergeDiff::Empty => {}
+                        MergeDiff::Runs(runs) => {
+                            *runs_left = runs_left.saturating_sub(runs.len());
+                            for (r, m) in runs {
+                                MERGED[1].fetch_add(1, Ordering::Relaxed);
+                                MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                                let (c_from, c_to) = (at + r, at + r + m);
+                                card.clear_hot_hashes(c_from, c_to);
+                                self.card_changed(c_from, c_to);
+                            }
                         }
-                        *runs_left -= runs.len();
-                        for (r, m) in runs {
-                            held[r..r + m].copy_from_slice(&title[r..r + m]);
-                            changed.push((at + r, at + r + m));
-                            MERGED[1].fetch_add(1, Ordering::Relaxed);
-                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        MergeDiff::Masked {
+                            offset,
+                            data,
+                            mask,
+                            changed_runs,
+                            changed_bytes,
+                            first_off,
+                            last_end,
+                        } => {
+                            MERGED[1].fetch_add(changed_runs as u64, Ordering::Relaxed);
+                            MERGED[2].fetch_add(changed_bytes as u64, Ordering::Relaxed);
+                            card.clear_hot_hashes(first_off, last_end);
+                            self.card_masked_push(offset, data, mask);
                         }
-                    }
-                    for (c_from, c_to) in changed {
-                        card.clear_hot_hashes(c_from, c_to);
-                        self.card_changed(c_from, c_to);
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -4726,6 +4866,36 @@ impl Shadow {
         }
     }
 
+    fn card_masked_push(&self, offset: usize, data: Vec<u8>, mask: Vec<u8>) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        if data.is_empty() {
+            return;
+        }
+        let mut masked = card.masked.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(prev) = masked
+            .iter_mut()
+            .rev()
+            .take(8)
+            .find(|m| m.offset == offset && m.data.len() == data.len())
+            && let Some(prev_mask) = Arc::get_mut(&mut prev.mask)
+        {
+            for i in 0..data.len() {
+                if mask[i] != 0 {
+                    prev.data[i] = data[i];
+                    prev_mask[i] = 0xFF;
+                }
+            }
+            return;
+        }
+        masked.push(CardMasked {
+            offset,
+            data,
+            mask: Arc::new(mask),
+        });
+    }
+
     pub(crate) fn card_sides(&self) -> Option<(Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card
@@ -5367,7 +5537,12 @@ impl Shadow {
     }
 }
 
-enum RelaySkipSnapshot {
+struct RelaySkipSnapshot {
+    ranges: RelaySkipRanges,
+    masked: Vec<(usize, Arc<Vec<u8>>, u64)>,
+}
+
+enum RelaySkipRanges {
     Empty,
     Unified(Vec<(usize, usize)>),
     Mixed {
@@ -5380,9 +5555,12 @@ impl RelaySkipSnapshot {
     fn capture(card: &Card, pieces: &[(usize, &[u8], u64)]) -> Self {
         let first_after = pieces[0].2;
         let uniform = pieces.iter().all(|p| p.2 == first_after);
+        let min_after = pieces.iter().map(|p| p.2).min().unwrap_or(0);
+        let min_at = pieces.iter().map(|p| p.0).min().unwrap_or(0);
+        let max_end = pieces.iter().map(|p| p.0 + p.1.len()).max().unwrap_or(0);
         let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
         let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-        if uniform {
+        let ranges = if uniform {
             let mut all: Vec<(usize, usize)> = dirty
                 .iter()
                 .copied()
@@ -5393,31 +5571,51 @@ impl RelaySkipSnapshot {
                 )
                 .collect();
             if all.is_empty() {
-                return Self::Empty;
+                RelaySkipRanges::Empty
+            } else {
+                all = joined(all);
+                RelaySkipRanges::Unified(all)
             }
-            all = joined(all);
-            Self::Unified(all)
+        } else if dirty.is_empty() && sent.is_empty() {
+            RelaySkipRanges::Empty
         } else {
-            if dirty.is_empty() && sent.is_empty() {
-                return Self::Empty;
-            }
             let dirty_joined = if dirty.is_empty() {
                 Vec::new()
             } else {
                 joined(dirty.clone())
             };
-            Self::Mixed {
+            RelaySkipRanges::Mixed {
                 dirty: dirty_joined,
                 sent: sent.clone(),
             }
+        };
+        drop(sent);
+        drop(dirty);
+        let mut masked = Vec::new();
+        {
+            let m = card.masked.lock().unwrap_or_else(|e| e.into_inner());
+            for item in m.iter() {
+                if item.offset < max_end && item.offset + item.mask.len() > min_at {
+                    masked.push((item.offset, item.mask.clone(), u64::MAX));
+                }
+            }
         }
+        {
+            let sm = card.sent_masked.lock().unwrap_or_else(|e| e.into_inner());
+            for (off, mask, seq) in sm.iter() {
+                if *seq > min_after && *off < max_end && *off + mask.len() > min_at {
+                    masked.push((*off, mask.clone(), *seq));
+                }
+            }
+        }
+        Self { ranges, masked }
     }
 
     fn active_ranges(&self, at: usize, end: usize, fetched_after: u64, out: &mut Vec<(usize, usize)>) {
         out.clear();
-        match self {
-            Self::Empty => out.push((at, end)),
-            Self::Unified(ranges) => {
+        match &self.ranges {
+            RelaySkipRanges::Empty => out.push((at, end)),
+            RelaySkipRanges::Unified(ranges) => {
                 let mut cur = at;
                 let idx = ranges.partition_point(|&(_, b)| b <= at);
                 for &(a, b) in &ranges[idx..] {
@@ -5429,14 +5627,14 @@ impl RelaySkipSnapshot {
                     }
                     cur = cur.max(b);
                     if cur >= end {
-                        return;
+                        break;
                     }
                 }
                 if cur < end {
                     out.push((cur, end));
                 }
             }
-            Self::Mixed { dirty, sent } => {
+            RelaySkipRanges::Mixed { dirty, sent } => {
                 let skip: Vec<(usize, usize)> = dirty
                     .iter()
                     .copied()
@@ -5452,6 +5650,61 @@ impl RelaySkipSnapshot {
                 } else {
                     out.extend(outside(at, end, skip));
                 }
+            }
+        }
+        if self.masked.is_empty() || out.is_empty() {
+            return;
+        }
+        let mut next: Vec<(usize, usize)> = Vec::new();
+        for (m_off, m_mask, m_seq) in &self.masked {
+            if *m_seq <= fetched_after {
+                continue;
+            }
+            let m_end = *m_off + m_mask.len();
+            if *m_off >= end || m_end <= at {
+                continue;
+            }
+            next.clear();
+            let push_merged = |v: &mut Vec<(usize, usize)>, s: usize, e: usize| {
+                if s >= e {
+                    return;
+                }
+                match v.last_mut() {
+                    Some(last) if last.1 == s => last.1 = e,
+                    _ => v.push((s, e)),
+                }
+            };
+            for &(a, b) in out.iter() {
+                if b <= *m_off || a >= m_end {
+                    push_merged(&mut next, a, b);
+                    continue;
+                }
+                if a < *m_off {
+                    push_merged(&mut next, a, *m_off);
+                }
+                let lo = a.max(*m_off);
+                let hi = b.min(m_end);
+                let mut cur = lo;
+                while cur < hi {
+                    while cur < hi && m_mask[cur - *m_off] != 0 {
+                        cur += 1;
+                    }
+                    if cur >= hi {
+                        break;
+                    }
+                    let run_start = cur;
+                    while cur < hi && m_mask[cur - *m_off] == 0 {
+                        cur += 1;
+                    }
+                    push_merged(&mut next, run_start, cur);
+                }
+                if b > m_end {
+                    push_merged(&mut next, m_end, b);
+                }
+            }
+            std::mem::swap(out, &mut next);
+            if out.is_empty() {
+                return;
             }
         }
     }
@@ -5825,6 +6078,8 @@ mod relay_batch_tests {
             has_old: AtomicBool::new(false),
             dirty: Mutex::new(vec![(100, 140)]),
             sent: Mutex::new(vec![(20, 40, 5), (60, 80, 9), (130, 160, 11)]),
+            masked: Mutex::default(),
+            sent_masked: Mutex::default(),
             hot_hashes: Mutex::default(),
             has_hot_hashes: AtomicBool::new(false),
             size: 1024,
@@ -5841,6 +6096,95 @@ mod relay_batch_tests {
         assert_eq!(active, vec![(0, 20), (40, 60), (80, 100)]);
         mixed.active_ranges(128, 200, 10, &mut active);
         assert_eq!(active, vec![(160, 200)]);
+    }
+
+    #[test]
+    fn diff_runs_or_masked_handles_sparse_and_dense_byte_diffs_with_alignment() {
+        use super::{MergeDiff, diff_runs_or_masked};
+
+        // Sparse diff (<= 16 runs) returns exact runs and updates held in place.
+        let mut held = vec![0u8; 64];
+        let mut title = held.clone();
+        title[5] = 0x11;
+        title[20..24].fill(0x22);
+        match diff_runs_or_masked(64, 256, &title, &mut held, 16) {
+            MergeDiff::Runs(runs) => assert_eq!(runs, vec![(5, 1), (20, 4)]),
+            _ => panic!("expected Runs for 2 sparse diffs"),
+        }
+        assert_eq!(held, title);
+
+        // Dense diff (> 16 scattered single-byte runs, with odd `at = 3`) switches to 4-byte aligned Masked.
+        let mut held = vec![0xAAu8; 128];
+        let mut title = held.clone();
+        for k in 0..30 {
+            title[2 + k * 3] = (k as u8).wrapping_add(1);
+        }
+        let expected_held = title.clone();
+        match diff_runs_or_masked(3, 256, &title, &mut held, 16) {
+            MergeDiff::Masked {
+                offset,
+                data,
+                mask,
+                changed_runs,
+                changed_bytes,
+                ..
+            } => {
+                assert_eq!(offset % 4, 0);
+                assert_eq!(data.len() % 4, 0);
+                assert_eq!(data.len(), mask.len());
+                assert_eq!(changed_runs, 30);
+                assert_eq!(changed_bytes, 30);
+                for i in 0..data.len() {
+                    let abs = offset + i;
+                    let rel = abs.checked_sub(3);
+                    let changed = rel.is_some_and(|r| r < 128 && (r >= 2 && (r - 2) % 3 == 0 && (r - 2) / 3 < 30));
+                    if changed {
+                        assert_eq!(mask[i], 0xFF);
+                        assert_eq!(data[i], expected_held[rel.unwrap()]);
+                    } else {
+                        assert_eq!(mask[i], 0x00);
+                    }
+                }
+            }
+            _ => panic!("expected Masked for 30 scattered byte diffs"),
+        }
+        assert_eq!(held, expected_held);
+    }
+
+    #[test]
+    fn skip_snapshot_respects_byte_exact_masked_and_sent_masked_entries() {
+        use super::CardMasked;
+        use std::sync::Arc;
+
+        // Byte mask at offset 16..24: bytes 17, 18, 21 are CPU-changed (0xFF); rest are 0x00.
+        let mask_live = Arc::new(vec![0, 0xFF, 0xFF, 0, 0, 0xFF, 0, 0]);
+        // Sent mask at offset 32..36 with seq=10: byte 33 is CPU-changed.
+        let mask_sent = Arc::new(vec![0, 0xFF, 0, 0]);
+        let card = Card {
+            before: Mutex::default(),
+            old: Mutex::default(),
+            has_old: AtomicBool::new(false),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            masked: Mutex::new(vec![CardMasked {
+                offset: 16,
+                data: vec![0; 8],
+                mask: mask_live,
+            }]),
+            sent_masked: Mutex::new(vec![(32, mask_sent, 10)]),
+            hot_hashes: Mutex::default(),
+            has_hot_hashes: AtomicBool::new(false),
+            size: 1024,
+        };
+        let buf = [0u8; 64];
+        let skip = RelaySkipSnapshot::capture(&card, &[(0, &buf[..], 5)]);
+        let mut active = Vec::new();
+        // fetched_after=5 < 10: skips 17..19, 21..22, and 33..34, preserving adjacent GPU bytes!
+        skip.active_ranges(10, 40, 5, &mut active);
+        assert_eq!(active, vec![(10, 17), (19, 21), (22, 33), (34, 40)]);
+        // fetched_after=10: skips only live masked (17..19, 21..22), NOT seq=10 sent_masked!
+        skip.active_ranges(10, 40, 10, &mut active);
+        assert_eq!(active, vec![(10, 17), (19, 21), (22, 40)]);
     }
 
     #[test]
@@ -5864,6 +6208,8 @@ mod relay_batch_tests {
             has_old: AtomicBool::new(false),
             dirty: Mutex::new(vec![(100, 112)]),
             sent: Mutex::default(),
+            masked: Mutex::default(),
+            sent_masked: Mutex::default(),
             hot_hashes: Mutex::default(),
             has_hot_hashes: AtomicBool::new(false),
             size: (2 * PAGE) as u64,
@@ -5946,6 +6292,8 @@ mod relay_batch_tests {
             has_old: AtomicBool::new(false),
             dirty: Mutex::default(),
             sent: Mutex::default(),
+            masked: Mutex::default(),
+            sent_masked: Mutex::default(),
             hot_hashes: Mutex::default(),
             has_hot_hashes: AtomicBool::new(false),
             size: PAGE as u64,
@@ -6006,6 +6354,8 @@ mod relay_batch_tests {
             has_old: AtomicBool::new(false),
             dirty: Mutex::new(vec![(PAGE + 16, PAGE + 32)]),
             sent: Mutex::new(vec![(PAGE + 32, PAGE + 64, 10)]),
+            masked: Mutex::default(),
+            sent_masked: Mutex::default(),
             hot_hashes: Mutex::default(),
             has_hot_hashes: AtomicBool::new(false),
             size: (4 * PAGE) as u64,
@@ -6065,7 +6415,10 @@ mod relay_batch_tests {
         let mut old_u = vec![0u8; PAGE];
         let mut gpu_u = vec![0u8; PAGE];
         gpu_u[0..16].fill(0x77);
-        let empty_skip = RelaySkipSnapshot::Empty;
+        let empty_skip = RelaySkipSnapshot {
+            ranges: super::RelaySkipRanges::Empty,
+            masked: Vec::new(),
+        };
         let bucket_u = merge_relay_chunk(
             unmapped_ptr,
             vec![RelayPieceWork {
@@ -6282,6 +6635,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     has_old: AtomicBool::new(false),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    masked: Mutex::default(),
+                    sent_masked: Mutex::default(),
                     hot_hashes: Mutex::default(),
                     has_hot_hashes: AtomicBool::new(false),
                     size,
@@ -6506,6 +6861,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 has_old: AtomicBool::new(false),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                masked: Mutex::default(),
+                sent_masked: Mutex::default(),
                 hot_hashes: Mutex::default(),
                 has_hot_hashes: AtomicBool::new(false),
                 size: len,
@@ -6738,6 +7095,8 @@ mod window_tests {
             has_old: AtomicBool::new(false),
             dirty: Mutex::default(),
             sent: Mutex::default(),
+            masked: Mutex::default(),
+            sent_masked: Mutex::default(),
             hot_hashes: Mutex::new(HotHashes {
                 slots: vec![0u128; slots],
                 quiet: Vec::new(),
@@ -6855,6 +7214,8 @@ mod window_tests {
             has_old: AtomicBool::new(false),
             dirty: Mutex::default(),
             sent: Mutex::default(),
+            masked: Mutex::default(),
+            sent_masked: Mutex::default(),
             hot_hashes: Mutex::default(),
             has_hot_hashes: AtomicBool::new(false),
             size: LEN as u64,
@@ -6955,6 +7316,8 @@ mod window_tests {
             has_old: AtomicBool::new(false),
             dirty: Mutex::default(),
             sent: Mutex::default(),
+            masked: Mutex::default(),
+            sent_masked: Mutex::default(),
             hot_hashes: Mutex::default(),
             has_hot_hashes: AtomicBool::new(false),
             size: len as u64,
@@ -7002,6 +7365,8 @@ mod window_tests {
             has_old: AtomicBool::new(false),
             dirty: Mutex::default(),
             sent: Mutex::default(),
+            masked: Mutex::default(),
+            sent_masked: Mutex::default(),
             hot_hashes: Mutex::default(),
             has_hot_hashes: AtomicBool::new(false),
             size: small_len as u64,

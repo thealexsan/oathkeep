@@ -1555,6 +1555,8 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    merge_root: ID3D12RootSignature,
+    merge_pso: ID3D12PipelineState,
     differs: (ID3D12Resource, usize, u64),
     fetched: Option<(ID3D12Resource, usize, u64)>,
     upload_pool: Vec<(ID3D12Resource, usize, u64)>,
@@ -1606,6 +1608,33 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (compare == 2u) hashes.Store4(piece * 16u, h);
     } else {
         hashes.Store4(piece * 16u, h);
+    }
+}
+"#;
+
+pub(crate) const CARD_MASKED_MERGE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u0)"
+cbuffer Merge : register(b0) {
+    uint dst_off;  // 4-byte aligned byte offset in dst (card buffer)
+    uint data_off; // 4-byte aligned byte offset of new bytes in upload buffer
+    uint mask_off; // 4-byte aligned byte offset of byte mask (0xFF=write, 0x00=keep)
+    uint dwords;   // number of 32-bit dwords to merge
+};
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= dwords) return;
+    uint off = id.x * 4u;
+    uint m = src.Load(mask_off + off);
+    if (m == 0u) return;
+    uint v = src.Load(data_off + off);
+    if (m == 0xFFFFFFFFu) {
+        dst.Store(dst_off + off, v);
+    } else {
+        uint cur = dst.Load(dst_off + off);
+        dst.Store(dst_off + off, (cur & ~m) | (v & m));
     }
 }
 "#;
@@ -2449,28 +2478,38 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 
 fn stale_under_flights(runs: &[&HostList]) -> bool {
     use std::sync::Arc;
-    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    let mut spans: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
             {
+                let range = (*address, *address + *len);
                 match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+                    Some(s) => s.1.push(range),
+                    None => spans.push((shadow.clone(), vec![range])),
                 }
             }
         }
     }
+    for (_, ranges) in &mut spans {
+        let mut merged = Vec::new();
+        join_ranges(&mut merged, std::mem::take(ranges));
+        *ranges = merged;
+    }
     if late_exact() {
-        let mut runs_left = 8192;
-        return spans.iter().any(|(shadow, from, to)| {
-            shadow.merge_under_writes(*from, *to - *from, &mut runs_left)
+        let mut runs_left = 256;
+        return spans.iter().any(|(shadow, ranges)| {
+            ranges
+                .iter()
+                .any(|&(from, to)| shadow.merge_under_writes(from, to - from, &mut runs_left))
         });
     }
-    spans
-        .iter()
-        .any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+    spans.iter().any(|(shadow, ranges)| {
+        ranges
+            .iter()
+            .any(|&(from, to)| shadow.stale_under_writes(from, to - from))
+    })
 }
 
 pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
@@ -3620,6 +3659,7 @@ impl Host {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
+        let mut merge_code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
@@ -3636,8 +3676,22 @@ impl Host {
                 &mut code,
                 None,
             )?;
+            D3DCompile(
+                CARD_MASKED_MERGE.as_ptr().cast(),
+                CARD_MASKED_MERGE.len(),
+                windows::core::s!("card masked merge"),
+                None,
+                None,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+                0,
+                0,
+                &mut merge_code,
+                None,
+            )?;
         }
         let code = code.ok_or_else(windows::core::Error::empty)?;
+        let merge_code = merge_code.ok_or_else(windows::core::Error::empty)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         const RESULTS: u64 = 1 << 20;
         let (differs, data) = self
@@ -3662,12 +3716,29 @@ impl Host {
                         },
                         ..Default::default()
                     })?;
+            let m_bytes = std::slice::from_raw_parts(
+                merge_code.GetBufferPointer().cast::<u8>(),
+                merge_code.GetBufferSize(),
+            );
+            let merge_root: ID3D12RootSignature = self.device.CreateRootSignature(0, m_bytes)?;
+            let merge_pso: ID3D12PipelineState =
+                self.device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&merge_root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: m_bytes.as_ptr().cast(),
+                            BytecodeLength: m_bytes.len(),
+                        },
+                        ..Default::default()
+                    })?;
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
                 fetch: list()?,
                 root,
                 pso,
+                merge_root,
+                merge_pso,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 upload_pool: Vec::new(),
@@ -3722,21 +3793,22 @@ impl Host {
         } else {
             0
         };
-        let mut dirty = crate::shadow::card_dirty(sent_as);
+        let (mut dirty, masked) = crate::shadow::card_dirty(sent_as);
         #[cfg(feature = "diagnostics")]
         {
             prep.prepare_write += prep_write_start.elapsed().as_micros() as u64;
         }
-        if declared.is_empty() && dirty.is_empty() {
+        if declared.is_empty() && dirty.is_empty() && masked.is_empty() {
             return None;
         }
         #[cfg(feature = "diagnostics")]
         let record_phase_start = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let mut fill_upload_us = 0u64;
-        let mut written_shadows: Vec<usize> = Vec::with_capacity(declared.len() + dirty.len());
+        let mut written_shadows: Vec<usize> =
+            Vec::with_capacity(declared.len() + dirty.len() + masked.len());
         let mut seen_written: std::collections::HashSet<usize> =
-            std::collections::HashSet::with_capacity(declared.len() + dirty.len());
+            std::collections::HashSet::with_capacity(declared.len() + dirty.len() + masked.len());
         for (s, _) in &declared {
             let ptr = Arc::as_ptr(s) as usize;
             if seen_written.insert(ptr) {
@@ -3745,6 +3817,14 @@ impl Host {
         }
         for (s, ranges) in &dirty {
             if !ranges.is_empty() {
+                let ptr = Arc::as_ptr(s) as usize;
+                if seen_written.insert(ptr) {
+                    written_shadows.push(ptr);
+                }
+            }
+        }
+        for (s, items) in &masked {
+            if !items.is_empty() {
                 let ptr = Arc::as_ptr(s) as usize;
                 if seen_written.insert(ptr) {
                     written_shadows.push(ptr);
@@ -3771,7 +3851,7 @@ impl Host {
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut plan_uploads: Vec<(ID3D12Resource, usize, u64)> = Vec::new();
         let mut sync_cmd: Option<ID3D12CommandList> = None;
-        if !dirty.is_empty() {
+        if !dirty.is_empty() || !masked.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!(
                     "no host list to bring host copies in the card's memory up to date"
@@ -3807,15 +3887,48 @@ impl Host {
                 (buf, ptr as usize, cap)
             };
             let emit_hashes = |list: &ID3D12GraphicsCommandList,
-                               copied_in_this_list: &std::collections::HashSet<usize>| {
+                               copied_in_this_list: &std::collections::HashSet<usize>,
+                               uav_in_this_list: &std::collections::HashSet<usize>| {
+                let mut targets: Vec<(&Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
+                    Vec::with_capacity(dirty.len() + masked.len());
+                let mut target_idx: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::with_capacity(dirty.len() + masked.len());
                 for (shadow, ranges) in &dirty {
+                    let ptr = Arc::as_ptr(shadow) as usize;
+                    let idx = *target_idx.entry(ptr).or_insert_with(|| {
+                        let i = targets.len();
+                        targets.push((shadow, Vec::new()));
+                        i
+                    });
+                    targets[idx].1.extend_from_slice(ranges);
+                }
+                for (shadow, items) in &masked {
+                    let ptr = Arc::as_ptr(shadow) as usize;
+                    let idx = *target_idx.entry(ptr).or_insert_with(|| {
+                        let i = targets.len();
+                        targets.push((shadow, Vec::new()));
+                        i
+                    });
+                    for item in items {
+                        targets[idx]
+                            .1
+                            .push((item.offset, item.offset + item.data.len()));
+                    }
+                }
+                for (shadow, ranges) in &targets {
                     let Some((Some(before), size)) = shadow.card_sides() else {
                         continue;
                     };
                     let ptr = Arc::as_ptr(shadow) as usize;
                     // SAFETY: live buffers and compute root signature/PSO.
                     unsafe {
-                        if copied_in_this_list.contains(&ptr) {
+                        if uav_in_this_list.contains(&ptr) {
+                            list.ResourceBarrier(&[transition(
+                                &shadow.buffer,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            )]);
+                        } else if copied_in_this_list.contains(&ptr) {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -3863,11 +3976,11 @@ impl Host {
             // are recorded into ONE command list with zero mid-call GPU waits.
             let recorded = unsafe {
                 (|| -> windows::core::Result<ID3D12CommandList> {
-                    if total_copy == 0 {
+                    if total_copy == 0 && masked.is_empty() {
                         allocator.Reset()?;
                         list.Reset(allocator, None)?;
                         let empty = std::collections::HashSet::new();
-                        emit_hashes(list, &empty);
+                        emit_hashes(list, &empty, &empty);
                         list.Close()?;
                         list.cast()
                     } else {
@@ -3875,7 +3988,11 @@ impl Host {
                             crate::shadow::CARD_STATS[1]
                                 .fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         }
-                        let chunks = plan_upload_chunks(&dirty, CARD_UPLOAD_CHUNK as usize);
+                        let chunks = if total_copy > 0 {
+                            plan_upload_chunks(&dirty, CARD_UPLOAD_CHUNK as usize)
+                        } else {
+                            Vec::new()
+                        };
                         plan_uploads.reserve(chunks.len());
                         for &(chunk_bytes, _) in &chunks {
                             plan_uploads.push(take_upload(&mut work.upload_pool, chunk_bytes));
@@ -3935,7 +4052,7 @@ impl Host {
                                     shadow.card_fill_upload(a, len, dst_ptr as *mut u8);
                                 }
                             }
-                        } else {
+                        } else if total_copy > 0 {
                             for (ci, (_, items)) in chunks.iter().enumerate() {
                                 let base_ptr = plan_uploads[ci].1;
                                 for &(si, a, len, dst_off) in items {
@@ -3947,11 +4064,64 @@ impl Host {
                                 }
                             }
                         }
+                        // Pack GPU masked-merge payloads `(data, mask)` into upload buffers.
+                        let mut masked_ops: Vec<(usize, usize, u32, u32, u32, u32)> = Vec::new();
+                        let mut total_masked_bytes = 0u64;
+                        if !masked.is_empty() {
+                            let max_chunk = CARD_UPLOAD_CHUNK as usize;
+                            let mut m_chunks: Vec<(u64, Vec<(usize, usize, usize)>)> = Vec::new();
+                            let mut cur: Vec<(usize, usize, usize)> = Vec::new();
+                            let mut cur_bytes = 0usize;
+                            for (mi, (_, items)) in masked.iter().enumerate() {
+                                for (ii, item) in items.iter().enumerate() {
+                                    let need = item.data.len() * 2;
+                                    if need == 0 || need > max_chunk {
+                                        continue;
+                                    }
+                                    if cur_bytes + need > max_chunk && !cur.is_empty() {
+                                        m_chunks.push((cur_bytes as u64, std::mem::take(&mut cur)));
+                                        cur_bytes = 0;
+                                    }
+                                    cur.push((mi, ii, cur_bytes));
+                                    cur_bytes += need;
+                                    total_masked_bytes += item.data.len() as u64;
+                                }
+                            }
+                            if !cur.is_empty() {
+                                m_chunks.push((cur_bytes as u64, cur));
+                            }
+                            for (chunk_bytes, items) in m_chunks {
+                                let upload_idx = plan_uploads.len();
+                                plan_uploads.push(take_upload(&mut work.upload_pool, chunk_bytes));
+                                let base_ptr = plan_uploads[upload_idx].1;
+                                for (mi, ii, off) in items {
+                                    let item = &masked[mi].1[ii];
+                                    let len = item.data.len();
+                                    let data_dst = (base_ptr + off) as *mut u8;
+                                    let mask_dst = (base_ptr + off + len) as *mut u8;
+                                    std::ptr::copy_nonoverlapping(item.data.as_ptr(), data_dst, len);
+                                    std::ptr::copy_nonoverlapping(item.mask.as_ptr(), mask_dst, len);
+                                    masked_ops.push((
+                                        mi,
+                                        upload_idx,
+                                        item.offset as u32,
+                                        off as u32,
+                                        (off + len) as u32,
+                                        (len / 4) as u32,
+                                    ));
+                                }
+                            }
+                        }
                         #[cfg(feature = "diagnostics")]
                         {
                             fill_upload_us += fill_start.elapsed().as_micros() as u64;
                         }
-                        crate::shadow::CARD_STATS[0].fetch_add(total_copy, Ordering::Relaxed);
+                        crate::shadow::CARD_STATS[0]
+                            .fetch_add(total_copy + total_masked_bytes, Ordering::Relaxed);
+                        if !masked_ops.is_empty() {
+                            crate::shadow::CARD_STATS[1]
+                                .fetch_add(masked_ops.len() as u64, Ordering::Relaxed);
+                        }
                         allocator.Reset()?;
                         list.Reset(allocator, None)?;
                         let mut copied_shadows: std::collections::HashSet<usize> =
@@ -3970,7 +4140,48 @@ impl Host {
                                 copied_shadows.insert(Arc::as_ptr(shadow) as usize);
                             }
                         }
-                        emit_hashes(list, &copied_shadows);
+                        let mut uav_shadows: std::collections::HashSet<usize> =
+                            std::collections::HashSet::with_capacity(masked.len());
+                        if !masked_ops.is_empty() {
+                            for (shadow, items) in &masked {
+                                if items.is_empty() {
+                                    continue;
+                                }
+                                let ptr = Arc::as_ptr(shadow) as usize;
+                                if uav_shadows.insert(ptr) {
+                                    let before_state = if copied_shadows.remove(&ptr) {
+                                        D3D12_RESOURCE_STATE_COPY_DEST
+                                    } else {
+                                        D3D12_RESOURCE_STATE_COMMON
+                                    };
+                                    list.ResourceBarrier(&[transition(
+                                        &shadow.buffer,
+                                        before_state,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    )]);
+                                }
+                            }
+                            list.SetComputeRootSignature(&work.merge_root);
+                            list.SetPipelineState(&work.merge_pso);
+                            for &(mi, upload_idx, dst_off, data_off, mask_off, dwords) in &masked_ops {
+                                if dwords == 0 {
+                                    continue;
+                                }
+                                let shadow = &masked[mi].0;
+                                let constants = [dst_off, data_off, mask_off, dwords];
+                                list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                                list.SetComputeRootShaderResourceView(
+                                    1,
+                                    plan_uploads[upload_idx].0.GetGPUVirtualAddress(),
+                                );
+                                list.SetComputeRootUnorderedAccessView(
+                                    2,
+                                    shadow.buffer.GetGPUVirtualAddress(),
+                                );
+                                list.Dispatch(dwords.div_ceil(64), 1, 1);
+                            }
+                        }
+                        emit_hashes(list, &copied_shadows, &uav_shadows);
                         list.Close()?;
                         list.cast()
                     }
@@ -3989,7 +4200,11 @@ impl Host {
             compares: Vec::new(),
             sync: sync_cmd,
             check: None,
-            _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            _synced: dirty
+                .into_iter()
+                .map(|(shadow, _)| shadow)
+                .chain(masked.into_iter().map(|(shadow, _)| shadow))
+                .collect(),
             written_shadows,
             lists: used,
             uploads: plan_uploads,
