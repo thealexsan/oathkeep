@@ -34,6 +34,12 @@ enum Val {
     Missing(Why),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SamplerRef {
+    Words([u32; 4]),
+    Immediate(u8),
+}
+
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     pub cmp_samplers: u64,
@@ -42,6 +48,7 @@ pub(crate) struct Lowered {
     pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    pub sampler_refs: Vec<SamplerRef>,
     pub wave_size: Option<u32>,
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -160,7 +167,7 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
-    samplers: Vec<[u32; 4]>,
+    samplers: Vec<SamplerRef>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
@@ -1966,6 +1973,14 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let samplers = self
+            .samplers
+            .iter()
+            .map(|s| match *s {
+                SamplerRef::Words(w) => w,
+                SamplerRef::Immediate(_) => [0; 4],
+            })
+            .collect();
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -1978,7 +1993,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
             user_data,
-            samplers: self.samplers,
+            samplers,
+            sampler_refs: self.samplers,
         })
     }
 
@@ -2168,6 +2184,11 @@ impl<'a> Lower<'a> {
         match self.vals.get(&v) {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
+            }
+            Some(&Val::Missing(_)) | None
+                if self.mask_ok && self.x.st.scc_some.contains_key(&v) =>
+            {
+                return self.scc_some(v).map(Val::Bit);
             }
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
@@ -2788,6 +2809,11 @@ impl<'a> Lower<'a> {
             Operand::Vector { reg, .. } => {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
+            }
+            Operand::Const(253) => {
+                let b = self.scc_in(inst)?;
+                let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
+                Ok(self.s.m.select(self.cur, b, one, zero))
             }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
@@ -5602,19 +5628,13 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
-                    Some(n) => n,
-                    None => {
-                        self.samplers.push(words);
-                        self.samplers.len() - 1
-                    }
-                };
-                if props.0 & 0x8000 != 0 {
-                    self.s.cmp_samplers |= 1 << n;
-                }
-                Ok(self.s.sampler_handle(self.cur, n as u32))
+                self.static_sampler_handle(SamplerRef::Words(words), props)
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
+            Source::ImmediateSampler { slot } if sampler => {
+                self.static_sampler_handle(SamplerRef::Immediate(*slot), props)
+            }
+            Source::ImmediateSampler { .. } => Err("an immediate sampler used as a resource"),
             Source::Built { address, .. } => {
                 let rp = *self
                     .x
@@ -5672,6 +5692,27 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    fn static_sampler_handle(
+        &mut self,
+        sampler_ref: SamplerRef,
+        props: (u32, u32),
+    ) -> Result<V, Why> {
+        let n = match self.samplers.iter().position(|s| *s == sampler_ref) {
+            Some(n) => n,
+            None => {
+                if self.samplers.len() >= 64 {
+                    return Err("too many static samplers");
+                }
+                self.samplers.push(sampler_ref);
+                self.samplers.len() - 1
+            }
+        };
+        if props.0 & 0x8000 != 0 {
+            self.s.cmp_samplers |= 1 << n;
+        }
+        Ok(self.s.sampler_handle(self.cur, n as u32))
     }
 
     fn descriptor_phi(
@@ -6058,6 +6099,58 @@ impl<'a> Lower<'a> {
         }
         if let Some(op) = name.strip_prefix("v_pk_") {
             return self.packed16(inst, op, guard);
+        }
+        if matches!(name, "v_dot4_i32_i8" | "v_dot4c_i32_i8") {
+            if v.sdwa.is_some() || v.dpp.is_some() || v.omod != 0 {
+                return Err("modifiers on a dot product");
+            }
+            let (a, b) = (s(self, 0)?, s(self, 1)?);
+            let Some(Operand::Vector { reg, .. }) = v.dst else {
+                return Err("a dot product result outside a VGPR");
+            };
+            let acc = if name == "v_dot4c_i32_i8" {
+                self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?
+            } else {
+                s(self, 2)?
+            };
+            let k24 = self.s.m.i32(24);
+            let mut sum = None;
+            for lane in 0..4u32 {
+                let shl = self.s.m.i32(24 - 8 * lane);
+                let byte = |l: &mut Self, x: V| {
+                    let t = if lane == 3 {
+                        x
+                    } else {
+                        l.s.m.bin(c, Bin::Shl, x, shl)
+                    };
+                    l.s.m.bin(c, Bin::AShr, t, k24)
+                };
+                let (xa, xb) = (byte(self, a), byte(self, b));
+                let prod = self.s.m.bin(c, Bin::Mul, xa, xb);
+                sum = Some(match sum {
+                    Some(prev) => self.s.m.bin(c, Bin::Add, prev, prod),
+                    None => prod,
+                });
+            }
+            let dot = sum.expect("4 lanes");
+            let r = if v.clamp {
+                let i64t = self.s.m.int(64);
+                self.s.flags |= flags::INT64;
+                let d64 = self.s.m.cast(c, Cast::SExt, dot, i64t);
+                let a64 = self.s.m.cast(c, Cast::SExt, acc, i64t);
+                let s64 = self.s.m.bin(c, Bin::Add, d64, a64);
+                let lo = self.s.m.int_const(i64t, i64::from(i32::MIN));
+                let hi = self.s.m.int_const(i64t, i64::from(i32::MAX));
+                let too_lo = self.s.m.cmp(c, pred::SLT, s64, lo);
+                let clamped = self.s.m.select(c, too_lo, lo, s64);
+                let too_hi = self.s.m.cmp(c, pred::SGT, clamped, hi);
+                let clamped = self.s.m.select(c, too_hi, hi, clamped);
+                self.s.m.cast(c, Cast::Trunc, clamped, self.s.t.i32)
+            } else {
+                self.s.m.bin(c, Bin::Add, dot, acc)
+            };
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
         }
         match name {
             "v_mad_u64_u32" => {
@@ -7516,12 +7609,23 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, r, m16))
     }
 
-    fn packed_src(&mut self, inst: &Inst, k: usize, high: bool, float: bool) -> Result<V, Why> {
+    fn packed_src(
+        &mut self,
+        inst: &Inst,
+        k: usize,
+        high: bool,
+        float: bool,
+        vop2: bool,
+    ) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
+        let sel = if vop2 {
+            high && !matches!(op, Operand::Const(_))
+        } else {
+            (if high { v.opsel_hi } else { v.opsel }) >> k & 1 != 0
+        };
         let x = if float {
             self.f16_operand(inst, &op)?
         } else {
@@ -7543,23 +7647,35 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let float = op.ends_with("_f16");
+        let fmac = op == "fmac_f16";
         let n = match op {
             "fma_f16" | "mad_u16" | "mad_i16" => 3,
-            "add_f16" | "mul_f16" | "min_f16" | "max_f16" | "add_u16" | "sub_u16" | "add_i16"
-            | "sub_i16" | "mul_lo_u16" | "lshlrev_b16" | "lshrrev_b16" | "ashrrev_i16"
-            | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
+            "fmac_f16" | "add_f16" | "mul_f16" | "min_f16" | "max_f16" | "add_u16" | "sub_u16"
+            | "add_i16" | "sub_i16" | "mul_lo_u16" | "lshlrev_b16" | "lshrrev_b16"
+            | "ashrrev_i16" | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
             _ => return Err("a packed 16-bit operation"),
         };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("modifiers on a packed 16-bit operation");
+        }
         if v.omod != 0 || !float && (v.clamp || v.neg != 0 || v.neg_hi != 0) {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let acc_raw = if fmac {
+            let Some(Operand::Vector { reg, .. }) = v.dst else {
+                return Err("an accumulator");
+            };
+            Some(self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?)
+        } else {
+            None
+        };
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
             for k in 0..n {
-                let h = self.packed_src(inst, k, high, float)?;
+                let h = self.packed_src(inst, k, high, float, fmac)?;
                 if float {
                     let mut f = self
                         .s
@@ -7573,6 +7689,20 @@ impl<'a> Lower<'a> {
                 } else {
                     xs.push(h);
                 }
+            }
+            if let Some(raw) = acc_raw {
+                let h = if high {
+                    let k16 = self.s.m.i32(16);
+                    self.s.m.bin(c, Bin::LShr, raw, k16)
+                } else {
+                    raw
+                };
+                let m = self.s.m.i32(0xFFFF);
+                let h = self.s.m.bin(c, Bin::And, h, m);
+                let f = self
+                    .s
+                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+                xs.push(f);
             }
             let r = if float {
                 let mut f = match op {
@@ -8543,7 +8673,7 @@ impl<'a> Lower<'a> {
             let Fields::Image { cache, .. } = &inst.fields else {
                 unreachable!()
             };
-            if *d16 || *a16 {
+            if *d16 {
                 return Err("a 16-bit image atomic");
             }
             let compare = code == u32::MAX;
@@ -8630,10 +8760,8 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
-            }
             let iu = self.s.m.undef(self.s.t.i32);
+            let fz = self.s.m.f32(0);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 *slot = addr_val(self, k)?;
@@ -8641,13 +8769,17 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
-            for k in 0..4u8 {
-                let r = if *d16 { k / 2 } else { k };
+            let mut vals = [fz; 4];
+            let mut packed_idx = 0u8;
+            for ch in 0..4u8 {
+                if *dmask >> ch & 1 == 0 {
+                    continue;
+                }
+                let r = if *d16 { packed_idx / 2 } else { packed_idx };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
-                vals.push(if *d16 {
+                vals[usize::from(ch)] = if *d16 {
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if packed_idx % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
@@ -8656,7 +8788,8 @@ impl<'a> Lower<'a> {
                         .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
                 } else {
                     self.float_of(v)?
-                });
+                };
+                packed_idx += 1;
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);

@@ -103,7 +103,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     }
     leaders.sort_unstable();
     leaders.dedup();
-    let parked = unspill(&mut list, &leaders, wave64, lanes, vgprs);
+    let parked = unspill(&mut list, &leaders, &flows, wave64, lanes, vgprs);
     let block_at = |offset: usize| {
         leaders
             .binary_search(&offset)
@@ -184,6 +184,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
 fn unspill(
     list: &mut [gfx10::Instruction],
     leaders: &[usize],
+    flows: &[Flow],
     wave64: bool,
     lanes: u8,
     vgprs: u16,
@@ -219,12 +220,13 @@ fn unspill(
         }
     }
     let mut stores = [false; 256];
-    let mut other = [false; 256];
+    let mut last_other = [None::<usize>; 256];
+    let mut first_park = [None::<usize>; 256];
     let mut used = [false; 128];
     let mut parks: Vec<Option<(bool, u8, u8, u32)>> = Vec::with_capacity(list.len());
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
-    for inst in list.iter() {
+    for (idx, inst) in list.iter().enumerate() {
         let Some(name) = inst.name() else {
             return Vec::new();
         };
@@ -254,8 +256,11 @@ fn unspill(
                 }
                 match reg {
                     Reg::S(c) => used[usize::from(c)] = true,
-                    Reg::V(r) if park.is_some_and(|p| p.1 == r) => stores[usize::from(r)] = true,
-                    Reg::V(r) => other[usize::from(r)] = true,
+                    Reg::V(r) if park.is_some_and(|p| p.1 == r) => {
+                        stores[usize::from(r)] = true;
+                        first_park[usize::from(r)].get_or_insert(idx);
+                    }
+                    Reg::V(r) => last_other[usize::from(r)] = Some(idx),
                     Reg::Scc => {}
                 }
             }
@@ -264,11 +269,45 @@ fn unspill(
         written.push(codes);
         read.push(from);
     }
-    for (i, park) in parks.iter_mut().enumerate() {
-        if park.is_some_and(|p| other[usize::from(p.1)]) {
+    let mut forbidden = [false; 256];
+    for r in 0..256 {
+        let Some(last) = last_other[r] else {
+            continue;
+        };
+        let Some(fp) = first_park[r] else {
+            continue;
+        };
+        if last >= fp {
+            forbidden[r] = true;
+            continue;
+        }
+        let boundary = list[fp].offset;
+        let loops_before = flows[fp..].iter().any(|f| match *f {
+            Flow::Jump(t) | Flow::Branch(t) => t < boundary,
+            _ => false,
+        });
+        if loops_before {
+            forbidden[r] = true;
+            continue;
+        }
+        let mut saved_lanes = 0u64;
+        for p in parks[fp..].iter().flatten() {
+            if usize::from(p.1) != r {
+                continue;
+            }
+            let bit = 1u64 << p.3;
+            if p.0 {
+                saved_lanes |= bit;
+            } else if saved_lanes & bit == 0 {
+                forbidden[r] = true;
+                break;
+            }
+        }
+    }
+    for park in &mut parks {
+        if park.is_some_and(|p| forbidden[usize::from(p.1)]) {
             *park = None;
         }
-        let _ = i;
     }
     if parks.iter().all(Option::is_none) {
         return Vec::new();

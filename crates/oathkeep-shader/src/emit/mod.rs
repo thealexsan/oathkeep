@@ -477,22 +477,42 @@ fn emit_program(
         mesh_stride,
     })?;
     let wave_size = l.wave_size;
+    let rts_samplers = if l
+        .sampler_refs
+        .iter()
+        .any(|s| matches!(s, lower::SamplerRef::Immediate(_)))
+    {
+        let rts = c
+            .part(FourCC::RTS0)
+            .ok_or(ShaderError::Malformed("no RTS0 part for immediate sampler"))?;
+        StaticSampler::from_rts0(rts.data)?
+    } else {
+        Vec::new()
+    };
+    let static_samplers = l
+        .sampler_refs
+        .iter()
+        .enumerate()
+        .map(|(n, s)| {
+            let mut sampler = match *s {
+                lower::SamplerRef::Words(w) => StaticSampler::from_words(w),
+                lower::SamplerRef::Immediate(slot) => *rts_samplers
+                    .get(usize::from(slot))
+                    .ok_or(ShaderError::Malformed(
+                        "immediate sampler slot out of RTS0 range",
+                    ))?,
+            };
+            if l.cmp_samplers >> n & 1 != 0 {
+                sampler.filter |= 0x80;
+            }
+            Ok(sampler)
+        })
+        .collect::<Result<Vec<_>, ShaderError>>()?;
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,
         user_data: l.user_data,
-        static_samplers: l
-            .samplers
-            .iter()
-            .enumerate()
-            .map(|(n, &w)| {
-                let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
-                }
-                s
-            })
-            .collect(),
+        static_samplers,
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
@@ -1470,5 +1490,129 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    #[test]
+    fn translates_accc_compute_container_with_rts0_immediate_sampler() {
+        // Compute shader: s[0:3] = ImmediateSampler(slot=0), s4 = Table(slot=0, SRV tex @ 0, UAV buf @ 8)
+        // s_mov_b32 s5, 0
+        // s_load_dwordx8 s[8:15], s[4:5], 0
+        // s_load_dwordx4 s[16:19], s[4:5], 0x20
+        // v_mov_b32 v1, 0.5
+        // v_mov_b32 v2, 0.5
+        // image_sample_lz v3, v[1:2], s[8:15], s[0:3] dmask:0x1 dim:SQ_RSRC_IMG_2D
+        // v_lshlrev_b32 v0, 2, v0
+        // buffer_store_dword v3, v0, s[16:19], 0 offen
+        // s_endpgm
+        let words: [u32; 14] = [
+            0xBE85_0380,
+            0xF40C_0202,
+            0xFA00_0000,
+            0xF408_0402,
+            0xFA00_0020,
+            0x7E02_02F0,
+            0x7E04_02F0,
+            0xF09C_0108,
+            0x0002_0301,
+            0x3400_0082,
+            0xE070_1000,
+            0x8004_0300,
+            0xBF81_0000,
+            0xBF81_0000,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        // Build kind=0 compute metadata: threads=[64,1,1], wave32 (0x10), rsrc1=1 (16 VGPRs), rsrc2=5<<1 (5 user SGPRs)
+        let mut meta = [0u8; 28];
+        meta[0x0c..0x0e].copy_from_slice(&64u16.to_le_bytes());
+        meta[0x0e..0x10].copy_from_slice(&1u16.to_le_bytes());
+        meta[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+        meta[0x12..0x14].copy_from_slice(&0x10u16.to_le_bytes());
+        meta[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        meta[0x18..0x1c].copy_from_slice(&(5u32 << 1).to_le_bytes());
+
+        // Build kind=7 binding table
+        let mut bindings = vec![0u8; 24];
+        for rec in [
+            [0x41u32, 1 | (4 << 8), 0, 0, 0, 4 | (0 << 8) | (0 << 16), 0, 0],
+            [0x41, 0 | (3 << 8), 0, 0, 0, 8 | (4 << 8) | (0 << 16), 0, 0],
+            [0x41, 3 | (3 << 8), 8, 0, 4, 4 | (4 << 8) | (0 << 16), 0, 0],
+            [0x43, 0, 0, 0, 0, 0, 0, 0],
+        ] {
+            for w in rec {
+                bindings.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+
+        // Pack ACCC (FSPX v1) part
+        let entries: [(u32, &[u8]); 3] = [(0, &meta), (6, &code), (7, &bindings)];
+        let table_end = 16 + entries.len() * 16;
+        let total = table_end + entries.iter().map(|(_, d)| d.len()).sum::<usize>();
+        let mut accc = Vec::with_capacity(total);
+        accc.extend_from_slice(b"FSPX");
+        accc.extend_from_slice(&1u32.to_le_bytes());
+        accc.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        accc.extend_from_slice(&(total as u32).to_le_bytes());
+        let mut off = table_end;
+        for &(kind, data) in &entries {
+            accc.extend_from_slice(&kind.to_le_bytes());
+            accc.extend_from_slice(&(off as u32).to_le_bytes());
+            accc.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            accc.extend_from_slice(&0u32.to_le_bytes());
+            off += data.len();
+        }
+        for &(_, data) in &entries {
+            accc.extend_from_slice(data);
+        }
+
+        // Pack RTS0 part with 1 static sampler at slot 0
+        let mut rts0 = Vec::new();
+        for w in [
+            2u32,
+            0,
+            24,
+            1,
+            24,
+            0,
+            0x15,
+            3,
+            3,
+            3,
+            0.0f32.to_bits(),
+            16,
+            4,
+            2,
+            0.0f32.to_bits(),
+            f32::MAX.to_bits(),
+            0,
+            0,
+            0,
+        ] {
+            rts0.extend_from_slice(&w.to_le_bytes());
+        }
+
+        let container = crate::dxbc::build(&[(FourCC::RTS0, &rts0), (FourCC::ACCC, &accc)]);
+        let mut host = translate(&container).unwrap();
+        assert_eq!(host.stage, HwStage::Cs);
+        assert_eq!(host.samplers.len(), 1);
+        assert_eq!(
+            host.static_samplers,
+            [StaticSampler {
+                filter: 0x15,
+                address: [3, 3, 3],
+                mip_lod_bias: 0.0,
+                max_anisotropy: 16,
+                comparison: 4,
+                border: 2,
+                min_lod: 0.0,
+                max_lod: f32::MAX,
+            }]
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut host.dxil).unwrap();
+        }
     }
 }

@@ -1,3 +1,8 @@
+use crate::ShaderError;
+use crate::dxbc::u32_at;
+
+const MAX_RTS0_SAMPLERS: usize = 2048;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StaticSampler {
     pub filter: u32,
@@ -43,6 +48,49 @@ impl StaticSampler {
             min_lod,
             max_lod,
         }
+    }
+
+    pub fn from_rts0(part: &[u8]) -> Result<Vec<Self>, ShaderError> {
+        let version = u32_at(part, 0)?;
+        let stride = match version {
+            1 | 2 => 52usize,
+            3 => 56usize,
+            _ => return Err(ShaderError::Malformed("unknown RTS0 version")),
+        };
+        let count = u32_at(part, 0x0c)? as usize;
+        if count > MAX_RTS0_SAMPLERS {
+            return Err(ShaderError::Malformed("implausible RTS0 static sampler count"));
+        }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let offset = u32_at(part, 0x10)? as usize;
+        let end = count
+            .checked_mul(stride)
+            .and_then(|bytes| offset.checked_add(bytes))
+            .ok_or(ShaderError::Malformed("RTS0 static sampler table overflow"))?;
+        if end > part.len() {
+            return Err(ShaderError::Malformed("RTS0 static sampler table out of bounds"));
+        }
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let at = offset + i * stride;
+            out.push(StaticSampler {
+                filter: u32_at(part, at)?,
+                address: [
+                    u32_at(part, at + 4)?,
+                    u32_at(part, at + 8)?,
+                    u32_at(part, at + 12)?,
+                ],
+                mip_lod_bias: f32::from_bits(u32_at(part, at + 16)?),
+                max_anisotropy: u32_at(part, at + 20)?,
+                comparison: u32_at(part, at + 24)?,
+                border: u32_at(part, at + 28)?,
+                min_lod: f32::from_bits(u32_at(part, at + 32)?),
+                max_lod: f32::from_bits(u32_at(part, at + 36)?),
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -92,5 +140,96 @@ mod tests {
             ),
             (0x1D5, 16, 15.0)
         );
+    }
+
+    #[test]
+    fn parses_rts0_static_samplers() {
+        let mut rts = Vec::new();
+        // Version 1.1 (2), 0 params, 2 static samplers at offset 24
+        for w in [2u32, 0, 24, 2, 24, 0] {
+            rts.extend_from_slice(&w.to_le_bytes());
+        }
+        // Sampler 0: linear clamp
+        for w in [
+            0x15u32,
+            3,
+            3,
+            3,
+            (-0.5f32).to_bits(),
+            16,
+            4,
+            2,
+            0.0f32.to_bits(),
+            f32::MAX.to_bits(),
+            0,
+            0,
+            0,
+        ] {
+            rts.extend_from_slice(&w.to_le_bytes());
+        }
+        // Sampler 1: point wrap
+        for w in [
+            0u32,
+            1,
+            1,
+            1,
+            0.25f32.to_bits(),
+            1,
+            1,
+            0,
+            1.0f32.to_bits(),
+            8.0f32.to_bits(),
+            1,
+            0,
+            0,
+        ] {
+            rts.extend_from_slice(&w.to_le_bytes());
+        }
+        let parsed = StaticSampler::from_rts0(&rts).unwrap();
+        assert_eq!(
+            parsed,
+            [
+                StaticSampler {
+                    filter: 0x15,
+                    address: [3, 3, 3],
+                    mip_lod_bias: -0.5,
+                    max_anisotropy: 16,
+                    comparison: 4,
+                    border: 2,
+                    min_lod: 0.0,
+                    max_lod: f32::MAX,
+                },
+                StaticSampler {
+                    filter: 0,
+                    address: [1, 1, 1],
+                    mip_lod_bias: 0.25,
+                    max_anisotropy: 1,
+                    comparison: 1,
+                    border: 0,
+                    min_lod: 1.0,
+                    max_lod: 8.0,
+                },
+            ]
+        );
+
+        // Version 1.2 (3) uses 56-byte entries.
+        let mut rts12 = Vec::new();
+        for w in [3u32, 0, 24, 1, 24, 0] {
+            rts12.extend_from_slice(&w.to_le_bytes());
+        }
+        rts12.extend_from_slice(&rts[24..24 + 52]);
+        rts12.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(StaticSampler::from_rts0(&rts12).unwrap(), [parsed[0]]);
+
+        // Empty sampler table and error checks.
+        let empty: Vec<u8> = [2u32, 0, 24, 0, 24, 0]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        assert!(StaticSampler::from_rts0(&empty).unwrap().is_empty());
+        assert!(StaticSampler::from_rts0(&rts[..rts.len() - 4]).is_err());
+        let mut bad_ver = rts.clone();
+        bad_ver[0] = 9;
+        assert!(StaticSampler::from_rts0(&bad_ver).is_err());
     }
 }

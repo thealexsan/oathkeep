@@ -37,6 +37,9 @@ pub enum Source {
         words: [u32; 2],
     },
     Constant(Vec<u32>),
+    ImmediateSampler {
+        slot: u8,
+    },
     Phi {
         block: usize,
         args: Vec<Source>,
@@ -986,6 +989,9 @@ impl<'a> Tracer<'a> {
         {
             return Ok(Source::Constant(consts));
         }
+        if let Some(source) = self.immediate_sampler(words) {
+            return Ok(source);
+        }
         if let Some(source) = self.loaded(words) {
             return Ok(source);
         }
@@ -1055,7 +1061,7 @@ impl<'a> Tracer<'a> {
 
     fn anywhere(&self, source: &Source) -> bool {
         match source {
-            Source::Constant(_) => true,
+            Source::Constant(_) | Source::ImmediateSampler { .. } => true,
             Source::Built { address, .. } => address.dynamic.is_none(),
             Source::Loaded { load, .. } => {
                 let inst = self.inst(*load);
@@ -1789,6 +1795,27 @@ impl<'a> Tracer<'a> {
         Ok(out)
     }
 
+    fn immediate_sampler(&self, words: &[Term]) -> Option<Source> {
+        if words.len() != 4 {
+            return None;
+        }
+        let mut param = None;
+        for (k, w) in words.iter().enumerate() {
+            let Term::Value(v) = *w else { return None };
+            let reg = self.inputs[v.0 as usize]?;
+            let (p, dword) = self.param_of(reg)?;
+            if dword != k as u32 || self.layout[p].root != RootType::ImmediateSampler {
+                return None;
+            }
+            if *param.get_or_insert(p) != p {
+                return None;
+            }
+        }
+        Some(Source::ImmediateSampler {
+            slot: self.layout[param?].slot,
+        })
+    }
+
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
             return None;
@@ -1799,15 +1826,74 @@ impl<'a> Tracer<'a> {
             return None;
         }
         let first = inst.writes.iter().position(|w| w.1 == v0)?;
-        let same = words.iter().enumerate().all(|(k, w)| {
-            inst.writes
-                .get(first + k)
-                .is_some_and(|x| *w == Term::Value(x.1))
-        });
-        same.then_some(Source::Loaded {
-            load,
-            first: first as u8,
-        })
+        let orig = |k: usize| inst.writes.get(first + k).map(|x| Term::Value(x.1));
+        let same = words.iter().enumerate().all(|(k, w)| orig(k) == Some(*w));
+        if same {
+            return Some(Source::Loaded {
+                load,
+                first: first as u8,
+            });
+        }
+        // AMD GFX10 structured-to-raw buffer descriptor conversion:
+        //   w0 = orig0 (base address low)
+        //   w1 = orig1 & 0xC000_FFFF (clears STRIDE [29:16])
+        //   w2 = orig2 * stride (scales NUM_RECORDS to byte size)
+        //   w3 = (orig3 & 0xCFFF_FFFF) | 0x3000_0000 (sets OOB_SELECT = 3 / raw)
+        if words.len() == 4
+            && let (Some(o1), Some(o2), Some(o3)) = (orig(1), orig(2), orig(3))
+            && self.cleared_stride(words[1], o1)
+            && self.scaled_records(words[2], o2)
+            && self.raw_oob(words[3], o3)
+        {
+            return Some(Source::Loaded {
+                load,
+                first: first as u8,
+            });
+        }
+        None
+    }
+
+    fn cleared_stride(&self, w: Term, orig: Term) -> bool {
+        if w == orig {
+            return true;
+        }
+        let Term::Value(v) = w else { return false };
+        matches!(
+            self.sop2(v, &["s_and_b32"]),
+            Some((_, [a, Term::Const(0xC000_FFFF)] | [Term::Const(0xC000_FFFF), a])) if a == orig
+        )
+    }
+
+    fn scaled_records(&self, w: Term, orig: Term) -> bool {
+        if w == orig {
+            return true;
+        }
+        let Term::Value(v) = w else { return false };
+        matches!(
+            self.sop2(v, &["s_mul_i32"]),
+            Some((_, [a, b])) if a == orig || b == orig
+        )
+    }
+
+    fn raw_oob(&self, w: Term, orig: Term) -> bool {
+        if w == orig {
+            return true;
+        }
+        let Term::Value(v) = w else { return false };
+        let Some((_, [a, Term::Const(0x3000_0000)] | [Term::Const(0x3000_0000), a])) =
+            self.sop2(v, &["s_or_b32"])
+        else {
+            return false;
+        };
+        if a == orig {
+            return true;
+        }
+        let Term::Value(av) = a else { return false };
+        matches!(
+            self.sop2(av, &["s_and_b32"]),
+            Some((_, [x, Term::Const(mask)] | [Term::Const(mask), x]))
+                if x == orig && (mask | 0x3000_0000) == u32::MAX
+        )
     }
 
     fn lane_copies(&self, words: &[Term]) -> Option<Source> {
@@ -2022,16 +2108,24 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
-    let src = src.first()?;
-    match (inst.name(), *src) {
+    let first = src.first()?;
+    match (inst.name(), *first) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
             inst.read(Reg::S(code + k as u8)).map(Moved::Value)
         }
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { .. }) => Some(Moved::Const(0)),
         ("s_mov_b32", Operand::Literal(x)) => Some(Moved::Const(x)),
+        ("s_mov_b64", Operand::Literal(x)) => Some(Moved::Const(if k == 0 { x } else { 0 })),
         ("s_mov_b32", Operand::Const(c)) => inline(c).map(Moved::Const),
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
+        ("s_bfm_b32", Operand::Const(c0)) => {
+            let Operand::Const(c1) = *src.get(1)? else {
+                return None;
+            };
+            let (w, o) = (inline(c0)? & 31, inline(c1)? & 31);
+            Some(Moved::Const(((1u32 << w).wrapping_sub(1)) << o))
+        }
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
             Some(Moved::Const(if k == 0 {
@@ -3398,5 +3492,95 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn immediate_sampler_in_user_sgprs_is_tracked() {
+        // s[0:3] = ImmediateSampler(slot=1), s4 = Table(slot=0)
+        // s_mov_b32 s5, 0
+        // s_load_dwordx8 s[8:15], s[4:5], 0
+        // image_sample_lz v[2:5], v[0:1], s[8:15], s[0:3] dmask:0xf dim:SQ_RSRC_IMG_2D
+        // s_endpgm
+        let words = [
+            0xBE85_0380u32,
+            0xF40C_0202,
+            0xFA00_0000,
+            0xF09C_0F08,
+            0x0002_0200,
+            0xBF81_0000,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 8).unwrap();
+        let layout = vec![
+            RootParam {
+                root: RootType::ImmediateSampler,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 0,
+            },
+        ];
+        let r = track(&p, &layout, HwStage::Cs, None).unwrap();
+        let sampler = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Sampler)
+            .expect("sampler descriptor");
+        assert_eq!(sampler.source, Source::ImmediateSampler { slot: 1 });
+    }
+
+    #[test]
+    fn loaded_structured_buffer_rewritten_as_raw_stays_loaded() {
+        // s_mov_b32 s1, 0
+        // s_load_dwordx4 s[4:7], s[0:1], 0
+        // s_and_b32 s5, s5, 0xC000_FFFF
+        // s_mul_i32 s6, s6, 16
+        // s_and_b32 s7, s7, 0xCFFF_FFFF
+        // s_or_b32 s7, s7, 0x3000_0000
+        // buffer_load_dword v1, v0, s[4:7], 0 offen
+        // s_endpgm
+        let words = [
+            0xBE81_0380u32,
+            0xF408_0100,
+            0xFA00_0000,
+            0x8705_FF05,
+            0xC000_FFFF,
+            0x9306_9006,
+            0x8707_FF07,
+            0xCFFF_FFFF,
+            0x8807_FF07,
+            0x3000_0000,
+            0xE030_1000,
+            0x8001_0100,
+            0xBF81_0000,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 8).unwrap();
+        let layout = vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        let r = track(&p, &layout, HwStage::Cs, None).unwrap();
+        assert!(matches!(
+            r.descriptors.as_slice(),
+            [super::Descriptor {
+                role: Role::Resource,
+                source: Source::Loaded { first: 0, .. },
+                ..
+            }]
+        ));
     }
 }

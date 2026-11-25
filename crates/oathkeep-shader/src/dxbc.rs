@@ -15,6 +15,7 @@ impl FourCC {
     pub const HASH: FourCC = FourCC(*b"HASH");
     pub const ILDB: FourCC = FourCC(*b"ILDB");
     pub const ILDN: FourCC = FourCC(*b"ILDN");
+    pub const ACCC: FourCC = FourCC(*b"ACCC");
 }
 
 impl std::fmt::Debug for FourCC {

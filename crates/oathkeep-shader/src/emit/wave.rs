@@ -137,12 +137,25 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
             insts[j].write(Reg::S(EXEC)).is_some()
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
         });
-        let Some(end) = end else {
+        let Some(restore) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
+        let mut tail = restore + 1;
+        while let Some(next) = insts.get(tail)
+            && next.name() == "v_readlane_b32"
+            && let Fields::Valu(v) = &next.fields
+            && let Some(&Operand::Vector { reg, .. }) = v.src.first()
+            && let Some(val) = next.read(Reg::V(reg))
+            && insts[i + 1..restore]
+                .iter()
+                .any(|x| x.writes.iter().any(|w| w.1 == val))
+        {
+            tail += 1;
+        }
+        let end = if tail > restore + 1 { tail } else { restore };
+        let shapes = simulate(&insts[i + 1..restore], &insts[restore + 1..tail], wave, saved);
         out.insert(i, Section { end, shapes });
-        i = end + 1;
+        i = tail;
     }
     out
 }
@@ -226,7 +239,7 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn simulate(insts: &[Inst], trailing: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -236,7 +249,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let mut vec: HashMap<Value, Vec<Sym>> = HashMap::new();
     let mut uni: HashMap<Value, Sym> = HashMap::new();
     let mut masked = vec![saved];
-    for inst in insts {
+    for inst in insts.iter().chain(trailing) {
         let name = inst.name();
         if inst.write(Reg::S(EXEC)).is_some() {
             let lo = name
