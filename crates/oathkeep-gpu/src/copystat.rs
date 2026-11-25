@@ -169,6 +169,7 @@ pub(crate) fn barrier_test() -> u8 {
 }
 
 static COMPARED: Mutex<Option<HashMap<(usize, usize), (u64, u64)>>> = Mutex::new(None);
+static CARD_BACK: Mutex<Option<HashMap<(usize, usize), (u64, u64, u64, u64)>>> = Mutex::new(None);
 
 pub(crate) fn compared(src: usize, len: usize, written: usize) {
     let mut map = COMPARED.lock().unwrap_or_else(|e| e.into_inner());
@@ -178,6 +179,31 @@ pub(crate) fn compared(src: usize, len: usize, written: usize) {
         .or_insert((0, 0));
     e.0 += 1;
     e.1 += written as u64;
+}
+
+pub(crate) fn compared_batch(entries: &[(usize, usize, usize)]) {
+    if entries.is_empty() {
+        return;
+    }
+    let mut map = COMPARED.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    for &(src, len, written) in entries {
+        let e = map.entry((src, len)).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += written as u64;
+    }
+}
+
+pub(crate) fn card_back(src: usize, len: usize, pieces: usize, fetched: usize, written: usize) {
+    let mut map = CARD_BACK.lock().unwrap_or_else(|e| e.into_inner());
+    let e = map
+        .get_or_insert_with(HashMap::new)
+        .entry((src, len))
+        .or_insert((0, 0, 0, 0));
+    e.0 += 1;
+    e.1 += pieces as u64;
+    e.2 += fetched as u64;
+    e.3 += written as u64;
 }
 
 pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
@@ -1190,6 +1216,24 @@ pub(crate) fn log(frames: f64) {
             (len as u64 * n) as f64 / 1e6 / frames,
             written as f64 / 1e6 / frames
         );
+    }
+    let card_back = CARD_BACK.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut card_back: Vec<_> = card_back.into_iter().flatten().collect();
+    card_back.sort_by_key(|&(_, (_, _, fetched, written))| std::cmp::Reverse((fetched, written)));
+    if !card_back.is_empty() {
+        tracing::info!(
+            "  card copies fetched back: {} shadows; the largest follow",
+            card_back.len()
+        );
+        for ((src, len), (n, pieces, fetched, written)) in card_back.into_iter().take(5) {
+            tracing::info!(
+                "  card copy back {src:#x}+{len:#x}: {:.1}x/frame ({:.0} pieces/frame), {:.2} MB/frame fetched, {:.3} MB/frame written back",
+                n as f64 / frames,
+                pieces as f64 / frames,
+                fetched as f64 / 1e6 / frames,
+                written as f64 / 1e6 / frames
+            );
+        }
     }
     let mut submitters = std::mem::take(&mut *SUBMITTERS.lock().unwrap_or_else(|e| e.into_inner()));
     submitters.sort_by_key(|s| std::cmp::Reverse(s.1.submissions));

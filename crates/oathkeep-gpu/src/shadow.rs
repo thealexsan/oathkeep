@@ -4434,6 +4434,7 @@ impl Shadow {
         written
     }
 
+    #[allow(dead_code)]
     pub(crate) fn card_merge_relay(
         &self,
         at: usize,
@@ -4499,6 +4500,484 @@ impl Shadow {
         );
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
+    }
+
+    pub(crate) fn card_merge_relay_batch(
+        &self,
+        pieces: &[(usize, &[u8], u64)],
+        parallel: bool,
+    ) -> usize {
+        let start = self.start as usize;
+        let Some(card) = &self.card else {
+            return 0;
+        };
+        if pieces.is_empty() {
+            return 0;
+        }
+        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut old_map = card.old.lock().unwrap_or_else(|e| e.into_inner());
+        let skip = Arc::new(RelaySkipSnapshot::capture(card, pieces));
+
+        let mut piece_index: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        let mut works: Vec<RelayPieceWork> = Vec::new();
+        for &(at, gpu, fetched_after) in pieces {
+            if gpu.is_empty() || at + gpu.len() > self.len as usize {
+                continue;
+            }
+            let p = self.pieces(at, at + gpu.len()).start;
+            let (p_lo, _) = self.piece(p);
+            if let Some(&idx) = piece_index.get(&p) {
+                let w = &mut works[idx];
+                if at >= p_lo && at - p_lo + gpu.len() <= w.old_len {
+                    w.items.push((at, gpu.as_ptr() as usize, gpu.len(), fetched_after));
+                }
+            } else if let Some(piece_buf) = old_map.get_mut(&p)
+                && at >= p_lo
+                && at - p_lo + gpu.len() <= piece_buf.len()
+            {
+                let idx = works.len();
+                piece_index.insert(p, idx);
+                works.push(RelayPieceWork {
+                    p_lo,
+                    old_ptr: piece_buf.as_mut_ptr() as usize,
+                    old_len: piece_buf.len(),
+                    items: vec![(at, gpu.as_ptr() as usize, gpu.len(), fetched_after)],
+                });
+            }
+        }
+        if works.is_empty() {
+            return 0;
+        }
+
+        let record_race = merge_race_on();
+        let buckets: Vec<RelayMergeBucket> = if parallel && works.len() >= 16 {
+            let worker_count = (works.len() / 8).clamp(2, 6);
+            let chunk_size = works.len().div_ceil(worker_count);
+            let mut results: Vec<Arc<Mutex<Option<RelayMergeBucket>>>> =
+                Vec::with_capacity(worker_count);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(worker_count);
+            let mut iter = works.into_iter();
+            loop {
+                let chunk: Vec<RelayPieceWork> = iter.by_ref().take(chunk_size).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                let skip = skip.clone();
+                let slot = Arc::new(Mutex::new(None));
+                results.push(slot.clone());
+                jobs.push(Box::new(move || {
+                    let out = merge_relay_chunk(start, chunk, &skip, record_race);
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
+                }));
+            }
+            wide_run(jobs);
+            results
+                .into_iter()
+                .filter_map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).take())
+                .filter(|b| !b.writes.is_empty())
+                .collect()
+        } else {
+            let out = merge_relay_chunk(start, works, &skip, record_race);
+            if out.writes.is_empty() {
+                Vec::new()
+            } else {
+                vec![out]
+            }
+        };
+
+        if buckets.is_empty() {
+            return 0;
+        }
+
+        let total_writes: usize = buckets.iter().map(|b| b.writes.len()).sum();
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(total_writes);
+        let mut total_written = 0usize;
+        for b in &buckets {
+            for w in &b.writes {
+                spans.push((w.at, w.at + w.len));
+                total_written += w.len;
+            }
+        }
+
+        if card.has_hot_hashes.load(Ordering::Acquire) {
+            for (a, b) in coalesce_hash_spans(&spans) {
+                card.clear_hot_hashes(a, b);
+            }
+        }
+        for (a, b) in coalesce_watch_spans(start, &spans) {
+            crate::watch::writing(start + a, b - a);
+        }
+
+        let copy_span = (self.start, self.len);
+        if parallel && buckets.len() >= 2 && total_written >= (2 << 20) {
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                .into_iter()
+                .map(|bucket| {
+                    Box::new(move || {
+                        for w in &bucket.writes {
+                            let bytes = &bucket.arena[w.arena_off..w.arena_off + w.len];
+                            merge_race(
+                                w.as_read.as_deref(),
+                                copy_span,
+                                start + w.at,
+                                bytes,
+                                "card relay",
+                            );
+                            crate::host::write_mapped(
+                                (start + w.at) as *mut u8,
+                                bytes.as_ptr(),
+                                w.len,
+                            );
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            wide_run(jobs);
+        } else {
+            for bucket in &buckets {
+                for w in &bucket.writes {
+                    let bytes = &bucket.arena[w.arena_off..w.arena_off + w.len];
+                    merge_race(
+                        w.as_read.as_deref(),
+                        copy_span,
+                        start + w.at,
+                        bytes,
+                        "card relay",
+                    );
+                    crate::host::write_mapped((start + w.at) as *mut u8, bytes.as_ptr(), w.len);
+                }
+            }
+        }
+        total_written
+    }
+}
+
+enum RelaySkipSnapshot {
+    Empty,
+    Unified(Vec<(usize, usize)>),
+    Mixed {
+        dirty: Vec<(usize, usize)>,
+        sent: Vec<(usize, usize, u64)>,
+    },
+}
+
+impl RelaySkipSnapshot {
+    fn capture(card: &Card, pieces: &[(usize, &[u8], u64)]) -> Self {
+        let first_after = pieces[0].2;
+        let uniform = pieces.iter().all(|p| p.2 == first_after);
+        let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+        if uniform {
+            let mut all: Vec<(usize, usize)> = dirty
+                .iter()
+                .copied()
+                .chain(
+                    sent.iter()
+                        .filter(|s| s.2 > first_after)
+                        .map(|s| (s.0, s.1)),
+                )
+                .collect();
+            if all.is_empty() {
+                return Self::Empty;
+            }
+            all = joined(all);
+            Self::Unified(all)
+        } else {
+            if dirty.is_empty() && sent.is_empty() {
+                return Self::Empty;
+            }
+            let dirty_joined = if dirty.is_empty() {
+                Vec::new()
+            } else {
+                joined(dirty.clone())
+            };
+            Self::Mixed {
+                dirty: dirty_joined,
+                sent: sent.clone(),
+            }
+        }
+    }
+
+    fn active_ranges(&self, at: usize, end: usize, fetched_after: u64, out: &mut Vec<(usize, usize)>) {
+        out.clear();
+        match self {
+            Self::Empty => out.push((at, end)),
+            Self::Unified(ranges) => {
+                let mut cur = at;
+                let idx = ranges.partition_point(|&(_, b)| b <= at);
+                for &(a, b) in &ranges[idx..] {
+                    if a >= end {
+                        break;
+                    }
+                    if a > cur {
+                        out.push((cur, a));
+                    }
+                    cur = cur.max(b);
+                    if cur >= end {
+                        return;
+                    }
+                }
+                if cur < end {
+                    out.push((cur, end));
+                }
+            }
+            Self::Mixed { dirty, sent } => {
+                let skip: Vec<(usize, usize)> = dirty
+                    .iter()
+                    .copied()
+                    .chain(
+                        sent.iter()
+                            .filter(|s| s.2 > fetched_after)
+                            .map(|s| (s.0, s.1)),
+                    )
+                    .filter(|&(a, b)| a < end && b > at)
+                    .collect();
+                if skip.is_empty() {
+                    out.push((at, end));
+                } else {
+                    out.extend(outside(at, end, skip));
+                }
+            }
+        }
+    }
+}
+
+struct RelayPieceWork {
+    p_lo: usize,
+    old_ptr: usize,
+    old_len: usize,
+    items: Vec<(usize, usize, usize, u64)>,
+}
+
+struct RelayPendingWrite {
+    at: usize,
+    len: usize,
+    arena_off: usize,
+    as_read: Option<Vec<u8>>,
+}
+
+struct RelayMergeBucket {
+    arena: Vec<u8>,
+    writes: Vec<RelayPendingWrite>,
+}
+
+fn merge_relay_chunk(
+    start: usize,
+    works: Vec<RelayPieceWork>,
+    skip: &RelaySkipSnapshot,
+    record_race: bool,
+) -> RelayMergeBucket {
+    let mut arena = Vec::new();
+    let mut writes = Vec::new();
+    let mut scratch = Vec::new();
+    let mut active = Vec::new();
+    for work in works {
+        // SAFETY: `old_map` is locked exclusively by `card_merge_relay_batch` until
+        // all workers finish, and each `RelayPieceWork` owns a distinct piece key `p`
+        // whose `Vec<u8>` allocation is disjoint from all other workers' buffers.
+        let piece_buf =
+            unsafe { std::slice::from_raw_parts_mut(work.old_ptr as *mut u8, work.old_len) };
+        for (at, gpu_ptr, gpu_len, fetched_after) in work.items {
+            // SAFETY: `gpu_ptr..gpu_ptr+gpu_len` is a valid borrowed read-only slice for
+            // the duration of `card_merge_relay_batch`, which joins before returning.
+            let gpu = unsafe { std::slice::from_raw_parts(gpu_ptr as *const u8, gpu_len) };
+            let held = &mut piece_buf[at - work.p_lo..at - work.p_lo + gpu_len];
+            let Some(first) = first_difference(gpu, held) else {
+                continue;
+            };
+            let last = last_difference(gpu, held).unwrap_or(first);
+            let (diff_at, n) = (at + first, last + 1 - first);
+            skip.active_ranges(diff_at, diff_at + n, fetched_after, &mut active);
+            if active.is_empty() {
+                continue;
+            }
+            let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
+            scratch.clear();
+            scratch.resize(n, 0);
+            let mapped = crate::host::read_into((start + diff_at) as *const u8, &mut scratch);
+            let as_read = (mapped && record_race).then(|| scratch.clone());
+            let mut changed = false;
+            for &(a, b) in &active {
+                let (a, b) = (a - diff_at, b - diff_at);
+                changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut scratch[a..b]);
+            }
+            if !mapped || !changed {
+                continue;
+            }
+            let arena_off = arena.len();
+            arena.extend_from_slice(&scratch);
+            writes.push(RelayPendingWrite {
+                at: diff_at,
+                len: n,
+                arena_off,
+                as_read,
+            });
+        }
+    }
+    RelayMergeBucket { arena, writes }
+}
+
+fn coalesce_watch_spans(start: usize, spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut sorted: Vec<(usize, usize)> = spans.iter().copied().filter(|&(a, b)| a < b).collect();
+    if sorted.is_empty() {
+        return sorted;
+    }
+    sorted.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+    for (a, b) in sorted {
+        match out.last_mut() {
+            Some(last) if (start + a) / PAGE <= (start + last.1).div_ceil(PAGE) => {
+                last.1 = last.1.max(b);
+            }
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
+fn coalesce_hash_spans(spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut sorted: Vec<(usize, usize)> = spans.iter().copied().filter(|&(a, b)| a < b).collect();
+    if sorted.is_empty() {
+        return sorted;
+    }
+    sorted.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+    for (a, b) in sorted {
+        match out.last_mut() {
+            Some(last) if a / HOT_HASH_BLOCK <= last.1.div_ceil(HOT_HASH_BLOCK) => {
+                last.1 = last.1.max(b);
+            }
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod relay_batch_tests {
+    use super::{
+        Card, HOT_HASH_BLOCK, PAGE, RelayPieceWork, RelaySkipSnapshot, coalesce_hash_spans,
+        coalesce_watch_spans, merge_relay_chunk,
+    };
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn watch_spans_coalesce_adjacent_pages_without_bridging_untouched_pages() {
+        let start = 0x10_0000usize; // page-aligned
+        let spans = [
+            (0x0010, 0x0ff0),                 // page 0
+            (0x2000, 0xfe00),                 // still page 0
+            (PAGE + 0x40, PAGE + 0x800),      // page 1 (adjacent to page 0)
+            (3 * PAGE + 0x10, 3 * PAGE + 0x20), // page 3 (leaves page 2 untouched!)
+            (4 * PAGE, 4 * PAGE + 0x100),     // page 4 (adjacent to page 3)
+        ];
+        assert_eq!(
+            coalesce_watch_spans(start, &spans),
+            vec![
+                (0x0010, PAGE + 0x800),
+                (3 * PAGE + 0x10, 4 * PAGE + 0x100),
+            ]
+        );
+        assert!(coalesce_watch_spans(start, &[(10, 10)]).is_empty());
+    }
+
+    #[test]
+    fn hash_spans_coalesce_adjacent_4k_blocks_only() {
+        let spans = [
+            (100, 200),
+            (HOT_HASH_BLOCK + 10, HOT_HASH_BLOCK + 50),
+            (3 * HOT_HASH_BLOCK + 1, 3 * HOT_HASH_BLOCK + 8),
+        ];
+        assert_eq!(
+            coalesce_hash_spans(&spans),
+            vec![
+                (100, HOT_HASH_BLOCK + 50),
+                (3 * HOT_HASH_BLOCK + 1, 3 * HOT_HASH_BLOCK + 8),
+            ]
+        );
+    }
+
+    #[test]
+    fn skip_snapshot_unified_and_mixed_cut_dirty_and_newer_sent_ranges() {
+        let card = Card {
+            before: Mutex::default(),
+            old: Mutex::default(),
+            has_old: AtomicBool::new(false),
+            dirty: Mutex::new(vec![(100, 140)]),
+            sent: Mutex::new(vec![(20, 40, 5), (60, 80, 9), (130, 160, 11)]),
+            hot_hashes: Mutex::default(),
+            has_hot_hashes: AtomicBool::new(false),
+            size: 1024,
+        };
+        let buf = [0u8; 256];
+        let uniform = RelaySkipSnapshot::capture(&card, &[(0, &buf[..], 7)]);
+        let mut active = Vec::new();
+        uniform.active_ranges(0, 200, 7, &mut active);
+        // (20, 40, seq=5 <= 7) is NOT skipped; (60, 80, seq=9 > 7) and (100, 160) ARE skipped.
+        assert_eq!(active, vec![(0, 60), (80, 100), (160, 200)]);
+
+        let mixed = RelaySkipSnapshot::capture(&card, &[(0, &buf[..128], 4), (128, &buf[128..], 10)]);
+        mixed.active_ranges(0, 128, 4, &mut active);
+        assert_eq!(active, vec![(0, 20), (40, 60), (80, 100)]);
+        mixed.active_ranges(128, 200, 10, &mut active);
+        assert_eq!(active, vec![(160, 200)]);
+    }
+
+    #[test]
+    fn batched_relay_merge_chunk_merges_multiple_pieces_and_respects_skip() {
+        let mut title_mem: Vec<u8> = (0..2 * PAGE).map(|i| (i * 13 + 7) as u8).collect();
+        let mut old0 = title_mem[0..PAGE].to_vec();
+        let mut old1 = title_mem[PAGE..2 * PAGE].to_vec();
+        let mut gpu0 = old0.clone();
+        let mut gpu1 = old1.clone();
+
+        // GPU modified bytes in both pieces.
+        gpu0[16..24].fill(0xaa);
+        gpu0[100..112].fill(0xbb); // covered by skip
+        gpu1[32..48].fill(0xcc);
+        // Title modified a different byte in piece 0 concurrently.
+        title_mem[18] = 0x55;
+
+        let card = Card {
+            before: Mutex::default(),
+            old: Mutex::default(),
+            has_old: AtomicBool::new(false),
+            dirty: Mutex::new(vec![(100, 112)]),
+            sent: Mutex::default(),
+            hot_hashes: Mutex::default(),
+            has_hot_hashes: AtomicBool::new(false),
+            size: (2 * PAGE) as u64,
+        };
+        let skip = RelaySkipSnapshot::capture(&card, &[(0, &gpu0[..], 1), (PAGE, &gpu1[..], 1)]);
+        let works = vec![
+            RelayPieceWork {
+                p_lo: 0,
+                old_ptr: old0.as_mut_ptr() as usize,
+                old_len: old0.len(),
+                items: vec![(0, gpu0.as_ptr() as usize, gpu0.len(), 1)],
+            },
+            RelayPieceWork {
+                p_lo: PAGE,
+                old_ptr: old1.as_mut_ptr() as usize,
+                old_len: old1.len(),
+                items: vec![(PAGE, gpu1.as_ptr() as usize, gpu1.len(), 1)],
+            },
+        ];
+        let start = title_mem.as_ptr() as usize;
+        let bucket = merge_relay_chunk(start, works, &skip, false);
+        assert_eq!(bucket.writes.len(), 2);
+        for w in &bucket.writes {
+            let bytes = &bucket.arena[w.arena_off..w.arena_off + w.len];
+            title_mem[w.at..w.at + w.len].copy_from_slice(bytes);
+        }
+        assert!(title_mem[16..24].iter().all(|&b| b == 0xaa));
+        assert!(title_mem[100..112].iter().all(|&b| b != 0xbb));
+        assert!(title_mem[PAGE + 32..PAGE + 48].iter().all(|&b| b == 0xcc));
+        assert_eq!(old0[16..24], [0xaa; 8]);
+        assert_ne!(old0[100], 0xbb);
+        assert_eq!(old1[32..48], [0xcc; 16]);
     }
 }
 

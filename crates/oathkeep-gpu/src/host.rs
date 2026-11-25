@@ -26,6 +26,7 @@ pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     copy_queue: Option<ID3D12CommandQueue>,
+    copy_fence: Option<ID3D12Fence>,
     fence: ID3D12Fence,
     submitted: Mutex<u64>,
     event: HANDLE,
@@ -630,16 +631,20 @@ fn create() -> windows::core::Result<Host> {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
         })?;
-        let copy_queue: Option<ID3D12CommandQueue> =
+        let (copy_queue, copy_fence) =
             if std::env::var_os("OATHKEEP_RELAY_COPY_QUEUE").is_none_or(|v| v != "0") {
-                device
-                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                match (
+                    device.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
                         Type: D3D12_COMMAND_LIST_TYPE_COPY,
                         ..Default::default()
-                    })
-                    .ok()
+                    }),
+                    device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE),
+                ) {
+                    (Ok(q), Ok(f)) => (Some(q), Some(f)),
+                    _ => (None, None),
+                }
             } else {
-                None
+                (None, None)
             };
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
@@ -665,6 +670,7 @@ fn create() -> windows::core::Result<Host> {
             device,
             queue,
             copy_queue,
+            copy_fence,
             fence,
             submitted: Mutex::new(0),
             event,
@@ -1533,8 +1539,10 @@ struct CardCompare {
 struct CardPlan {
     ranges: Vec<CardRange>,
     compares: Vec<CardCompare>,
+    sync: Option<ID3D12CommandList>,
     check: Option<ID3D12CommandList>,
     _synced: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    written_shadows: Vec<usize>,
     lists: Vec<(bool, Prelude)>,
     uploads: Vec<(ID3D12Resource, usize, u64)>,
     order_seq: u64,
@@ -1622,7 +1630,105 @@ static RELAY_MOVED: std::sync::Condvar = std::sync::Condvar::new();
 
 static LINE_LANDED: std::sync::Condvar = std::sync::Condvar::new();
 
-static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
+struct QueueSync {
+    order: u64,
+    /// Latest `(self.fence, order_seq)` submitted on `self.queue` that writes each card shadow.
+    last_3d_write: std::collections::HashMap<usize, (u64, u64)>,
+    /// Latest `copy_fence` value submitted on `self.copy_queue` that reads each card shadow.
+    last_copy_read: std::collections::HashMap<usize, u64>,
+    copy_sent: u64,
+}
+
+impl QueueSync {
+    fn new() -> Self {
+        Self {
+            order: 0,
+            last_3d_write: std::collections::HashMap::new(),
+            last_copy_read: std::collections::HashMap::new(),
+            copy_sent: 0,
+        }
+    }
+
+    fn next_order(&mut self) -> u64 {
+        self.order += 1;
+        self.order
+    }
+
+    fn record_3d_writes(
+        &mut self,
+        shadows: &[usize],
+        fence: u64,
+        order_seq: u64,
+        completed_3d: u64,
+    ) {
+        for &ptr in shadows {
+            self.last_3d_write.insert(ptr, (fence, order_seq));
+        }
+        if self.last_3d_write.len() > 128 {
+            self.last_3d_write.retain(|_, &mut (f, _)| f > completed_3d);
+        }
+    }
+
+    fn record_copy_reads(&mut self, shadows: &[usize], copy_sent: u64, completed_copy: u64) {
+        for &ptr in shadows {
+            self.last_copy_read.insert(ptr, copy_sent);
+        }
+        if self.last_copy_read.len() > 128 {
+            self.last_copy_read.retain(|_, &mut f| f > completed_copy);
+        }
+    }
+
+    fn max_copy_read_for(&self, shadows: &[usize]) -> u64 {
+        shadows
+            .iter()
+            .filter_map(|ptr| self.last_copy_read.get(ptr).copied())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn is_shadow_busy(&self, ptr: usize, completed_3d: u64) -> bool {
+        self.last_3d_write
+            .get(&ptr)
+            .is_some_and(|&(f, _)| f > completed_3d)
+    }
+
+    /// Computes `(max_wait_fence, per_shadow_fetched_after)` for a copy-queue fetch batch.
+    /// Any shadow with a pending 3D write (`write_fence > completed_3d`) contributes its
+    /// `write_fence` to `max_wait_fence` and advances its `fetched_after` to `write_order`.
+    fn sync_for_copy_fetch(
+        &self,
+        shadows: &[usize],
+        completed_3d: u64,
+        landed_seq: u64,
+    ) -> (u64, std::collections::HashMap<usize, u64>) {
+        let mut max_wait_fence = 0u64;
+        let mut after_by_shadow = std::collections::HashMap::with_capacity(shadows.len());
+        for &ptr in shadows {
+            let after = match self.last_3d_write.get(&ptr).copied() {
+                Some((write_fence, write_order)) => {
+                    if write_fence > completed_3d && write_fence > max_wait_fence {
+                        max_wait_fence = write_fence;
+                    }
+                    landed_seq.max(write_order)
+                }
+                None => landed_seq,
+            };
+            after_by_shadow.insert(ptr, after);
+        }
+        (max_wait_fence, after_by_shadow)
+    }
+}
+
+static QUEUE_SYNC: Mutex<Option<QueueSync>> = Mutex::new(None);
+
+fn queue_sync() -> std::sync::MutexGuard<'static, Option<QueueSync>> {
+    QUEUE_SYNC.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn with_queue_sync<R>(f: impl FnOnce(&mut QueueSync) -> R) -> R {
+    let mut guard = queue_sync();
+    f(guard.get_or_insert_with(QueueSync::new))
+}
 
 static RELAY_STATS: [std::sync::atomic::AtomicU64; 9] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 9];
@@ -1694,9 +1800,11 @@ fn should_defer_landing(
 ) -> bool {
     const MAX_DEFER_ROUNDS: u32 = 4;
     const MAX_DEFER_MS: u64 = 6;
+    const MAX_DEFER_FENCE_AHEAD: u64 = 2;
     !has_waiters
         && !has_urgent_items
         && max_busy_fence > completed
+        && max_busy_fence - completed <= MAX_DEFER_FENCE_AHEAD
         && lists < (late_most / 2).max(1)
         && !results_low
         && defer_count < MAX_DEFER_ROUNDS
@@ -1706,7 +1814,7 @@ fn should_defer_landing(
 #[cfg(test)]
 mod relay_tests {
     use super::{
-        coalesce_copy_regions, flagged_pieces, landable, merge_piece_intervals,
+        QueueSync, coalesce_copy_regions, flagged_pieces, landable, merge_piece_intervals,
         should_defer_landing,
     };
 
@@ -1787,6 +1895,43 @@ mod relay_tests {
         assert!(!should_defer_landing(false, false, 10, 8, 12, 256, true, 0, 0));
         assert!(!should_defer_landing(false, false, 10, 8, 12, 256, false, 4, 0));
         assert!(!should_defer_landing(false, false, 10, 8, 12, 256, false, 1, 6));
+        assert!(!should_defer_landing(false, false, 15, 8, 12, 256, false, 0, 0));
+    }
+
+    #[test]
+    fn queue_sync_classifies_busy_shadows_and_tracks_cross_queue_fences() {
+        let mut sync = QueueSync::new();
+        let (a, b, c) = (0x1000usize, 0x2000usize, 0x3000usize);
+        let o1 = sync.next_order();
+        let o2 = sync.next_order();
+        assert_eq!((o1, o2), (1, 2));
+
+        // Shadow `a` finished at fence 5 (order 1); shadow `b` is still in flight at fence 9 (order 2).
+        sync.record_3d_writes(&[a], 5, o1, 4);
+        sync.record_3d_writes(&[b], 9, o2, 6);
+
+        // At completed_3d = 6: `a` is idle, `b` is busy, `c` was never written.
+        assert!(!sync.is_shadow_busy(a, 6));
+        assert!(sync.is_shadow_busy(b, 6));
+        assert!(!sync.is_shadow_busy(c, 6));
+
+        // Immediate copy batch (`a`, `c`) needs NO 3D wait (wait_fence == 0).
+        let (wait_now, after_now) = sync.sync_for_copy_fetch(&[a, c], 6, 1);
+        assert_eq!(wait_now, 0);
+        assert_eq!(after_now[&a], 1);
+        assert_eq!(after_now[&c], 1);
+
+        // Busy copy batch (`b`) waits ONLY for fence 9 (not future unrelated flights) and advances `after` to o2.
+        let (wait_busy, after_busy) = sync.sync_for_copy_fetch(&[b], 6, 1);
+        assert_eq!(wait_busy, 9);
+        assert_eq!(after_busy[&b], o2);
+
+        // Record copy reads and verify subsequent 3D writes know which copy_fence to wait for.
+        sync.record_copy_reads(&[a, c], 10, 0);
+        sync.record_copy_reads(&[b], 11, 0);
+        assert_eq!(sync.max_copy_read_for(&[a]), 10);
+        assert_eq!(sync.max_copy_read_for(&[a, b]), 11);
+        assert_eq!(sync.max_copy_read_for(&[0x9999]), 0);
     }
 }
 
@@ -2166,35 +2311,18 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
 }
 
-static RELAY_READING: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
-static RELAY_READING_DONE: std::sync::Condvar = std::sync::Condvar::new();
-
-fn wait_relay_reading(shadows: &[usize]) {
-    if shadows.is_empty() {
-        return;
-    }
-    let mut reading = RELAY_READING.lock().unwrap_or_else(|e| e.into_inner());
-    while reading
-        .as_ref()
-        .is_some_and(|set| shadows.iter().any(|ptr| set.contains(ptr)))
-    {
-        reading = RELAY_READING_DONE
-            .wait(reading)
-            .unwrap_or_else(|e| e.into_inner());
-    }
-}
-
 struct RelayFetch {
     list: Prelude,
     copy_list: Option<Prelude>,
+    copy_wait_list: Option<Prelude>,
     fence: ID3D12Fence,
     event: HANDLE,
     sent: u64,
-    copy_fence: ID3D12Fence,
     copy_event: HANDLE,
-    copy_sent: u64,
+    copy_wait_event: HANDLE,
     buffer: Option<(ID3D12Resource, usize, u64)>,
     copy_buffer: Option<(ID3D12Resource, usize, u64)>,
+    copy_wait_buffer: Option<(ID3D12Resource, usize, u64)>,
 }
 
 fn relay_worker() {
@@ -2251,15 +2379,7 @@ fn relay_worker() {
                             && let Some(card) = &flight.card
                         {
                             let mut touches_landed = false;
-                            for r in &card.ranges {
-                                let ptr = std::sync::Arc::as_ptr(&r.shadow) as usize;
-                                busy_shadows.insert(ptr);
-                                if landed_card_shadows.contains(&ptr) {
-                                    touches_landed = true;
-                                }
-                            }
-                            for s in &card._synced {
-                                let ptr = std::sync::Arc::as_ptr(s) as usize;
+                            for &ptr in &card.written_shadows {
                                 busy_shadows.insert(ptr);
                                 if landed_card_shadows.contains(&ptr) {
                                     touches_landed = true;
@@ -2330,7 +2450,8 @@ fn relay_worker() {
 }
 
 fn relay_hand_back(back: &[Declared]) {
-    let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    use std::sync::Arc;
+    let mut work: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
         if shadow.carded() {
             continue;
@@ -2357,16 +2478,113 @@ fn relay_hand_back(back: &[Declared]) {
         crate::copystat::C::BackScanUs,
         scanning.elapsed().as_micros() as u64,
     );
-    let (mut now, mut title) = (Vec::new(), Vec::new());
-    for ((shadow, from, to), found) in work.iter().zip(found) {
-        let mut written = 0;
-        for (at, n) in found {
-            written += shadow.relay_merge(at, n, &mut now, &mut title);
+    let mut non_empty_ranges = 0usize;
+    let mut found_bytes = 0usize;
+    for pieces in &found {
+        if !pieces.is_empty() {
+            non_empty_ranges += 1;
+            found_bytes += pieces.iter().map(|&(_, n)| n).sum::<usize>();
         }
-        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+    }
+    if non_empty_ranges == 0 {
         #[cfg(feature = "diagnostics")]
-        crate::copystat::compared(*from, to - from, written);
-        let _ = (from, to);
+        {
+            let entries: Vec<(usize, usize, usize)> = work
+                .iter()
+                .map(|(_, from, to)| (*from, to - from, 0))
+                .collect();
+            crate::copystat::compared_batch(&entries);
+        }
+        return;
+    }
+    let mut written_per_work = vec![0usize; work.len()];
+    let mut by_shadow: Vec<Vec<(usize, Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>> =
+        Vec::new();
+    let mut shadow_pos: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (idx, ((shadow, _, _), pieces)) in work.iter().zip(found).enumerate() {
+        if pieces.is_empty() {
+            continue;
+        }
+        let ptr = Arc::as_ptr(shadow) as usize;
+        match shadow_pos.get(&ptr) {
+            Some(&pos) => by_shadow[pos].push((idx, shadow.clone(), pieces)),
+            None => {
+                shadow_pos.insert(ptr, by_shadow.len());
+                by_shadow.push(vec![(idx, shadow.clone(), pieces)]);
+            }
+        }
+    }
+    if wide_merge() && by_shadow.len() >= 2 && (non_empty_ranges >= 4 || found_bytes >= (2 << 20)) {
+        let counts: Arc<Vec<std::sync::atomic::AtomicUsize>> = Arc::new(
+            (0..work.len())
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
+        );
+        let worker_count = by_shadow.len().min(6);
+        let mut buckets: Vec<Vec<(usize, Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>> =
+            (0..worker_count).map(|_| Vec::new()).collect();
+        let mut bucket_bytes = vec![0usize; worker_count];
+        for group in by_shadow {
+            let bytes: usize = group
+                .iter()
+                .flat_map(|(_, _, ps)| ps.iter())
+                .map(|&(_, n)| n)
+                .sum();
+            let dst = bucket_bytes
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, b)| **b)
+                .map_or(0, |(i, _)| i);
+            bucket_bytes[dst] += bytes;
+            buckets[dst].extend(group);
+        }
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+            .into_iter()
+            .filter(|b| !b.is_empty())
+            .map(|chunk| {
+                let counts = counts.clone();
+                Box::new(move || {
+                    let (mut now, mut title) = (Vec::new(), Vec::new());
+                    for (idx, shadow, pieces) in chunk {
+                        let mut written = 0usize;
+                        for (at, n) in pieces {
+                            written += shadow.relay_merge(at, n, &mut now, &mut title);
+                        }
+                        if written > 0 {
+                            counts[idx].store(written, Ordering::Relaxed);
+                        }
+                    }
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+        for (dst, src) in written_per_work.iter_mut().zip(counts.iter()) {
+            *dst = src.load(Ordering::Relaxed);
+        }
+    } else {
+        let (mut now, mut title) = (Vec::new(), Vec::new());
+        for group in by_shadow {
+            for (idx, shadow, pieces) in group {
+                let mut written = 0usize;
+                for (at, n) in pieces {
+                    written += shadow.relay_merge(at, n, &mut now, &mut title);
+                }
+                written_per_work[idx] = written;
+            }
+        }
+    }
+    let total_written: usize = written_per_work.iter().sum();
+    if total_written > 0 {
+        COPY_BACK[1].fetch_add(total_written as u64, Ordering::Relaxed);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        let entries: Vec<(usize, usize, usize)> = work
+            .iter()
+            .zip(written_per_work)
+            .map(|((_, from, to), written)| (*from, to - from, written))
+            .collect();
+        crate::copystat::compared_batch(&entries);
     }
 }
 
@@ -2959,27 +3177,31 @@ impl Host {
             }
             *ranges = merged;
         }
-        let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
-        let sent_as = match order.as_mut() {
-            Some(order) => {
-                **order += 1;
-                **order
-            }
-            None => 0,
+        let sent_as = if relay() {
+            with_queue_sync(QueueSync::next_order)
+        } else {
+            0
         };
         let mut dirty = crate::shadow::card_dirty(sent_as);
         if declared.is_empty() && dirty.is_empty() {
             return None;
         }
-        if self.copy_queue.is_some() {
-            let mut touched: Vec<usize> = Vec::with_capacity(declared.len() + dirty.len());
-            for (s, _) in &declared {
-                touched.push(Arc::as_ptr(s) as usize);
+        let mut written_shadows: Vec<usize> = Vec::with_capacity(declared.len() + dirty.len());
+        let mut seen_written: std::collections::HashSet<usize> =
+            std::collections::HashSet::with_capacity(declared.len() + dirty.len());
+        for (s, _) in &declared {
+            let ptr = Arc::as_ptr(s) as usize;
+            if seen_written.insert(ptr) {
+                written_shadows.push(ptr);
             }
-            for (s, _) in &dirty {
-                touched.push(Arc::as_ptr(s) as usize);
+        }
+        for (s, ranges) in &dirty {
+            if !ranges.is_empty() {
+                let ptr = Arc::as_ptr(s) as usize;
+                if seen_written.insert(ptr) {
+                    written_shadows.push(ptr);
+                }
             }
-            wait_relay_reading(&touched);
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
@@ -3000,6 +3222,7 @@ impl Host {
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut plan_uploads: Vec<(ID3D12Resource, usize, u64)> = Vec::new();
+        let mut sync_cmd: Option<ID3D12CommandList> = None;
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!(
@@ -3090,13 +3313,13 @@ impl Host {
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
             let recorded = unsafe {
-                (|| -> windows::core::Result<()> {
+                (|| -> windows::core::Result<ID3D12CommandList> {
                     if total_copy == 0 {
                         allocator.Reset()?;
                         list.Reset(allocator, None)?;
                         emit_hashes(list, &[]);
                         list.Close()?;
-                        self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                        list.cast()
                     } else if total_copy <= CARD_UPLOAD_CHUNK {
                         let (upload_buf, upload_ptr, upload_cap) =
                             take_upload(&mut work.upload_pool, total_copy);
@@ -3127,8 +3350,8 @@ impl Host {
                         }
                         emit_hashes(list, &copied_in_final);
                         list.Close()?;
-                        self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                         plan_uploads.push((upload_buf, upload_ptr, upload_cap));
+                        list.cast()
                     } else {
                         let (upload_buf, upload_ptr, upload_cap) =
                             take_upload(&mut work.upload_pool, CARD_UPLOAD_CHUNK);
@@ -3156,6 +3379,9 @@ impl Host {
                         }
                         if !cur.is_empty() {
                             chunks.push(cur);
+                        }
+                        if chunks.len() > 1 {
+                            self.wait_copy_queue_on_3d(&written_shadows)?;
                         }
                         for (ci, chunk) in chunks.iter().enumerate() {
                             let is_last = ci + 1 == chunks.len();
@@ -3185,8 +3411,8 @@ impl Host {
                                 emit_hashes(list, &copied_in_final);
                             }
                             list.Close()?;
-                            self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                             if !is_last {
+                                self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                                 *submitted += 1;
                                 self.queue.Signal(&self.fence, *submitted)?;
                                 self.fence.SetEventOnCompletion(*submitted, self.event)?;
@@ -3194,23 +3420,25 @@ impl Host {
                             }
                         }
                         plan_uploads.push((upload_buf, upload_ptr, upload_cap));
+                        list.cast()
                     }
-                    Ok(())
                 })()
             };
-            if let Err(e) = recorded {
-                fail(format_args!(
+            match recorded {
+                Ok(cmd) => sync_cmd = Some(cmd),
+                Err(e) => fail(format_args!(
                     "host copies in the card's memory could not be brought up to date ({e})"
-                ));
+                )),
             }
             used.push((false, sync));
         }
-        drop(order);
         let mut plan = CardPlan {
             ranges: Vec::new(),
             compares: Vec::new(),
+            sync: sync_cmd,
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            written_shadows,
             lists: used,
             uploads: plan_uploads,
             order_seq: sent_as,
@@ -3355,28 +3583,161 @@ impl Host {
         }
     }
 
+    fn wait_copy_queue_on_3d(&self, shadows: &[usize]) -> windows::core::Result<()> {
+        let Some(copy_fence) = &self.copy_fence else {
+            return Ok(());
+        };
+        if shadows.is_empty() {
+            return Ok(());
+        }
+        let need_copy = with_queue_sync(|sync| sync.max_copy_read_for(shadows));
+        if need_copy > 0 {
+            // SAFETY: plain fence query and cross-queue GPU wait on live host queues.
+            unsafe {
+                if copy_fence.GetCompletedValue() < need_copy {
+                    self.queue.Wait(copy_fence, need_copy)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
         let list = self.make_prelude()?;
         let copy_list = self.copy_queue.as_ref().and_then(|_| self.make_copy_prelude());
+        let copy_wait_list = self.copy_queue.as_ref().and_then(|_| self.make_copy_prelude());
         // SAFETY: plain objects of our own.
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
-            let copy_fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let copy_event = CreateEventW(None, false, false, None).ok()?;
+            let copy_wait_event = CreateEventW(None, false, false, None).ok()?;
             Some(RelayFetch {
                 list,
                 copy_list,
+                copy_wait_list,
                 fence,
                 event,
                 sent: 0,
-                copy_fence,
                 copy_event,
-                copy_sent: 0,
+                copy_wait_event,
                 buffer: None,
                 copy_buffer: None,
+                copy_wait_buffer: None,
             })
         }
+    }
+
+    fn merge_relay_pieces(pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)>) -> usize {
+        use std::sync::Arc;
+        if pieces.is_empty() {
+            return 0;
+        }
+        // Group pieces by shadow so each shadow runs a single batched merge (snapshot `skip` once,
+        // coalesce `watch::writing` and `clear_hot_hashes`, and fan out across workers even when
+        // a single large shadow dominates the landing).
+        let mut by_shadow: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize, usize, u64)>, usize)> =
+            Vec::new();
+        let mut shadow_pos: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        for (shadow, lo, hi, src, after) in pieces {
+            let len = hi - lo;
+            let ptr = Arc::as_ptr(&shadow) as usize;
+            match shadow_pos.get(&ptr) {
+                Some(&idx) => {
+                    by_shadow[idx].1.push((lo, src, len, after));
+                    by_shadow[idx].2 += len;
+                }
+                None => {
+                    shadow_pos.insert(ptr, by_shadow.len());
+                    by_shadow.push((shadow, vec![(lo, src, len, after)], len));
+                }
+            }
+        }
+        let merge_one = |shadow: &Arc<crate::shadow::Shadow>,
+                         items: &[(usize, usize, usize, u64)],
+                         fetched: usize,
+                         parallel: bool|
+         -> usize {
+            let slices: Vec<(usize, &[u8], u64)> = items
+                .iter()
+                .map(|&(lo, src, len, after)| {
+                    // SAFETY: the mapping of the fetched bytes; the copy into it has completed
+                    // before `merge_relay_pieces` is called, and every job joins before returning.
+                    let gpu = unsafe { std::slice::from_raw_parts(src as *const u8, len) };
+                    (lo, gpu, after)
+                })
+                .collect();
+            let merged = shadow.card_merge_relay_batch(&slices, parallel);
+            shadow.walls_merged(fetched, merged);
+            #[cfg(feature = "diagnostics")]
+            {
+                let (s_start, s_len) = shadow.span();
+                crate::copystat::card_back(
+                    s_start as usize,
+                    s_len as usize,
+                    items.len(),
+                    fetched,
+                    merged,
+                );
+            }
+            merged
+        };
+        let wide = wide_merge();
+        let mut large = Vec::new();
+        let mut small = Vec::new();
+        for group in by_shadow {
+            if wide && (group.1.len() >= 16 || group.2 >= (1 << 20)) {
+                large.push(group);
+            } else {
+                small.push(group);
+            }
+        }
+        let mut total_written = 0usize;
+        for (shadow, items, fetched) in large {
+            total_written += merge_one(&shadow, &items, fetched, true);
+        }
+        let small_pieces: usize = small.iter().map(|g| g.1.len()).sum();
+        if wide && small.len() >= 2 && small_pieces >= 8 {
+            let written_atomic = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let worker_count = small.len().min(6);
+            let mut buckets: Vec<Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize, usize, u64)>, usize)>> =
+                (0..worker_count).map(|_| Vec::new()).collect();
+            let mut bucket_bytes = vec![0usize; worker_count];
+            small.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+            for group in small {
+                let dst = bucket_bytes
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, b)| **b)
+                    .map_or(0, |(i, _)| i);
+                bucket_bytes[dst] += group.2;
+                buckets[dst].push(group);
+            }
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                .into_iter()
+                .filter(|b| !b.is_empty())
+                .map(|chunk| {
+                    let written_atomic = written_atomic.clone();
+                    Box::new(move || {
+                        let mut local = 0usize;
+                        for (shadow, items, fetched) in chunk {
+                            local += merge_one(&shadow, &items, fetched, false);
+                        }
+                        if local > 0 {
+                            written_atomic.fetch_add(local, Ordering::Relaxed);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            total_written += written_atomic.load(Ordering::Relaxed);
+        } else {
+            for (shadow, items, fetched) in small {
+                total_written += merge_one(&shadow, &items, fetched, false);
+            }
+        }
+        total_written
     }
 
     fn relay_card_back(
@@ -3386,6 +3747,7 @@ impl Host {
         fetch: &mut Option<RelayFetch>,
     ) {
         use std::sync::Arc;
+        let landed_seq = plans.iter().map(|p| p.order_seq).max().unwrap_or(0);
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref()
@@ -3442,7 +3804,9 @@ impl Host {
             }
         }
         if by_piece.is_empty() {
-            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            if landed_seq > 0 {
+                crate::shadow::relay_fetched(landed_seq);
+            }
             return;
         }
         if fetch.is_none() {
@@ -3453,162 +3817,183 @@ impl Host {
                 "no list, fence or event to fetch what shaders wrote to the card's memory (OATHKEEP_RELAY=1)"
             ));
         };
-        let landed_seq = plans.iter().map(|p| p.order_seq).max().unwrap_or(0);
-        let can_copy_queue = self.copy_queue.is_some() && f.copy_list.is_some();
-        let mut fast: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
+        let can_copy_queue = self.copy_queue.is_some()
+            && self.copy_fence.is_some()
+            && f.copy_list.is_some();
+        let can_split_copy = can_copy_queue && f.copy_wait_list.is_some();
+        // SAFETY: plain fence query.
+        let completed_3d = unsafe { self.fence.GetCompletedValue() };
+        let mut fast_now: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
+        let mut fast_wait: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
         let mut slow: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        for ((ptr, _), (shadow, mut intervals)) in by_piece {
-            merge_piece_intervals(&mut intervals);
-            let target = if can_copy_queue && !busy_shadows.contains(&ptr) {
-                &mut fast
-            } else {
-                &mut slow
-            };
-            for (lo, hi) in intervals {
-                target.push((shadow.clone(), lo, hi, 0));
+        {
+            let guard = queue_sync();
+            for ((ptr, _), (shadow, mut intervals)) in by_piece {
+                merge_piece_intervals(&mut intervals);
+                let target = if can_copy_queue {
+                    let busy = busy_shadows.contains(&ptr)
+                        || guard
+                            .as_ref()
+                            .is_some_and(|sync| sync.is_shadow_busy(ptr, completed_3d));
+                    if busy && can_split_copy {
+                        &mut fast_wait
+                    } else {
+                        &mut fast_now
+                    }
+                } else {
+                    &mut slow
+                };
+                for (lo, hi) in intervals {
+                    target.push((shadow.clone(), lo, hi, 0));
+                }
             }
         }
-        if fast.is_empty() && slow.is_empty() {
-            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+        if fast_now.is_empty() && fast_wait.is_empty() && slow.is_empty() {
+            if landed_seq > 0 {
+                crate::shadow::relay_fetched(landed_seq);
+            }
             return;
         }
-        fast.sort_unstable_by_key(|p| (Arc::as_ptr(&p.0) as usize, p.1));
-        slow.sort_unstable_by_key(|p| (Arc::as_ptr(&p.0) as usize, p.1));
-        let mut fast_total = 0u64;
-        for p in &mut fast {
-            p.3 = fast_total;
-            fast_total += (p.2 - p.1) as u64;
-        }
-        let mut slow_total = 0u64;
-        for p in &mut slow {
-            p.3 = slow_total;
-            slow_total += (p.2 - p.1) as u64;
-        }
-        let total = fast_total + slow_total;
-        let fast_buf = if fast_total > 0 {
-            if f.copy_buffer.as_ref().is_none_or(|b| b.2 < fast_total) {
-                let size = fast_total.next_multiple_of(4 << 20);
-                f.copy_buffer = self
-                    .read_back_mapped(size)
-                    .map(|(buffer, data)| (buffer, data as usize, size));
+        let prepare_batch = |batch: &mut [(Arc<crate::shadow::Shadow>, usize, usize, u64)]| -> u64 {
+            batch.sort_unstable_by_key(|p| (Arc::as_ptr(&p.0) as usize, p.1));
+            let mut total = 0u64;
+            for p in batch.iter_mut() {
+                p.3 = total;
+                total += (p.2 - p.1) as u64;
             }
-            let Some((buffer, data, _)) = f.copy_buffer.clone() else {
-                fail(format_args!(
-                    "no memory to fetch what shaders wrote to the card's memory ({fast_total} bytes, OATHKEEP_RELAY=1)"
-                ));
-            };
-            Some((buffer, data))
-        } else {
-            None
+            total
         };
-        let slow_buf = if slow_total > 0 {
-            if f.buffer.as_ref().is_none_or(|b| b.2 < slow_total) {
-                let size = slow_total.next_multiple_of(4 << 20);
-                f.buffer = self
-                    .read_back_mapped(size)
-                    .map(|(buffer, data)| (buffer, data as usize, size));
-            }
-            let Some((buffer, data, _)) = f.buffer.clone() else {
-                fail(format_args!(
-                    "no memory to fetch what shaders wrote to the card's memory ({slow_total} bytes, OATHKEEP_RELAY=1)"
-                ));
+        let fast_now_total = prepare_batch(&mut fast_now);
+        let fast_wait_total = prepare_batch(&mut fast_wait);
+        let slow_total = prepare_batch(&mut slow);
+        let total = fast_now_total + fast_wait_total + slow_total;
+        let piece_count = fast_now.len() + fast_wait.len() + slow.len();
+
+        let ensure_readback =
+            |slot: &mut Option<(ID3D12Resource, usize, u64)>, need: u64| -> Option<(ID3D12Resource, usize)> {
+                if need == 0 {
+                    return None;
+                }
+                if slot.as_ref().is_none_or(|b| b.2 < need) {
+                    let size = need.next_multiple_of(4 << 20);
+                    *slot = self
+                        .read_back_mapped(size)
+                        .map(|(buffer, data)| (buffer, data as usize, size));
+                }
+                let Some((buffer, data, _)) = slot.clone() else {
+                    fail(format_args!(
+                        "no memory to fetch what shaders wrote to the card's memory ({need} bytes, OATHKEEP_RELAY=1)"
+                    ));
+                };
+                Some((buffer, data))
             };
-            Some((buffer, data))
-        } else {
-            None
-        };
-        let waiting = std::time::Instant::now();
-        let mut waits = 0u64;
-        // Record and submit BOTH `fast` (copy queue) and `slow` (3D queue) before waiting
-        // on either so both hardware queues overlap when both are non-empty.
-        let fast_started = if !fast.is_empty() {
-            let fast_start = std::time::Instant::now();
-            let copy_queue = self.copy_queue.as_ref().unwrap();
-            let (allocator, list) = f.copy_list.as_ref().unwrap().clone();
-            let (buffer, _) = fast_buf.as_ref().unwrap();
-            let copy_regions: Vec<(usize, usize, usize, u64)> = {
+        let fast_now_buf = ensure_readback(&mut f.copy_buffer, fast_now_total);
+        let fast_wait_buf = ensure_readback(&mut f.copy_wait_buffer, fast_wait_total);
+        let slow_buf = ensure_readback(&mut f.buffer, slow_total);
+
+        let build_copy_regions =
+            |batch: &[(Arc<crate::shadow::Shadow>, usize, usize, u64)]| -> (Vec<(usize, usize, usize, u64)>, Vec<usize>) {
                 let mut shadow_by_ptr: std::collections::HashMap<usize, usize> =
                     std::collections::HashMap::new();
-                for (i, (s, ..)) in fast.iter().enumerate() {
-                    shadow_by_ptr.entry(Arc::as_ptr(s) as usize).or_insert(i);
+                let mut shadow_ptrs = Vec::new();
+                for (i, (s, ..)) in batch.iter().enumerate() {
+                    let ptr = Arc::as_ptr(s) as usize;
+                    shadow_by_ptr.entry(ptr).or_insert_with(|| {
+                        shadow_ptrs.push(ptr);
+                        i
+                    });
                 }
-                let keyed: Vec<(usize, usize, usize, u64)> = fast
+                let keyed: Vec<(usize, usize, usize, u64)> = batch
                     .iter()
                     .map(|(s, lo, hi, at)| (shadow_by_ptr[&(Arc::as_ptr(s) as usize)], *lo, *hi, *at))
                     .collect();
-                coalesce_copy_regions(&keyed)
+                (coalesce_copy_regions(&keyed), shadow_ptrs)
             };
-            {
-                let mut reading = RELAY_READING.lock().unwrap_or_else(|e| e.into_inner());
-                let set = reading.get_or_insert_with(Default::default);
-                for (shadow, ..) in &fast {
-                    set.insert(Arc::as_ptr(shadow) as usize);
-                }
-            }
-            f.copy_sent += 1;
-            let (copy_fence, copy_sent) = (f.copy_fence.clone(), f.copy_sent);
-            // SAFETY: the copy list's last run was waited for; landed flights
-            // finished on `self.queue` so these buffers decayed to COMMON; no
-            // pending flight writes to them; `RELAY_READING` blocks concurrent
-            // `card_before` writes until the copy finishes.
+
+        let submit_copy_batch = |batch: &[(Arc<crate::shadow::Shadow>, usize, usize, u64)],
+                                 prelude: &Prelude,
+                                 dst_buf: &ID3D12Resource|
+         -> (u64, std::collections::HashMap<usize, u64>) {
+            let copy_queue = self.copy_queue.as_ref().unwrap();
+            let copy_fence = self.copy_fence.as_ref().unwrap();
+            let (allocator, list) = prelude;
+            let (copy_regions, shadow_ptrs) = build_copy_regions(batch);
+            // SAFETY: this copy list's previous run was awaited; buffers decay to COMMON
+            // after every `ExecuteCommandLists` on `self.queue`; cross-queue `Wait` under
+            // `QUEUE_SYNC` orders this read strictly after any pending 3D write to these
+            // shadows and strictly before any subsequent 3D write to these shadows.
             let submitted = unsafe {
-                (|| -> windows::core::Result<()> {
+                (|| -> windows::core::Result<(u64, std::collections::HashMap<usize, u64>)> {
                     allocator.Reset()?;
-                    list.Reset(&allocator, None)?;
+                    list.Reset(allocator, None)?;
                     for &(shadow_idx, lo, hi, at) in &copy_regions {
                         list.CopyBufferRegion(
-                            buffer,
+                            dst_buf,
                             at,
-                            &fast[shadow_idx].0.buffer,
+                            &batch[shadow_idx].0.buffer,
                             lo as u64,
                             (hi - lo) as u64,
                         );
                     }
                     list.Close()?;
                     let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                    let completed_3d = self.fence.GetCompletedValue();
+                    let completed_copy = copy_fence.GetCompletedValue();
+                    let mut sync_guard = queue_sync();
+                    let sync = sync_guard.get_or_insert_with(QueueSync::new);
+                    let (wait_fence, after_by_shadow) =
+                        sync.sync_for_copy_fetch(&shadow_ptrs, completed_3d, landed_seq);
+                    if wait_fence > completed_3d {
+                        copy_queue.Wait(&self.fence, wait_fence)?;
+                    }
                     copy_queue.ExecuteCommandLists(&lists);
-                    copy_queue.Signal(&copy_fence, copy_sent)?;
-                    Ok(())
+                    sync.copy_sent += 1;
+                    let copy_sent = sync.copy_sent;
+                    copy_queue.Signal(copy_fence, copy_sent)?;
+                    sync.record_copy_reads(&shadow_ptrs, copy_sent, completed_copy);
+                    Ok((copy_sent, after_by_shadow))
                 })()
             };
-            if let Err(e) = submitted {
-                {
-                    let mut reading = RELAY_READING.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(set) = reading.as_mut() {
-                        set.clear();
-                    }
-                }
-                RELAY_READING_DONE.notify_all();
-                fail(format_args!(
+            match submitted {
+                Ok(res) => res,
+                Err(e) => fail(format_args!(
                     "what shaders wrote to the card's memory could not be fetched on the copy queue ({e}, OATHKEEP_RELAY=1)"
-                ));
+                )),
             }
-            Some((fast_start, copy_fence, f.copy_event, copy_sent))
+        };
+
+        let mut waits = 0u64;
+        let mut wait_us_total = 0u64;
+        let mut total_written = 0usize;
+
+        // Submit BOTH `fast_now` (immediate, no 3D wait) and `fast_wait` (GPU-waits only for
+        // the specific 3D fence touching busy shadows, never draining unrelated future flights)
+        // before waiting so `fast_wait` progresses on GPU while we merge `fast_now` on CPU!
+        let fast_now_submitted = if !fast_now.is_empty() {
+            let (dst_buf, dst_data) = fast_now_buf.as_ref().unwrap();
+            let (copy_sent, after_by_shadow) =
+                submit_copy_batch(&fast_now, f.copy_list.as_ref().unwrap(), dst_buf);
+            Some((copy_sent, *dst_data, after_by_shadow))
         } else {
             None
         };
-        let mut slow_after = landed_seq;
-        let slow_started = if !slow.is_empty() {
-            let slow_start = std::time::Instant::now();
+        let fast_wait_submitted = if !fast_wait.is_empty() {
+            let (dst_buf, dst_data) = fast_wait_buf.as_ref().unwrap();
+            let (copy_sent, after_by_shadow) =
+                submit_copy_batch(&fast_wait, f.copy_wait_list.as_ref().unwrap(), dst_buf);
+            Some((copy_sent, *dst_data, after_by_shadow))
+        } else {
+            None
+        };
+
+        let slow_submitted = if !slow.is_empty() {
             f.sent += 1;
             let ((allocator, list), fence, event, sent) =
                 (f.list.clone(), f.fence.clone(), f.event, f.sent);
-            let (buffer, _) = slow_buf.as_ref().unwrap();
-            let copy_regions: Vec<(usize, usize, usize, u64)> = {
-                let mut shadow_by_ptr: std::collections::HashMap<usize, usize> =
-                    std::collections::HashMap::new();
-                for (i, (s, ..)) in slow.iter().enumerate() {
-                    shadow_by_ptr.entry(Arc::as_ptr(s) as usize).or_insert(i);
-                }
-                let keyed: Vec<(usize, usize, usize, u64)> = slow
-                    .iter()
-                    .map(|(s, lo, hi, at)| (shadow_by_ptr[&(Arc::as_ptr(s) as usize)], *lo, *hi, *at))
-                    .collect();
-                coalesce_copy_regions(&keyed)
-            };
-            // SAFETY: the list's last run was waited for by this thread; live
-            // buffers (the copies are held by the plans); the fence and the
-            // event are this thread's.
+            let (buffer, slow_data) = slow_buf.as_ref().unwrap();
+            let (copy_regions, _) = build_copy_regions(&slow);
+            // SAFETY: fallback 3D queue path when copy queue is disabled; list's last run
+            // was awaited by this thread.
             let submitted = unsafe {
                 (|| -> windows::core::Result<u64> {
                     allocator.Reset()?;
@@ -3624,64 +4009,91 @@ impl Host {
                     }
                     list.Close()?;
                     let lists = [Some(list.cast::<ID3D12CommandList>()?)];
-                    let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                    self.queue.ExecuteCommandLists(&lists);
-                    let after = *order;
-                    drop(order);
+                    let after = with_queue_sync(|sync| {
+                        self.queue.ExecuteCommandLists(&lists);
+                        sync.order
+                    });
                     self.card_sent();
                     self.queue.Signal(&fence, sent)?;
                     Ok(after)
                 })()
             };
-            slow_after = match submitted {
-                Ok(after) => after,
-                Err(e) => {
-                    if let Some((_, copy_fence, copy_event, copy_sent)) = &fast_started {
-                        // SAFETY: finish copy queue before failing so `RELAY_READING` is released.
-                        unsafe {
-                            let _ = copy_fence.SetEventOnCompletion(*copy_sent, *copy_event);
-                            WaitForSingleObject(*copy_event, INFINITE);
-                        }
-                        if let Some(set) =
-                            RELAY_READING.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
-                        {
-                            set.clear();
-                        }
-                        RELAY_READING_DONE.notify_all();
-                    }
-                    fail(format_args!(
-                        "what shaders wrote to the card's memory could not be fetched ({e}, OATHKEEP_RELAY=1)"
-                    ));
-                }
-            };
-            Some((slow_start, fence, event, sent))
+            match submitted {
+                Ok(after) => Some((fence, event, sent, *slow_data, after)),
+                Err(e) => fail(format_args!(
+                    "what shaders wrote to the card's memory could not be fetched ({e}, OATHKEEP_RELAY=1)"
+                )),
+            }
         } else {
             None
         };
-        if let Some((fast_start, copy_fence, copy_event, copy_sent)) = fast_started {
+
+        if let Some((copy_sent, dst_data, after_by_shadow)) = fast_now_submitted {
+            let copy_fence = self.copy_fence.as_ref().unwrap();
+            let wait_start = std::time::Instant::now();
             // SAFETY: copy queue fence and this thread's copy event.
             let waited = unsafe {
-                copy_fence.SetEventOnCompletion(copy_sent, copy_event).map(|()| {
-                    WaitForSingleObject(copy_event, INFINITE);
-                })
+                copy_fence
+                    .SetEventOnCompletion(copy_sent, f.copy_event)
+                    .map(|()| {
+                        WaitForSingleObject(f.copy_event, INFINITE);
+                    })
             };
-            {
-                let mut reading = RELAY_READING.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(set) = reading.as_mut() {
-                    set.clear();
-                }
-            }
-            RELAY_READING_DONE.notify_all();
             if let Err(e) = waited {
                 fail(format_args!(
                     "what shaders wrote to the card's memory could not be awaited on the copy queue ({e}, OATHKEEP_RELAY=1)"
                 ));
             }
+            let us = wait_start.elapsed().as_micros() as u64;
             RELAY_STATS[5].fetch_add(1, Ordering::Relaxed);
-            RELAY_STATS[6].fetch_add(fast_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            RELAY_STATS[6].fetch_add(us, Ordering::Relaxed);
+            wait_us_total += us;
             waits += 1;
+            let items = fast_now
+                .into_iter()
+                .map(|(shadow, lo, hi, at)| {
+                    let ptr = Arc::as_ptr(&shadow) as usize;
+                    let after = after_by_shadow.get(&ptr).copied().unwrap_or(landed_seq);
+                    (shadow, lo, hi, dst_data + at as usize, after)
+                })
+                .collect();
+            total_written += Self::merge_relay_pieces(items);
         }
-        if let Some((slow_start, fence, event, sent)) = slow_started {
+
+        if let Some((copy_sent, dst_data, after_by_shadow)) = fast_wait_submitted {
+            let copy_fence = self.copy_fence.as_ref().unwrap();
+            let wait_start = std::time::Instant::now();
+            // SAFETY: copy queue fence and this thread's second copy event.
+            let waited = unsafe {
+                copy_fence
+                    .SetEventOnCompletion(copy_sent, f.copy_wait_event)
+                    .map(|()| {
+                        WaitForSingleObject(f.copy_wait_event, INFINITE);
+                    })
+            };
+            if let Err(e) = waited {
+                fail(format_args!(
+                    "what shaders wrote to the card's memory could not be awaited on the copy queue ({e}, OATHKEEP_RELAY=1)"
+                ));
+            }
+            let us = wait_start.elapsed().as_micros() as u64;
+            RELAY_STATS[5].fetch_add(1, Ordering::Relaxed);
+            RELAY_STATS[6].fetch_add(us, Ordering::Relaxed);
+            wait_us_total += us;
+            waits += 1;
+            let items = fast_wait
+                .into_iter()
+                .map(|(shadow, lo, hi, at)| {
+                    let ptr = Arc::as_ptr(&shadow) as usize;
+                    let after = after_by_shadow.get(&ptr).copied().unwrap_or(landed_seq);
+                    (shadow, lo, hi, dst_data + at as usize, after)
+                })
+                .collect();
+            total_written += Self::merge_relay_pieces(items);
+        }
+
+        if let Some((fence, event, sent, slow_data, slow_after)) = slow_submitted {
+            let wait_start = std::time::Instant::now();
             // SAFETY: 3D queue fence and this thread's event.
             let waited = unsafe {
                 fence.SetEventOnCompletion(sent, event).map(|()| {
@@ -3693,110 +4105,30 @@ impl Host {
                     "what shaders wrote to the card's memory could not be awaited ({e}, OATHKEEP_RELAY=1)"
                 ));
             }
+            let us = wait_start.elapsed().as_micros() as u64;
             RELAY_STATS[7].fetch_add(1, Ordering::Relaxed);
-            RELAY_STATS[8].fetch_add(slow_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            RELAY_STATS[8].fetch_add(us, Ordering::Relaxed);
+            wait_us_total += us;
             waits += 1;
+            let items = slow
+                .into_iter()
+                .map(|(shadow, lo, hi, at)| (shadow, lo, hi, slow_data + at as usize, slow_after))
+                .collect();
+            total_written += Self::merge_relay_pieces(items);
         }
-        let us = waiting.elapsed().as_micros() as u64;
-        RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
-        let piece_count = fast.len() + slow.len();
+
+        RELAY_STATS[3].fetch_add(wait_us_total, Ordering::Relaxed);
         {
             use crate::shadow::CARD_STATS;
             CARD_STATS[3].fetch_add(piece_count as u64, Ordering::Relaxed);
             CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
             CARD_STATS[5].fetch_add(waits, Ordering::Relaxed);
-            CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+            CARD_STATS[6].fetch_add(wait_us_total, Ordering::Relaxed);
         }
-        // Group pieces by shadow so parallel `wide_merge` workers never contend on
-        // the same shadow's `before`/`old` mutexes.
-        let fast_data = fast_buf.map_or(0, |(_, d)| d);
-        let slow_data = slow_buf.map_or(0, |(_, d)| d);
-        type MergePiece = (Arc<crate::shadow::Shadow>, usize, usize, usize, u64);
-        let mut by_shadow: Vec<(usize, Vec<MergePiece>)> = Vec::new();
-        let mut shadow_pos: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::new();
-        for (shadow, lo, hi, at) in fast {
-            let ptr = Arc::as_ptr(&shadow) as usize;
-            let item = (shadow, lo, hi, fast_data + at as usize, landed_seq);
-            match shadow_pos.get(&ptr) {
-                Some(&idx) => by_shadow[idx].1.push(item),
-                None => {
-                    shadow_pos.insert(ptr, by_shadow.len());
-                    by_shadow.push((ptr, vec![item]));
-                }
-            }
+        COPY_BACK[1].fetch_add(total_written as u64, Ordering::Relaxed);
+        if landed_seq > 0 {
+            crate::shadow::relay_fetched(landed_seq);
         }
-        for (shadow, lo, hi, at) in slow {
-            let ptr = Arc::as_ptr(&shadow) as usize;
-            let item = (shadow, lo, hi, slow_data + at as usize, slow_after);
-            match shadow_pos.get(&ptr) {
-                Some(&idx) => by_shadow[idx].1.push(item),
-                None => {
-                    shadow_pos.insert(ptr, by_shadow.len());
-                    by_shadow.push((ptr, vec![item]));
-                }
-            }
-        }
-        let written = if wide_merge() && by_shadow.len() >= 2 && piece_count >= 8 {
-            let total_written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let worker_count = by_shadow.len().min(8);
-            let mut buckets: Vec<Vec<MergePiece>> = (0..worker_count).map(|_| Vec::new()).collect();
-            let mut bucket_bytes = vec![0usize; worker_count];
-            by_shadow.sort_unstable_by(|a, b| {
-                let ba: usize = a.1.iter().map(|p| p.2 - p.1).sum();
-                let bb: usize = b.1.iter().map(|p| p.2 - p.1).sum();
-                bb.cmp(&ba)
-            });
-            for (_, group) in by_shadow {
-                let bytes: usize = group.iter().map(|p| p.2 - p.1).sum();
-                let dst = bucket_bytes
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, b)| **b)
-                    .map_or(0, |(i, _)| i);
-                bucket_bytes[dst] += bytes;
-                buckets[dst].extend(group);
-            }
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
-                .into_iter()
-                .filter(|b| !b.is_empty())
-                .map(|chunk| {
-                    let total_written = total_written.clone();
-                    Box::new(move || {
-                        let mut title = Vec::new();
-                        let mut local = 0usize;
-                        for (shadow, lo, hi, src, after) in chunk {
-                            // SAFETY: the mapping of the fetched bytes; the copy into it
-                            // has run, and `wide_run` joins before this function returns.
-                            let gpu = unsafe {
-                                std::slice::from_raw_parts(src as *const u8, hi - lo)
-                            };
-                            let merged = shadow.card_merge_relay(lo, gpu, after, &mut title);
-                            shadow.walls_merged(gpu.len(), merged);
-                            local += merged;
-                        }
-                        total_written.fetch_add(local, Ordering::Relaxed);
-                    }) as Box<dyn FnOnce() + Send>
-                })
-                .collect();
-            crate::shadow::wide_run(jobs);
-            total_written.load(Ordering::Relaxed)
-        } else {
-            let mut title = Vec::new();
-            let mut written = 0;
-            for (_, group) in by_shadow {
-                for (shadow, lo, hi, src, after) in group {
-                    // SAFETY: the mapping of the fetched bytes; the copy into it has run.
-                    let gpu = unsafe { std::slice::from_raw_parts(src as *const u8, hi - lo) };
-                    let merged = shadow.card_merge_relay(lo, gpu, after, &mut title);
-                    shadow.walls_merged(gpu.len(), merged);
-                    written += merged;
-                }
-            }
-            written
-        };
-        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-        crate::shadow::relay_fetched(slow_after);
     }
 
     fn relay_land(
@@ -4120,6 +4452,17 @@ impl Host {
                                 };
                                 let merged = shadow.card_merge(lo, gpu, &mut title);
                                 shadow.walls_merged(gpu.len(), merged);
+                                #[cfg(feature = "diagnostics")]
+                                {
+                                    let (s_start, s_len) = shadow.span();
+                                    crate::copystat::card_back(
+                                        s_start as usize,
+                                        s_len as usize,
+                                        1,
+                                        gpu.len(),
+                                        merged,
+                                    );
+                                }
                                 counts[i].fetch_add(merged, Ordering::Relaxed);
                             }
                         }) as Box<dyn FnOnce() + Send>
@@ -4143,6 +4486,17 @@ impl Host {
                         };
                         let merged = shadow.card_merge(lo, gpu, &mut title);
                         shadow.walls_merged(gpu.len(), merged);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            let (s_start, s_len) = shadow.span();
+                            crate::copystat::card_back(
+                                s_start as usize,
+                                s_len as usize,
+                                1,
+                                gpu.len(),
+                                merged,
+                            );
+                        }
                         written[i] += merged;
                     }
                 }
@@ -4534,17 +4888,53 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown, &mut submitted);
+        let mut card = self.card_before(runs, flown, &mut submitted);
+        let sync_cmd = card.as_mut().and_then(|c| c.sync.take());
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
-            // SAFETY: closed lists; the fence is ours.
+            // SAFETY: closed lists; the fence is ours. `sync_cmd` runs in its own
+            // `ExecuteCommandLists` call before `lists` so card buffers decay back
+            // to `COMMON` before title command lists bind them.
             let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
-                self.queue.Signal(&self.fence, *submitted)
+                let completed_3d = self.fence.GetCompletedValue();
+                let mut sync_guard = queue_sync();
+                let sync = sync_guard.get_or_insert_with(QueueSync::new);
+                let wait_res = if let Some(c) = &card
+                    && let Some(copy_fence) = &self.copy_fence
+                {
+                    let need_copy = sync.max_copy_read_for(&c.written_shadows);
+                    if need_copy > 0 && copy_fence.GetCompletedValue() < need_copy {
+                        self.queue.Wait(copy_fence, need_copy)
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
+                };
+                if wait_res.is_ok() {
+                    if let Some(sync_list) = sync_cmd {
+                        self.queue.ExecuteCommandLists(&[Some(sync_list)]);
+                    }
+                    self.queue.ExecuteCommandLists(&lists);
+                    let sig = self.queue.Signal(&self.fence, *submitted);
+                    if sig.is_ok()
+                        && let Some(c) = &card
+                    {
+                        sync.record_3d_writes(
+                            &c.written_shadows,
+                            *submitted,
+                            c.order_seq,
+                            completed_3d,
+                        );
+                    }
+                    sig
+                } else {
+                    wait_res
+                }
             };
             self.card_sent();
             if let Err(e) = signalled {
@@ -4586,6 +4976,17 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        if let Some(c) = &card
+            && let Err(e) = self.wait_copy_queue_on_3d(&c.written_shadows)
+        {
+            tracing::warn!(error = %e, "host submission copy-queue wait failed");
+        }
+        if let Some(sync_list) = sync_cmd {
+            // SAFETY: closed card sync list executed separately so buffers decay to COMMON.
+            unsafe {
+                self.queue.ExecuteCommandLists(&[Some(sync_list)]);
+            }
+        }
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -4714,7 +5115,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_ends(lock);
         if relay() {
-            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            crate::shadow::relay_fetched(with_queue_sync(|sync| sync.order));
         }
         working(was_working);
         None
