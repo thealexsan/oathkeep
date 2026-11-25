@@ -8,16 +8,79 @@ const DEFAULT_HOT_FRAMES: u64 = 48;
 const HOT_WINDOW_FRAMES: u64 = 16;
 const MAX_COOL_BACKOFF: u8 = 6;
 
-static WRITE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GLOBAL_WRITE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RANGED_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WriteStamp {
+    pub(crate) global: u64,
+    pub(crate) ranged: u64,
+}
+
+const WRITE_RANGE_LOG_CAP: usize = 256;
+
+struct WriteRangeLog {
+    seq: u64,
+    entries: [(u64, usize, usize); WRITE_RANGE_LOG_CAP],
+}
+
+static WRITE_RANGE_LOG: std::sync::Mutex<WriteRangeLog> = std::sync::Mutex::new(WriteRangeLog {
+    seq: 0,
+    entries: [(0, 0, 0); WRITE_RANGE_LOG_CAP],
+});
 
 #[inline]
-pub(crate) fn write_epoch() -> u64 {
-    WRITE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+pub(crate) fn write_stamp() -> WriteStamp {
+    let ranged = RANGED_WRITE_SEQ.load(std::sync::atomic::Ordering::Acquire);
+    let global = GLOBAL_WRITE_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    WriteStamp { global, ranged }
 }
 
 #[inline]
-fn bump_write_epoch() {
-    WRITE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+fn bump_global_write_epoch() {
+    GLOBAL_WRITE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+#[inline]
+fn record_written_range(start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    match WRITE_RANGE_LOG.try_lock() {
+        Ok(mut log) => {
+            let seq = log.seq.wrapping_add(1);
+            log.seq = seq;
+            log.entries[(seq as usize) % WRITE_RANGE_LOG_CAP] = (seq, start, end);
+            RANGED_WRITE_SEQ.store(seq, std::sync::atomic::Ordering::Release);
+        }
+        Err(_) => bump_global_write_epoch(),
+    }
+}
+
+pub(crate) fn written_ranges_since(prev: WriteStamp, now: WriteStamp) -> Option<Vec<(usize, usize)>> {
+    if prev.global != now.global {
+        return None;
+    }
+    if prev.ranged == now.ranged {
+        return Some(Vec::new());
+    }
+    if now.ranged < prev.ranged || now.ranged - prev.ranged > WRITE_RANGE_LOG_CAP as u64 {
+        return None;
+    }
+    let log = WRITE_RANGE_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if log.seq < now.ranged || log.seq - prev.ranged > WRITE_RANGE_LOG_CAP as u64 {
+        return None;
+    }
+    let count = (now.ranged - prev.ranged) as usize;
+    let mut out = Vec::with_capacity(count);
+    for seq in (prev.ranged + 1)..=now.ranged {
+        let (entry_seq, start, end) = log.entries[(seq as usize) % WRITE_RANGE_LOG_CAP];
+        if entry_seq != seq {
+            return None;
+        }
+        out.push((start, end));
+    }
+    Some(out)
 }
 
 fn hot_frames() -> u64 {
@@ -355,7 +418,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 }
 
 pub(crate) fn ask_once_end() {
-    bump_write_epoch();
+    bump_global_write_epoch();
     let mut j = journal_write();
     if j.kept {
         j.kept = false;
@@ -367,7 +430,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     if len == 0 {
         return;
     }
-    bump_write_epoch();
+    record_written_range(at, at.saturating_add(len));
     let mut j = journal_write();
     if !j.kept {
         return;
@@ -1164,7 +1227,19 @@ fn open_fault(g: &mut Guards, at: usize) -> bool {
     if !opened {
         return false;
     }
-    bump_write_epoch();
+    let fault_block = at / BLOCK;
+    record_written_range(
+        fault_block.saturating_mul(BLOCK),
+        fault_block.saturating_add(1).saturating_mul(BLOCK),
+    );
+    for &alias in &aliases {
+        if alias != fault_block {
+            record_written_range(
+                alias.saturating_mul(BLOCK),
+                alias.saturating_add(1).saturating_mul(BLOCK),
+            );
+        }
+    }
     if hot_enabled() {
         let block = at / BLOCK;
         let frame = crate::frame::current();
@@ -1279,7 +1354,7 @@ pub fn title_memory_committed(at: usize, len: usize) {
     if len == 0 {
         return;
     }
-    bump_write_epoch();
+    record_written_range(at, at.saturating_add(len));
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let g = guards_read();
@@ -1300,7 +1375,7 @@ pub fn title_memory_committed(at: usize, len: usize) {
 
 pub fn writing(at: usize, len: usize) {
     if len > 0 {
-        bump_write_epoch();
+        record_written_range(at, at.saturating_add(len));
         if let Some(commit) = COMMIT_TITLE_MEMORY.get() {
             commit(at, len);
         }
@@ -1343,7 +1418,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
-    bump_write_epoch();
+    record_written_range(at, at.saturating_add(len));
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -1465,7 +1540,7 @@ pub fn wait_if_title_memory_remapping() -> bool {
 }
 
 pub fn title_memory_remapped(at: usize, len: usize) {
-    bump_write_epoch();
+    bump_global_write_epoch();
     crate::descriptor::host::remapped(at, len);
     crate::inplace::views_gone(at, len);
     crate::inplace::title_memory_freeing(at, len);

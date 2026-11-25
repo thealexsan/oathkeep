@@ -6629,6 +6629,10 @@ impl HostList {
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
+        let end = (dst as usize).saturating_add(len);
+        deferred
+            .refreshed
+            .retain(|&(_, a, n)| a >= end || a.saturating_add(n) <= dst as usize);
         if let Some(Step::Copy(d, s, n)) = deferred.copies.last_mut()
             && continues((*d, *s, *n), (dst as usize, src as usize, len))
         {
@@ -6641,7 +6645,6 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
     }
 
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
@@ -6883,7 +6886,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_written_range(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     crate::watch::wrote(dst, len);
                     len
@@ -6934,7 +6937,8 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
+                    let (start, len) = staging.memory();
+                    if batch.texture_due_range(staging, start, len) {
                         batch.pending_textures.push(staging.clone());
                     }
                     continue;
@@ -6959,7 +6963,7 @@ fn wide_refresh() -> bool {
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     index: std::collections::HashMap<usize, usize>,
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashMap<usize, (usize, usize)>,
     pending_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
     after_textures: Vec<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
@@ -7006,14 +7010,69 @@ impl Batch {
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
+        self.texture_due_range(staging, 0, usize::MAX)
+    }
+
+    fn texture_due_range<T>(&mut self, staging: &std::sync::Arc<T>, start: usize, len: usize) -> bool {
+        let key = std::sync::Arc::as_ptr(staging) as *const () as usize;
         self.textures
-            .insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+            .insert(key, (start, start.saturating_add(len)))
+            .is_none()
     }
 
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+    }
+
+    fn title_written_range(&mut self, dst: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = dst.saturating_add(len);
+        let mut overlapping_shadows = Vec::new();
+        let mut i = 0;
+        while i < self.refreshes.len() {
+            if self.refreshes[i]
+                .1
+                .iter()
+                .any(|&(a, b)| a < end && b > dst)
+            {
+                let (shadow, spans) = self.refreshes.swap_remove(i);
+                self.index
+                    .remove(&(std::sync::Arc::as_ptr(&shadow) as usize));
+                if let Some(moved) = self.refreshes.get(i) {
+                    self.index
+                        .insert(std::sync::Arc::as_ptr(&moved.0) as usize, i);
+                }
+                overlapping_shadows.push((shadow, spans));
+            } else {
+                i += 1;
+            }
+        }
+        for (shadow, spans) in overlapping_shadows {
+            for (from, to) in spans {
+                Self::update(&shadow, from, to);
+            }
+        }
+        let mut overlapping_textures = Vec::new();
+        let mut i = 0;
+        while i < self.pending_textures.len() {
+            let (t_start, t_len) = self.pending_textures[i].memory();
+            let t_end = t_start.saturating_add(t_len);
+            if t_start < end && t_end > dst {
+                overlapping_textures.push(self.pending_textures.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        for staging in overlapping_textures {
+            staging.refresh();
+        }
+        self.textures
+            .retain(|_, &mut (t_start, t_end)| t_end <= dst || t_start >= end);
     }
 
     fn flush(&mut self) {
@@ -9006,6 +9065,22 @@ mod batch {
         assert!(!batch.texture_due(&a));
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[test]
+    fn title_written_range_only_invalidates_overlapping_textures() {
+        let mut batch = Batch::default();
+        let (a, b) = (Arc::new(1u32), Arc::new(2u32));
+        assert!(batch.texture_due_range(&a, 0x1000, 0x400));
+        assert!(batch.texture_due_range(&b, 0x4000, 0x400));
+        // Non-overlapping write leaves both textures deduplicated.
+        batch.title_written_range(0x2000, 0x400);
+        assert!(!batch.texture_due_range(&a, 0x1000, 0x400));
+        assert!(!batch.texture_due_range(&b, 0x4000, 0x400));
+        // Write overlapping only `a` makes `a` due again while keeping `b`.
+        batch.title_written_range(0x1200, 0x100);
+        assert!(batch.texture_due_range(&a, 0x1000, 0x400));
+        assert!(!batch.texture_due_range(&b, 0x4000, 0x400));
     }
 
     #[test]

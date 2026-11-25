@@ -562,6 +562,43 @@ pub(crate) fn thread_edges(
     Ok(rename(blocks, p.wave64, p.vgprs))
 }
 
+fn reaches_cycle(p: &Program, start: usize, stop: Option<usize>) -> bool {
+    let mut state = vec![0u8; p.blocks.len()];
+    let mut stack = vec![(start, 0usize)];
+    while let Some((x, next_idx)) = stack.last_mut() {
+        let u = *x;
+        if Some(u) == stop {
+            stack.pop();
+            continue;
+        }
+        if *next_idx == 0 {
+            if state[u] == 2 {
+                stack.pop();
+                continue;
+            }
+            state[u] = 1;
+        }
+        let succs = p.blocks[u].exit.successors();
+        if *next_idx < succs.len() {
+            let v = succs[*next_idx];
+            *next_idx += 1;
+            if Some(v) == stop {
+                continue;
+            }
+            if state[v] == 1 {
+                return true;
+            }
+            if state[v] == 0 {
+                stack.push((v, 0));
+            }
+        } else {
+            state[u] = 2;
+            stack.pop();
+        }
+    }
+    false
+}
+
 pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
     let ends = |b: usize| {
         p.blocks[b].exit == Exit::End
@@ -577,6 +614,7 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
             continue;
         };
         if ends(taken)
+            && !reaches_cycle(p, not_taken, None)
             && block
                 .insts
                 .last()
@@ -661,6 +699,9 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         v
     };
     let skipped = |b: usize, target: usize, first: usize| -> Option<Vec<bool>> {
+        if reaches_cycle(p, first, Some(target)) {
+            return None;
+        }
         let mut inside = vec![false; n];
         let mut stack = vec![first];
         while let Some(x) = stack.pop() {
@@ -726,7 +767,9 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         {
             continue;
         }
-        if ends(taken) || skipped(b, taken, not_taken).is_some() {
+        if (ends(taken) && !reaches_cycle(p, not_taken, None))
+            || skipped(b, taken, not_taken).is_some()
+        {
             blocks[b].insts.pop();
             blocks[b].exit = Exit::Jump(not_taken);
             any = true;
@@ -1530,6 +1573,34 @@ mod tests {
         let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
         assert!(without_skips(&idle, false).is_none());
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
+
+        // An s_cbranch_execz guarding a loop must NEVER be stripped: entering a loop
+        // with EXEC == 0 breaks v_cmp / s_cbranch_vccz exit checks and spins to the loop cap.
+        let loop_body = [
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBF86_FFFE, // s_cbranch_vccz -2 (backedge to v_cmp_gt_u32)
+        ];
+        let guarded_loop = skip(&loop_body, &[]);
+        assert_eq!(skips(&guarded_loop), 1);
+        assert!(without_skips(&guarded_loop, false).is_none());
+        assert!(without_skips(&guarded_loop, true).is_none());
+
+        // An early-out s_cbranch_execz to s_endpgm before a loop must also be kept.
+        let early_loop = build_words(
+            &[
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0002, // s_cbranch_execz +2 -> s_endpgm
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBF86_FFFE, // s_cbranch_vccz -2
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert_eq!(skips(&early_loop), 1);
+        assert!(without_early_outs(&early_loop).is_none());
+        assert!(without_skips(&early_loop, false).is_none());
+        assert!(without_skips(&early_loop, true).is_none());
     }
 
     #[test]

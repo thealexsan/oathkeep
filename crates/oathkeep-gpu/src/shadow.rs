@@ -35,16 +35,70 @@ pub(crate) struct Shadow {
 #[derive(Default)]
 struct ScannedSubmission {
     submission: u64,
-    epoch: u64,
+    stamp: crate::watch::WriteStamp,
     spans: Vec<(usize, usize)>,
 }
 
 impl ScannedSubmission {
-    fn uncovered(&self, submission: u64, epoch: u64, from: usize, to: usize) -> Vec<(usize, usize)> {
+    fn sync(&mut self, submission: u64, now: crate::watch::WriteStamp) {
+        if self.submission != submission || self.stamp.global != now.global {
+            self.submission = submission;
+            self.stamp = now;
+            self.spans.clear();
+            return;
+        }
+        if self.stamp.ranged == now.ranged {
+            return;
+        }
+        match crate::watch::written_ranges_since(self.stamp, now) {
+            Some(ranges) => {
+                for (wa, wb) in ranges {
+                    self.subtract(wa, wb);
+                }
+                self.stamp = now;
+            }
+            None => {
+                self.stamp = now;
+                self.spans.clear();
+            }
+        }
+    }
+
+    fn subtract(&mut self, wa: usize, wb: usize) {
+        if wa >= wb || self.spans.is_empty() {
+            return;
+        }
+        let mut i = self.spans.partition_point(|&(_, b)| b <= wa);
+        while i < self.spans.len() && self.spans[i].0 < wb {
+            let (a, b) = self.spans[i];
+            if a < wa && b > wb {
+                self.spans[i] = (a, wa);
+                self.spans.insert(i + 1, (wb, b));
+                break;
+            } else if a < wa {
+                self.spans[i].1 = wa;
+                i += 1;
+            } else if b > wb {
+                self.spans[i].0 = wb;
+                break;
+            } else {
+                self.spans.remove(i);
+            }
+        }
+    }
+
+    fn uncovered(
+        &mut self,
+        submission: u64,
+        now: crate::watch::WriteStamp,
+        from: usize,
+        to: usize,
+    ) -> Vec<(usize, usize)> {
         if from >= to {
             return Vec::new();
         }
-        if self.submission != submission || self.epoch != epoch || self.spans.is_empty() {
+        self.sync(submission, now);
+        if self.spans.is_empty() {
             return vec![(from, to)];
         }
         let mut out = Vec::new();
@@ -68,17 +122,17 @@ impl ScannedSubmission {
         out
     }
 
-    fn record(&mut self, submission: u64, epoch: u64, from: usize, to: usize) {
+    fn record(
+        &mut self,
+        submission: u64,
+        now: crate::watch::WriteStamp,
+        from: usize,
+        to: usize,
+    ) {
         if from >= to {
             return;
         }
-        if self.submission != submission || self.epoch != epoch {
-            self.submission = submission;
-            self.epoch = epoch;
-            self.spans.clear();
-            self.spans.push((from, to));
-            return;
-        }
+        self.sync(submission, now);
         let mut lo = from;
         let mut hi = to;
         let mut first = self.spans.len();
@@ -3722,12 +3776,12 @@ impl Shadow {
         if sub == 0 {
             return self.update_free_span(from, to);
         }
-        let epoch = crate::watch::write_epoch();
+        let stamp = crate::watch::write_stamp();
         let todo = self
             .scanned
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .uncovered(sub, epoch, from, to);
+            .uncovered(sub, stamp, from, to);
         if todo.is_empty() {
             return 0;
         }
@@ -3735,10 +3789,10 @@ impl Shadow {
         for &(a, b) in &todo {
             copied += self.update_free_span(a, b);
         }
-        if crate::watch::write_epoch() == epoch {
+        if crate::watch::write_stamp() == stamp {
             let mut scanned = self.scanned.lock().unwrap_or_else(|e| e.into_inner());
             for (a, b) in todo {
-                scanned.record(sub, epoch, a, b);
+                scanned.record(sub, stamp, a, b);
             }
         }
         copied
@@ -6517,30 +6571,50 @@ mod window_tests {
     #[test]
     fn scanned_submission_deduplicates_overlapping_ranges_and_invalidates_on_epoch_or_sub() {
         use super::ScannedSubmission;
+        use crate::watch::{WriteStamp, wrote};
         let mut s = ScannedSubmission::default();
+        let st0 = crate::watch::write_stamp();
 
-        // First scan in submission 1, epoch 7 covers [100, 300).
-        assert_eq!(s.uncovered(1, 7, 100, 300), vec![(100, 300)]);
-        s.record(1, 7, 100, 300);
+        // First scan in submission 1 covers [100, 300).
+        assert_eq!(s.uncovered(1, st0, 100, 300), vec![(100, 300)]);
+        s.record(1, st0, 100, 300);
 
-        // Exact and contained repeats in the same submission & epoch return empty!
-        assert!(s.uncovered(1, 7, 100, 300).is_empty());
-        assert!(s.uncovered(1, 7, 150, 250).is_empty());
+        // Exact and contained repeats in the same submission & stamp return empty!
+        assert!(s.uncovered(1, st0, 100, 300).is_empty());
+        assert!(s.uncovered(1, st0, 150, 250).is_empty());
 
         // Overlapping range returns only the uncovered wings and coalesces on record.
-        assert_eq!(s.uncovered(1, 7, 50, 400), vec![(50, 100), (300, 400)]);
-        s.record(1, 7, 50, 100);
-        s.record(1, 7, 300, 400);
-        assert!(s.uncovered(1, 7, 50, 400).is_empty());
+        assert_eq!(s.uncovered(1, st0, 50, 400), vec![(50, 100), (300, 400)]);
+        s.record(1, st0, 50, 100);
+        s.record(1, st0, 300, 400);
+        assert!(s.uncovered(1, st0, 50, 400).is_empty());
         assert_eq!(s.spans, vec![(50, 400)]);
 
-        // Epoch bump (e.g. Step::Copy / Step::Run / watch::writing / VEH fault) invalidates cache.
-        assert_eq!(s.uncovered(1, 8, 50, 400), vec![(50, 400)]);
-        s.record(1, 8, 50, 400);
-        assert!(s.uncovered(1, 8, 50, 400).is_empty());
+        // Non-overlapping ranged write preserves scanned spans completely.
+        wrote(1000, 256);
+        let st1 = crate::watch::write_stamp();
+        assert!(s.uncovered(1, st1, 50, 400).is_empty());
+        assert_eq!(s.spans, vec![(50, 400)]);
+
+        // Overlapping ranged write subtracts ONLY the written subrange [150, 220).
+        wrote(150, 70);
+        let st2 = crate::watch::write_stamp();
+        assert_eq!(s.uncovered(1, st2, 50, 400), vec![(150, 220)]);
+        assert_eq!(s.spans, vec![(50, 150), (220, 400)]);
+        s.record(1, st2, 150, 220);
+        assert_eq!(s.spans, vec![(50, 400)]);
+
+        // Global epoch bump invalidates the entire cache.
+        let st3 = WriteStamp {
+            global: st2.global + 1,
+            ranged: st2.ranged,
+        };
+        assert_eq!(s.uncovered(1, st3, 50, 400), vec![(50, 400)]);
+        s.record(1, st3, 50, 400);
+        assert!(s.uncovered(1, st3, 50, 400).is_empty());
 
         // New submission invalidates cache.
-        assert_eq!(s.uncovered(2, 8, 50, 400), vec![(50, 400)]);
+        assert_eq!(s.uncovered(2, st3, 50, 400), vec![(50, 400)]);
     }
 }
 
