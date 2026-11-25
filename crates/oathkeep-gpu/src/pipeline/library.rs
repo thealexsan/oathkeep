@@ -128,8 +128,31 @@ enum Blob {
 
 impl Blob {
     fn of(dir: &std::path::Path) -> Blob {
+        Self::of_version(dir, &crate::shader_cache::build_hex())
+    }
+
+    fn of_version(dir: &std::path::Path, version: &str) -> Blob {
         let path = dir.join(LIBRARY_FILE);
         let next = dir.join(NEXT_FILE);
+        let ver_path = dir.join(VERSION_FILE);
+        let stored = std::fs::read_to_string(&ver_path).ok();
+        if stored.as_deref().map(str::trim) != Some(version) {
+            let had_old = path.exists() || next.exists();
+            if had_old {
+                tracing::info!(
+                    old = stored.as_deref().map(str::trim).unwrap_or("none"),
+                    new = version,
+                    "host pipeline library version changed; clearing stale cache"
+                );
+            }
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&next);
+            let _ = std::fs::remove_file(path.with_extension("tmp"));
+            if std::fs::create_dir_all(dir).is_ok() {
+                let _ = write_atomically(&ver_path, version.as_bytes());
+            }
+            return Blob::None;
+        }
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!(
                 "the host pipeline library saved last could not take the old one's place"
@@ -350,6 +373,7 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 const NEXT_FILE: &str = "host-pipelines.next";
+const VERSION_FILE: &str = "host-pipelines.ver";
 const EARLY_FILE: &str = "early-pipelines.txt";
 const EARLY_MAX: usize = 8192;
 
@@ -559,6 +583,14 @@ pub(crate) fn save(now: bool) {
         });
     }
     let written = library_written
+        .and_then(|()| {
+            let ver = dir.join(VERSION_FILE);
+            if ver.exists() {
+                Ok(())
+            } else {
+                write_atomically(&ver, crate::shader_cache::build_hex().as_bytes())
+            }
+        })
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
@@ -688,6 +720,24 @@ mod tests {
         drop(blob);
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
         assert!(!dir.path().join(NEXT_FILE).exists());
+    }
+
+    #[test]
+    fn stale_library_is_cleared_on_version_change_preserving_early_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        let early = dir.path().join(EARLY_FILE);
+        std::fs::write(&early, b"abc123\n").unwrap();
+        assert!(matches!(Blob::of_version(dir.path(), "v1"), Blob::None));
+        std::fs::write(&path, b"old-blob-bytes").unwrap();
+        assert_eq!(Blob::of_version(dir.path(), "v1").bytes(), b"old-blob-bytes");
+        assert!(matches!(Blob::of_version(dir.path(), "v2"), Blob::None));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(&early).unwrap(), "abc123\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(VERSION_FILE)).unwrap(),
+            "v2"
+        );
     }
 
     fn pattern(at: usize, out: &mut [u8]) {

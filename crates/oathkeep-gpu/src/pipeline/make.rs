@@ -215,7 +215,7 @@ impl Queue {
     }
 
     fn pop(&mut self, allow_early: bool) -> Option<(Arc<Pending>, bool)> {
-        if let Some(p) = self.requested.pop_front() {
+        if let Some(p) = self.requested.pop_back() {
             p.queue_state.store(MAKING, Ordering::Relaxed);
             return Some((p, false));
         }
@@ -274,11 +274,17 @@ fn early_allowed() -> bool {
 }
 
 fn early_limit() -> usize {
-    let max = worker_count().min(2);
+    let max = worker_count().min(4);
     let Some(avail) = crate::host::available_commit() else {
         return max;
     };
-    if avail < (4608u64 << 20) { 1 } else { max }
+    if avail < (3072u64 << 20) {
+        1
+    } else if avail < (4096u64 << 20) {
+        max.min(2)
+    } else {
+        max
+    }
 }
 
 fn next() -> (Arc<Pending>, bool) {
@@ -473,8 +479,8 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &requested));
         assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &promoted));
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &requested));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(queue.pop(false).is_none());
         assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &earlier));

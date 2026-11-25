@@ -30,6 +30,16 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+pub(crate) fn build_hex() -> String {
+    let bytes = build();
+    let mut out = String::with_capacity(32);
+    for b in &bytes[..16] {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 fn build() -> [u8; 32] {
     static WARNED: std::sync::Once = std::sync::Once::new();
     let limit = oathkeep_shader::emit::loop_limit();

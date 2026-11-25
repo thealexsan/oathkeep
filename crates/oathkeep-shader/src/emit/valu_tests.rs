@@ -5,6 +5,24 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
+#[repr(transparent)]
+struct AgilitySdkPath(*const u8);
+// SAFETY: Points to a static NUL-terminated ASCII string literal.
+unsafe impl Sync for AgilitySdkPath {}
+
+#[unsafe(export_name = "D3D12SDKVersion")]
+#[used]
+static D3D12_SDK_VERSION: u32 = 620;
+
+#[unsafe(export_name = "D3D12SDKPath")]
+#[used]
+static D3D12_SDK_PATH: AgilitySdkPath = AgilitySdkPath(c".\\D3D12\\".as_ptr().cast());
+
+#[cfg(target_env = "msvc")]
+#[unsafe(link_section = ".drectve")]
+#[used]
+static AGILITY_EXPORTS: [u8; 56] = *b" /EXPORT:D3D12SDKVersion,DATA /EXPORT:D3D12SDKPath,DATA ";
+
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
@@ -1488,5 +1506,227 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
                 want.to_bits(),
             );
         }
+    }
+}
+
+const fn vop3p(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16, clamp: bool) -> [u32; 2] {
+    [
+        0x33 << 26 | (op as u32 & 0x7F) << 16 | (clamp as u32) << 15 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18,
+    ]
+}
+
+const fn s_buffer_load(op: u16, dst: u8, base: u8, byte_off: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | (op as u32 & 0xFF) << 18 | (dst as u32 & 0x7F) << 6 | ((base as u32 >> 1) & 0x3F),
+        125 << 25 | (byte_off & 0x1F_FFFF),
+    ]
+}
+
+fn dot4_i8_ref(a: u32, b: u32, acc: u32, clamp: bool) -> u32 {
+    let mut dot = 0i64;
+    for lane in 0..4 {
+        let ba = ((a >> (8 * lane)) as u8 as i8) as i64;
+        let bb = ((b >> (8 * lane)) as u8 as i8) as i64;
+        dot += ba * bb;
+    }
+    let sum = dot + (acc as i32 as i64);
+    if clamp {
+        sum.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32 as u32
+    } else {
+        (sum as i32) as u32
+    }
+}
+
+fn pack_i8(b: [i8; 4]) -> u32 {
+    u32::from_le_bytes(b.map(|x| x as u8))
+}
+
+#[test]
+fn v_dot4_i32_i8_and_v_dot4c_i32_i8_match_rdna2() {
+    let cases: &[[u32; 4]] = &[
+        // Distinct signed bytes + non-zero acc to catch any (acc, a, b) vs (a, b, acc) swap.
+        [pack_i8([1, -2, 3, -4]), pack_i8([5, 6, -7, 8]), 1000, 0],
+        [pack_i8([127, -128, 64, -63]), pack_i8([-128, 127, -32, 31]), -500i32 as u32, 0],
+        [pack_i8([-1, -1, -1, -1]), pack_i8([10, 20, 30, 40]), 42, 0],
+        // Positive overflow (tests clamp vs wrap).
+        [pack_i8([127, 127, 127, 127]), pack_i8([127, 127, 127, 127]), i32::MAX as u32 - 10, 0],
+        // Negative overflow (tests clamp vs wrap).
+        [pack_i8([-128, -128, -128, -128]), pack_i8([127, 127, 127, 127]), i32::MIN as u32 + 10, 0],
+    ];
+
+    for clamp in [false, true] {
+        // v_dot4_i32_i8 v0, v1, v2, v3 [clamp]
+        let shader = build_valu_cs(&vop3p(0x016, 0, vgpr(1), vgpr(2), vgpr(3), clamp));
+        run_cases(&shader, cases, |backend, i, inputs, got| {
+            let want = dot4_i8_ref(inputs[0], inputs[1], inputs[2], clamp);
+            assert_eq!(
+                got, want,
+                "{backend}: v_dot4_i32_i8 clamp={clamp} case {i} ({inputs:08x?}) = {got:#010x} ({}), want {want:#010x} ({})",
+                got as i32, want as i32
+            );
+        });
+    }
+
+    // v_dot4c_i32_i8 v0, v1, v2 (accumulates into v0; seed v0 from v3 first).
+    let body = [
+        vop1(0x001, 0, vgpr(3)),
+        vop2(0x00d, 0, vgpr(1), 2),
+    ];
+    let shader = build_valu_cs(&body);
+    run_cases(&shader, cases, |backend, i, inputs, got| {
+        let want = dot4_i8_ref(inputs[0], inputs[1], inputs[2], false);
+        assert_eq!(
+            got, want,
+            "{backend}: v_dot4c_i32_i8 case {i} ({inputs:08x?}) = {got:#010x} ({}), want {want:#010x} ({})",
+            got as i32, want as i32
+        );
+    });
+}
+
+#[test]
+fn s_buffer_load_dwordx_vectorized_srv_returns_exact_dwords() {
+    use super::host::Stride;
+
+    let srv_data: Vec<u32> = (0..32u32)
+        .map(|i| 0xA500_0000 ^ i.wrapping_mul(0x0101_0101) ^ (i << 12))
+        .collect();
+
+    for (op, count, base_off) in [
+        (0x00au16, 4u32, 8u32),   // s_buffer_load_dwordx4 at byte offset 8 (words 2..6)
+        (0x00bu16, 8u32, 16u32),  // s_buffer_load_dwordx8 at byte offset 16 (words 4..12)
+        (0x00cu16, 16u32, 24u32), // s_buffer_load_dwordx16 at byte offset 24 (words 6..22)
+    ] {
+        let mut words = Vec::new();
+        // Table at user_data s0 (descriptor 0 = SRV, descriptor 1 = UAV).
+        words.push(s_mov_b32(1, 0x80)); // s1 = 0
+        // Load SRV descriptor into s[4:7] (offset 0) and UAV descriptor into s[8:11] (offset 32).
+        words.extend_from_slice(&s_load_dwordx4(4, 0));
+        words.extend_from_slice(&[
+            0x3D << 26 | 0x02 << 18 | (8u32 << 6) | 0,
+            125 << 25 | 32,
+        ]);
+        // Load `count` dwords from SRV s[4:7] into s[16..16+count].
+        words.extend_from_slice(&s_buffer_load(op, 16, 4, base_off));
+        // Store each loaded SGPR s[16+k] to UAV s[8:11] at byte offset 4*k.
+        for k in 0..count {
+            words.push(vop1(0x001, 0, sgpr(16 + k as u8)));
+            words.extend_from_slice(&buffer_store_dword(0, 8, (k * 4) as u16));
+        }
+        words.push(S_ENDPGM);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                },
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                },
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res =
+            resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower");
+
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views,
+        };
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[
+                            View::Buffer {
+                                data: &srv_data,
+                                stride: Stride::Raw,
+                            },
+                            View::RawUav(count),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            let start = (base_off / 4) as usize;
+            let expected = &srv_data[start..start + count as usize];
+            assert_eq!(
+                out[0], expected,
+                "{label}: s_buffer_load_dwordx{count} mismatch"
+            );
+            ran += 1;
+        }
+        assert!(ran > 0, "no SM 6.6 device available");
     }
 }

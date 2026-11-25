@@ -73,6 +73,11 @@ enum Stop {
     Fail(ShaderError),
 }
 
+fn smem_vec_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_SMEM_VEC").is_none_or(|v| v != "0"))
+}
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
@@ -4975,14 +4980,15 @@ impl<'a> Lower<'a> {
             None => self.slot_stride(src)?,
             Some(_) => None,
         };
+        let smem_step = if smem_vec_enabled() { 4 } else { 1 };
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
             let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
-            for first in (0..count).step_by(4) {
-                let n = (count - first).min(4);
+            for first in (0..count).step_by(smem_step) {
+                let n = (count - first).min(smem_step as u32);
                 let b = self.cur;
                 let off = self.s.m.i32(4 * first);
                 let a = self.s.m.bin(b, Bin::Add, addr, off);
@@ -5023,8 +5029,8 @@ impl<'a> Lower<'a> {
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
             let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-            for first in (0..count).step_by(4) {
-                let n = (count - first).min(4);
+            for first in (0..count).step_by(smem_step) {
+                let n = (count - first).min(smem_step as u32);
                 let off = self.s.m.i32(4 * first);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
                 let mask = self.s.m.i8((1u8 << n) - 1);
