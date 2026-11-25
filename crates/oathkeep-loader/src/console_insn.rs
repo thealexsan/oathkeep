@@ -39,13 +39,24 @@ fn readable(va: usize, bytes: usize) -> bool {
         && m.BaseAddress as usize + m.RegionSize >= va + bytes
 }
 
-fn writable(va: usize, bytes: usize) -> bool {
-    writable_to(va, va + bytes) == Some(va + bytes)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Writable {
+    Committed(usize),
+    ZeroReserved(usize),
 }
 
-fn writable_to(va: usize, end: usize) -> Option<usize> {
+fn writable(va: usize, bytes: usize) -> Option<bool> {
+    match writable_to(va, va + bytes)? {
+        Writable::Committed(to) if to == va + bytes => Some(true),
+        Writable::ZeroReserved(to) if to == va + bytes => Some(false),
+        _ => None,
+    }
+}
+
+fn writable_to(va: usize, end: usize) -> Option<Writable> {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery,
+        MEM_COMMIT, MEM_MAPPED, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE,
+        PAGE_READWRITE, VirtualQuery,
     };
     let remember = remembers();
     if remember {
@@ -57,7 +68,7 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
                 (regions, answers + 1)
             };
             WRITABLE.with(|w| w.set(next));
-            return Some(to.min(end));
+            return Some(Writable::Committed(to.min(end)));
         }
     }
     // SAFETY: plain data filled in by the query.
@@ -65,14 +76,22 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
     // SAFETY: a valid out pointer of the right size.
     let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
     ASKED.fetch_add(1, Relaxed);
-    if !found || m.State != MEM_COMMIT || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0
-    {
+    if !found {
         return None;
     }
     let (from, to) = (
         m.BaseAddress as usize,
         m.BaseAddress as usize + m.RegionSize,
     );
+    if m.State == MEM_RESERVE
+        && m.Type == MEM_MAPPED
+        && m.AllocationProtect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
+    {
+        return Some(Writable::ZeroReserved(to.min(end)));
+    }
+    if m.State != MEM_COMMIT || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 {
+        return None;
+    }
     if remember {
         WRITABLE.with(|w| {
             let (mut regions, answers) = w.get();
@@ -81,7 +100,7 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
             w.set((regions, answers));
         });
     }
-    Some(to.min(end))
+    Some(Writable::Committed(to.min(end)))
 }
 
 pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
@@ -140,11 +159,13 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         ConsoleOnly::Clzero => {
             let a32 = code[..len - 3].contains(&0x67);
             let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
-            if !writable(line, 64) {
+            let Some(needs_write) = writable(line, 64) else {
                 return 0;
+            };
+            if needs_write {
+                // SAFETY: the 64-byte line is committed and writable.
+                unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
             }
-            // SAFETY: the 64-byte line is committed and writable.
-            unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
         }
         ConsoleOnly::ClzeroLoop { end_reg } => {
             let regs: [u64; 16] = [
@@ -156,12 +177,17 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             if end > start && end - start < 2 << 30 {
                 let mut at = start;
                 while at < end {
-                    let Some(to) = writable_to(at, end) else {
-                        break;
-                    };
-                    // SAFETY: committed and writable from `at` to `to`.
-                    unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
-                    at = to;
+                    match writable_to(at, end) {
+                        Some(Writable::Committed(to)) => {
+                            // SAFETY: committed and writable from `at` to `to`.
+                            unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
+                            at = to;
+                        }
+                        Some(Writable::ZeroReserved(to)) => {
+                            at = to;
+                        }
+                        None => break,
+                    }
                 }
                 if at == start {
                     return 0;

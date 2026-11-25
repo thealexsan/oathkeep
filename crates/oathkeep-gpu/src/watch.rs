@@ -1012,7 +1012,29 @@ fn open_here_count(g: &mut Guards, start: usize, end: usize) -> u64 {
     blocks
 }
 
+static COMMIT_TITLE_MEMORY: std::sync::OnceLock<fn(usize, usize)> = std::sync::OnceLock::new();
+
+pub fn set_commit_title_memory(hook: fn(usize, usize)) {
+    let _ = COMMIT_TITLE_MEMORY.set(hook);
+}
+
+pub fn title_memory_committed(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if !guards_read().absent.overlaps(first, last) {
+        return;
+    }
+    guards().absent.remove_range(first, last);
+}
+
 pub fn writing(at: usize, len: usize) {
+    if len > 0
+        && let Some(commit) = COMMIT_TITLE_MEMORY.get()
+    {
+        commit(at, len);
+    }
     open(&mut guards(), at, at.saturating_add(len));
     crate::descriptor::host::remapped(at, len);
 }

@@ -5613,6 +5613,19 @@ fn install_safe_read() {
     });
 }
 
+#[cfg(windows)]
+pub fn is_safe_copy_ip(rip: u64) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        rip == (&raw const oathkeep_safe_copy_loop) as usize as u64
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = rip;
+        false
+    }
+}
+
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn safe_read_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

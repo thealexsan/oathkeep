@@ -1335,6 +1335,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     {
         let len = len as usize;
         list.defer(move || {
+            crate::watch::writing(dst as usize, len);
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {
@@ -1776,6 +1777,17 @@ impl ValueWait {
         }
         let mut raw = [0u8; 8];
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
+            use windows_sys::Win32::System::Memory::{
+                MEM_MAPPED, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+            };
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n =
+                unsafe { VirtualQuery(self.address as *const _, &mut info, size_of_val(&info)) };
+            if n != 0 && info.State == MEM_RESERVE && info.Type == MEM_MAPPED {
+                return self.holds_for(0);
+            }
             return true;
         }
         self.holds_for(u64::from_le_bytes(raw))

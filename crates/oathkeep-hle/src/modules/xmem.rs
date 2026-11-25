@@ -4,18 +4,24 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_COMMITMENT_LIMIT, EXCEPTION_ACCESS_VIOLATION, HANDLE, INVALID_HANDLE_VALUE,
+    NTSTATUS,
+};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+    EXCEPTION_POINTERS,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_MAPPED,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery,
+    VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -151,6 +157,20 @@ pub extern "system" fn XMemVirtualQuery(
             return 0;
         }
         let info = &mut *out;
+        if demand_commit()
+            && process == GetCurrentProcess()
+            && info.host.State == MEM_RESERVE
+            && info.host.Type == MEM_MAPPED
+            && let Some(view_end) = demand_view_end(address as usize)
+        {
+            info.host.State = MEM_COMMIT;
+            info.host.Protect = PAGE_READWRITE;
+            let region_base = info.host.BaseAddress as usize;
+            let max_size = view_end.saturating_sub(region_base);
+            if max_size > 0 && info.host.RegionSize > max_size {
+                info.host.RegionSize = max_size;
+            }
+        }
         info.flags = if info.host.State == MEM_COMMIT {
             GRAPHICS
         } else {
@@ -276,7 +296,42 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+struct Section {
+    handle: HANDLE,
+    committed: Box<[AtomicU64]>,
+}
+
+impl Section {
+    fn new(handle: HANDLE, pages: usize, initially_committed: bool) -> Self {
+        let words = pages.div_ceil(64);
+        let fill = if initially_committed { u64::MAX } else { 0 };
+        let committed = (0..words)
+            .map(|_| AtomicU64::new(fill))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Section { handle, committed }
+    }
+
+    fn is_committed(&self, index: usize) -> bool {
+        let (word, bit) = (index / 64, 1u64 << (index % 64));
+        self.committed
+            .get(word)
+            .is_some_and(|w| w.load(Ordering::Acquire) & bit != 0)
+    }
+
+    fn mark_committed(&self, index: usize) -> bool {
+        let (word, bit) = (index / 64, 1u64 << (index % 64));
+        self.committed
+            .get(word)
+            .is_some_and(|w| w.fetch_or(bit, Ordering::Release) & bit == 0)
+    }
+
+    fn mark_range_committed(&self, start: usize, count: usize) {
+        for i in start..start + count {
+            self.mark_committed(i);
+        }
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -285,10 +340,19 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
-        oathkeep_gpu::title_memory_section_closing(self.0 as usize);
+        oathkeep_gpu::title_memory_section_closing(self.handle as usize);
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
     }
+}
+
+fn demand_commit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !on_wine()
+            && !inplace_sections()
+            && std::env::var_os("OATHKEEP_DEMAND_COMMIT").is_none_or(|v| v != "0")
+    })
 }
 
 fn inplace_sections() -> bool {
@@ -357,6 +421,16 @@ struct Physical {
     next_page: usize,
     pages: HashMap<usize, Slice>,
     views: BTreeMap<usize, (usize, Slice)>,
+}
+
+struct DemandView {
+    len: usize,
+    slice: Slice,
+}
+
+#[derive(Default)]
+struct DemandState {
+    views: BTreeMap<usize, DemandView>,
     shown: HashMap<(usize, usize), ShownAddrs>,
 }
 
@@ -366,6 +440,197 @@ static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
         ..Default::default()
     })
 });
+
+// Leaf lock: never acquire `PHYSICAL`, `oathkeep_gpu::title_memory_remapping`,
+// or `watch::GUARDS` while holding `DEMAND`.
+static DEMAND: LazyLock<RwLock<DemandState>> = LazyLock::new(|| RwLock::new(DemandState::default()));
+
+static DEMAND_COMMITTED_PAGES: AtomicU64 = AtomicU64::new(0);
+
+fn demand_view_end(at: usize) -> Option<usize> {
+    let demand = DEMAND.read().unwrap_or_else(|e| e.into_inner());
+    demand
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, view)| at < **base + view.len)
+        .map(|(&base, view)| base + view.len)
+}
+
+fn commit_if_reserved(at: usize, len: usize) -> bool {
+    if len == 0 || on_wine() {
+        return true;
+    }
+    let end = at.saturating_add(len);
+    let mut cur = at;
+    while cur < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(cur as *const c_void, &mut info, size_of_val(&info)) };
+        if n == 0 || info.RegionSize == 0 {
+            return false;
+        }
+        let next = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .min(end);
+        if next <= cur {
+            return false;
+        }
+        if info.State == MEM_RESERVE && info.Type == MEM_MAPPED && !commit(cur, next - cur) {
+            return false;
+        }
+        cur = next;
+    }
+    true
+}
+
+fn note_demand_committed(pages: u64) {
+    if pages == 0 {
+        return;
+    }
+    let prev = DEMAND_COMMITTED_PAGES.fetch_add(pages, Ordering::Relaxed);
+    let total = prev + pages;
+    if prev / 2048 != total / 2048 {
+        tracing::info!(
+            pages = total,
+            mb = (total * PAGE as u64) >> 20,
+            "xmem demand-commit physical pages committed"
+        );
+    }
+}
+
+fn ensure_committed(at: usize, len: usize) {
+    if len == 0 || !demand_commit() {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut committed_spans: Vec<(usize, usize)> = Vec::new();
+    let mut newly_committed = 0u64;
+    {
+        let demand = DEMAND.read().unwrap_or_else(|e| e.into_inner());
+        let first = demand
+            .views
+            .range(..=at)
+            .next_back()
+            .filter(|(base, view)| **base + view.len > at)
+            .map(|(&base, _)| base);
+        let start_key = first.unwrap_or(at);
+        for (&base, view) in demand.views.range(start_key..end) {
+            let view_end = base + view.len;
+            if view_end <= at || base >= end {
+                continue;
+            }
+            let lo = (at.max(base) - base) / PAGE;
+            let hi = (end.min(view_end) - base).div_ceil(PAGE);
+            let span_base = base + lo * PAGE;
+            let span_len = (hi - lo) * PAGE;
+            if commit_if_reserved(span_base, span_len) {
+                committed_spans.push((span_base, span_len));
+            }
+            for k in lo..hi {
+                if view.slice.section.mark_committed(view.slice.index + k) {
+                    newly_committed += 1;
+                }
+                if let Some(addrs) = demand.shown.get(&view.slice.key(k)) {
+                    let here = base + k * PAGE;
+                    for &alias in addrs.as_slice() {
+                        if alias != here && commit_if_reserved(alias, PAGE) {
+                            committed_spans.push((alias, PAGE));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    note_demand_committed(newly_committed);
+    for (span_base, span_len) in committed_spans {
+        oathkeep_gpu::title_memory_committed(span_base, span_len);
+    }
+}
+
+fn install_demand_commit() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        oathkeep_gpu::set_commit_title_memory(ensure_committed);
+        unsafe extern "system" fn on_demand_commit(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: the system passes valid exception and context pointers.
+            let (r, ctx) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
+            if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+                || r.NumberParameters < 2
+                || r.ExceptionInformation[0] > 1
+            {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            #[cfg(target_arch = "x86_64")]
+            if oathkeep_gpu::is_safe_copy_ip(ctx.Rip) {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let fault = r.ExceptionInformation[1];
+            let page_addr = fault & !(PAGE - 1);
+            // Fast lock-free reject of non-SEC_RESERVE faults (watch guards, unmapped placeholders, etc.).
+            // SAFETY: plain data filled in by the query.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            if unsafe { VirtualQuery(fault as *const c_void, &mut mbi, size_of_val(&mbi)) } == 0
+                || mbi.State != MEM_RESERVE
+                || mbi.Type != MEM_MAPPED
+            {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let mut notify = [0usize; 8];
+            let mut notify_len = 0usize;
+            let mut notify_extra: Vec<usize> = Vec::new();
+            let newly;
+            {
+                let demand = DEMAND.read().unwrap_or_else(|e| e.into_inner());
+                let Some((&base, view)) = demand
+                    .views
+                    .range(..=fault)
+                    .next_back()
+                    .filter(|(b, v)| fault < **b + v.len)
+                else {
+                    return EXCEPTION_CONTINUE_SEARCH;
+                };
+                let page_off = (page_addr - base) / PAGE;
+                let sec_index = view.slice.index + page_off;
+                if !commit(page_addr, PAGE) {
+                    return EXCEPTION_CONTINUE_SEARCH;
+                }
+                newly = view.slice.section.mark_committed(sec_index);
+                notify[notify_len] = page_addr;
+                notify_len += 1;
+                if let Some(addrs) = demand.shown.get(&view.slice.key(page_off)) {
+                    for &alias in addrs.as_slice() {
+                        if alias != page_addr && commit_if_reserved(alias, PAGE) {
+                            if notify_len < notify.len() {
+                                notify[notify_len] = alias;
+                                notify_len += 1;
+                            } else {
+                                notify_extra.push(alias);
+                            }
+                        }
+                    }
+                }
+            }
+            if newly {
+                note_demand_committed(1);
+            }
+            for &addr in &notify[..notify_len] {
+                oathkeep_gpu::title_memory_committed(addr, PAGE);
+            }
+            for addr in notify_extra {
+                oathkeep_gpu::title_memory_committed(addr, PAGE);
+            }
+            EXCEPTION_CONTINUE_EXECUTION
+        }
+        // SAFETY: registered first (`first=1`); fast-rejects non-MEM_MAPPED/MEM_RESERVE faults
+        // and only touches the leaf `DEMAND` lock and `VirtualAlloc(..., MEM_COMMIT)`.
+        unsafe {
+            AddVectoredExceptionHandler(1, Some(on_demand_commit));
+        }
+    });
+}
 
 fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
@@ -434,7 +699,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
             return 0;
         }
         oathkeep_gpu::title_memory_section(handle as usize, chunk_bytes as u64, commit);
-        chunks.push((Arc::new(Section(handle)), take));
+        chunks.push((Arc::new(Section::new(handle, take, commit)), take));
         left -= take;
     }
     tracing::debug!(
@@ -489,7 +754,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -500,7 +765,11 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        if !commit(at.Value as usize, len) {
+            return None;
+        }
+        slice.section.mark_range_committed(slice.index, n);
+        Some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -595,11 +864,12 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
     let mut pieces: Vec<(usize, usize)> = Vec::new();
     {
         let physical = physical();
+        let demand = DEMAND.read().unwrap_or_else(|e| e.into_inner());
         for (i, page) in touched.iter().enumerate() {
             let Some(addresses) = physical
                 .pages
                 .get(page)
-                .and_then(|slice| physical.shown.get(&slice.key(0)))
+                .and_then(|slice| demand.shown.get(&slice.key(0)))
             else {
                 continue;
             };
@@ -620,7 +890,16 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
 }
 
 pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
+    let demand = demand_commit();
     for (at, bytes) in shown_at(pages, offset, len) {
+        if demand && bytes > 0 {
+            let aligned = at & !(PAGE - 1);
+            let aligned_end = at.saturating_add(bytes).next_multiple_of(PAGE);
+            let aligned_len = aligned_end.saturating_sub(aligned);
+            if commit_if_reserved(aligned, aligned_len) {
+                oathkeep_gpu::title_memory_committed(aligned, aligned_len);
+            }
+        }
         oathkeep_gpu::title_memory_written(at, bytes, true);
     }
 }
@@ -719,6 +998,10 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 }
 
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    let lazy = demand_commit();
+    if lazy {
+        install_demand_commit();
+    }
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -729,7 +1012,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -749,27 +1032,61 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
-        // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
-        return false;
+    let page_count = len.div_ceil(PAGE);
+    if lazy {
+        // Only commit pages whose backing section pages are already committed
+        // (costs 0 extra Windows commit); untouched pages stay MEM_RESERVE and
+        // commit on first access via `on_demand_commit` / `ensure_committed`.
+        let mut k = 0;
+        while k < page_count {
+            if !slice.section.is_committed(slice.index + k) {
+                k += 1;
+                continue;
+            }
+            let start = k;
+            while k < page_count && slice.section.is_committed(slice.index + k) {
+                k += 1;
+            }
+            if !commit(base + start * PAGE, (k - start) * PAGE) {
+                // SAFETY: the view just mapped, back to a placeholder.
+                unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+                return false;
+            }
+        }
+    } else {
+        if !commit(base, len) {
+            // SAFETY: the view just mapped, back to a placeholder.
+            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+            return false;
+        }
+        slice.section.mark_range_committed(slice.index, page_count);
     }
     oathkeep_gpu::title_memory_remapped(base, len);
     oathkeep_gpu::title_memory_view(
         base,
         len,
-        slice.section.0 as usize,
+        slice.section.handle as usize,
         (slice.index * PAGE) as u64,
     );
-    for k in 0..len.div_ceil(PAGE) {
-        let key = slice.key(k);
-        let addr = base + k * PAGE;
-        match physical.shown.get_mut(&key) {
-            Some(addresses) => addresses.push(addr),
-            None => {
-                physical.shown.insert(key, ShownAddrs::One(addr));
+    {
+        let mut demand = DEMAND.write().unwrap_or_else(|e| e.into_inner());
+        for k in 0..page_count {
+            let key = slice.key(k);
+            let addr = base + k * PAGE;
+            match demand.shown.get_mut(&key) {
+                Some(addresses) => addresses.push(addr),
+                None => {
+                    demand.shown.insert(key, ShownAddrs::One(addr));
+                }
             }
         }
+        demand.views.insert(
+            base,
+            DemandView {
+                len,
+                slice: slice.clone(),
+            },
+        );
     }
     physical.views.insert(base, (len, slice));
     true
@@ -841,12 +1158,16 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
-        for k in 0..size.div_ceil(PAGE) {
-            let key = slice.key(k);
-            if let Some(addresses) = physical.shown.get_mut(&key)
-                && addresses.remove(at + k * PAGE)
-            {
-                physical.shown.remove(&key);
+        {
+            let mut demand = DEMAND.write().unwrap_or_else(|e| e.into_inner());
+            demand.views.remove(&at);
+            for k in 0..size.div_ceil(PAGE) {
+                let key = slice.key(k);
+                if let Some(addresses) = demand.shown.get_mut(&key)
+                    && addresses.remove(at + k * PAGE)
+                {
+                    demand.shown.remove(&key);
+                }
             }
         }
         oathkeep_gpu::title_memory_remapped(at, size);
@@ -1347,5 +1668,71 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn demand_commit_defers_untouched_pages_and_syncs_aliases() {
+        if !demand_commit() {
+            return;
+        }
+        let os_state = |ptr: *const c_void| -> u32 {
+            // SAFETY: plain data filled in by VirtualQuery.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: valid out pointer.
+            assert_ne!(unsafe { VirtualQuery(ptr, &mut mbi, size_of_val(&mbi)) }, 0);
+            mbi.State
+        };
+        let pages = allocate(4);
+        let reserve = |n: usize| {
+            let at = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                n * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            );
+            assert!(!at.is_null());
+            at
+        };
+        let (a, b) = (reserve(4), reserve(2));
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 4, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 2, pages[1..].as_ptr()), b);
+
+        // Untouched pages remain MEM_RESERVE at the OS level (0 commit), while
+        // XMemVirtualQuery reports them logically committed.
+        for i in 0..4 {
+            assert_eq!(os_state(at(a, i)), MEM_RESERVE);
+            assert_eq!(query(at(a, i)).host.State, MEM_COMMIT);
+        }
+
+        // Writing through `a[1]` faults and commits both `a[1]` and its alias `b[0]`,
+        // leaving `a[0]`, `a[2]`, `a[3]`, `b[1]` untouched (MEM_RESERVE).
+        // SAFETY: mapped read-write via demand-commit VEH.
+        unsafe { at(a, 1).cast::<u8>().write(0x42) };
+        assert_eq!(os_state(at(a, 1)), MEM_COMMIT);
+        assert_eq!(os_state(at(b, 0)), MEM_COMMIT);
+        assert_eq!(os_state(at(a, 0)), MEM_RESERVE);
+        assert_eq!(os_state(at(a, 2)), MEM_RESERVE);
+        assert_eq!(os_state(at(b, 1)), MEM_RESERVE);
+        // SAFETY: alias was committed with the same backing page.
+        assert_eq!(unsafe { at(b, 0).cast::<u8>().read() }, 0x42);
+
+        // kernel_will_write commits target range before kernel I/O and syncs aliases.
+        oathkeep_gpu::kernel_will_write(at(a, 2) as usize, 128);
+        assert_eq!(os_state(at(a, 2)), MEM_COMMIT);
+        assert_eq!(os_state(at(b, 1)), MEM_COMMIT);
+        assert_eq!(os_state(at(a, 3)), MEM_RESERVE);
+
+        // write_physical + pages_written commits section page and syncs mapped view.
+        assert!(write_physical(&pages[3..], 0, &[0x99]));
+        pages_written(&pages[3..], 0, 1);
+        assert_eq!(os_state(at(a, 3)), MEM_COMMIT);
+        // SAFETY: mapped and committed via pages_written.
+        assert_eq!(unsafe { at(a, 3).cast::<u8>().read() }, 0x99);
+
+        assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 2, std::ptr::null()), b);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 }
