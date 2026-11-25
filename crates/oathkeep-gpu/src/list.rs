@@ -643,6 +643,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
         if !host.is_empty() {
+            let cleans_uav = host.iter().any(|b| b.kind == 2 && b.first.is_null());
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
             // SAFETY: the same layout; borrowed resource pointers, never
@@ -655,6 +656,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
+            if cleans_uav {
+                list.mark_uav_clean();
+            }
         }
     }
     0
@@ -1846,6 +1850,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
             unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        list.mark_uav_clean();
     }
     #[cfg(not(windows))]
     let _ = (this, count);

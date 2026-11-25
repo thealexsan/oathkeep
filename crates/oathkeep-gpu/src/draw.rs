@@ -712,6 +712,9 @@ impl State {
 
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        if compute || p.stages.iter().any(|s| s.translated().stores) {
+            list.mark_uav_dirty();
+        }
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
             self.walls_census(p, compute);

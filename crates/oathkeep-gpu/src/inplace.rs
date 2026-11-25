@@ -97,7 +97,7 @@ fn section_heap(
             };
         }
     }
-    const SHARED_HEADROOM: u64 = 1536 << 20;
+    const SHARED_HEADROOM: u64 = 2048 << 20;
     if SECTION_BYTES.load(Ordering::Relaxed).saturating_add(size) > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return Err(None);
@@ -193,7 +193,17 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     let host = crate::host::host()?;
     let placed = match cover(at as usize, bytes as usize) {
         Cover::None => {
+            const SHARED_HEADROOM: u64 = 2048 << 20;
             if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+                STATS[6].fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            if let Some([_, _, shared_budget, shared_usage]) = host.video_memory()
+                && shared_usage
+                    .saturating_add(bytes)
+                    .saturating_add(SHARED_HEADROOM)
+                    > shared_budget
+            {
                 STATS[6].fetch_add(1, Ordering::Relaxed);
                 return None;
             }

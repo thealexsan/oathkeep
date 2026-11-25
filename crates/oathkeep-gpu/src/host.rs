@@ -672,6 +672,7 @@ pub(crate) struct HostList {
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    uav_dirty: std::sync::atomic::AtomicBool,
     _alive: Counted,
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
@@ -2450,6 +2451,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                uav_dirty: std::sync::atomic::AtomicBool::new(true),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4219,10 +4221,23 @@ impl HostList {
         }
     }
 
+    pub(crate) fn mark_uav_dirty(&self) {
+        self.uav_dirty.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mark_uav_clean(&self) {
+        self.uav_dirty.store(false, Ordering::Relaxed);
+    }
+
+    pub(crate) fn take_uav_dirty(&self) -> bool {
+        self.uav_dirty.swap(false, Ordering::Relaxed)
+    }
+
     pub(crate) fn reset(&self) {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        self.uav_dirty.store(true, Ordering::Relaxed);
         let old_deferred = std::mem::take(&mut *self.deferred());
         let old_states =
             std::mem::take(&mut *self.states.lock().unwrap_or_else(|e| e.into_inner()));

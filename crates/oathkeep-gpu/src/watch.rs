@@ -526,34 +526,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             return Some(Vec::new());
         }
         let known = g.protected.contains(first) || g.absent.contains(first);
-        let absent_gaps = if known {
+        if known {
             let gaps = g.clean.gaps_in(first, last);
             if !gaps.is_empty() && gaps.iter().all(|&(a, b)| g.absent.contains_range(a, b)) {
-                Some(gaps)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        drop(g);
-        if let Some(gaps) = absent_gaps {
-            let mut still_absent = true;
-            'check: for (a, b) in gaps {
-                let mut at = a;
-                while at < b {
-                    let until = uncommitted_end(at);
-                    if until <= at {
-                        still_absent = false;
-                        break 'check;
-                    }
-                    at = until;
-                }
-            }
-            if still_absent {
                 return Some(Vec::new());
             }
         }
+        drop(g);
         if !known && !is_view(start, end) {
             return None;
         }

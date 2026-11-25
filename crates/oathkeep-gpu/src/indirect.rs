@@ -222,7 +222,8 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let need_uav = list.take_uav_dirty();
+    record_clamp_as(c, &list.list, &dst, budget, src, count, spec, false, need_uav).then_some(dst)
 }
 
 pub(crate) fn bound_ahead(
@@ -232,9 +233,11 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    let need_uav = list.take_uav_dirty();
+    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, need_uav).then_some(dst)
 }
 
+#[cfg(test)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -244,7 +247,7 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    record_clamp_as(c, l, dst, budget, src, count, spec, false, true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -257,6 +260,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    need_uav: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -329,17 +333,17 @@ fn record_clamp_as(
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         ),
     ];
-    let second = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ),
-    ];
-    let skip = usize::from(!waits);
+    // `dst` transitions UNORDERED_ACCESS -> INDIRECT_ARGUMENT which guarantees
+    // visibility before ExecuteIndirect; `budget` only uses Interlocked* atomics,
+    // so no global UAV barrier is needed after the clamp dispatch.
+    let second = [transition(
+        dst,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    )];
+    let skip_first = usize::from(!(waits && need_uav));
     unsafe {
-        l.ResourceBarrier(&first[skip..]);
+        l.ResourceBarrier(&first[skip_first..]);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -350,7 +354,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second);
     }
     true
 }
@@ -908,6 +912,7 @@ void main() {
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
                 ahead,
+                true,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.

@@ -2960,7 +2960,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         let size = len.next_multiple_of(1 << 16);
-        let big = cards() && size >= card_limits().0;
+        static INPLACE_BIG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let inplace_big = *INPLACE_BIG
+            .get_or_init(|| std::env::var_os("OATHKEEP_INPLACE_BIG").is_none_or(|v| v != "0"));
+        let big = !inplace_big && cards() && size >= card_limits().0;
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
