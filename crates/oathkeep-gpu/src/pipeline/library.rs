@@ -491,7 +491,7 @@ pub(crate) fn save(now: bool) {
     let (Some(dir), Some(library)) = (DIR.get(), library()) else {
         return;
     };
-    if !now && crate::host::available_commit().is_some_and(|c| c < (2u64 << 30)) {
+    if !now && crate::host::available_commit().is_some_and(|c| c < (3u64 << 30)) {
         return;
     }
     {

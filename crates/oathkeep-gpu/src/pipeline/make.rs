@@ -214,13 +214,18 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+    fn pop(&mut self, allow_early: bool) -> Option<(Arc<Pending>, bool)> {
+        if let Some(p) = self.requested.pop_front() {
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            return Some((p, false));
+        }
+        if !allow_early {
+            return None;
+        }
+        let p = std::iter::from_fn(|| self.early.pop_front())
+            .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
-        Some(p)
+        Some((p, true))
     }
 }
 
@@ -249,13 +254,48 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
 }
 
-fn next() -> Arc<Pending> {
+fn early_commit_floor() -> u64 {
+    static FLOOR: OnceLock<u64> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("OATHKEEP_EARLY_PIPELINE_COMMIT_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(3072)
+            << 20
+    })
+}
+
+fn early_allowed() -> bool {
+    let floor = early_commit_floor();
+    if floor == 0 {
+        return true;
+    }
+    crate::host::available_commit().is_none_or(|avail| avail >= floor)
+}
+
+fn early_limit() -> usize {
+    let max = worker_count().min(2);
+    let Some(avail) = crate::host::available_commit() else {
+        return max;
+    };
+    if avail < (4608u64 << 20) { 1 } else { max }
+}
+
+fn next() -> (Arc<Pending>, bool) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
-            return p;
+        let allow_early = early_allowed();
+        if let Some(item) = queue.pop(allow_early) {
+            return item;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        if !allow_early && !queue.early.is_empty() {
+            let (guard, _) = AVAILABLE
+                .wait_timeout(queue, Duration::from_millis(250))
+                .unwrap_or_else(|e| e.into_inner());
+            queue = guard;
+        } else {
+            queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        }
     }
 }
 
@@ -286,21 +326,26 @@ fn compile_limit() -> usize {
     }
 }
 
-static COMPILE_GATE: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+static COMPILE_GATE: (Mutex<(usize, usize)>, Condvar) = (Mutex::new((0, 0)), Condvar::new());
 
-struct ActiveCompile;
+struct ActiveCompile {
+    early: bool,
+}
 
 impl ActiveCompile {
-    fn enter() -> Self {
+    fn enter(early: bool) -> Self {
         let (lock, cv) = &COMPILE_GATE;
         let mut active = lock.lock().unwrap_or_else(|e| e.into_inner());
-        while *active >= compile_limit() {
+        while active.0 >= compile_limit() || (early && active.1 >= early_limit()) {
             let (guard, _) = cv
                 .wait_timeout(active, Duration::from_millis(50))
                 .unwrap_or_else(|e| e.into_inner());
             active = guard;
         }
-        *active += 1;
+        active.0 += 1;
+        if early {
+            active.1 += 1;
+        }
         drop(active);
         if crate::host::available_commit().is_some_and(|c| c < (1024u64 << 20)) {
             static LAST_RECLAIM: Mutex<Option<Instant>> = Mutex::new(None);
@@ -318,7 +363,7 @@ impl ActiveCompile {
                 crate::host::reclaim_for_oom();
             }
         }
-        ActiveCompile
+        ActiveCompile { early }
     }
 }
 
@@ -326,8 +371,11 @@ impl Drop for ActiveCompile {
     fn drop(&mut self) {
         let (lock, cv) = &COMPILE_GATE;
         let mut active = lock.lock().unwrap_or_else(|e| e.into_inner());
-        *active = active.saturating_sub(1);
-        cv.notify_one();
+        active.0 = active.0.saturating_sub(1);
+        if self.early {
+            active.1 = active.1.saturating_sub(1);
+        }
+        cv.notify_all();
     }
 }
 
@@ -346,9 +394,9 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        let pending = next();
+                        let (pending, is_early) = next();
                         {
-                            let _permit = ActiveCompile::enter();
+                            let _permit = ActiveCompile::enter(is_early);
                             pending.make();
                         }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
@@ -425,10 +473,11 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &requested));
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        assert!(queue.pop(false).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &earlier));
+        assert!(queue.pop(true).is_none());
     }
 }

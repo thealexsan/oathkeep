@@ -65,6 +65,7 @@ impl Hasher for Fx {
 
 const TERMINAL: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 21;
+const MAX_MEMO: usize = 100_000;
 const MAX_MEET: usize = 1 << 16;
 const MAX_MEETS: usize = 1 << 18;
 
@@ -125,7 +126,17 @@ impl Bools {
         self.mk(v, Bool::FALSE, Bool::TRUE)
     }
 
+    fn finish(&mut self) {
+        self.unique = Map::default();
+        self.memo = Map::default();
+        self.ids = Map::default();
+        self.born = Vec::new();
+    }
+
     fn mk(&mut self, v: u32, lo: Bool, hi: Bool) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         if lo == hi {
             return lo;
         }
@@ -134,6 +145,8 @@ impl Bools {
         }
         if self.nodes.len() >= MAX_NODES {
             self.overflow = true;
+            self.unique = Map::default();
+            self.memo = Map::default();
             return Bool::FALSE;
         }
         let b = Bool(self.nodes.len() as u32);
@@ -150,6 +163,9 @@ impl Bools {
     }
 
     fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         if f == Bool::TRUE || g == h {
             return g;
         }
@@ -166,9 +182,20 @@ impl Bools {
         let v = top(f).min(top(g)).min(top(h));
         let ((f0, f1), (g0, g1), (h0, h1)) = (self.split(f, v), self.split(g, v), self.split(h, v));
         let lo = self.ite(f0, g0, h0);
+        if self.overflow {
+            return Bool::FALSE;
+        }
         let hi = self.ite(f1, g1, h1);
+        if self.overflow {
+            return Bool::FALSE;
+        }
         let r = self.mk(v, lo, hi);
-        self.memo.insert((f, g, h), r);
+        if !self.overflow {
+            if self.memo.len() >= MAX_MEMO {
+                self.memo.clear();
+            }
+            self.memo.insert((f, g, h), r);
+        }
         r
     }
 
@@ -271,6 +298,9 @@ impl Bools {
     }
 
     fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         let (v, lo, hi) = self.nodes[b.0 as usize];
         if v == TERMINAL {
             return b;
@@ -285,11 +315,16 @@ impl Bools {
         } else {
             self.mk(v, lo, hi)
         };
-        memo.insert(b, r);
+        if !self.overflow {
+            memo.insert(b, r);
+        }
         r
     }
 
     fn restrict(&mut self, b: Bool, v: u32, value: bool, memo: &mut Map<Bool, Bool>) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         let (bv, lo, hi) = self.nodes[b.0 as usize];
         if bv == TERMINAL || bv > v {
             return b;
@@ -303,12 +338,17 @@ impl Bools {
         let l = self.restrict(lo, v, value, memo);
         let h = self.restrict(hi, v, value, memo);
         let r = self.mk(bv, l, h);
-        memo.insert(b, r);
+        if !self.overflow {
+            memo.insert(b, r);
+        }
         r
     }
 
     fn given(&mut self, mut b: Bool, known: Bool) -> Bool {
         for v in self.vars(b) {
+            if self.overflow {
+                return Bool::FALSE;
+            }
             let x = self.mk(v, Bool::FALSE, Bool::TRUE);
             let nx = self.not(x);
             if self.implies(known, x) {
@@ -678,6 +718,7 @@ impl<'a> Lanes<'a> {
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
+        self.b.finish();
         let (mut high, mut split) = (Map::default(), HashSet::new());
         let keys = self.masks.keys().chain(self.other.keys());
         for &(lo, hi) in keys.chain(&self.seen) {
