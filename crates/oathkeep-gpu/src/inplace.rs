@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -48,13 +48,44 @@ fn most() -> u64 {
 
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
-static SECTION_HEAPS: Mutex<Option<std::collections::HashMap<usize, Option<(ID3D12Heap, u64)>>>> =
+pub(crate) struct SectionHeap {
+    section: usize,
+    size: u64,
+    heap: ID3D12Heap,
+}
+
+impl Drop for SectionHeap {
+    fn drop(&mut self) {
+        SECTION_BYTES.fetch_sub(self.size, Ordering::Relaxed);
+        if let Ok(mut guard) = SECTION_HEAPS.lock()
+            && let Some(map) = guard.as_mut()
+            && let Some(SectionEntry::Open(weak)) = map.get(&self.section)
+            && weak.strong_count() == 0
+        {
+            map.remove(&self.section);
+        }
+        crate::host::retire(self.heap.clone());
+    }
+}
+
+enum SectionEntry {
+    Refused,
+    Open(Weak<SectionHeap>),
+}
+
+static SECTION_HEAPS: Mutex<Option<std::collections::HashMap<usize, SectionEntry>>> =
     Mutex::new(None);
 static SECTION_BYTES: AtomicU64 = AtomicU64::new(0);
 
+#[allow(dead_code)]
+pub(crate) enum PlaceHeap {
+    Part(ID3D12Heap),
+    Section(Arc<SectionHeap>),
+}
+
 pub(crate) struct Placed {
     pub(crate) buffer: ID3D12Resource,
-    pub(crate) heap: ID3D12Heap,
+    pub(crate) heap: PlaceHeap,
     pub(crate) gpu: u64,
     pub(crate) bias: u64,
 }
@@ -162,17 +193,21 @@ pub(crate) fn section_run_around(
 fn section_heap(
     host: &crate::host::Host,
     section: usize,
-) -> Result<ID3D12Heap, Option<windows::core::Error>> {
+) -> Result<Arc<SectionHeap>, Option<windows::core::Error>> {
     let Some((size, true)) = section_info(section) else {
         return Err(None);
     };
     {
         let heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = heaps.as_ref().and_then(|m| m.get(&section)) {
-            return match entry {
-                Some((heap, _)) => Ok(heap.clone()),
-                None => Err(None),
-            };
+            match entry {
+                SectionEntry::Open(weak) => {
+                    if let Some(existing) = weak.upgrade() {
+                        return Ok(existing);
+                    }
+                }
+                SectionEntry::Refused => return Err(None),
+            }
         }
     }
     const SHARED_HEADROOM: u64 = 1024 << 20;
@@ -193,24 +228,33 @@ fn section_heap(
         Ok(heap) => heap,
         Err(e) => {
             let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-            heaps.get_or_insert_with(Default::default).insert(section, None);
+            heaps
+                .get_or_insert_with(Default::default)
+                .insert(section, SectionEntry::Refused);
             return Err(Some(e));
         }
     };
     let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     let map = heaps.get_or_insert_with(Default::default);
-    if let Some(Some((existing, _))) = map.get(&section) {
-        return Ok(existing.clone());
+    if let Some(SectionEntry::Open(weak)) = map.get(&section)
+        && let Some(existing) = weak.upgrade()
+    {
+        return Ok(existing);
     }
     let total = SECTION_BYTES.fetch_add(size, Ordering::Relaxed) + size;
-    tracing::info!(
+    tracing::debug!(
         section = format_args!("{section:#x}"),
-        mb = size >> 20,
+        kb = size >> 10,
         total_mb = total >> 20,
         "title page-pool section opened in place as one host heap"
     );
-    map.insert(section, Some((opened.clone(), size)));
-    Ok(opened)
+    let arc = Arc::new(SectionHeap {
+        section,
+        size,
+        heap: opened,
+    });
+    map.insert(section, SectionEntry::Open(Arc::downgrade(&arc)));
+    Ok(arc)
 }
 
 fn place_section(
@@ -227,13 +271,13 @@ fn place_section(
     if section_off.checked_add(bytes).is_none_or(|end| end > size) {
         return Err(None);
     }
-    let heap = section_heap(host, section)?;
-    let buffer = place(&host.device, &heap, section_off, bytes).map_err(Some)?;
+    let section_heap = section_heap(host, section)?;
+    let buffer = place(&host.device, &section_heap.heap, section_off, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
     Ok(Placed {
         buffer,
-        heap,
+        heap: PlaceHeap::Section(section_heap),
         gpu,
         bias: start - at,
     })
@@ -255,7 +299,7 @@ pub(crate) fn place_part(
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
     Ok(Placed {
         buffer,
-        heap,
+        heap: PlaceHeap::Part(heap),
         gpu,
         bias: start - at,
     })
@@ -341,13 +385,25 @@ fn say() {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    let open_sections = SECTION_HEAPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, |m| {
+            m.values()
+                .filter(|e| matches!(e, SectionEntry::Open(w) if w.strong_count() > 0))
+                .count()
+        });
+    let section_mb = SECTION_BYTES.load(Ordering::Relaxed) >> 20;
     tracing::info!(
-        "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
+        "title memory in place: {} windows {} MB, {} title buffers {} MB ({} open sections {} MB) (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
          {} refused by the host, {} over OATHKEEP_INPLACE_MB; {} let go because their memory changed",
         s[0],
         s[1] >> 20,
         s[2],
         s[3] >> 20,
+        open_sections,
+        section_mb,
         s[4],
         s[5],
         s[6],
@@ -447,15 +503,10 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 
 pub fn title_memory_section_closing(section: usize) {
     views().sections.retain(|s| s.0 != section);
-    let removed = SECTION_HEAPS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_mut()
-        .and_then(|m| m.remove(&section))
-        .flatten();
-    if let Some((heap, size)) = removed {
-        SECTION_BYTES.fetch_sub(size, Ordering::Relaxed);
-        crate::host::retire(heap);
+    if let Ok(mut guard) = SECTION_HEAPS.lock()
+        && let Some(map) = guard.as_mut()
+    {
+        map.remove(&section);
     }
 }
 

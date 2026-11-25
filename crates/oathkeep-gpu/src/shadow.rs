@@ -28,7 +28,7 @@ pub(crate) struct Shadow {
     id: u64,
     card: Option<Card>,
     window: bool,
-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    place: Option<(crate::inplace::PlaceHeap, u64)>,
 }
 
 struct Card {

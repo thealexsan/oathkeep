@@ -351,17 +351,24 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let commit = on_wine() || inplace_sections();
     // D3D12's OpenExistingHeapFromFileMapping rejects sections >= 4 GiB with
     // E_INVALIDARG, and each opened section counts against WDDM's shared GPU
-    // memory budget. Chunk committed sections (default 4 MiB) so only small
+    // memory budget. Chunk committed sections (default 1 MiB) so only small
     // chunks backing GPU buffers are opened as host heaps without wasting
     // WDDM shared memory budget.
     static CHUNK_PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let chunk_pages = if inplace_sections() {
         *CHUNK_PAGES.get_or_init(|| {
+            if let Some(kb) = std::env::var("OATHKEEP_INPLACE_SECTION_KB")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+            {
+                let bytes = kb.clamp(64, 512 << 10) << 10;
+                return bytes.div_ceil(PAGE).max(1);
+            }
             let mb = std::env::var("OATHKEEP_INPLACE_SECTION_MB")
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(4)
-                .clamp(4, 512);
+                .unwrap_or(1)
+                .clamp(1, 512);
             (mb << 20) / PAGE
         })
     } else {
