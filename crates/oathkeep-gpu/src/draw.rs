@@ -3408,11 +3408,32 @@ impl State {
             })
             .flatten();
         let (bounded, at) = match hit {
-            Some(hit) => hit,
+            Some(hit) => {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::IndHits, 1);
+                hit
+            }
             None => {
                 let prev_window = windowed
                     .then(|| self.windows.iter().rev().find(|w| same(w)))
                     .flatten();
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    if !windowed {
+                        if kind == DISPATCH {
+                            add(C::IndNonWinDispatch, 1);
+                        } else if max > 1 {
+                            add(C::IndNonWinMax, 1);
+                        } else if count.is_some() {
+                            add(C::IndNonWinCount, 1);
+                        }
+                    } else if prev_window.is_none() {
+                        add(C::IndMissFirst, 1);
+                    } else {
+                        add(C::IndMissStep, 1);
+                    }
+                }
                 let (step, records) = match prev_window {
                     Some(w) => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);

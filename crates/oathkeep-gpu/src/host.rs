@@ -818,7 +818,7 @@ mod tests {
     }
 }
 
-const INDIRECT_RING_SLOTS: usize = 8;
+const INDIRECT_RING_SLOTS: usize = 2;
 
 #[derive(Default)]
 struct IndirectPool {
@@ -7507,10 +7507,11 @@ fn copy_mapped_deferred(dst: *mut u8, src: *const u8, len: usize) {
         done += read_partial(src.wrapping_add(done), dst.wrapping_add(done), len - done);
     }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(
-        crate::copystat::C::MoveUs,
-        moved.elapsed().as_micros() as u64,
-    );
+    {
+        let us = moved.elapsed().as_micros() as u64;
+        crate::copystat::add(crate::copystat::C::MoveUs, us);
+        crate::copystat::add(crate::copystat::C::MoveDeferredUs, us);
+    }
     if done == len {
         return;
     }
@@ -7557,10 +7558,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     let done = read_partial(src, dst, len);
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(
-        crate::copystat::C::MoveUs,
-        moved.elapsed().as_micros() as u64,
-    );
+    {
+        let us = moved.elapsed().as_micros() as u64;
+        crate::copystat::add(crate::copystat::C::MoveUs, us);
+        crate::copystat::add(crate::copystat::C::MoveShadowUs, us);
+    }
     if done == len {
         return;
     }

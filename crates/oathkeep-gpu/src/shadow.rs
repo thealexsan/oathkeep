@@ -864,7 +864,25 @@ fn scan_card_pages_chunk(
                 push_coalesced_span(&mut changed_spans, p_from, p_to);
                 page_changed = true;
             } else {
-                let _ = crate::host::read_into_zero_unmapped(p_from as *const u8, &mut buf[..len]);
+                #[cfg(feature = "diagnostics")]
+                let t_rd = std::time::Instant::now();
+                let ok = crate::host::read_into_zero_unmapped(p_from as *const u8, &mut buf[..len]);
+                #[cfg(feature = "diagnostics")]
+                {
+                    let rd_us = t_rd.elapsed().as_micros() as u64;
+                    crate::copystat::add(crate::copystat::C::CardScanPages, 1);
+                    if is_hot {
+                        crate::copystat::add(crate::copystat::C::CardScanHotPages, 1);
+                    }
+                    crate::copystat::add(crate::copystat::C::CardScanReadUs, rd_us);
+                    if !ok {
+                        crate::copystat::add(crate::copystat::C::CardScanSparseFaults, 1);
+                    }
+                }
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = ok;
+                #[cfg(feature = "diagnostics")]
+                let t_hash = std::time::Instant::now();
                 let stored = diff_hot_card_blocks_at(
                     slots,
                     slot_base,
@@ -873,8 +891,18 @@ fn scan_card_pages_chunk(
                     &buf[..len],
                     |cov_lo, cov_hi| {
                         page_changed = true;
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(
+                            crate::copystat::C::CardScanChangedBytes,
+                            (cov_hi - cov_lo) as u64,
+                        );
                         push_coalesced_span(&mut changed_spans, start + cov_lo, start + cov_hi);
                     },
+                );
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(
+                    crate::copystat::C::CardScanHashUs,
+                    t_hash.elapsed().as_micros() as u64,
                 );
                 stored_any |= stored;
             }
@@ -4342,6 +4370,8 @@ impl Shadow {
             static HOT_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         HOT_BUF.with(|cell| {
+            #[cfg(feature = "diagnostics")]
+            let t_hot = std::time::Instant::now();
             let mut buf = cell.borrow_mut();
             if buf.len() < len {
                 buf.resize(PAGE, 0);
@@ -4352,12 +4382,25 @@ impl Shadow {
             // SAFETY: inside the write-back shared buffer mapping (`from..to` is within `start..end`).
             let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), len) };
             let Some(first) = first_difference(slice, held) else {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(
+                    crate::copystat::C::CopyHotUs,
+                    t_hot.elapsed().as_micros() as u64,
+                );
                 return 0;
             };
             let last = first + last_difference(&slice[first..], &held[first..]).unwrap_or(0);
             let n = last + 1 - first;
             held[first..=last].copy_from_slice(&slice[first..=last]);
             self.changed(off + first, off + first + n);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(
+                    crate::copystat::C::CopyHotUs,
+                    t_hot.elapsed().as_micros() as u64,
+                );
+                crate::copystat::add(crate::copystat::C::CopyHotBytes, n as u64);
+            }
             n
         })
     }

@@ -82,8 +82,34 @@ pub(crate) enum C {
     PrepCardFillUploadUs,
     PrepCardRecordUs,
     PrepOtherUs,
+    GuardReadFastN,
+    GuardReadFastUs,
+    GuardPreAliasUs,
+    GuardWriteWaitUs,
+    GuardProtectUs,
+    GuardAliasApplyUs,
+    GuardRetHotPages,
+    GuardRetPartlyPages,
+    GuardRetGuardedPages,
+    CardScanPages,
+    CardScanHotPages,
+    CardScanReadUs,
+    CardScanSparseFaults,
+    CardScanHashUs,
+    CardScanChangedBytes,
+    MoveDeferredUs,
+    MoveShadowUs,
+    CopyHotUs,
+    CopyHotBytes,
+    IndHits,
+    IndMissFirst,
+    IndMissStep,
+    IndNonWinDispatch,
+    IndNonWinMax,
+    IndNonWinCount,
+    IndUavEmitted,
 }
-const COUNTERS: usize = 96;
+const COUNTERS: usize = 128;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1124,6 +1150,44 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::PrepCardFillUploadUs as usize]),
         ms(c[C::PrepCardRecordUs as usize]),
         ms(c[C::PrepOtherUs as usize]),
+    );
+    tracing::info!(
+        "micro-diag guards/frame: read_fast {:.0}x {:.2} ms, pre_alias {:.2} ms, write_wait {:.2} ms, \
+         protect {:.2} ms, alias_apply {:.2} ms; ret_pages: hot {:.0}, partly {:.0}, guarded {:.0}",
+        c[C::GuardReadFastN as usize],
+        ms(c[C::GuardReadFastUs as usize]),
+        ms(c[C::GuardPreAliasUs as usize]),
+        ms(c[C::GuardWriteWaitUs as usize]),
+        ms(c[C::GuardProtectUs as usize]),
+        ms(c[C::GuardAliasApplyUs as usize]),
+        c[C::GuardRetHotPages as usize],
+        c[C::GuardRetPartlyPages as usize],
+        c[C::GuardRetGuardedPages as usize],
+    );
+    tracing::info!(
+        "micro-diag scan_card/moves/frame: scan {:.0} pages ({:.0} hot), read {:.2} ms ({:.0} sparse faults), \
+         hash {:.2} ms, changed {:.2} MB; moves: deferred {:.2} ms, shadow {:.2} ms; copy_hot {:.2} ms {:.2} MB",
+        c[C::CardScanPages as usize],
+        c[C::CardScanHotPages as usize],
+        ms(c[C::CardScanReadUs as usize]),
+        c[C::CardScanSparseFaults as usize],
+        ms(c[C::CardScanHashUs as usize]),
+        mb(c[C::CardScanChangedBytes as usize]),
+        ms(c[C::MoveDeferredUs as usize]),
+        ms(c[C::MoveShadowUs as usize]),
+        ms(c[C::CopyHotUs as usize]),
+        mb(c[C::CopyHotBytes as usize]),
+    );
+    tracing::info!(
+        "micro-diag indirect/frame: hits {:.0}, miss_first {:.0}, miss_step {:.0}, \
+         non_win(dispatch {:.0}, max>1 {:.0}, count {:.0}), uav_emitted {:.0}",
+        c[C::IndHits as usize],
+        c[C::IndMissFirst as usize],
+        c[C::IndMissStep as usize],
+        c[C::IndNonWinDispatch as usize],
+        c[C::IndNonWinMax as usize],
+        c[C::IndNonWinCount as usize],
+        c[C::IndUavEmitted as usize],
     );
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut whole: Vec<_> = whole.into_iter().flatten().collect();

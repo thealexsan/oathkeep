@@ -417,6 +417,10 @@ fn record_clamp_as(
         D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
     )];
     let skip_first = usize::from(!(waits && need_uav));
+    #[cfg(feature = "diagnostics")]
+    if skip_first == 0 {
+        crate::copystat::add(crate::copystat::C::IndUavEmitted, 1);
+    }
     unsafe {
         l.ResourceBarrier(&first[skip_first..]);
         if records > 0 {
@@ -1183,7 +1187,7 @@ void main() {
         }
 
         let mut first_ring = Vec::new();
-        for i in 0..8u64 {
+        for i in 0..2u64 {
             let (buf, evicted) =
                 bound(&list, (&src_buf, i * 64), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
             assert!(evicted.is_none(), "initial ring fill should not evict");
@@ -1194,7 +1198,7 @@ void main() {
             first_ring[1].as_raw(),
             "consecutive indirect calls must use distinct ring slots"
         );
-        // 9th call wraps to slot 0 and reuses the existing buffer without reallocating.
+        // 3rd call wraps to slot 0 and reuses the existing buffer without reallocating.
         let (b_wrap, evicted) =
             bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
         assert_eq!(

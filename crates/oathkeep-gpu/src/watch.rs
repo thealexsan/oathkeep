@@ -793,8 +793,18 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
     let probe_absent = COMMIT_TITLE_MEMORY.get().is_none();
     let mut pre_gaps: Vec<(usize, usize)> = Vec::new();
     if !ask {
+        #[cfg(feature = "diagnostics")]
+        let t_read = std::time::Instant::now();
         let g = guards_read();
         if g.clean.contains_range(first, last) {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::GuardReadFastN, 1);
+                crate::copystat::add(
+                    crate::copystat::C::GuardReadFastUs,
+                    t_read.elapsed().as_micros() as u64,
+                );
+            }
             return Some(GuardHot::HotOnly(Vec::new()));
         }
         if g.accounted.contains_range(first, last)
@@ -802,6 +812,14 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
         {
             let has_partly = g.partly.overlaps(first, last);
             if g.hot.is_empty() && !has_partly {
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::copystat::add(crate::copystat::C::GuardReadFastN, 1);
+                    crate::copystat::add(
+                        crate::copystat::C::GuardReadFastUs,
+                        t_read.elapsed().as_micros() as u64,
+                    );
+                }
                 return Some(GuardHot::HotOnly(Vec::new()));
             }
             let mut hot_pages = Vec::new();
@@ -817,6 +835,8 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
                 }
             }
             if all_active {
+                #[cfg(feature = "diagnostics")]
+                let hot_n = hot_pages.len() as u64;
                 if has_partly {
                     let had_hot = !hot_pages.is_empty();
                     g.partly.for_each_overlap(first, last, |a, b| {
@@ -825,6 +845,20 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
                     if had_hot {
                         hot_pages.sort_unstable_by_key(|&(block, _)| block);
                     }
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    let total_n = hot_pages.len() as u64;
+                    crate::copystat::add(crate::copystat::C::GuardReadFastN, 1);
+                    crate::copystat::add(
+                        crate::copystat::C::GuardReadFastUs,
+                        t_read.elapsed().as_micros() as u64,
+                    );
+                    crate::copystat::add(crate::copystat::C::GuardRetHotPages, hot_n);
+                    crate::copystat::add(
+                        crate::copystat::C::GuardRetPartlyPages,
+                        total_n.saturating_sub(hot_n),
+                    );
                 }
                 return Some(GuardHot::HotOnly(hot_pages));
             }
@@ -852,6 +886,8 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
     }
     // Pre-query `inplace::VIEWS` OUTSIDE `GUARDS.write()` so view-map mutations on other
     // threads never stall `GUARDS` readers behind `inplace::VIEWS.read()`.
+    #[cfg(feature = "diagnostics")]
+    let t_pre = std::time::Instant::now();
     let pre_aliases = if view_guard() && !pre_gaps.is_empty() {
         let seq = crate::inplace::views_seq();
         let mut all_blocks = Vec::new();
@@ -873,8 +909,20 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
     } else {
         None
     };
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::GuardPreAliasUs,
+        t_pre.elapsed().as_micros() as u64,
+    );
     install();
+    #[cfg(feature = "diagnostics")]
+    let t_wlock = std::time::Instant::now();
     let mut g = guards();
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::GuardWriteWaitUs,
+        t_wlock.elapsed().as_micros() as u64,
+    );
     if g.clean.contains_range(first, last) {
         return Some(GuardHot::HotOnly(Vec::new()));
     }
@@ -936,6 +984,8 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
             hot_pages.into_iter().map(|p| (p, HOT_WRITE)).collect(),
         ));
     }
+    #[cfg(feature = "diagnostics")]
+    let t_prot = std::time::Instant::now();
     let mut written = Vec::new();
     let mut protected_runs = Vec::new();
     for (gap_first, gap_last) in g.accounted.gaps_in(first, last) {
@@ -956,7 +1006,17 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
             }
         }
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::add(
+            crate::copystat::C::GuardProtectUs,
+            t_prot.elapsed().as_micros() as u64,
+        );
+        crate::copystat::add(crate::copystat::C::GuardRetGuardedPages, written.len() as u64);
+    }
     if !protected_runs.is_empty() {
+        #[cfg(feature = "diagnostics")]
+        let t_alias = std::time::Instant::now();
         let reused = if let Some((seq, ref covered, all_blocks, other_runs, total_count)) =
             pre_aliases
             && crate::inplace::views_seq() == seq
@@ -974,6 +1034,11 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
         if !reused {
             protect_aliases(&mut g, &protected_runs);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::GuardAliasApplyUs,
+            t_alias.elapsed().as_micros() as u64,
+        );
     }
     Some(GuardHot::Guarded {
         guarded: written,
