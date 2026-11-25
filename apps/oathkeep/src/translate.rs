@@ -757,7 +757,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.dynamic += usize::from(address.dynamic.is_some());
                 Some(address)
             }
-            resource::Source::Constant(_) => {
+            resource::Source::Constant(_) | resource::Source::ImmediateSampler { .. } => {
                 t.constant += 1;
                 None
             }
