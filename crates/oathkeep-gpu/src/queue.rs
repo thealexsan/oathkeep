@@ -707,6 +707,33 @@ extern "system" fn present(
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
+        static LOGGED_PLANES: AtomicU64 = AtomicU64::new(0);
+        let key = (u64::from(planes) << 32) | u64::from(plane.count);
+        if LOGGED_PLANES.swap(key, Ordering::Relaxed) != key {
+            let mut extra = String::new();
+            if plane.count > 1 {
+                for i in 0..plane.count.min(4) as usize {
+                    // SAFETY: `plane.count` resources are present.
+                    let r = unsafe { *plane.resources.add(i) };
+                    extra.push_str(&format!(" p0[{i}]={r:?}"));
+                }
+            }
+            if planes > 1 {
+                // SAFETY: probe first 16 u64 words to observe plane stride.
+                let words = unsafe { std::slice::from_raw_parts(plane_parameters.cast::<u64>(), 16) };
+                for (i, w) in words.iter().enumerate() {
+                    extra.push_str(&format!(" w{i}={w:#x}"));
+                }
+            }
+            tracing::info!(
+                frame,
+                planes,
+                count = plane.count,
+                resource = ?resource,
+                extra = %extra,
+                "PresentX plane layout"
+            );
+        }
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);

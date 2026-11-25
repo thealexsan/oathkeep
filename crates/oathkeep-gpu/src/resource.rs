@@ -1168,7 +1168,7 @@ fn commit_headroom() -> u64 {
         std::env::var("OATHKEEP_COMMIT_HEADROOM_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(3072)
+            .unwrap_or(1536)
             << 20
     })
 }

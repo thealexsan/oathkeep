@@ -491,6 +491,9 @@ pub(crate) fn save(now: bool) {
     let (Some(dir), Some(library)) = (DIR.get(), library()) else {
         return;
     };
+    if !now && crate::host::available_commit().is_some_and(|c| c < (2u64 << 30)) {
+        return;
+    }
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {

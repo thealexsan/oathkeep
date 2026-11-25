@@ -259,11 +259,70 @@ fn next() -> Arc<Pending> {
     }
 }
 
+fn worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::env::var("OATHKEEP_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 8))
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+            })
+    })
+}
+
+fn compile_limit() -> usize {
+    let max = worker_count();
+    let Some(avail) = crate::host::available_commit() else {
+        return max;
+    };
+    if avail < (2u64 << 30) {
+        1
+    } else if avail < (3584u64 << 20) {
+        max.min(2)
+    } else {
+        max
+    }
+}
+
+static COMPILE_GATE: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+struct ActiveCompile;
+
+impl ActiveCompile {
+    fn enter() -> Self {
+        let (lock, cv) = &COMPILE_GATE;
+        let mut active = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while *active >= compile_limit() {
+            let (guard, _) = cv
+                .wait_timeout(active, Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner());
+            active = guard;
+        }
+        *active += 1;
+        drop(active);
+        if crate::host::available_commit().is_some_and(|c| c < (1536u64 << 20)) {
+            crate::host::reclaim_for_oom();
+        }
+        ActiveCompile
+    }
+}
+
+impl Drop for ActiveCompile {
+    fn drop(&mut self) {
+        let (lock, cv) = &COMPILE_GATE;
+        let mut active = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *active = active.saturating_sub(1);
+        cv.notify_one();
+    }
+}
+
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = worker_count();
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("oathkeep-pipelines-{i}"))
@@ -274,7 +333,11 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        let pending = next();
+                        {
+                            let _permit = ActiveCompile::enter();
+                            pending.make();
+                        }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
