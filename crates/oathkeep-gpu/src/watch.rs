@@ -441,6 +441,14 @@ pub(crate) fn writes_kind(
 }
 
 pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_guarded_since(start, end, 0)
+}
+
+pub(crate) fn writes_guarded_since(
+    start: usize,
+    end: usize,
+    since: u64,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     #[cfg(feature = "diagnostics")]
     let guarding = std::time::Instant::now();
@@ -456,10 +464,14 @@ pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usiz
     let guarded = written?;
     if guarded.is_empty() {
         let j = journal_read();
+        if since != 0 && j.asked <= since {
+            return Some((j.asked, Vec::new()));
+        }
         return Some((
             j.asked,
             j.written
                 .range(first..last)
+                .filter(|&(_, &w)| since == 0 || w > since)
                 .map(|(&p, &w)| (p, w))
                 .collect(),
         ));
@@ -474,6 +486,7 @@ pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usiz
         now,
         j.written
             .range(first..last)
+            .filter(|&(_, &w)| since == 0 || w > since)
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
@@ -513,7 +526,34 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             return Some(Vec::new());
         }
         let known = g.protected.contains(first) || g.absent.contains(first);
+        let absent_gaps = if known {
+            let gaps = g.clean.gaps_in(first, last);
+            if !gaps.is_empty() && gaps.iter().all(|&(a, b)| g.absent.contains_range(a, b)) {
+                Some(gaps)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         drop(g);
+        if let Some(gaps) = absent_gaps {
+            let mut still_absent = true;
+            'check: for (a, b) in gaps {
+                let mut at = a;
+                while at < b {
+                    let until = uncommitted_end(at);
+                    if until <= at {
+                        still_absent = false;
+                        break 'check;
+                    }
+                    at = until;
+                }
+            }
+            if still_absent {
+                return Some(Vec::new());
+            }
+        }
         if !known && !is_view(start, end) {
             return None;
         }
@@ -529,29 +569,31 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut uncommitted_until = first;
     for (gap_first, gap_last) in g.clean.gaps_in(first, last) {
         let mut run: Option<usize> = None;
-        for block in gap_first..gap_last {
-            let mut open = true;
+        let mut block = gap_first;
+        while block < gap_last {
             if g.absent.contains(block) {
                 if block >= uncommitted_until {
                     uncommitted_until = uncommitted_end(block);
                 }
-                open = block >= uncommitted_until;
-                if open {
-                    g.absent.remove(block);
-                }
-            }
-            if open {
-                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-                if g.protected.contains(block) {
-                    g.clean.insert(block);
-                } else {
-                    run.get_or_insert(block);
+                if block < uncommitted_until {
+                    if let Some(from) = run.take() {
+                        protect(&mut g, from, block);
+                    }
+                    block = uncommitted_until.min(gap_last);
                     continue;
                 }
+                g.absent.remove(block);
             }
-            if let Some(from) = run.take() {
-                protect(&mut g, from, block);
+            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+            if g.protected.contains(block) {
+                if let Some(from) = run.take() {
+                    protect(&mut g, from, block);
+                }
+                g.clean.insert(block);
+            } else {
+                run.get_or_insert(block);
             }
+            block += 1;
         }
         if let Some(from) = run.take() {
             protect(&mut g, from, gap_last);

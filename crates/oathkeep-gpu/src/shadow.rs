@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -15,6 +15,8 @@ pub(crate) struct Shadow {
     len: u64,
     copied: Mutex<Vec<u64>>,
     uncopied: AtomicU64,
+    synced_at: AtomicU64,
+    ever_written: AtomicBool,
     watched: AtomicU8,
     pending: Mutex<Vec<(usize, usize)>>,
     flights: Mutex<Flights>,
@@ -1767,6 +1769,19 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == WATCHED_GUARDED
     }
 
+    pub(crate) fn ever_written(&self) -> bool {
+        self.ever_written.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn pending_touches(&self, address: usize, len: usize) -> bool {
+        let end = address.saturating_add(len);
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(a, e)| a < end && e > address)
+    }
+
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
@@ -1805,6 +1820,8 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             uncopied: AtomicU64::new(pages),
+            synced_at: AtomicU64::new(0),
+            ever_written: AtomicBool::new(false),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -1833,6 +1850,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        self.ever_written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
@@ -2384,8 +2402,13 @@ impl Shadow {
     fn update_free(&self, from: usize, to: usize) -> usize {
         let mode = self.watched.load(Ordering::Relaxed);
         if mode != NOT_WATCHED {
+            let since = if self.uncopied.load(Ordering::Acquire) == 0 {
+                self.synced_at.load(Ordering::Acquire)
+            } else {
+                0
+            };
             let found = match mode {
-                WATCHED_GUARDED => crate::watch::writes_guarded(from, to),
+                WATCHED_GUARDED => crate::watch::writes_guarded_since(from, to, since),
                 WATCHED_KERNEL => crate::watch::writes(from, to, true),
                 _ => match crate::watch::writes_kind(from, to, true) {
                     Some((now, written, kind)) => {
@@ -2476,8 +2499,12 @@ impl Shadow {
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let full = from <= start && to >= end;
         if self.uncopied.load(Ordering::Acquire) == 0 {
             if written.is_empty() {
+                if full && now != 0 {
+                    self.synced_at.fetch_max(now, Ordering::Release);
+                }
                 return 0;
             }
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -2505,6 +2532,9 @@ impl Shadow {
             }
             if let Some((first, prev)) = run {
                 bytes += self.copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
+            }
+            if full && now != 0 {
+                self.synced_at.fetch_max(now, Ordering::Release);
             }
             return bytes;
         }
@@ -2539,6 +2569,9 @@ impl Shadow {
         }
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        }
+        if full && now != 0 && self.uncopied.load(Ordering::Acquire) == 0 {
+            self.synced_at.fetch_max(now, Ordering::Release);
         }
         bytes
     }
@@ -2838,6 +2871,27 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
+}
+
+pub(crate) fn find_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    {
+        let map = buffers_read();
+        if let Some((_, entry)) = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end)
+            && let Some(shadow) = &entry.shadow
+        {
+            return Some(shadow.clone());
+        }
+    }
+    let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    let (cell, _) = window_of(address, end, WINDOW);
+    map.range((cell, 0)..=(address, u64::MAX))
+        .find(|((start, bytes), _)| *start <= address && *start + *bytes >= end)
+        .map(|(_, s)| s.clone())
 }
 
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {

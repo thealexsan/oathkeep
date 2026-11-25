@@ -701,6 +701,76 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        if len == 0 {
+            return;
+        }
+        static DIRECT_BUF_COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let direct = *DIRECT_BUF_COPY
+            .get_or_init(|| std::env::var_os("OATHKEEP_DIRECT_BUF_COPY").is_none_or(|v| v != "0"));
+        if direct {
+            let (from_u64, to_u64) = (from as u64, to as u64);
+            let (from_u, to_u, len_u) = (from as usize, to as usize, len as usize);
+            let src_existing = crate::shadow::find_existing(from_u64, len);
+            let dst_existing = crate::shadow::find_existing(to_u64, len);
+            let gpu_active = src_existing.as_ref().is_some_and(|s| {
+                s.ever_written()
+                    && (s.pending_touches(from_u, len_u)
+                        || list.touches_gpu_write(from_u, len_u)
+                        || crate::host::written_in_flight(from_u, len_u))
+            }) || dst_existing.as_ref().is_some_and(|s| {
+                s.ever_written()
+                    && (s.pending_touches(to_u, len_u)
+                        || list.touches_gpu_write(to_u, len_u)
+                        || crate::host::written_in_flight(to_u, len_u))
+            });
+            if gpu_active
+                && let Some(src_shadow) = src_existing.or_else(|| crate::shadow::find(from_u64, len))
+                && let Some(dst_shadow) = dst_existing.or_else(|| crate::shadow::find(to_u64, len))
+                && src_shadow.left(from_u64) >= len
+                && dst_shadow.left(to_u64) >= len
+            {
+                let (src_off, dst_off) = (src_shadow.offset(from_u64), dst_shadow.offset(to_u64));
+                let same_overlap = std::sync::Arc::ptr_eq(&src_shadow, &dst_shadow)
+                    && src_off < dst_off.saturating_add(len)
+                    && dst_off < src_off.saturating_add(len);
+                if !same_overlap {
+                    src_shadow.refresh(list, from_u64, len);
+                    dst_shadow.refresh(list, to_u64, len);
+                    list.keep(&src_shadow.buffer);
+                    list.keep(&dst_shadow.buffer);
+                    // SAFETY: an open list with live shadow buffers; UAV barriers
+                    // bracket CopyBufferRegion so prior shader writes are visible
+                    // and destination bytes are visible to subsequent shaders.
+                    unsafe {
+                        use windows::Win32::Graphics::Direct3D12::{
+                            D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
+                            D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                            D3D12_RESOURCE_UAV_BARRIER,
+                        };
+                        let uav = || D3D12_RESOURCE_BARRIER {
+                            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                    pResource: std::mem::ManuallyDrop::new(None),
+                                }),
+                            },
+                        };
+                        list.list.ResourceBarrier(&[uav()]);
+                        list.list.CopyBufferRegion(
+                            &dst_shadow.buffer,
+                            dst_off,
+                            &src_shadow.buffer,
+                            src_off,
+                            len,
+                        );
+                        list.list.ResourceBarrier(&[uav()]);
+                    }
+                    dst_shadow.gpu_writes(list, to_u64, len);
+                    return;
+                }
+            }
+        }
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
