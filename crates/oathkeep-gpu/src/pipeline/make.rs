@@ -9,7 +9,9 @@ use super::host::{GraphicsState, HostPipeline};
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Mutex<Option<Box<GraphicsState>>>,
+    is_compute: bool,
     queue_state: AtomicU8,
+    last_frame: AtomicU64,
     made: OnceLock<Option<HostPipeline>>,
     key: String,
     used: AtomicBool,
@@ -35,10 +37,13 @@ impl Pending {
                 .unwrap_or_default()
                 .as_bytes(),
         );
+        let is_compute = graphics.is_none() && shaders.iter().any(|s| s.stage == "compute");
         Pending {
             shaders,
             graphics: Mutex::new(graphics),
+            is_compute,
             queue_state: AtomicU8::new(NOT_QUEUED),
+            last_frame: AtomicU64::new(0),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -106,8 +111,10 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
+        let frame = crate::frame::current();
+        p.last_frame.fetch_max(frame, Ordering::Relaxed);
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        wait(p, frame);
     }
     p.made.get()?.as_ref()
 }
@@ -215,7 +222,23 @@ impl Queue {
     }
 
     fn pop(&mut self, allow_early: bool) -> Option<(Arc<Pending>, bool)> {
-        if let Some(p) = self.requested.pop_back() {
+        if !self.requested.is_empty() {
+            let mut best_idx = self.requested.len() - 1;
+            let mut best_key = (
+                self.requested[best_idx].last_frame.load(Ordering::Relaxed),
+                self.requested[best_idx].is_compute,
+            );
+            for i in (0..best_idx).rev() {
+                let key = (
+                    self.requested[i].last_frame.load(Ordering::Relaxed),
+                    self.requested[i].is_compute,
+                );
+                if key > best_key {
+                    best_key = key;
+                    best_idx = i;
+                }
+            }
+            let p = self.requested.remove(best_idx)?;
             p.queue_state.store(MAKING, Ordering::Relaxed);
             return Some((p, false));
         }
@@ -484,6 +507,28 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(queue.pop(false).is_none());
         assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &earlier));
+        assert!(queue.pop(true).is_none());
+    }
+
+    #[test]
+    fn active_frame_and_compute_pipelines_beat_stale_graphics() {
+        let stale_gfx = Arc::new(Pending::new(Vec::new(), None));
+        stale_gfx.last_frame.store(10, Ordering::Relaxed);
+        let active_gfx = Arc::new(Pending::new(Vec::new(), None));
+        active_gfx.last_frame.store(20, Ordering::Relaxed);
+        let mut active_cs = Pending::new(Vec::new(), None);
+        active_cs.is_compute = true;
+        active_cs.last_frame.store(20, Ordering::Relaxed);
+        let active_cs = Arc::new(active_cs);
+
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&active_cs, REQUESTED), Some(true));
+        assert_eq!(queue.push(&stale_gfx, REQUESTED), Some(true));
+        assert_eq!(queue.push(&active_gfx, REQUESTED), Some(true));
+
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &active_cs));
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &active_gfx));
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &stale_gfx));
         assert!(queue.pop(true).is_none());
     }
 }
