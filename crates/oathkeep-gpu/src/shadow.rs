@@ -32,8 +32,9 @@ pub(crate) struct Shadow {
 }
 
 struct Card {
-    staging: ID3D12Resource,
     before: Mutex<Option<ID3D12Resource>>,
+    old: Mutex<BTreeMap<usize, Vec<u8>>>,
+    has_old: AtomicBool,
     dirty: Mutex<Vec<(usize, usize)>>,
     sent: Mutex<Vec<(usize, usize, u64)>>,
     size: u64,
@@ -775,16 +776,18 @@ fn pooled(n: usize) -> Vec<u8> {
 }
 
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    const KEPT: usize = 64 << 20;
+    if v.capacity() > KEPT {
+        return;
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     pool.truncate(8);
-    let (mut seen, mut total) = (0, 0usize);
+    let mut total = 0usize;
     pool.retain(|v| {
-        seen += 1;
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+        total <= KEPT
     });
 }
 
@@ -1675,39 +1678,109 @@ pub(crate) fn window_use() -> [u64; 8] {
 }
 
 pub(crate) fn let_go_idle() {
-    let gone: Vec<Arc<Shadow>> = {
-        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-        if map.is_empty() {
-            return;
-        }
-        let avail_phys = crate::host::available_physical_ram();
-        let avail_commit = crate::host::available_commit();
-        let idle_ms = crate::host::ram_idle_ms(avail_phys)
-            .min(crate::host::commit_idle_ms(avail_commit));
-        let idle_frames = crate::host::commit_idle_frames(avail_commit);
-        let idle: Vec<(u64, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, idle_frames)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(key, _)| *key)
-            .collect();
-        idle.into_iter()
-            .filter_map(|key| map.remove(&key))
-            .collect()
+    let_go_idle_with(false);
+}
+
+pub(crate) fn let_go_idle_urgent() {
+    let_go_idle_with(true);
+}
+
+fn let_go_idle_with(urgent: bool) {
+    let avail_phys = crate::host::available_physical_ram();
+    let avail_commit = crate::host::available_commit();
+    let (idle_ms, idle_frames, drain_pool) = if urgent {
+        (0, 1, true)
+    } else {
+        (
+            crate::host::ram_idle_ms(avail_phys).min(crate::host::commit_idle_ms(avail_commit)),
+            crate::host::commit_idle_frames(avail_commit),
+            avail_commit.is_some_and(|c| c < (3584u64 << 20)),
+        )
     };
-    if !gone.is_empty() {
-        let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
+    if drain_pool {
+        let drained = if urgent {
+            POOL.try_lock().ok().map(|mut p| std::mem::take(&mut *p))
+        } else {
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            Some(std::mem::take(&mut *pool))
+        };
+        drop(drained);
+    }
+    let gone_loose: Vec<Arc<Shadow>> = {
+        let map = if urgent {
+            LOOSE.try_write().ok()
+        } else {
+            Some(LOOSE.write().unwrap_or_else(|e| e.into_inner()))
+        };
+        if let Some(mut map) = map
+            && !map.is_empty()
+        {
+            let idle: Vec<(u64, u64)> = map
+                .iter()
+                .filter(|(_, s)| {
+                    Arc::strong_count(s) == 1
+                        && !s.writes_pending()
+                        && crate::host::long_ago(
+                            s.used.load(Ordering::Relaxed),
+                            idle_ms,
+                            idle_frames,
+                        )
+                        && crate::host::references(&s.buffer) == 1
+                })
+                .map(|(key, _)| *key)
+                .collect();
+            idle.into_iter()
+                .filter_map(|key| map.remove(&key))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
+    let gone_buffers: Vec<Arc<Shadow>> = {
+        let map = if urgent {
+            BUFFERS.try_write().ok()
+        } else {
+            Some(buffers_write())
+        };
+        if let Some(mut map) = map {
+            let mut out = Vec::new();
+            for entry in map.values_mut() {
+                let evict = entry.shadow.as_ref().is_some_and(|s| {
+                    Arc::strong_count(s) == 1
+                        && !s.writes_pending()
+                        && crate::host::long_ago(
+                            s.used.load(Ordering::Relaxed),
+                            idle_ms,
+                            idle_frames,
+                        )
+                        && crate::host::references(&s.buffer) == 1
+                });
+                if evict && let Some(s) = entry.shadow.take() {
+                    out.push(s);
+                }
+            }
+            out
+        } else {
+            Vec::new()
+        }
+    };
+    if !gone_loose.is_empty() || !gone_buffers.is_empty() {
+        let went = gone_loose.len() + gone_buffers.len();
+        let bytes: u64 = gone_loose
+            .iter()
+            .chain(gone_buffers.iter())
+            .map(|s| s.len)
+            .sum();
         crate::host::trail(|| {
             format!(
-                "sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot",
-                bytes >> 10
+                "sweep: {went} host copies of title memory let go ({} KiB; {} windows, {} buffers), held by no list and no slot",
+                bytes >> 10,
+                gone_loose.len(),
+                gone_buffers.len()
             )
         });
     }
-    for shadow in gone {
+    for shadow in gone_loose.into_iter().chain(gone_buffers) {
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         crate::host::retire(shadow);
@@ -1814,6 +1887,7 @@ impl Shadow {
     }
 
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.used.store(crate::host::moment(), Ordering::Relaxed);
         if self.place.is_some() {
             list.keep(&self.buffer);
             return;
@@ -1861,6 +1935,7 @@ impl Shadow {
     }
 
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.used.store(crate::host::moment(), Ordering::Relaxed);
         if self.place.is_some() {
             return;
         }
@@ -2324,20 +2399,30 @@ impl Shadow {
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
                 let at = lo - start;
-                if self.card.is_some() {
-                    // SAFETY: inside the mapping of the copy's CPU side,
-                    // which only the submitting thread writes.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
-                    if runs.len() > *runs_left {
-                        return true;
+                if let Some(card) = &self.card {
+                    let p = self.pieces(at, at + n).start;
+                    let (p_lo, _) = self.piece(p);
+                    let mut changed = Vec::new();
+                    {
+                        let mut old = card.old.lock().unwrap_or_else(|e| e.into_inner());
+                        let Some(piece_buf) = old.get_mut(&p) else {
+                            return true;
+                        };
+                        let held = &mut piece_buf[at - p_lo..at - p_lo + n];
+                        let runs = changed_runs(title, held);
+                        if runs.len() > *runs_left {
+                            return true;
+                        }
+                        *runs_left -= runs.len();
+                        for (r, m) in runs {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            changed.push((at + r, at + r + m));
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
                     }
-                    *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    for (c_from, c_to) in changed {
+                        self.card_changed(c_from, c_to);
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -2462,6 +2547,9 @@ impl Shadow {
     }
 
     fn refresh_check(&self, from: usize, to: usize) {
+        if self.data.is_null() {
+            return;
+        }
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("OATHKEEP_REFRESH_CHECK").is_some_and(|v| v == "1"))
         {
@@ -2608,6 +2696,9 @@ impl Shadow {
     }
 
     fn copy_hot(&self, from: usize, to: usize) -> usize {
+        if self.card.is_some() {
+            return self.copy(from, to);
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         if from >= to {
@@ -2647,11 +2738,34 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        let (off_from, off_to) = (from - start, to - start);
+        if let Some(card) = &self.card {
+            if card.has_old.load(Ordering::Acquire) {
+                let mut old = card.old.lock().unwrap_or_else(|e| e.into_inner());
+                for p in self.pieces(off_from, off_to) {
+                    if let Some(buf) = old.get_mut(&p) {
+                        let (p_lo, p_hi) = self.piece(p);
+                        let a = off_from.max(p_lo);
+                        let b = off_to.min(p_hi);
+                        crate::host::read_into(
+                            (start + a) as *const u8,
+                            &mut buf[a - p_lo..b - p_lo],
+                        );
+                    }
+                }
+            }
+            self.changed(off_from, off_to);
+            self.card_changed(off_from, off_to);
+            return to - from;
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(from - start) };
+        let at = unsafe { self.data.add(off_from) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
-        self.changed(from - start, to - start);
-        self.card_changed(from - start, to - start);
+        self.changed(off_from, off_to);
+        self.card_changed(off_from, off_to);
         to - from
     }
 
@@ -2675,14 +2789,121 @@ impl Shadow {
         }
     }
 
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    pub(crate) fn card_sides(&self) -> Option<(Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card
             .before
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        Some((&card.staging, before, card.size))
+        Some((before, card.size))
+    }
+
+    pub(crate) fn card_prepare_write(&self, address: usize, end: usize) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        let (from, to) = self.inside(address, end.saturating_sub(address));
+        if from >= to {
+            return;
+        }
+        let start = self.start as usize;
+        let base = start / PAGE;
+        let unwatched = self.watched.load(Ordering::Relaxed) == NOT_WATCHED;
+        let mut new_dirty: Vec<(usize, usize)> = Vec::new();
+        for p in self.pieces(from, to) {
+            let missing = {
+                let old = card.old.lock().unwrap_or_else(|e| e.into_inner());
+                !old.contains_key(&p)
+            };
+            if !missing {
+                continue;
+            }
+            let (p_lo, p_hi) = self.piece(p);
+            let mut buf = vec![0u8; p_hi - p_lo];
+            if unwatched {
+                if crate::host::read_into((start + p_lo) as *const u8, &mut buf) {
+                    new_dirty.push((p_lo, p_hi));
+                }
+            } else {
+                let copied_pages: Vec<(usize, usize)> = {
+                    let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    let first_page = (start + p_lo) / PAGE;
+                    let last_page = (start + p_hi - 1) / PAGE;
+                    let mut spans = Vec::new();
+                    for page in first_page..=last_page {
+                        if copied.get(page - base).copied().unwrap_or(0) != 0 {
+                            let lo = (page * PAGE).max(start + p_lo) - start;
+                            let hi = ((page + 1) * PAGE).min(start + p_hi) - start;
+                            if lo < hi {
+                                spans.push((lo, hi));
+                            }
+                        }
+                    }
+                    spans
+                };
+                for (lo, hi) in copied_pages {
+                    if crate::host::read_into(
+                        (start + lo) as *const u8,
+                        &mut buf[lo - p_lo..hi - p_lo],
+                    ) {
+                        new_dirty.push((lo, hi));
+                    }
+                }
+            }
+            let mut old = card.old.lock().unwrap_or_else(|e| e.into_inner());
+            old.entry(p).or_insert(buf);
+            card.has_old.store(true, Ordering::Release);
+        }
+        for (d_from, d_to) in new_dirty {
+            self.card_changed(d_from, d_to);
+        }
+    }
+
+    pub(crate) fn card_fill_upload(&self, a: usize, len: usize, dst: *mut u8) {
+        if len == 0 {
+            return;
+        }
+        let start = self.start as usize;
+        let Some(card) = &self.card else {
+            return;
+        };
+        if !card.has_old.load(Ordering::Acquire) {
+            crate::host::copy_mapped(dst, (start + a) as *const u8, len, false);
+            return;
+        }
+        let old = card.old.lock().unwrap_or_else(|e| e.into_inner());
+        if old.is_empty() {
+            drop(old);
+            crate::host::copy_mapped(dst, (start + a) as *const u8, len, false);
+            return;
+        }
+        let mut cursor = a;
+        let end = a + len;
+        for p in self.pieces(a, end) {
+            let (p_lo, p_hi) = self.piece(p);
+            let seg_lo = cursor.max(p_lo);
+            let seg_hi = end.min(p_hi);
+            if seg_lo >= seg_hi {
+                continue;
+            }
+            let seg_len = seg_hi - seg_lo;
+            // SAFETY: `dst` has at least `len` bytes and `seg_lo - a + seg_len <= len`.
+            let seg_dst = unsafe { dst.add(seg_lo - a) };
+            if let Some(buf) = old.get(&p) {
+                // SAFETY: `buf` covers `[p_lo, p_hi)` and `seg_lo..seg_hi` lies inside it.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        buf.as_ptr().add(seg_lo - p_lo),
+                        seg_dst,
+                        seg_len,
+                    );
+                }
+            } else {
+                crate::host::copy_mapped(seg_dst, (start + seg_lo) as *const u8, seg_len, false);
+            }
+            cursor = seg_hi;
+        }
     }
 
     pub(crate) fn card_make_before(
@@ -2756,47 +2977,57 @@ impl Shadow {
 
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
-        if self.card.is_none() || at + gpu.len() > self.len as usize {
-            return 0;
-        }
-        // SAFETY: inside the mapping (checked above); only the submitting
-        // thread writes it.
-        let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
-        let Some(first) = first_difference(gpu, old) else {
+        let Some(card) = &self.card else {
             return 0;
         };
-        let last = last_difference(gpu, old).unwrap_or(first);
-        let (at, n) = (at + first, last + 1 - first);
-        let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
-        title.clear();
-        title.resize(n, 0);
-        let mut written = 0;
-        if crate::host::read_into((start + at) as *const u8, title) {
-            let as_read = merge_race_on().then(|| title.clone());
-            let mut differs = 0u8;
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                let wrote = if *g != *o { 0xffu8 } else { 0 };
-                let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
-                *t = merged;
-                *o = merged;
-            }
-            if differs != 0 {
-                crate::watch::writing(start + at, n);
-                merge_race(
-                    as_read.as_deref(),
-                    (self.start, self.len),
-                    start + at,
-                    &title[..],
-                    "card",
-                );
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                written = n;
-            }
-        } else {
-            old.copy_from_slice(gpu);
+        if gpu.is_empty() || at + gpu.len() > self.len as usize {
+            return 0;
         }
-        self.card_changed(at, at + n);
+        let p = self.pieces(at, at + gpu.len()).start;
+        let (p_lo, _) = self.piece(p);
+        let (changed_at, changed_n, written) = {
+            let mut old_map = card.old.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(piece_buf) = old_map.get_mut(&p) else {
+                return 0;
+            };
+            let old = &mut piece_buf[at - p_lo..at - p_lo + gpu.len()];
+            let Some(first) = first_difference(gpu, old) else {
+                return 0;
+            };
+            let last = last_difference(gpu, old).unwrap_or(first);
+            let (at, n) = (at + first, last + 1 - first);
+            let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
+            title.clear();
+            title.resize(n, 0);
+            let mut written = 0;
+            if crate::host::read_into((start + at) as *const u8, title) {
+                let as_read = merge_race_on().then(|| title.clone());
+                let mut differs = 0u8;
+                for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
+                    let wrote = if *g != *o { 0xffu8 } else { 0 };
+                    let merged = (*t & !wrote) | (*g & wrote);
+                    differs |= merged ^ *t;
+                    *t = merged;
+                    *o = merged;
+                }
+                if differs != 0 {
+                    crate::watch::writing(start + at, n);
+                    merge_race(
+                        as_read.as_deref(),
+                        (self.start, self.len),
+                        start + at,
+                        &title[..],
+                        "card",
+                    );
+                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    written = n;
+                }
+            } else {
+                old.copy_from_slice(gpu);
+            }
+            (at, n, written)
+        };
+        self.card_changed(changed_at, changed_at + changed_n);
         written
     }
 
@@ -2811,15 +3042,17 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
-        if at + gpu.len() > self.len as usize {
+        if gpu.is_empty() || at + gpu.len() > self.len as usize {
             return 0;
         }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: inside the mapping (checked above). The offsets are in a
-        // range declared and not done with, which no refresh writes; what
-        // does write it (the title's bytes put in under shader writes)
-        // holds the lock held here.
-        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        let p = self.pieces(at, at + gpu.len()).start;
+        let (p_lo, _) = self.piece(p);
+        let mut old_map = card.old.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(piece_buf) = old_map.get_mut(&p) else {
+            return 0;
+        };
+        let held = &mut piece_buf[at - p_lo..at - p_lo + gpu.len()];
         let Some(first) = first_difference(gpu, held) else {
             return 0;
         };
@@ -2965,6 +3198,7 @@ pub(crate) fn find_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
             .find(|(_, e)| e.end >= end)
             && let Some(shadow) = &entry.shadow
         {
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
             return Some(shadow.clone());
         }
     }
@@ -2972,7 +3206,10 @@ pub(crate) fn find_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let from = address.saturating_sub(WINDOW);
     map.range((from, 0)..=(address, u64::MAX))
         .find(|((start, bytes), _)| *start <= address && *start + *bytes >= end)
-        .map(|(_, s)| s.clone())
+        .map(|(_, s)| {
+            s.used.store(crate::host::moment(), Ordering::Relaxed);
+            s.clone()
+        })
 }
 
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
@@ -2996,7 +3233,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             .take(64)
             .find(|(_, e)| e.end >= end);
         match found {
-            Some((_, entry)) if entry.shadow.is_some() => return entry.shadow.clone(),
+            Some((_, entry)) if entry.shadow.is_some() => {
+                if let Some(s) = &entry.shadow {
+                    s.used.store(crate::host::moment(), Ordering::Relaxed);
+                }
+                return entry.shadow.clone();
+            }
             None => {
                 drop(map);
                 return loose(address, end, len <= 1, any);
@@ -3027,9 +3269,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        let (buffer, card) = match card_for(size) {
+        let (buffer, data, card) = match card_for(size) {
             Some(on_card) => {
                 crate::host::name(&on_card, || {
                     format!("title buffer {:#x}+{len:#x} on the card", key.0)
@@ -3040,15 +3280,20 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     "a buffer's host copy is in the card's memory"
                 );
                 let card = Card {
-                    staging: buffer,
                     before: Mutex::default(),
+                    old: Mutex::default(),
+                    has_old: AtomicBool::new(false),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
                 };
-                (on_card, Some(card))
+                (on_card, std::ptr::null_mut(), Some(card))
             }
-            None => (buffer, None),
+            None => {
+                let (buffer, data) = host()?.shared_buffer(size)?;
+                crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+                (buffer, data, None)
+            }
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -3075,6 +3320,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 .push(Arc::downgrade(&shadow));
         }
         entry.shadow = Some(shadow);
+    } else if let Some(s) = &entry.shadow {
+        s.used.store(crate::host::moment(), Ordering::Relaxed);
     }
     entry.shadow.clone()
 }
@@ -3244,23 +3491,26 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    let (buffer, card) = match window_card_for(len) {
+    let (buffer, data, card) = match window_card_for(len) {
         Some(on_card) => {
             crate::host::name(&on_card, || {
                 format!("title memory {start:#x}+{len:#x} on the card")
             });
             let card = Card {
-                staging: buffer,
                 before: Mutex::default(),
+                old: Mutex::default(),
+                has_old: AtomicBool::new(false),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
             };
-            (on_card, Some(card))
+            (on_card, std::ptr::null_mut(), Some(card))
         }
-        None => (buffer, None),
+        None => {
+            let (buffer, data) = host()?.shared_buffer(len)?;
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+            (buffer, data, None)
+        }
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };

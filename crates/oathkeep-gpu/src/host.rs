@@ -209,6 +209,9 @@ fn sweep() {
     if let Some(avail) = avail_commit
         && avail < (3u64 << 30)
     {
+        if avail < (2560u64 << 20) {
+            drain_spare(false);
+        }
         if avail < (2u64 << 30) {
             crate::list::trim_idle_to(4);
             trim_prelude_pool(2);
@@ -217,6 +220,38 @@ fn sweep() {
             trim_prelude_pool(4);
         }
     }
+}
+
+pub(crate) fn reclaim_for_oom() {
+    static RECLAIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if RECLAIMING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            RECLAIMING.store(false, Ordering::Release);
+        }
+    }
+    let _guard = Guard;
+    tracing::warn!("reclaim_for_oom: trimming idle caches and retired resources after E_OUTOFMEMORY");
+    crate::pipeline::trim_library();
+    crate::shadow::let_go_idle_urgent();
+    crate::texture::let_go_idle_urgent();
+    crate::resource::let_go_idle_urgent();
+    crate::list::trim_idle_to(0);
+    trim_prelude_pool(0);
+    drain_spare(true);
+    if let Ok(mut guard) = CARD_WORK.try_lock()
+        && let Some(work) = guard.as_mut()
+    {
+        drop(work.fetched.take());
+        drop(std::mem::take(&mut work.upload_pool));
+    }
+    bury(FINISHED.load(Ordering::Acquire));
 }
 
 pub(crate) fn retire<T: 'static>(object: T) {
@@ -1362,6 +1397,38 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
 }
 
+fn drain_spare(sync_drop: bool) {
+    let freed: Vec<(Chunk, u64)> = {
+        let mut spare = if sync_drop {
+            let Ok(guard) = SPARE.try_lock() else {
+                return;
+            };
+            guard
+        } else {
+            SPARE.lock().unwrap_or_else(|e| e.into_inner())
+        };
+        if spare.kept.is_empty() {
+            return;
+        }
+        spare.bytes = 0;
+        std::mem::take(&mut spare.kept)
+    };
+    let count = freed.len() as u64;
+    let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
+    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+    if sync_drop {
+        drop(freed);
+    } else {
+        defer_drop(SendDrop(freed));
+    }
+}
+
+const CARD_UPLOAD_CHUNK: u64 = 16 << 20;
+const CARD_UPLOAD_POOL_MAX: u64 = 16 << 20;
+
 struct CardWork {
     sync: Vec<Prelude>,
     check: Vec<Prelude>,
@@ -1370,6 +1437,7 @@ struct CardWork {
     pso: ID3D12PipelineState,
     differs: (ID3D12Resource, usize, u64),
     fetched: Option<(ID3D12Resource, usize, u64)>,
+    upload_pool: Vec<(ID3D12Resource, usize, u64)>,
     taken: u32,
     out: u32,
 }
@@ -1448,6 +1516,7 @@ struct CardPlan {
     check: Option<ID3D12CommandList>,
     _synced: Vec<std::sync::Arc<crate::shadow::Shadow>>,
     lists: Vec<(bool, Prelude)>,
+    uploads: Vec<(ID3D12Resource, usize, u64)>,
     order_seq: u64,
 }
 
@@ -2679,13 +2748,14 @@ impl Host {
                 pso,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
+                upload_pool: Vec::new(),
                 taken: 0,
                 out: 0,
             })
         }
     }
 
-    fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+    fn card_before(&self, runs: &[&HostList], flown: bool, submitted: &mut u64) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -2706,6 +2776,11 @@ impl Host {
                         None => declared.push((shadow.clone(), vec![range])),
                     }
                 }
+            }
+        }
+        for (shadow, ranges) in &declared {
+            for &(from, to) in ranges {
+                shadow.card_prepare_write(from, to);
             }
         }
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -2748,6 +2823,7 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        let mut plan_uploads: Vec<(ID3D12Resource, usize, u64)> = Vec::new();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!(
@@ -2755,34 +2831,44 @@ impl Host {
                 ));
             };
             let (allocator, list) = &sync;
-            // SAFETY: the list's last run finished (it ran ahead of a
-            // submission that was waited for, and came back after that);
-            // live buffers, and the ranges lie in them.
-            let recorded = unsafe {
-                (|| -> windows::core::Result<()> {
-                    allocator.Reset()?;
-                    list.Reset(allocator, None)?;
-                    for (shadow, ranges) in &dirty {
-                        let Some((staging, before, size)) = shadow.card_sides() else {
-                            continue;
-                        };
-                        for &(a, b) in ranges {
-                            list.CopyBufferRegion(
-                                &shadow.buffer,
-                                a as u64,
-                                staging,
-                                a as u64,
-                                (b - a) as u64,
-                            );
-                            crate::shadow::CARD_STATS[0]
-                                .fetch_add((b - a) as u64, Ordering::Relaxed);
-                        }
-                        crate::shadow::CARD_STATS[1]
-                            .fetch_add(ranges.len() as u64, Ordering::Relaxed);
-                        let Some(before) = before else {
-                            continue;
-                        };
-                        if !ranges.is_empty() {
+            let total_copy: u64 = dirty
+                .iter()
+                .flat_map(|(_, rs)| rs.iter())
+                .map(|&(a, b)| (b - a) as u64)
+                .sum();
+            let take_upload = |pool: &mut Vec<(ID3D12Resource, usize, u64)>,
+                               want: u64|
+             -> (ID3D12Resource, usize, u64) {
+                if let Some((idx, _)) = pool
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, _, sz))| *sz >= want)
+                    .min_by_key(|(_, (_, _, sz))| *sz)
+                {
+                    return pool.swap_remove(idx);
+                }
+                let cap = want
+                    .max(256 << 10)
+                    .next_multiple_of(256 << 10)
+                    .min(CARD_UPLOAD_CHUNK);
+                let Some((buf, ptr)) = self.upload_buffer(cap) else {
+                    fail(format_args!(
+                        "no upload scratch buffer ({cap} bytes) to update host copies on the card"
+                    ));
+                };
+                name(&buf, || "card upload scratch".into());
+                (buf, ptr as usize, cap)
+            };
+            let emit_hashes = |list: &ID3D12GraphicsCommandList,
+                               copied_in_this_list: &[usize]| {
+                for (shadow, ranges) in &dirty {
+                    let Some((Some(before), size)) = shadow.card_sides() else {
+                        continue;
+                    };
+                    let ptr = Arc::as_ptr(shadow) as usize;
+                    // SAFETY: live buffers and compute root signature/PSO.
+                    unsafe {
+                        if copied_in_this_list.contains(&ptr) {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -2822,8 +2908,117 @@ impl Host {
                             list.Dispatch(run.pieces.div_ceil(64), 1, 1);
                         }
                     }
-                    list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                }
+            };
+            // SAFETY: the list's last run finished (it ran ahead of a
+            // submission that was waited for, and came back after that);
+            // live buffers, and the ranges lie in them.
+            let recorded = unsafe {
+                (|| -> windows::core::Result<()> {
+                    if total_copy == 0 {
+                        allocator.Reset()?;
+                        list.Reset(allocator, None)?;
+                        emit_hashes(list, &[]);
+                        list.Close()?;
+                        self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    } else if total_copy <= CARD_UPLOAD_CHUNK {
+                        let (upload_buf, upload_ptr, upload_cap) =
+                            take_upload(&mut work.upload_pool, total_copy);
+                        allocator.Reset()?;
+                        list.Reset(allocator, None)?;
+                        let mut off = 0usize;
+                        let mut copied_in_final: Vec<usize> = Vec::with_capacity(dirty.len());
+                        for (shadow, ranges) in &dirty {
+                            for &(a, b) in ranges {
+                                let len = b - a;
+                                shadow.card_fill_upload(a, len, (upload_ptr + off) as *mut u8);
+                                list.CopyBufferRegion(
+                                    &shadow.buffer,
+                                    a as u64,
+                                    &upload_buf,
+                                    off as u64,
+                                    len as u64,
+                                );
+                                off += len;
+                                crate::shadow::CARD_STATS[0]
+                                    .fetch_add(len as u64, Ordering::Relaxed);
+                            }
+                            crate::shadow::CARD_STATS[1]
+                                .fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                            if !ranges.is_empty() {
+                                copied_in_final.push(Arc::as_ptr(shadow) as usize);
+                            }
+                        }
+                        emit_hashes(list, &copied_in_final);
+                        list.Close()?;
+                        self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                        plan_uploads.push((upload_buf, upload_ptr, upload_cap));
+                    } else {
+                        let (upload_buf, upload_ptr, upload_cap) =
+                            take_upload(&mut work.upload_pool, CARD_UPLOAD_CHUNK);
+                        let cap = upload_cap as usize;
+                        let mut chunks: Vec<Vec<(usize, usize, usize)>> = Vec::new();
+                        let mut cur: Vec<(usize, usize, usize)> = Vec::new();
+                        let mut cur_bytes = 0usize;
+                        for (si, (_, ranges)) in dirty.iter().enumerate() {
+                            crate::shadow::CARD_STATS[1]
+                                .fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                            for &(mut a, b) in ranges {
+                                while a < b {
+                                    let room = cap - cur_bytes;
+                                    if room == 0 {
+                                        chunks.push(std::mem::take(&mut cur));
+                                        cur_bytes = 0;
+                                        continue;
+                                    }
+                                    let take = (b - a).min(room);
+                                    cur.push((si, a, a + take));
+                                    cur_bytes += take;
+                                    a += take;
+                                }
+                            }
+                        }
+                        if !cur.is_empty() {
+                            chunks.push(cur);
+                        }
+                        for (ci, chunk) in chunks.iter().enumerate() {
+                            let is_last = ci + 1 == chunks.len();
+                            allocator.Reset()?;
+                            list.Reset(allocator, None)?;
+                            let mut off = 0usize;
+                            let mut copied_in_final: Vec<usize> = Vec::new();
+                            for &(si, a, b) in chunk {
+                                let shadow = &dirty[si].0;
+                                let len = b - a;
+                                shadow.card_fill_upload(a, len, (upload_ptr + off) as *mut u8);
+                                list.CopyBufferRegion(
+                                    &shadow.buffer,
+                                    a as u64,
+                                    &upload_buf,
+                                    off as u64,
+                                    len as u64,
+                                );
+                                off += len;
+                                crate::shadow::CARD_STATS[0]
+                                    .fetch_add(len as u64, Ordering::Relaxed);
+                                if is_last {
+                                    copied_in_final.push(Arc::as_ptr(shadow) as usize);
+                                }
+                            }
+                            if is_last {
+                                emit_hashes(list, &copied_in_final);
+                            }
+                            list.Close()?;
+                            self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                            if !is_last {
+                                *submitted += 1;
+                                self.queue.Signal(&self.fence, *submitted)?;
+                                self.fence.SetEventOnCompletion(*submitted, self.event)?;
+                                WaitForSingleObject(self.event, INFINITE);
+                            }
+                        }
+                        plan_uploads.push((upload_buf, upload_ptr, upload_cap));
+                    }
                     Ok(())
                 })()
             };
@@ -2840,6 +3035,7 @@ impl Host {
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
+            uploads: plan_uploads,
             order_seq: sent_as,
         };
         let mut at = work.taken;
@@ -2855,7 +3051,7 @@ impl Host {
             }
             let twin = shadow
                 .card_sides()
-                .is_some_and(|(_, before, _)| before.is_some());
+                .is_some_and(|(before, _)| before.is_some());
             for (from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
@@ -2904,7 +3100,7 @@ impl Host {
                         work.differs.0.GetGPUVirtualAddress(),
                     );
                     for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let Some((_, Some(before), size)) = r.shadow.card_sides() else {
+                        let Some((Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
                         let constants = [
@@ -2949,20 +3145,35 @@ impl Host {
     }
 
     fn card_done(&self, plan: CardPlan) {
-        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(work) = work.as_mut() else {
-            return;
-        };
-        for (check, list) in plan.lists {
-            if check {
-                work.check.push(list)
-            } else {
-                work.sync.push(list)
+        let mut excess = Vec::new();
+        {
+            let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(work) = work.as_mut() else {
+                return;
+            };
+            for (check, list) in plan.lists {
+                if check {
+                    work.check.push(list)
+                } else {
+                    work.sync.push(list)
+                }
+            }
+            let mut pool_bytes: u64 = work.upload_pool.iter().map(|(_, _, sz)| *sz).sum();
+            for item in plan.uploads {
+                if pool_bytes + item.2 <= CARD_UPLOAD_POOL_MAX {
+                    pool_bytes += item.2;
+                    work.upload_pool.push(item);
+                } else {
+                    excess.push(item.0);
+                }
+            }
+            work.out = work.out.saturating_sub(1);
+            if !relay() || work.out == 0 {
+                work.taken = 0;
             }
         }
-        work.out = work.out.saturating_sub(1);
-        if !relay() || work.out == 0 {
-            work.taken = 0;
+        if !excess.is_empty() {
+            defer_drop(SendDrop(excess));
         }
     }
 
@@ -3888,7 +4099,7 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown);
+        let card = self.card_before(runs, flown, &mut submitted);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -5598,22 +5809,36 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
+        let make = |buffer: &mut Option<ID3D12Resource>, data: &mut *mut std::ffi::c_void| {
+            // SAFETY: plain creation and mapping of an upload buffer.
+            unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                        None,
+                        buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        b.Map(0, None, Some(data))
+                    })
+            }
         };
+        let mut made = make(&mut buffer, &mut data);
+        if let Err(ref e) = made
+            && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+        {
+            reclaim_for_oom();
+            buffer = None;
+            data = std::ptr::null_mut();
+            made = make(&mut buffer, &mut data);
+            if made.is_ok() {
+                tracing::info!(size, "upload buffer succeeded after reclaim_for_oom");
+            }
+        }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
@@ -6232,22 +6457,36 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
+        let make = |buffer: &mut Option<ID3D12Resource>, data: &mut *mut std::ffi::c_void| {
+            // SAFETY: plain creation and mapping of a CPU-visible buffer.
+            unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        b.Map(0, None, Some(data))
+                    })
+            }
         };
+        let mut made = make(&mut buffer, &mut data);
+        if let Err(ref e) = made
+            && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+        {
+            reclaim_for_oom();
+            buffer = None;
+            data = std::ptr::null_mut();
+            made = make(&mut buffer, &mut data);
+            if made.is_ok() {
+                tracing::info!(size, "shared buffer succeeded after reclaim_for_oom");
+            }
+        }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
@@ -6279,17 +6518,30 @@ impl Host {
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a device-local buffer.
-        let made = unsafe {
-            self.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut buffer,
-            )
+        let make = |buffer: &mut Option<ID3D12Resource>| {
+            // SAFETY: plain creation of a device-local buffer.
+            unsafe {
+                self.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    buffer,
+                )
+            }
         };
+        let mut made = make(&mut buffer);
+        if let Err(ref e) = made
+            && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+        {
+            reclaim_for_oom();
+            buffer = None;
+            made = make(&mut buffer);
+            if made.is_ok() {
+                tracing::info!(size, "unordered-access buffer succeeded after reclaim_for_oom");
+            }
+        }
         match made {
             Ok(()) => buffer,
             Err(e) => {

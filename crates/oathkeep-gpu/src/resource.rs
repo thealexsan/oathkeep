@@ -1468,17 +1468,40 @@ pub(crate) fn card_accounting(
 
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
+    let_go_idle_with(false);
+}
+
+#[cfg(windows)]
+pub(crate) fn let_go_idle_urgent() {
+    let_go_idle_with(true);
+}
+
+#[cfg(windows)]
+fn let_go_idle_with(urgent: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let avail_commit = crate::host::available_commit();
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()))
-        .min(crate::host::commit_idle_ms(avail_commit));
-    let idle_frames = crate::host::commit_idle_frames(avail_commit);
+    let (idle_ms, idle_frames) = if urgent {
+        (0, 1)
+    } else {
+        let avail_commit = crate::host::available_commit();
+        (
+            crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()))
+                .min(crate::host::commit_idle_ms(avail_commit)),
+            crate::host::commit_idle_frames(avail_commit),
+        )
+    };
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
-    let all = textures();
+    let all = if urgent {
+        let Ok(guard) = TEXTURES.try_lock() else {
+            return;
+        };
+        guard
+    } else {
+        textures()
+    };
     for &at in all.iter() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
@@ -1487,7 +1510,14 @@ pub(crate) fn let_go_idle() {
             continue;
         }
         let gone = {
-            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let mut made = if urgent {
+                let Ok(guard) = r.host.made.try_lock() else {
+                    continue;
+                };
+                guard
+            } else {
+                r.host.made.lock().unwrap_or_else(|e| e.into_inner())
+            };
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
                     && std::sync::Arc::strong_count(host) == 1
@@ -1781,7 +1811,7 @@ fn host_texture_as(
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    let made = if reserved {
+    let mut made = if reserved {
         d.layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE.0 as u32;
         // SAFETY: as below; a texture the title fills has no clear value.
         unsafe {
@@ -1796,23 +1826,53 @@ fn host_texture_as(
             )
         }
     } else {
+        let initial_state = D3D12_RESOURCE_STATES(crate::host::legal_for(
+            d.flags,
+            crate::host::texture_state(state),
+        ) as i32);
+        let clear_ptr = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast());
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
-        unsafe {
+        let res = unsafe {
             host.device.CreateCommittedResource(
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
                 (&raw const d).cast(),
-                D3D12_RESOURCE_STATES(crate::host::legal_for(
-                    d.flags,
-                    crate::host::texture_state(state),
-                ) as i32),
-                clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                initial_state,
+                clear_ptr,
                 &mut texture,
             )
+        };
+        if let Err(ref e) = res
+            && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+        {
+            crate::host::reclaim_for_oom();
+            texture = None;
+            // SAFETY: same as above.
+            let retry = unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    (&raw const d).cast(),
+                    initial_state,
+                    clear_ptr,
+                    &mut texture,
+                )
+            };
+            if retry.is_ok() {
+                tracing::info!(
+                    width = d.width,
+                    height = d.height,
+                    format = d.format,
+                    "host texture succeeded after reclaim_for_oom"
+                );
+            }
+            retry
+        } else {
+            res
         }
     };
-    if let Err(e) = made {
+    if let Err(e) = &mut made {
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
     if let Some(t) = &texture {

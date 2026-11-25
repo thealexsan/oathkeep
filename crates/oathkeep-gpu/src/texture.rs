@@ -391,31 +391,68 @@ pub(crate) fn let_go() -> [u64; 2] {
 }
 
 pub(crate) fn let_go_idle() {
+    let_go_idle_with(false);
+}
+
+pub(crate) fn let_go_idle_urgent() {
+    let_go_idle_with(true);
+}
+
+fn let_go_idle_with(urgent: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let avail_phys = crate::host::available_physical_ram();
+    let avail_commit = crate::host::available_commit();
+    if urgent
+        || avail_phys.is_some_and(|b| b < (2 << 30))
+        || avail_commit.is_some_and(|c| c < (2560u64 << 20))
+    {
+        let drained = if urgent {
+            STAGING_POOL.try_lock().ok().map(|mut pool| {
+                pool.bytes = 0;
+                std::mem::take(&mut pool.kept)
+            })
+        } else {
+            let mut pool = STAGING_POOL.lock().unwrap_or_else(|e| e.into_inner());
+            pool.bytes = 0;
+            Some(std::mem::take(&mut pool.kept))
+        };
+        if let Some(drained) = drained
+            && !drained.is_empty()
+        {
+            if urgent {
+                drop(drained);
+            } else {
+                crate::host::defer_drop(crate::host::SendDrop(drained));
+            }
+        }
+    }
+    let mut map = if urgent {
+        let Ok(guard) = STAGING.try_lock() else {
+            return;
+        };
+        guard
+    } else {
+        STAGING.lock().unwrap_or_else(|e| e.into_inner())
+    };
     let Some(map) = map.as_mut() else {
         return;
     };
     if map.is_empty() {
         return;
     }
-    let avail = crate::host::available_physical_ram();
-    if avail.is_some_and(|b| b < (2 << 30)) {
-        let drained = {
-            let mut pool = STAGING_POOL.lock().unwrap_or_else(|e| e.into_inner());
-            pool.bytes = 0;
-            std::mem::take(&mut pool.kept)
-        };
-        if !drained.is_empty() {
-            crate::host::defer_drop(crate::host::SendDrop(drained));
-        }
-    }
-    let idle_ms = crate::host::ram_idle_ms(avail);
+    let (idle_ms, idle_frames) = if urgent {
+        (0, 1)
+    } else {
+        (
+            crate::host::ram_idle_ms(avail_phys).min(crate::host::commit_idle_ms(avail_commit)),
+            crate::host::commit_idle_frames(avail_commit).min(IDLE_FRAMES),
+        )
+    };
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, idle_frames);
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
