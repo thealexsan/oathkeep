@@ -4422,7 +4422,10 @@ impl Host {
                 };
                 for (lo, hi) in intervals {
                     let len = hi - lo;
-                    if skip_uncommitted && !readable_cache.any_readable(s_start + lo, len) {
+                    if !shadow.card_has_old_piece(lo, len)
+                        || shadow.card_piece_is_superseded(lo, hi, landed_seq)
+                        || (skip_uncommitted && !readable_cache.any_readable(s_start + lo, len))
+                    {
                         skipped_pieces += 1;
                         skipped_bytes += len as u64;
                         continue;

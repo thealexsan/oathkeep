@@ -95,7 +95,7 @@ fn early_budgets() -> (u64, u64) {
         };
         (
             ms("OATHKEEP_EARLY_TEXTURES_MS", texture_stage_ms()),
-            ms("OATHKEEP_BAKE_TEXTURES_MS", 32),
+            ms("OATHKEEP_BAKE_TEXTURES_MS", 8),
         )
     })
 }
@@ -1706,23 +1706,29 @@ impl State {
         }
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static BAKED_US: AtomicU64 = AtomicU64::new(0);
+        static BAKED_PASSES: AtomicU64 = AtomicU64::new(0);
+        static IN_FLIGHT: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        const MAX_BAKE_PASSES_PER_FRAME: u64 = 2;
         let frame = crate::frame::current();
         let first = FRAME.load(Ordering::Relaxed) != frame
             && FRAME.swap(frame, Ordering::Relaxed) != frame;
         if first {
             BAKED_US.store(0, Ordering::Relaxed);
+            BAKED_PASSES.store(0, Ordering::Relaxed);
         }
         let left_us = bake_ms
             .saturating_mul(1000)
             .saturating_sub(BAKED_US.load(Ordering::Relaxed));
         let bake = left_us > 0
+            && BAKED_PASSES.load(Ordering::Relaxed) < MAX_BAKE_PASSES_PER_FRAME
             && p.stages
                 .iter()
                 .any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
         let budget = if bake {
             PassBudget {
                 ms: left_us.div_ceil(1000),
-                bytes: 2 << 30,
+                bytes: 64 << 20,
                 bake: true,
             }
         } else if first
@@ -1737,6 +1743,22 @@ impl State {
         } else {
             return;
         };
+        if IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        struct InFlightGuard;
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                IN_FLIGHT.store(false, Ordering::Release);
+            }
+        }
+        let _in_flight = InFlightGuard;
+        if bake && BAKED_PASSES.fetch_add(1, Ordering::Relaxed) >= MAX_BAKE_PASSES_PER_FRAME {
+            return;
+        }
         let Some(heap) = self
             .heaps
             .iter()

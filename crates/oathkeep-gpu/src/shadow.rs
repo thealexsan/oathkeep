@@ -4460,7 +4460,6 @@ impl Shadow {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn card_has_old_piece(&self, at: usize, len: usize) -> bool {
         let Some(card) = &self.card else {
             return false;
@@ -4475,7 +4474,6 @@ impl Shadow {
         self.pieces(at, at + len).all(|p| old.contains_key(&p))
     }
 
-    #[allow(dead_code)]
     pub(crate) fn card_piece_is_superseded(&self, lo: usize, hi: usize, after: u64) -> bool {
         let Some(card) = &self.card else {
             return false;
