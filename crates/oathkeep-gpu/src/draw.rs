@@ -61,7 +61,7 @@ fn early_budgets() -> (u64, u64) {
         };
         (
             ms("OATHKEEP_EARLY_TEXTURES_MS", 12),
-            ms("OATHKEEP_BAKE_TEXTURES_MS", 1500),
+            ms("OATHKEEP_BAKE_TEXTURES_MS", 32),
         )
     })
 }
@@ -96,7 +96,7 @@ const WINDOW_STEP_MAX: u64 = 4096;
 
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OATHKEEP_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
 #[derive(Default)]
@@ -1408,7 +1408,7 @@ impl State {
             std::env::var("OATHKEEP_TEXTURE_STAGE_MB")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(192)
+                .unwrap_or(32)
         }) << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
@@ -1457,11 +1457,11 @@ impl State {
             std::env::var("OATHKEEP_TEXTURE_STAGE_MS")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(250)
+                .unwrap_or(16)
         }));
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP
-            .get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
+            .get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_CATCHUP").is_some_and(|v| v == "1"));
         let (per_frame, span) = if catchup && due.len() >= 1024 {
             (per_frame * 3, span * 3)
         } else {

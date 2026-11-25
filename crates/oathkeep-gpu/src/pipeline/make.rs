@@ -89,7 +89,7 @@ fn wait_budget() -> Duration {
         let millis = std::env::var("OATHKEEP_PIPELINE_WAIT_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
+            .unwrap_or(16);
         tracing::info!(millis, "host pipeline wait budget per frame");
         Duration::from_millis(millis)
     })

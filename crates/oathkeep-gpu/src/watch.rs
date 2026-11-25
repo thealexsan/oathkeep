@@ -1058,11 +1058,11 @@ pub(crate) fn page_writes() -> u8 {
             .as_deref()
             .map(str::trim)
         {
-            Ok("1") => 3,
+            Ok("0") => 0,
             Ok("guards") => 1,
             Ok("slots") => 2,
             Ok("all") => 7,
-            _ => 0,
+            _ => 3,
         }
     })
 }

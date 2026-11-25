@@ -3367,7 +3367,7 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OATHKEEP_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_WINDOW_TAILS").is_none_or(|v| v != "0"))
 }
 
 const TAIL_STEP: u64 = 256 << 10;

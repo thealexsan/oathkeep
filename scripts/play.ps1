@@ -8,6 +8,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Exe,
     [ValidateSet('safe', 'fast', 'nvidia8gb')][string]$Profile = 'safe',
+    [ValidateSet('auto', 'series-x', 'series-s')][string]$Console = 'auto',
     [switch]$Diag,
     [switch]$Dred,
     [string]$Cache = "$env:LOCALAPPDATA\oathkeep\cache",
@@ -59,7 +60,10 @@ foreach ($v in @(
     'OATHKEEP_TEXTURE_CATCHUP', 'OATHKEEP_TEXTURE_STAGE_MS', 'OATHKEEP_TEXTURE_STAGE_MB',
     'OATHKEEP_BAKE_TEXTURES_MS', 'OATHKEEP_INPLACE', 'OATHKEEP_DISPLAY_MODE',
     'OATHKEEP_D3D12_DRED', 'OATHKEEP_PIPELINE_WAIT_MS', 'OATHKEEP_WINDOW_KB',
-    'OATHKEEP_WINDOW_TAILS'
+    'OATHKEEP_WINDOW_TAILS', 'OATHKEEP_TITLE_MEMORY_MB', 'OATHKEEP_SPILL_SHADERS',
+    'OATHKEEP_PIPELINE_WORKERS', 'OATHKEEP_EARLY_PIPELINE_COMMIT_MB',
+    'OATHKEEP_COMMIT_HEADROOM_MB', 'OATHKEEP_DEMAND_COMMIT', 'OATHKEEP_DEMAND_PRIVATE',
+    'OATHKEEP_CAPTURE_WORLD', 'OATHKEEP_CARD_ACCOUNTING'
 )) {
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
 }
@@ -122,6 +126,12 @@ if ($Dred) {
     $env:OATHKEEP_D3D12_DRED = '1'
 }
 
-Write-Host "Launching Oathkeep ($Profile) -> $Exe"
-& $oathkeepExe run $Exe --execute
+$runArgs = @('run')
+if ($Console -ne 'auto') {
+    $runArgs += @('--console', $Console)
+}
+$runArgs += @($Exe, '--execute')
+
+Write-Host "Launching Oathkeep ($Profile, console=$Console) -> $Exe"
+& $oathkeepExe @runArgs
 exit $LASTEXITCODE

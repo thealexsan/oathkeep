@@ -1503,7 +1503,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OATHKEEP_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
 }
 
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] =
@@ -1511,7 +1511,7 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] =
 
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OATHKEEP_WIDE_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_WIDE_MERGE").is_none_or(|v| v != "0"))
 }
 
 struct CardRange {
@@ -2350,7 +2350,7 @@ mod late_tests {
 
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OATHKEEP_JOIN_COPIES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_JOIN_COPIES").is_none_or(|v| v != "0"))
 }
 
 static COPIES_JOINED: [std::sync::atomic::AtomicU64; 2] =
@@ -5310,7 +5310,7 @@ impl HostList {
 
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OATHKEEP_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_WIDE_REFRESH").is_none_or(|v| v != "0"))
 }
 
 #[derive(Default)]
@@ -5882,6 +5882,10 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
+                // SAFETY: plain status query.
+                if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                    log_removal_context();
+                }
                 None
             }
         }
@@ -6938,6 +6942,10 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                // SAFETY: plain status query.
+                if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                    log_removal_context();
+                }
                 None
             }
         }
@@ -6993,6 +7001,10 @@ impl Host {
             Ok(()) => buffer,
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
+                // SAFETY: plain status query.
+                if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                    log_removal_context();
+                }
                 None
             }
         }

@@ -10010,8 +10010,7 @@ impl<'a> Lower<'a> {
         self.s.m.tag(next, Tag::Counter);
         let limit = match super::loop_limit() {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT => 1 << 12,
+            LOOP_LIMIT => 1 << 8,
             named => named,
         };
         let limit = self.s.m.i32(limit);

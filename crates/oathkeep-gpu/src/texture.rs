@@ -236,7 +236,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
 pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] =
@@ -451,7 +451,12 @@ fn let_go_idle_with(urgent: bool) {
     };
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
+        let in_flight = s
+            .buffer
+            .as_ref()
+            .is_some_and(|b| crate::host::references(b) > 1);
         let keep = Arc::strong_count(s) > 1
+            || in_flight
             || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, idle_frames);
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
@@ -1194,7 +1199,7 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 
 fn by_query() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OATHKEEP_COMMITTED_QUERY").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_COMMITTED_QUERY").is_none_or(|v| v != "0"))
 }
 
 fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
