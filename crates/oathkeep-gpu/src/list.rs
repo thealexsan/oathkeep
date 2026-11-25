@@ -188,7 +188,7 @@ unsafe impl Send for Idle {}
 static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
 
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (32, 64 << 20);
+const IDLE_MOST: (usize, u64) = (128, 128 << 20);
 
 #[cfg(windows)]
 pub(crate) fn trim_idle() {

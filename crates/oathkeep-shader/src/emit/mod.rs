@@ -147,10 +147,7 @@ pub struct UserData {
 
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let native = crate::native_programs_in_container(&c)?
         .into_iter()
         .find(|p| {
             matches!(

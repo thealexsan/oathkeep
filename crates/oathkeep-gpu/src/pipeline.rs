@@ -149,15 +149,15 @@ pub(crate) fn kept() -> [u64; 7] {
 
 #[cfg(windows)]
 fn compute_is_spilled(stage: &'static str, bytes: &[u8]) -> bool {
-    use oathkeep_shader::{Container, FourCC};
+    use oathkeep_shader::Container;
     if stage != "compute" {
         return false;
     }
     let Ok(c) = Container::parse(bytes) else {
         return false;
     };
-    c.part(FourCC::DXIL)
-        .and_then(|part| oathkeep_shader::native_programs(part.data).ok())
+    oathkeep_shader::native_programs_in_container(&c)
+        .ok()
         .is_some_and(|programs| programs.iter().any(oathkeep_shader::spill::is_spilled))
 }
 
@@ -334,12 +334,32 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use oathkeep_shader::{Container, FourCC, HwStage};
+    use oathkeep_shader::{Container, HwStage};
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
-        Some(part) => oathkeep_shader::native_programs(part.data).map_err(|e| e.to_string())?,
-        None => Vec::new(),
+    let programs = match oathkeep_shader::native_programs_in_container(&c) {
+        Ok(p) => p,
+        Err(_) => {
+            let summary: Vec<String> = c
+                .parts
+                .iter()
+                .map(|p| {
+                    let head = p
+                        .data
+                        .get(..4)
+                        .map(|b| format!("{:02x}{:02x}{:02x}{:02x}", b[0], b[1], b[2], b[3]))
+                        .unwrap_or_default();
+                    let at18 = p
+                        .data
+                        .get(0x18..0x1c)
+                        .map(|b| format!("{:02x}{:02x}{:02x}{:02x}", b[0], b[1], b[2], b[3]))
+                        .unwrap_or_default();
+                    format!("{}({}B,0x0={},0x18={})", p.fourcc, p.data.len(), head, at18)
+                })
+                .collect();
+            tracing::warn!(parts = ?summary, "container has no native DXIL/XDAT/XBCH part");
+            Vec::new()
+        }
     };
     let (mut host, cache_path) = crate::shader_cache::host_shader_with_path(container)?;
     let dxil = std::mem::take(&mut host.dxil);

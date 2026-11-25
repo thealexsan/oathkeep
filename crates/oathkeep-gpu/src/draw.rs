@@ -1462,7 +1462,7 @@ impl State {
             std::env::var("OATHKEEP_TEXTURE_STAGE_MS")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(16)
+                .unwrap_or(4)
         }));
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP

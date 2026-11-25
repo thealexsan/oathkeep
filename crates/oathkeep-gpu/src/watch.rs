@@ -609,16 +609,30 @@ fn guard_with_hot(start: usize, end: usize) -> Option<(Vec<usize>, Vec<usize>)> 
                         all_covered = false;
                         break;
                     }
-                    for block in a..b {
-                        if g.absent.contains(block) {
-                            continue;
+                    let has_absent = g.absent.overlaps(a, b);
+                    let mut cursor = a;
+                    for (&block, &until) in g.hot.range(a..b) {
+                        if block > cursor {
+                            if !has_absent || !g.absent.contains_range(cursor, block) {
+                                all_covered = false;
+                                break 'gaps;
+                            }
                         }
-                        if g.hot.get(&block).is_some_and(|&until| until > frame) {
-                            hot_pages.push(block);
-                        } else {
+                        if until > frame {
+                            if !has_absent || !g.absent.contains(block) {
+                                hot_pages.push(block);
+                            }
+                            cursor = block + 1;
+                        } else if !has_absent || !g.absent.contains(block) {
                             all_covered = false;
                             break 'gaps;
+                        } else {
+                            cursor = block + 1;
                         }
+                    }
+                    if cursor < b && (!has_absent || !g.absent.contains_range(cursor, b)) {
+                        all_covered = false;
+                        break 'gaps;
                     }
                 }
                 if all_covered {

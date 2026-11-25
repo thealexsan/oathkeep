@@ -274,16 +274,20 @@ pub struct UsedResource {
 }
 
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
-    if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
+    native_programs_at(part, XDAT_OFFSET)
+}
+
+pub fn native_programs_at(part: &[u8], xdat_offset: usize) -> Result<Vec<NativeProgram>, ShaderError> {
+    if part.get(xdat_offset..xdat_offset + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
     }
-    let count = u32_at(part, XDAT_OFFSET + 4)? as usize;
+    let count = u32_at(part, xdat_offset + 4)? as usize;
     if count > MAX_XDAT_ENTRIES {
         return Err(Malformed("implausible XDAT entry count"));
     }
     let mut out = Vec::new();
     for i in 0..count {
-        let at = XDAT_OFFSET + 12 + 12 * i;
+        let at = xdat_offset + 12 + 12 * i;
         if u32_at(part, at)? != KIND_NATIVE {
             continue;
         }
@@ -293,6 +297,26 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         out.extend(programs(&unpack(blob)?)?);
     }
     Ok(out)
+}
+
+pub fn native_programs_in_container(
+    container: &crate::dxbc::Container<'_>,
+) -> Result<Vec<NativeProgram>, ShaderError> {
+    if let Some(dxil) = container.part(crate::dxbc::FourCC::DXIL) {
+        return native_programs_at(dxil.data, XDAT_OFFSET);
+    }
+    for part in &container.parts {
+        if part.data.get(XDAT_OFFSET..XDAT_OFFSET + 4) == Some(b"XDAT") {
+            return native_programs_at(part.data, XDAT_OFFSET);
+        }
+        if part.data.get(0..4) == Some(b"XDAT") {
+            return native_programs_at(part.data, 0);
+        }
+        if part.data.get(0..4) == Some(b"XBCH") {
+            return programs(&unpack(part.data)?);
+        }
+    }
+    Err(Malformed("no DXIL part"))
 }
 
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {

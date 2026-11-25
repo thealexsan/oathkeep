@@ -14,6 +14,7 @@ pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
+    native_programs_in_container,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
