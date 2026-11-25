@@ -1,14 +1,14 @@
 [meta]
 updated = "2026-11-26"
-commit = "bc99622"
+commit = "2912eee"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "5.4-6.7 fps (uninstrumented, 3467-3832 draws, 0 PSOs left)"
-current_frame_ms = "150-184 ms (uninstrumented, GPU 54-59% busy)"
-current_gpu_ms = "39-49 ms on GPU (1519 indirect clamps / 3038 UAV barriers)"
-current_preparing_ms = "103-125 ms (batch_flush 71.7 ms, guards 55.9 ms, run_deferred 10.4 ms)"
+current_fps = "8.5-9.2 fps (diag-run67, 2783-3615 draws, 0 PSOs left)"
+current_frame_ms = "109-118 ms (GPU 68-78% busy, 0.0 ms present stall)"
+current_gpu_ms = "27-28 ms wait (100% WHY_READ upload-fill relay stall; 842 barrier groups, 448 indirect clamps)"
+current_preparing_ms = "69.6-79.8 ms (batch_flush 37.3 ms, GetWriteWatch 31.5 ms, shadow moves 49.1 ms, heap buffers 5.3 ms)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~30-60 min (fix GUARDS lock/ping-pong, heap_buffers mirror, and indirect-clamp GPU barriers)"
+eta = "~30-60 min (filter barrier_groups UAVs, cut GetWriteWatch/shadow-copy 211 MB/frame, and avoid WHY_READ relay stall)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -58,8 +58,8 @@ note = "host-pipelines.bin warmed to 258.8 MB (1082 added, only 5 being made at 
 
 [[subsystems]]
 name = "Shadow & Page Sync"
-cells = [4, 4, 4, 4, 4, 4, 4, 4, 3, 2]
-note = "bc99622 verified in diag-run63-warm: run_deferred 18.2->10.4 ms, copy queue 39->19.3 ms, copy-back 62.7->42.3 ms, fallbacks 230->35; GUARDS lock/0xae00000 + mirror 18.6 ms next"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 3, 3]
+note = "2912eee verified in diag-run66/67: 64-shard GUARDS (read_fast 68.5->10.2 ms), dispatch indirect windowing (uav_emitted 1079->3), scan_card 81.3->3.6 ms, heap_buffers 20.5->5.3 ms, 8.5-9.2 fps"
 
 [[subsystems]]
 name = "Texture Streaming"
@@ -190,3 +190,21 @@ frame_ms = 183.9
 gpu_ms = "49.3 ms (3467 draws, 54-59% busy)"
 preparing_ms = "125.3 ms (0 PSOs left, run_deferred 10.4 ms)"
 status = "run_deferred -43%, copy queue -51% (19.3 ms), copy-back -33% (42.3 ms), fallbacks -85% (35); remaining: GUARDS 55.9 ms (0xae00000 29.5 ms), mirror 18.6 ms, 1519 indirect clamps on GPU"
+
+[[runs]]
+label = "diag-run66"
+commit = "2912eee"
+fps = 7.9
+frame_ms = 126.9
+gpu_ms = "34.3 ms (2984 draws, 54% busy, uav_emitted 3)"
+preparing_ms = "82.1 ms (batch_flush 53.7 ms, read_fast 10.3 ms)"
+status = "Fixes D/E/F verified: 64-shard GUARDS (read_fast -85%), dispatch indirect windowing (uav_emitted 1079->3, GPU -20 ms), copy_hot 147->11 ms"
+
+[[runs]]
+label = "diag-run67"
+commit = "2912eee"
+fps = 9.2
+frame_ms = 109.0
+gpu_ms = "27.4 ms wait (3615 draws, 68-78% busy, 0.0 ms present stall)"
+preparing_ms = "69.6 ms (batch_flush 37.3-43.6 ms, heap_buffers 5.3-7.3 ms)"
+status = "LATE_WAIT=3 + RELAY=2 + GUARD_HOT=0 + BAKE_TEXTURES_MS=4: scan_card 81.3->3.6 ms (0xae00000 28.5->5.3 ms); next: barrier_groups (842/f), GetWriteWatch (31.5 ms) + 211 MB copies, WHY_READ relay stall (28 ms)"
