@@ -1,0 +1,164 @@
+[meta]
+updated = "2026-11-25"
+commit = "40200b5"
+branch = "perf/commit-reduction"
+target_fps = "20-30+ FPS (1:1 visuals)"
+current_fps = "verifying"
+current_frame_ms = "pending run59"
+current_gpu_ms = "127 ms -> target <65 ms"
+current_preparing_ms = "76 ms -> target <15 ms"
+headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
+pages_url = "https://thealexsan.github.io/oathkeep/"
+
+[[subsystems]]
+name = "PE32+ Loader & CPU"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 4, 3]
+note = "Native x86-64 loading, TLS redirection, console CPU emulation"
+
+[[subsystems]]
+name = "Win32 / GDK HLE"
+cells = [4, 4, 4, 4, 4, 4, 4, 3, 3, 3]
+note = "System libraries, threading, memory commit, input, saves"
+
+[[subsystems]]
+name = "DirectStorage & VFS"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 3, 3]
+note = "Async streaming, BCPack decode, read-only title mount"
+
+[[subsystems]]
+name = "Audio (XMA / Opus)"
+cells = [4, 4, 4, 4, 4, 3, 3, 3, 2, 2]
+note = "XMA2 & Opus decode pipelines active"
+
+[[subsystems]]
+name = "D3D12.x Command Host"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 3, 3]
+note = "Async relay queue, bindless heaps, indirect mesh/compute"
+
+[[subsystems]]
+name = "RDNA 2 -> DXIL Core"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 4, 3]
+note = "SM 6.6 dynamic resources, mesh/compute/pixel translation"
+
+[[subsystems]]
+name = "Wave64 -> Wave32"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 3, 3]
+note = "Loop-guarding s_cbranch_execz preserved (TDR fixed at 40200b5)"
+
+[[subsystems]]
+name = "DP4A / ML Compute"
+cells = [4, 4, 4, 4, 3, 3, 2, 1, 0, 0]
+note = "5/9 ML shaders 1.24x-2.87x faster; fixing 4 regressed shaders next"
+
+[[subsystems]]
+name = "Pipeline Cache & Queue"
+cells = [4, 4, 4, 4, 4, 4, 4, 3, 3, 2]
+note = "Versioned library cache, active-frame & compute priority"
+
+[[subsystems]]
+name = "Shadow & Page Sync"
+cells = [4, 4, 4, 4, 4, 4, 4, 3, 3, 2]
+note = "Range-scoped copy & write invalidation (preparing <15 ms target)"
+
+[[subsystems]]
+name = "Texture Streaming"
+cells = [4, 4, 4, 4, 4, 4, 4, 3, 3, 2]
+note = "Levels-on-demand budgeting for 8 GB VRAM, zero-wait upload"
+
+[[subsystems]]
+name = "Display & Input"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 3, 3]
+note = "1080p presentation, XInput + keyboard fallback, Agility SDK 620"
+
+[[milestones]]
+label = "Executable boot & HLE init"
+state = "done"
+level = 4
+detail = "verified"
+
+[[milestones]]
+label = "Intro & menus interactive"
+state = "done"
+level = 4
+detail = "verified"
+
+[[milestones]]
+label = "World entry & full 3D render"
+state = "done"
+level = 4
+detail = "verified"
+
+[[milestones]]
+label = "Zero-TDR lighting (2561af95)"
+state = "done"
+level = 4
+detail = "40200b5"
+
+[[milestones]]
+label = "CPU preparing <15 ms"
+state = "active"
+level = 3
+detail = "verifying run59"
+
+[[milestones]]
+label = "All 9 ML DP4A shaders fast"
+state = "active"
+level = 2
+detail = "5/9 fast"
+
+[[milestones]]
+label = "1:1 console visuals verified"
+state = "pending"
+level = 1
+detail = "next"
+
+[[milestones]]
+label = "Playable first mission (20-30+ FPS)"
+state = "pending"
+level = 0
+detail = "target"
+
+[[runs]]
+label = "diag-run52c"
+commit = "f78ba1b"
+fps = 4.9
+frame_ms = 204.0
+gpu_ms = "~130 ms"
+preparing_ms = "78 ms"
+status = "World entry baseline (cold PSOs)"
+
+[[runs]]
+label = "diag-run54b"
+commit = "a9461b1"
+fps = 6.2
+frame_ms = 161.0
+gpu_ms = "127 ms"
+preparing_ms = "76 ms"
+status = "Baseline GPU timing (9 ML shaders 83 ms)"
+
+[[runs]]
+label = "diag-run56-gpu"
+commit = "542b511"
+fps = 5.4
+frame_ms = 185.0
+gpu_ms = "118 ms"
+preparing_ms = "75 ms"
+status = "DP4A sped 5/9 ML shaders; 4/9 regressed"
+
+[[runs]]
+label = "diag-run58b"
+commit = "a76d93e"
+fps = 3.2
+frame_ms = 312.0
+gpu_ms = "297 ms TDR"
+preparing_ms = "74 ms"
+status = "Root-caused 2561af95 execz loop-guard TDR"
+
+[[runs]]
+label = "pending run59"
+commit = "40200b5"
+fps = 0.0
+frame_ms = 0.0
+gpu_ms = "testing"
+preparing_ms = "testing"
+status = "Verifying zero TDR + scoped copy/write sync"

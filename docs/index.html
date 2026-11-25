@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Oathkeep — Progress Dashboard</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #f0f6fc;
+      --muted: #8b949e;
+      --l0: #161b22;
+      --l1: #0e4429;
+      --l2: #006d32;
+      --l3: #26a641;
+      --l4: #39d353;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      line-height: 1.5;
+    }
+    main {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 16px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 16px;
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+    }
+    h1 { margin: 0; font-size: 24px; font-weight: 600; }
+    h2 { margin: 28px 0 12px; font-size: 15px; font-weight: 600; color: #c9d1d9; text-transform: uppercase; letter-spacing: 0.04em; }
+    p.sub { margin: 4px 0 0; color: var(--muted); font-size: 14px; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+    .muted { color: var(--muted); }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 16px;
+    }
+    .card .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .card .v { font-size: 20px; font-weight: 600; margin-top: 4px; }
+    .green { color: var(--l4); }
+    .svg-wrap {
+      background: var(--bg);
+      border-radius: 8px;
+      overflow-x: auto;
+      margin-bottom: 24px;
+    }
+    .svg-wrap img { display: block; width: 100%; height: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #21262d; }
+    th { color: var(--muted); font-weight: 600; font-size: 11.5px; text-transform: uppercase; }
+    td.num, th.num { text-align: right; }
+    td.name { font-weight: 500; white-space: nowrap; }
+    .boxes { white-space: nowrap; }
+    .box {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border-radius: 2.5px;
+      margin-right: 3px;
+      border: 1px solid #21262d;
+      vertical-align: middle;
+    }
+    .box.active { border-color: var(--l4); }
+    .l0 { background: var(--l0); }
+    .l1 { background: var(--l1); }
+    .l2 { background: var(--l2); }
+    .l3 { background: var(--l3); }
+    .l4 { background: var(--l4); }
+    .milestones {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 10px;
+    }
+    .milestone {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 12px;
+    }
+    .milestone .mlabel { font-size: 13px; font-weight: 500; flex: 1; }
+    footer {
+      margin-top: 40px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 12px;
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Oathkeep</h1>
+        <p class="sub">Clean-room Xbox Series X|S (GDK) compatibility &amp; RDNA 2-to-DXIL layer</p>
+      </div>
+      <div class="mono muted">
+        <a href="https://github.com/thealexsan/oathkeep">GitHub</a> ·
+        <a href="https://discord.gg/PM6pr4Azzk">Discord</a> ·
+        40200b5 (perf/commit-reduction) · 2026-11-25
+      </div>
+    </header>
+
+    <section class="stats">
+      <div class="card"><div class="k">Overall Matrix</div><div class="v green mono">90%</div></div>
+      <div class="card"><div class="k">Latest World FPS</div><div class="v mono">verifying</div></div>
+      <div class="card"><div class="k">Frame / GPU</div><div class="v mono">pending run59 / 127 ms -&gt; target &lt;65 ms</div></div>
+      <div class="card"><div class="k">CPU Preparing</div><div class="v mono">76 ms -&gt; target &lt;15 ms</div></div>
+    </section>
+
+    <div class="svg-wrap">
+      <img src="progress.svg" alt="Oathkeep Progress Matrix">
+    </div>
+
+    <h2>Playability Milestones</h2>
+    <section class="milestones">
+      <div class="milestone"><span class="box l4 "></span><span class="mlabel">Executable boot &amp; HLE init</span><span class="mono muted">verified</span></div>
+<div class="milestone"><span class="box l4 "></span><span class="mlabel">Intro &amp; menus interactive</span><span class="mono muted">verified</span></div>
+<div class="milestone"><span class="box l4 "></span><span class="mlabel">World entry &amp; full 3D render</span><span class="mono muted">verified</span></div>
+<div class="milestone"><span class="box l4 "></span><span class="mlabel">Zero-TDR lighting (2561af95)</span><span class="mono muted">40200b5</span></div>
+<div class="milestone"><span class="box l3 active"></span><span class="mlabel">CPU preparing &lt;15 ms</span><span class="mono muted">verifying run59</span></div>
+<div class="milestone"><span class="box l2 active"></span><span class="mlabel">All 9 ML DP4A shaders fast</span><span class="mono muted">5/9 fast</span></div>
+<div class="milestone"><span class="box l1 "></span><span class="mlabel">1:1 console visuals verified</span><span class="mono muted">next</span></div>
+<div class="milestone"><span class="box l0 "></span><span class="mlabel">Playable first mission (20-30+ FPS)</span><span class="mono muted">target</span></div>
+
+    </section>
+
+    <h2>Subsystem Breakdown</h2>
+    <div class="card" style="padding: 4px 12px; overflow-x: auto;">
+      <table>
+        <thead><tr><th>Subsystem</th><th>Progress</th><th class="num">Score</th><th>Notes</th></tr></thead>
+        <tbody><tr><td class="name">PE32+ Loader &amp; CPU</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span></td><td class="mono num">98%</td><td class="muted">Native x86-64 loading, TLS redirection, console CPU emulation</td></tr>
+<tr><td class="name">Win32 / GDK HLE</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span><span class="box l3"></span></td><td class="mono num">93%</td><td class="muted">System libraries, threading, memory commit, input, saves</td></tr>
+<tr><td class="name">DirectStorage &amp; VFS</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span></td><td class="mono num">95%</td><td class="muted">Async streaming, BCPack decode, read-only title mount</td></tr>
+<tr><td class="name">Audio (XMA / Opus)</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span><span class="box l3"></span><span class="box l2"></span><span class="box l2"></span></td><td class="mono num">83%</td><td class="muted">XMA2 &amp; Opus decode pipelines active</td></tr>
+<tr><td class="name">D3D12.x Command Host</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span></td><td class="mono num">95%</td><td class="muted">Async relay queue, bindless heaps, indirect mesh/compute</td></tr>
+<tr><td class="name">RDNA 2 -&gt; DXIL Core</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span></td><td class="mono num">98%</td><td class="muted">SM 6.6 dynamic resources, mesh/compute/pixel translation</td></tr>
+<tr><td class="name">Wave64 -&gt; Wave32</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span></td><td class="mono num">95%</td><td class="muted">Loop-guarding s_cbranch_execz preserved (TDR fixed at 40200b5)</td></tr>
+<tr><td class="name">DP4A / ML Compute</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span><span class="box l2"></span><span class="box l1"></span><span class="box l0"></span><span class="box l0"></span></td><td class="mono num">63%</td><td class="muted">5/9 ML shaders 1.24x-2.87x faster; fixing 4 regressed shaders next</td></tr>
+<tr><td class="name">Pipeline Cache &amp; Queue</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span><span class="box l2"></span></td><td class="mono num">90%</td><td class="muted">Versioned library cache, active-frame &amp; compute priority</td></tr>
+<tr><td class="name">Shadow &amp; Page Sync</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span><span class="box l2"></span></td><td class="mono num">90%</td><td class="muted">Range-scoped copy &amp; write invalidation (preparing &lt;15 ms target)</td></tr>
+<tr><td class="name">Texture Streaming</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span><span class="box l2"></span></td><td class="mono num">90%</td><td class="muted">Levels-on-demand budgeting for 8 GB VRAM, zero-wait upload</td></tr>
+<tr><td class="name">Display &amp; Input</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span></td><td class="mono num">95%</td><td class="muted">1080p presentation, XInput + keyboard fallback, Agility SDK 620</td></tr>
+</tbody>
+      </table>
+    </div>
+
+    <h2>Telemetry Progression</h2>
+    <div class="card" style="padding: 4px 12px; overflow-x: auto;">
+      <table>
+        <thead><tr><th>Run</th><th>Commit</th><th class="num">FPS</th><th class="num">Frame</th><th class="num">GPU</th><th class="num">Preparing</th><th>Status</th></tr></thead>
+        <tbody><tr><td class="mono">pending run59</td><td class="mono">40200b5</td><td class="mono num">0.0</td><td class="mono num">0.0 ms</td><td class="mono num">testing</td><td class="mono num">testing</td><td>Verifying zero TDR + scoped copy/write sync</td></tr>
+<tr><td class="mono">diag-run58b</td><td class="mono">a76d93e</td><td class="mono num">3.2</td><td class="mono num">312.0 ms</td><td class="mono num">297 ms TDR</td><td class="mono num">74 ms</td><td>Root-caused 2561af95 execz loop-guard TDR</td></tr>
+<tr><td class="mono">diag-run56-gpu</td><td class="mono">542b511</td><td class="mono num">5.4</td><td class="mono num">185.0 ms</td><td class="mono num">118 ms</td><td class="mono num">75 ms</td><td>DP4A sped 5/9 ML shaders; 4/9 regressed</td></tr>
+<tr><td class="mono">diag-run54b</td><td class="mono">a9461b1</td><td class="mono num">6.2</td><td class="mono num">161.0 ms</td><td class="mono num">127 ms</td><td class="mono num">76 ms</td><td>Baseline GPU timing (9 ML shaders 83 ms)</td></tr>
+<tr><td class="mono">diag-run52c</td><td class="mono">f78ba1b</td><td class="mono num">4.9</td><td class="mono num">204.0 ms</td><td class="mono num">~130 ms</td><td class="mono num">78 ms</td><td>World entry baseline (cold PSOs)</td></tr>
+</tbody>
+      </table>
+    </div>
+
+    <footer>
+      <span>Clean-room Xbox Series X|S (GDK) compatibility layer — GPL-3.0-or-later.</span>
+      <span class="mono">Target: 20-30+ FPS (1:1 visuals)</span>
+    </footer>
+  </main>
+</body>
+</html>
