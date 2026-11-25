@@ -14,8 +14,10 @@ pub(crate) struct HostHeap {
     dynamic: u32,
     sampler: bool,
     made_keys: Vec<std::sync::atomic::AtomicU64>,
-    made_lock: Mutex<()>,
+    made_lock: Mutex<std::collections::HashMap<u32, u64>>,
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    has_kept: Vec<std::sync::atomic::AtomicU64>,
+    is_buffer: Vec<std::sync::atomic::AtomicU64>,
     next: Mutex<(u32, Vec<bool>)>,
     free: std::sync::atomic::AtomicU32,
     too_long: std::sync::atomic::AtomicU32,
@@ -25,6 +27,53 @@ pub(crate) struct HostHeap {
     textures: Mutex<TextureQueue>,
     tabled: Vec<std::sync::atomic::AtomicU32>,
     placed: std::sync::Arc<Mutex<Spans>>,
+}
+
+fn bit_words(count: u32) -> Vec<std::sync::atomic::AtomicU64> {
+    (0..(count as usize).div_ceil(64))
+        .map(|_| std::sync::atomic::AtomicU64::new(0))
+        .collect()
+}
+
+fn bit_get(bits: &[std::sync::atomic::AtomicU64], index: u32) -> bool {
+    let word = (index as usize) >> 6;
+    let mask = 1u64 << (index & 63);
+    bits.get(word)
+        .is_some_and(|w| w.load(std::sync::atomic::Ordering::Acquire) & mask != 0)
+}
+
+fn bit_set(bits: &[std::sync::atomic::AtomicU64], index: u32, on: bool) {
+    let word = (index as usize) >> 6;
+    let mask = 1u64 << (index & 63);
+    if let Some(w) = bits.get(word) {
+        if on {
+            w.fetch_or(mask, std::sync::atomic::Ordering::Release);
+        } else {
+            w.fetch_and(!mask, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+fn coalesce_u64_ranges(ranges: &mut Vec<(u64, u64)>) {
+    if ranges.len() <= 1 {
+        ranges.retain(|&(start, end)| start < end);
+        return;
+    }
+    ranges.sort_unstable();
+    let mut write = 0usize;
+    for i in 0..ranges.len() {
+        let (start, end) = ranges[i];
+        if start >= end {
+            continue;
+        }
+        if write > 0 && start <= ranges[write - 1].1 {
+            ranges[write - 1].1 = ranges[write - 1].1.max(end);
+        } else {
+            ranges[write] = (start, end);
+            write += 1;
+        }
+    }
+    ranges.truncate(write);
 }
 
 static PLACED_SPANS: Mutex<Vec<std::sync::Weak<Mutex<Spans>>>> = Mutex::new(Vec::new());
@@ -130,39 +179,62 @@ impl Spans {
             return Vec::new();
         }
         let rule = self.rule;
-        let clashing: Vec<u64> = match rule {
+        let has_clash = match rule {
             Rule::Start => self
                 .by_start
                 .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
-                .map(|(at, _)| *at)
-                .collect(),
-            Rule::Overlap | Rule::Never => self.overlapping(start, end),
+                .any(|(&at, span)| !(at == start && span.0 == end)),
+            Rule::Overlap | Rule::Never => {
+                let before_clash = self
+                    .by_start
+                    .range(..start)
+                    .next_back()
+                    .is_some_and(|(_, span)| span.0 > start);
+                before_clash
+                    || self
+                        .by_start
+                        .range(start..end)
+                        .any(|(&at, span)| !(at == start && span.0 == end))
+            }
         };
         let mut stale = Vec::new();
-        for at in clashing {
-            if at == start && same(self.by_start.get(&at)) {
-                continue;
-            }
+        if has_clash {
             if !newer || rule == Rule::Never {
                 return stale;
             }
-            if let Some((old_end, slots)) = self.by_start.remove(&at) {
-                static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 48 {
-                    tracing::info!(
-                        slot = index,
-                        start = format_args!("{start:#x}"),
-                        end = format_args!("{end:#x}"),
-                        stale_start = format_args!("{at:#x}"),
-                        stale_end = format_args!("{old_end:#x}"),
-                        stale_slots = slots.len(),
-                        rule = ?rule,
-                        "a placed texture view makes older views of other memory stale"
-                    );
-                }
-                for slot in slots {
-                    self.by_slot.remove(&slot);
-                    stale.push(slot);
+            let clashing: Vec<u64> = match rule {
+                Rule::Start => self
+                    .by_start
+                    .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
+                    .filter(|&(&at, span)| !(at == start && span.0 == end))
+                    .map(|(&at, _)| at)
+                    .collect(),
+                Rule::Overlap | Rule::Never => self
+                    .overlapping(start, end)
+                    .into_iter()
+                    .filter(|&at| !(at == start && same(self.by_start.get(&at))))
+                    .collect(),
+            };
+            for at in clashing {
+                if let Some((old_end, slots)) = self.by_start.remove(&at) {
+                    static SAID: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 48 {
+                        tracing::info!(
+                            slot = index,
+                            start = format_args!("{start:#x}"),
+                            end = format_args!("{end:#x}"),
+                            stale_start = format_args!("{at:#x}"),
+                            stale_end = format_args!("{old_end:#x}"),
+                            stale_slots = slots.len(),
+                            rule = ?rule,
+                            "a placed texture view makes older views of other memory stale"
+                        );
+                    }
+                    for slot in slots {
+                        self.by_slot.remove(&slot);
+                        stale.push(slot);
+                    }
                 }
             }
         }
@@ -216,32 +288,53 @@ impl Spans {
         }
     }
 
-    fn slots_in(&self, start: u64, end: u64) -> Vec<u32> {
-        self.overlapping(start, end)
-            .iter()
-            .filter_map(|at| self.by_start.get(at))
-            .flat_map(|span| span.1.iter().copied())
-            .collect()
+    fn extend_slots_in(&self, start: u64, end: u64, out: &mut Vec<u32>) {
+        if end <= start {
+            return;
+        }
+        if let Some((_, span)) = self
+            .by_start
+            .range(..start)
+            .next_back()
+            .filter(|(_, span)| span.0 > start)
+        {
+            out.extend(span.1.iter().copied());
+        }
+        for (_, span) in self.by_start.range(start..end) {
+            out.extend(span.1.iter().copied());
+        }
     }
 
-    fn slots_holding(&self, start: u64, end: u64) -> Vec<u32> {
+    #[cfg(test)]
+    fn slots_in(&self, start: u64, end: u64) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.extend_slots_in(start, end, &mut out);
+        out
+    }
+
+    fn extend_slots_holding(&self, start: u64, end: u64, out: &mut Vec<u32>) {
         if end <= start {
-            return Vec::new();
+            return;
         }
-        let before = if self.by_start.contains_key(&start) {
-            None
-        } else {
-            self.by_start
+        if !self.by_start.contains_key(&start)
+            && let Some((_, span)) = self
+                .by_start
                 .range(..start)
                 .next_back()
                 .filter(|(_, span)| span.0 > start)
-                .map(|(_, span)| span)
-        };
-        before
-            .into_iter()
-            .chain(self.by_start.range(start..end).map(|(_, span)| span))
-            .flat_map(|span| span.1.iter().copied())
-            .collect()
+        {
+            out.extend(span.1.iter().copied());
+        }
+        for (_, span) in self.by_start.range(start..end) {
+            out.extend(span.1.iter().copied());
+        }
+    }
+
+    #[cfg(test)]
+    fn slots_holding(&self, start: u64, end: u64) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.extend_slots_holding(start, end, &mut out);
+        out
     }
 }
 
@@ -343,86 +436,329 @@ struct Waiting {
 
 #[derive(Default)]
 pub(crate) struct TextureQueue {
-    slots: std::collections::BTreeMap<u32, Waiting>,
+    slots: std::collections::HashMap<u32, Waiting>,
     writes: u64,
-    held: std::collections::BTreeMap<u32, u64>,
+    held: std::collections::HashMap<u32, u64>,
+    // High-water frame promoted into the ready maps. Every slot in `slots` lives
+    // in exactly one of:
+    // - `ready_again` (keyed by `write`) if `due <= ready_until && (looks > 0 || mapped > 0)`
+    // - `ready_fresh` (keyed by `write`) if `due <= ready_until && looks == 0 && mapped == 0`
+    // - `future` (ordered by `(due, index)`) if `due > ready_until`
+    ready_until: u64,
+    ready_again: std::collections::BTreeMap<u64, u32>,
+    ready_fresh: std::collections::BTreeMap<u64, u32>,
+    future: std::collections::BTreeSet<(u64, u32)>,
+    // Reference-counted `written` frames of entries in `ready_*` for O(1) oldest-due lookup.
+    ready_written: std::collections::BTreeMap<u64, u32>,
+    mapped_count: u64,
+    looks_only_count: u64,
 }
 
 impl TextureQueue {
+    #[inline]
+    fn is_again(w: &Waiting) -> bool {
+        w.looks > 0 || w.mapped > 0
+    }
+
+    fn ready_written_inc(&mut self, written: u64) {
+        *self.ready_written.entry(written).or_insert(0) += 1;
+    }
+
+    fn ready_written_dec(&mut self, written: u64) {
+        if let std::collections::btree_map::Entry::Occupied(mut e) =
+            self.ready_written.entry(written)
+        {
+            if *e.get() <= 1 {
+                e.remove();
+            } else {
+                *e.get_mut() -= 1;
+            }
+        }
+    }
+
+    fn index_insert(&mut self, index: u32, w: Waiting) {
+        if w.mapped > 0 {
+            self.mapped_count += 1;
+        } else if w.looks > 0 {
+            self.looks_only_count += 1;
+        }
+        if w.due <= self.ready_until {
+            if Self::is_again(&w) {
+                self.ready_again.insert(w.write, index);
+            } else {
+                self.ready_fresh.insert(w.write, index);
+            }
+            self.ready_written_inc(w.written);
+        } else {
+            self.future.insert((w.due, index));
+        }
+    }
+
+    fn index_remove(&mut self, index: u32, w: Waiting) {
+        if w.mapped > 0 {
+            self.mapped_count -= 1;
+        } else if w.looks > 0 {
+            self.looks_only_count -= 1;
+        }
+        if w.due <= self.ready_until {
+            if Self::is_again(&w) {
+                self.ready_again.remove(&w.write);
+            } else {
+                self.ready_fresh.remove(&w.write);
+            }
+            self.ready_written_dec(w.written);
+        } else {
+            self.future.remove(&(w.due, index));
+        }
+    }
+
+    fn promote(&mut self, frame: u64) {
+        if frame <= self.ready_until || frame == u64::MAX {
+            return;
+        }
+        while let Some(&(due, _)) = self.future.first() {
+            if due > frame {
+                break;
+            }
+            let Some((_, index)) = self.future.pop_first() else {
+                break;
+            };
+            if let Some(&w) = self.slots.get(&index) {
+                if Self::is_again(&w) {
+                    self.ready_again.insert(w.write, index);
+                } else {
+                    self.ready_fresh.insert(w.write, index);
+                }
+                self.ready_written_inc(w.written);
+            }
+        }
+        self.ready_until = frame;
+    }
+
     fn written(&mut self, index: u32, frame: u64, due: u64, seen: bool) {
         if seen && self.slots.contains_key(&index) {
             return;
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(
-            index,
-            Waiting {
-                due,
-                written: frame,
-                write,
-                looks: 0,
-                mapped: 0,
-                checked: (0, 0, 0, 0, 0),
-            },
-        );
+        let w = Waiting {
+            due,
+            written: frame,
+            write,
+            looks: 0,
+            mapped: 0,
+            checked: (0, 0, 0, 0, 0),
+        };
+        if let Some(old) = self.slots.insert(index, w) {
+            self.index_remove(index, old);
+        }
+        self.held.remove(&index);
+        self.index_insert(index, w);
     }
 
-    fn remove(&mut self, index: u32) {
-        self.slots.remove(&index);
+    fn remove(&mut self, index: u32) -> bool {
+        self.held.remove(&index);
+        if let Some(old) = self.slots.remove(&index) {
+            self.index_remove(index, old);
+            true
+        } else {
+            false
+        }
     }
 
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 {
-                &mut again
-            } else {
-                &mut fresh
-            };
-            class.push((w.written, index, w.write));
+        if max == 0 {
+            return Vec::new();
         }
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again
-            .iter()
-            .map(|&(_, index, write)| (index, write))
-            .collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let no_unpromoted = frame >= self.ready_until
+            && self.future.first().is_none_or(|&(due, _)| due > frame);
+        if no_unpromoted {
+            let cap = max.min(self.ready_again.len() + self.ready_fresh.len());
+            let mut order = Vec::with_capacity(cap);
+            for (&write, &index) in self.ready_again.iter().rev().take(max) {
+                order.push((index, write));
+            }
+            if order.len() < max {
+                let mut fresh = self.ready_fresh.iter();
+                while order.len() < max {
+                    let Some((&write, &index)) = fresh.next_back() else {
+                        break;
+                    };
+                    order.push((index, write));
+                    if order.len() < max {
+                        let Some((&write, &index)) = fresh.next() else {
+                            break;
+                        };
+                        order.push((index, write));
+                    }
+                }
+            }
+            return order;
+        }
+        if frame < self.ready_until {
+            let mut order = Vec::with_capacity(max.min(self.slots.len()));
+            for (&write, &index) in self.ready_again.iter().rev() {
+                if self.slots.get(&index).is_some_and(|w| w.due <= frame) {
+                    order.push((index, write));
+                    if order.len() == max {
+                        return order;
+                    }
+                }
+            }
+            let fresh: Vec<(u32, u64)> = self
+                .ready_fresh
+                .iter()
+                .filter(|&(_, index)| self.slots.get(index).is_some_and(|w| w.due <= frame))
+                .map(|(&write, &index)| (index, write))
+                .collect();
+            let (mut lo, mut hi) = (0, fresh.len());
+            while lo < hi && order.len() < max {
+                hi -= 1;
+                order.push(fresh[hi]);
+                if lo < hi && order.len() < max {
+                    order.push(fresh[lo]);
+                    lo += 1;
+                }
+            }
+            return order;
+        }
+        // `frame > self.ready_until` with unpromoted entries in `future.range(..=(frame, u32::MAX))`.
+        // Only visit entries actually due at `<= frame`, never scanning future-due slots.
+        let mut extra_again: Vec<(u64, u32)> = Vec::new();
+        let mut extra_fresh: Vec<(u64, u32)> = Vec::new();
+        for &(_, index) in self.future.range(..=(frame, u32::MAX)) {
+            if let Some(w) = self.slots.get(&index) {
+                if Self::is_again(w) {
+                    extra_again.push((w.write, index));
+                } else {
+                    extra_fresh.push((w.write, index));
+                }
             }
         }
-        order.truncate(max);
+        extra_again.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        extra_fresh.sort_unstable_by_key(|&(write, _)| write);
+        let mut order = Vec::with_capacity(
+            max.min(
+                self.ready_again.len()
+                    + extra_again.len()
+                    + self.ready_fresh.len()
+                    + extra_fresh.len(),
+            ),
+        );
+        // Merge `ready_again` (descending) and `extra_again` (descending).
+        let mut r_again = self.ready_again.iter().rev().peekable();
+        let mut e_again = extra_again.iter().peekable();
+        while order.len() < max {
+            match (r_again.peek(), e_again.peek()) {
+                (Some(&(&rw, &ri)), Some(&&(ew, ei))) => {
+                    if rw >= ew {
+                        r_again.next();
+                        order.push((ri, rw));
+                    } else {
+                        e_again.next();
+                        order.push((ei, ew));
+                    }
+                }
+                (Some(&(&rw, &ri)), None) => {
+                    r_again.next();
+                    order.push((ri, rw));
+                }
+                (None, Some(&&(ew, ei))) => {
+                    e_again.next();
+                    order.push((ei, ew));
+                }
+                (None, None) => break,
+            }
+        }
+        if order.len() < max {
+            // Merge `ready_fresh` (ascending) and `extra_fresh` (ascending) into ascending Vec,
+            // then alternate newest (`hi`) and oldest (`lo`).
+            let mut fresh = Vec::with_capacity(self.ready_fresh.len() + extra_fresh.len());
+            let mut r_fresh = self.ready_fresh.iter().peekable();
+            let mut e_fresh = extra_fresh.iter().peekable();
+            loop {
+                match (r_fresh.peek(), e_fresh.peek()) {
+                    (Some(&(&rw, &ri)), Some(&&(ew, ei))) => {
+                        if rw <= ew {
+                            r_fresh.next();
+                            fresh.push((ri, rw));
+                        } else {
+                            e_fresh.next();
+                            fresh.push((ei, ew));
+                        }
+                    }
+                    (Some(&(&rw, &ri)), None) => {
+                        r_fresh.next();
+                        fresh.push((ri, rw));
+                    }
+                    (None, Some(&&(ew, ei))) => {
+                        e_fresh.next();
+                        fresh.push((ei, ew));
+                    }
+                    (None, None) => break,
+                }
+            }
+            let (mut lo, mut hi) = (0, fresh.len());
+            while lo < hi && order.len() < max {
+                hi -= 1;
+                order.push(fresh[hi]);
+                if lo < hi && order.len() < max {
+                    order.push(fresh[lo]);
+                    lo += 1;
+                }
+            }
+        }
         order
     }
 
-    fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
-        self.slots.get_mut(&index).filter(|w| w.write == write)
+    fn all_due(&self, frame: u64) -> Vec<(u32, bool)> {
+        let mut out = Vec::new();
+        for &index in self.ready_again.values().chain(self.ready_fresh.values()) {
+            if let Some(w) = self.slots.get(&index)
+                && w.due <= frame
+            {
+                out.push((index, w.mapped > 0 || w.checked.2 != 0));
+            }
+        }
+        if frame > self.ready_until {
+            for &(_, index) in self.future.range(..=(frame, u32::MAX)) {
+                if let Some(w) = self.slots.get(&index) {
+                    out.push((index, w.mapped > 0 || w.checked.2 != 0));
+                }
+            }
+        }
+        out
     }
 
     fn done(&mut self, index: u32, write: u64) {
-        if self.same(index, write).is_some() {
-            self.slots.remove(&index);
+        if self.slots.get(&index).is_some_and(|w| w.write == write) {
+            let old = self.slots.remove(&index).unwrap();
+            self.index_remove(index, old);
+            self.held.remove(&index);
         }
     }
 
     fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(&old) = self.slots.get(&index).filter(|w| w.write == write) {
+            self.index_remove(index, old);
+            let mut w = old;
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
+            self.slots.insert(index, w);
+            self.index_insert(index, w);
         }
     }
 
     fn hold(&mut self, index: u32, write: u64, due: u64) {
-        if let Some(w) = self.same(index, write) {
-            w.due = w.due.max(due);
+        if let Some(&old) = self.slots.get(&index).filter(|w| w.write == write) {
+            let new_due = old.due.max(due);
+            if new_due != old.due {
+                self.index_remove(index, old);
+                let mut w = old;
+                w.due = new_due;
+                self.slots.insert(index, w);
+                self.index_insert(index, w);
+            }
             self.held.insert(index, write);
         }
     }
@@ -431,8 +767,15 @@ impl TextureQueue {
         let held = std::mem::take(&mut self.held);
         let mut back = 0;
         for (index, write) in held {
-            if let Some(w) = self.same(index, write) {
-                w.due = w.due.min(frame);
+            if let Some(&old) = self.slots.get(&index).filter(|w| w.write == write) {
+                let new_due = old.due.min(frame);
+                if new_due != old.due {
+                    self.index_remove(index, old);
+                    let mut w = old;
+                    w.due = new_due;
+                    self.slots.insert(index, w);
+                    self.index_insert(index, w);
+                }
                 back += 1;
             }
         }
@@ -440,8 +783,12 @@ impl TextureQueue {
     }
 
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(&old) = self.slots.get(&index).filter(|w| w.write == write) {
+            self.index_remove(index, old);
+            let mut w = old;
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
+            self.slots.insert(index, w);
+            self.index_insert(index, w);
         }
     }
 
@@ -456,9 +803,13 @@ impl TextureQueue {
         looks: u8,
         uploaded: u64,
     ) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(&old) = self.slots.get(&index).filter(|w| w.write == write) {
+            self.index_remove(index, old);
+            let mut w = old;
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
+            self.slots.insert(index, w);
+            self.index_insert(index, w);
         }
     }
 
@@ -473,17 +824,19 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(
-            index,
-            Waiting {
-                due,
-                written: frame,
-                write,
-                looks: 0,
-                mapped: 0,
-                checked: (0, 0, 0, 0, 0),
-            },
-        );
+        let w = Waiting {
+            due,
+            written: frame,
+            write,
+            looks: 0,
+            mapped: 0,
+            checked: (0, 0, 0, 0, 0),
+        };
+        if let Some(old) = self.slots.insert(index, w) {
+            self.index_remove(index, old);
+        }
+        self.held.remove(&index);
+        self.index_insert(index, w);
     }
 
     fn mapped(&self, index: u32) -> u64 {
@@ -491,16 +844,35 @@ impl TextureQueue {
     }
 
     fn census(&self, frame: u64) -> [u64; 5] {
-        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
-        for w in self.slots.values() {
-            if w.mapped > 0 {
-                c[3] += 1;
-            } else if w.looks > 0 {
-                c[2] += 1;
+        let mut c = [
+            self.slots.len() as u64,
+            0,
+            self.looks_only_count,
+            self.mapped_count,
+            0,
+        ];
+        if frame >= self.ready_until {
+            c[1] = (self.ready_again.len() + self.ready_fresh.len()) as u64;
+            if let Some(&oldest_written) = self.ready_written.keys().next() {
+                c[4] = frame.saturating_sub(oldest_written);
             }
-            if w.due <= frame {
-                c[1] += 1;
-                c[4] = c[4].max(frame.saturating_sub(w.written));
+            if frame > self.ready_until && self.future.first().is_some_and(|&(due, _)| due <= frame)
+            {
+                for &(_, index) in self.future.range(..=(frame, u32::MAX)) {
+                    if let Some(w) = self.slots.get(&index) {
+                        c[1] += 1;
+                        c[4] = c[4].max(frame.saturating_sub(w.written));
+                    }
+                }
+            }
+        } else {
+            for &index in self.ready_again.values().chain(self.ready_fresh.values()) {
+                if let Some(w) = self.slots.get(&index)
+                    && w.due <= frame
+                {
+                    c[1] += 1;
+                    c[4] = c[4].max(frame.saturating_sub(w.written));
+                }
             }
         }
         c
@@ -723,8 +1095,10 @@ impl HostHeap {
             made_keys: (0..count)
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
-            made_lock: Mutex::new(()),
+            made_lock: Mutex::default(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
+            has_kept: bit_words(count + extra),
+            is_buffer: bit_words(if sampler { 0 } else { count }),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -887,7 +1261,8 @@ impl HostHeap {
     }
 
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.promote(frame);
         (
             if max == 0 {
                 Vec::new()
@@ -900,12 +1275,7 @@ impl HostHeap {
 
     pub(crate) fn texture_slots_all_due(&self, frame: u64) -> Vec<(u32, bool)> {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures
-            .slots
-            .iter()
-            .filter(|(_, w)| w.due <= frame)
-            .map(|(&index, w)| (index, w.mapped > 0 || w.checked.2 != 0))
-            .collect()
+        textures.all_due(frame)
     }
 
     pub(crate) fn texture_slot_done(&self, index: u32, write: u64, again: Option<(u64, u64)>) {
@@ -967,20 +1337,30 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
-        let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
         }
-        let mut slots: Vec<u32> = {
+        coalesce_u64_ranges(&mut ranges);
+        if ranges.is_empty() {
+            return 0;
+        }
+        let mut slots = Vec::new();
+        {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            ranges
-                .iter()
-                .flat_map(|&(start, end)| placed.slots_in(start, end))
-                .collect()
-        };
+            for &(start, end) in &ranges {
+                placed.extend_slots_in(start, end, &mut slots);
+            }
+        }
+        if slots.is_empty() {
+            return 0;
+        }
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        if slots.is_empty() {
+            return 0;
+        }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
@@ -990,7 +1370,12 @@ impl HostHeap {
     }
 
     fn texture_slots_page_written(&self, frame: u64) -> usize {
-        let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges =
+            std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        if ranges.is_empty() {
+            return 0;
+        }
+        coalesce_u64_ranges(&mut ranges);
         if ranges.is_empty() {
             return 0;
         }
@@ -999,17 +1384,23 @@ impl HostHeap {
 
     fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64, due: bool) -> [usize; 3] {
         use std::sync::atomic::Ordering::Relaxed;
-        let mut slots: Vec<u32> = {
+        let mut slots = Vec::new();
+        {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            ranges
-                .iter()
-                .flat_map(|&(start, end)| placed.slots_holding(start, end))
-                .collect()
-        };
+            for &(start, end) in ranges {
+                placed.extend_slots_holding(start, end, &mut slots);
+            }
+        }
+        if slots.is_empty() {
+            return [0, 0, 0];
+        }
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let held = slots.len();
+        if held == 0 {
+            return [0, 0, 0];
+        }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         slots.retain(|slot| {
             textures
@@ -1044,12 +1435,7 @@ impl HostHeap {
                 let made = slot.load(std::sync::atomic::Ordering::Acquire);
                 made != 0 && made == key
             })
-            && self
-                .kept
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(index as usize)
-                .is_some_and(Option::is_some)
+            && bit_get(&self.has_kept, index)
     }
 
     pub(crate) fn texture_slots_waiting(&self, frame: u64) -> usize {
@@ -1099,17 +1485,24 @@ impl HostHeap {
         if self.sampler {
             return 0;
         }
-        let starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
         if starts.is_empty() {
             return 0;
         }
-        let slots: Vec<u32> = {
+        starts.sort_unstable();
+        starts.dedup();
+        let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             starts
                 .iter()
                 .flat_map(|&start| placed.slots_at(start))
                 .collect()
         };
+        if slots.is_empty() {
+            return 0;
+        }
+        slots.sort_unstable();
+        slots.dedup();
         let _made_guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut remade = 0;
         for slot in slots {
@@ -1132,7 +1525,7 @@ impl HostHeap {
     }
 
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
-        let _made_guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut deferred = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self
             .made_keys
             .get(index as usize)
@@ -1140,13 +1533,15 @@ impl HostHeap {
         {
             return false;
         }
+        deferred.remove(&index);
         self.unmake(index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
     }
 
     pub(crate) fn unmake_slot(&self, index: u32) {
-        let _made_guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut deferred = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
+        deferred.remove(&index);
         self.unmake(index);
     }
 
@@ -1186,7 +1581,7 @@ impl HostHeap {
             stamp.store(now | TABLED_READ, Relaxed);
             if tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.slots.remove(&index).is_some() {
+                if textures.remove(index) {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }
@@ -1309,12 +1704,17 @@ impl HostHeap {
                     .write_volatile(stride.unwrap_or(0))
             };
         }
-        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
+            bit_set(&self.is_buffer, index, true);
+            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
             buffers.insert(index);
             true
-        } else {
+        } else if bit_get(&self.is_buffer, index) {
+            bit_set(&self.is_buffer, index, false);
+            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
             buffers.remove(&index)
+        } else {
+            false
         };
         if was {
             self.changed
@@ -1343,8 +1743,9 @@ impl HostHeap {
         let base = self.count as usize;
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slots) = kept.get_mut(base + at as usize..base + end) {
-            for slot in slots {
+            for (offset, slot) in slots.iter_mut().enumerate() {
                 if let Some(old) = slot.take() {
+                    bit_set(&self.has_kept, (base + at as usize + offset) as u32, false);
                     crate::host::retire(old);
                 }
             }
@@ -1369,8 +1770,10 @@ impl HostHeap {
     }
 
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        let present = resource.is_some();
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
+            bit_set(&self.has_kept, index, present);
             if let Some(old) = std::mem::replace(slot, resource) {
                 crate::host::retire(old);
             }
@@ -1529,10 +1932,11 @@ impl HostHeap {
         {
             return view_at(i, generation);
         }
-        let _made_guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut deferred = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let cur = self.made_keys[index as usize].load(std::sync::atomic::Ordering::Relaxed);
         let Some(view) = view else {
+            deferred.remove(&index);
             if cur != 0 {
                 self.made_keys[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 self.make_null(index);
@@ -1543,9 +1947,14 @@ impl HostHeap {
             return None;
         };
         if cur != key {
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
-                if stale != index {
-                    self.unmake(stale);
+            let already_deferred_buffer =
+                for_draw && view.is_buffer() && deferred.remove(&index) == Some(key);
+            if !already_deferred_buffer {
+                for stale in self.note_buffer(index, Some(&view), for_draw) {
+                    if stale != index {
+                        deferred.remove(&stale);
+                        self.unmake(stale);
+                    }
                 }
             }
             let waiting = if for_draw {
@@ -1562,11 +1971,19 @@ impl HostHeap {
                 && view_at(cur as u32, (cur >> 32) as u32)
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
+                deferred.remove(&index);
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
             if later {
                 self.made_keys[index as usize].store(0, std::sync::atomic::Ordering::Release);
+                if view.is_buffer() {
+                    deferred.insert(index, key);
+                } else {
+                    deferred.remove(&index);
+                }
+            } else {
+                deferred.remove(&index);
             }
             let kept = if later {
                 None
@@ -2883,5 +3300,86 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn texture_queue_indexed_due_matches_priority_and_handles_future_slots() {
+        let mut q = TextureQueue::default();
+        // Queue 200 future-due slots plus 6 immediately-due slots.
+        for i in 0..200u32 {
+            q.written(1000 + i, 1, 500 + u64::from(i), false);
+        }
+        for i in 0..6u32 {
+            q.written(10 + i, 1 + u64::from(i), 0, false);
+        }
+        q.promote(10);
+        assert_eq!(q.census(10), [206, 6, 0, 0, 9]);
+        // Fresh order alternates newest (15) and oldest (10).
+        let due_slots: Vec<u32> = q.due(10, 10).into_iter().map(|d| d.0).collect();
+        assert_eq!(due_slots, [15, 10, 14, 11, 13, 12]);
+        assert_eq!(q.due(10, 0), []);
+        assert_eq!(q.due(10, 3).into_iter().map(|d| d.0).collect::<Vec<_>>(), [15, 10, 14]);
+
+        // Move slot 12 to `again` via `later` (due at 10 + 1 = 11) and slot 11 via `partly` (due at 11).
+        let due_map: std::collections::HashMap<u32, u64> = q.due(10, 10).into_iter().collect();
+        q.later(12, due_map[&12], 10, 16);
+        q.partly(11, due_map[&11], 11, 4096);
+        assert_eq!(q.census(10), [206, 4, 1, 1, 9]);
+
+        // Stale write tokens are ignored across done/later/hold/partly/recheck.
+        let stale = due_map[&12] + 9999;
+        q.done(12, stale);
+        q.later(12, stale, 10, 16);
+        q.hold(12, stale, 999);
+        q.partly(12, stale, 999, 8192);
+        q.recheck(12, stale, 999, (0, 0), 1, 0, 10);
+        assert_eq!(q.census(10)[0], 206);
+
+        // At frame 11, both `again` slots become due and precede all `fresh` slots, newest write first.
+        q.promote(11);
+        let at11: Vec<u32> = q.due(11, 10).into_iter().map(|d| d.0).collect();
+        assert_eq!(at11[..2], [12, 11]);
+        assert_eq!(at11[2..], [15, 10, 14, 13]);
+        assert_eq!(q.census(11), [206, 6, 1, 1, 10]);
+
+        // `remove` and `done` clean up both ready and future slots.
+        assert!(q.remove(1000));
+        assert!(!q.remove(1000));
+        q.done(12, due_map[&12]);
+        assert_eq!(q.census(11), [204, 5, 0, 1, 10]);
+
+        // `hold` pushes a ready slot into future; `room` brings it back.
+        q.hold(15, due_map[&15], 200);
+        assert!(!q.due(11, 10).iter().any(|d| d.0 == 15));
+        assert_eq!(q.room(11), 1);
+        assert!(q.due(11, 10).iter().any(|d| d.0 == 15));
+
+        // Backward frame query after promotion remains exact.
+        q.written(50, 11, 11, false);
+        assert!(!q.due(10, 100).iter().any(|d| d.0 == 50));
+        assert!(q.due(11, 100).iter().any(|d| d.0 == 50));
+
+        // Promoting to frame 502 brings only 1001 and 1002 into due (1000 was removed).
+        q.promote(502);
+        let at502: std::collections::HashSet<u32> =
+            q.all_due(502).into_iter().map(|(idx, _)| idx).collect();
+        assert!(at502.contains(&1001));
+        assert!(at502.contains(&1002));
+        assert!(!at502.contains(&1003));
+        assert!(!at502.contains(&1000));
+    }
+
+    #[test]
+    fn coalesce_u64_ranges_merges_overlapping_and_adjacent() {
+        let mut ranges = vec![
+            (0x4000, 0x5000),
+            (0x1000, 0x2000),
+            (0x2000, 0x3000),
+            (0x1500, 0x2500),
+            (0x9000, 0x9000),
+            (0x4800, 0x6000),
+        ];
+        coalesce_u64_ranges(&mut ranges);
+        assert_eq!(ranges, [(0x1000, 0x3000), (0x4000, 0x6000)]);
     }
 }

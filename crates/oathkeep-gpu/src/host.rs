@@ -187,14 +187,17 @@ fn sweep() {
         return;
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 250 {
+        return;
+    }
     let avail_commit = available_commit();
     let interval = if avail_commit.is_some_and(|c| c < (2560u64 << 20)) {
         250
     } else {
         1000
     };
-    let now = now_ms();
-    let last = LAST.load(Ordering::Relaxed);
     if now < last + interval
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
@@ -1518,12 +1521,18 @@ struct CardRange {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
     declared: (usize, usize),
     span: crate::shadow::CardSpan,
+}
+
+struct CardCompare {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    span: crate::shadow::CardSpan,
     at: u32,
     compared: bool,
 }
 
 struct CardPlan {
     ranges: Vec<CardRange>,
+    compares: Vec<CardCompare>,
     check: Option<ID3D12CommandList>,
     _synced: Vec<std::sync::Arc<crate::shadow::Shadow>>,
     lists: Vec<(bool, Prelude)>,
@@ -1624,13 +1633,82 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
         .unwrap_or(line.len())
 }
 
+#[cfg(test)]
 fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(usize, u32)> {
     flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
 }
 
+fn merge_piece_intervals(ranges: &mut Vec<(usize, usize)>) {
+    if ranges.len() <= 1 {
+        ranges.retain(|&(lo, hi)| lo < hi);
+        return;
+    }
+    ranges.sort_unstable();
+    let mut write = 0usize;
+    for i in 0..ranges.len() {
+        let (lo, hi) = ranges[i];
+        if lo >= hi {
+            continue;
+        }
+        if write > 0 && lo <= ranges[write - 1].1 {
+            ranges[write - 1].1 = ranges[write - 1].1.max(hi);
+        } else {
+            ranges[write] = (lo, hi);
+            write += 1;
+        }
+    }
+    ranges.truncate(write);
+}
+
+fn coalesce_copy_regions(pieces: &[(usize, usize, usize, u64)]) -> Vec<(usize, usize, usize, u64)> {
+    let mut out: Vec<(usize, usize, usize, u64)> = Vec::with_capacity(pieces.len());
+    for &(shadow_idx, lo, hi, dst_at) in pieces {
+        if lo >= hi {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last)
+                if last.0 == shadow_idx
+                    && last.2 == lo
+                    && last.3 + (last.2 - last.1) as u64 == dst_at =>
+            {
+                last.2 = hi;
+            }
+            _ => out.push((shadow_idx, lo, hi, dst_at)),
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn should_defer_landing(
+    has_waiters: bool,
+    has_urgent_items: bool,
+    max_busy_fence: u64,
+    completed: u64,
+    lists: usize,
+    late_most: usize,
+    results_low: bool,
+    defer_count: u32,
+    defer_elapsed_ms: u64,
+) -> bool {
+    const MAX_DEFER_ROUNDS: u32 = 4;
+    const MAX_DEFER_MS: u64 = 6;
+    !has_waiters
+        && !has_urgent_items
+        && max_busy_fence > completed
+        && lists < (late_most / 2).max(1)
+        && !results_low
+        && defer_count < MAX_DEFER_ROUNDS
+        && defer_elapsed_ms < MAX_DEFER_MS
+}
+
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{
+        coalesce_copy_regions, flagged_pieces, landable, merge_piece_intervals,
+        should_defer_landing,
+    };
 
     #[test]
     fn flights_land_in_the_order_they_were_sent() {
@@ -1662,6 +1740,53 @@ mod relay_tests {
         assert!(!fetch.contains(&(b, 3)));
         assert!(fetch.contains(&(b, 9)));
         assert_eq!(fetch.len(), 2);
+    }
+
+    #[test]
+    fn piece_intervals_merge_overlapping_subranges_and_keep_disjoint() {
+        let mut ranges = vec![
+            (0x8000, 0x10000),
+            (0x0000, 0x4000),
+            (0x2000, 0x5000),
+            (0x5000, 0x6000),
+            (0x9000, 0x9000),
+            (0x7000, 0x9000),
+        ];
+        merge_piece_intervals(&mut ranges);
+        assert_eq!(ranges, [(0x0000, 0x6000), (0x7000, 0x10000)]);
+    }
+
+    #[test]
+    fn copy_regions_coalesce_adjacent_pieces_of_same_shadow() {
+        let pieces = [
+            (0usize, 0x0000usize, 0x10000usize, 0u64),
+            (0, 0x10000, 0x20000, 0x10000),
+            (0, 0x20000, 0x28000, 0x20000),
+            (0, 0x40000, 0x50000, 0x28000),
+            (1, 0x50000, 0x60000, 0x38000),
+            (1, 0x60000, 0x70000, 0x48000),
+        ];
+        assert_eq!(
+            coalesce_copy_regions(&pieces),
+            [
+                (0, 0x0000, 0x28000, 0),
+                (0, 0x40000, 0x50000, 0x28000),
+                (1, 0x50000, 0x70000, 0x38000),
+            ]
+        );
+    }
+
+    #[test]
+    fn relay_defers_bounded_bursts_and_lands_immediately_when_urgent() {
+        assert!(should_defer_landing(false, false, 10, 8, 12, 256, false, 0, 0));
+        assert!(should_defer_landing(false, false, 10, 8, 12, 256, false, 3, 5));
+        assert!(!should_defer_landing(true, false, 10, 8, 12, 256, false, 0, 0));
+        assert!(!should_defer_landing(false, true, 10, 8, 12, 256, false, 0, 0));
+        assert!(!should_defer_landing(false, false, 8, 8, 12, 256, false, 0, 0));
+        assert!(!should_defer_landing(false, false, 10, 8, 128, 256, false, 0, 0));
+        assert!(!should_defer_landing(false, false, 10, 8, 12, 256, true, 0, 0));
+        assert!(!should_defer_landing(false, false, 10, 8, 12, 256, false, 4, 0));
+        assert!(!should_defer_landing(false, false, 10, 8, 12, 256, false, 1, 6));
     }
 }
 
@@ -1714,6 +1839,7 @@ struct Line {
     target: u64,
     settling: bool,
     poke: bool,
+    waiters: usize,
     landed: Vec<(Vec<crate::list::Detached>, Vec<usize>)>,
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -1729,6 +1855,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     target: 0,
     settling: false,
     poke: false,
+    waiters: 0,
     landed: Vec::new(),
     in_hand: Vec::new(),
 });
@@ -2025,9 +2152,11 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
     let waiting = std::time::Instant::now();
+    line.waiters += 1;
     while !done(&line) {
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
     }
+    line.waiters = line.waiters.saturating_sub(1);
     drop(line);
     stood(waiting);
     working(was_working);
@@ -2061,7 +2190,11 @@ struct RelayFetch {
     fence: ID3D12Fence,
     event: HANDLE,
     sent: u64,
+    copy_fence: ID3D12Fence,
+    copy_event: HANDLE,
+    copy_sent: u64,
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    copy_buffer: Option<(ID3D12Resource, usize, u64)>,
 }
 
 fn relay_worker() {
@@ -2075,24 +2208,24 @@ fn relay_worker() {
         ));
     };
     let mut fetch: Option<RelayFetch> = None;
-    let mut deferred = false;
+    let mut defer_count = 0u32;
+    let mut defer_since: Option<std::time::Instant> = None;
+    let mut fences: Vec<Option<u64>> = Vec::new();
     loop {
         let next = {
             let mut line = line();
             loop {
                 if line.line.is_empty() {
-                    deferred = false;
+                    defer_count = 0;
+                    defer_since = None;
                     line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
-                let fences: Vec<Option<u64>> = line
-                    .line
-                    .iter()
-                    .map(|l| match l {
-                        Late::Run(flight) => Some(flight.fence),
-                        _ => None,
-                    })
-                    .collect();
+                fences.clear();
+                fences.extend(line.line.iter().map(|l| match l {
+                    Late::Run(flight) => Some(flight.fence),
+                    _ => None,
+                }));
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
                 let n = landable(&fences, completed);
@@ -2138,11 +2271,33 @@ fn relay_worker() {
                         }
                     }
                 }
-                if !deferred && max_busy_fence > completed {
-                    deferred = true;
+                let has_urgent = line.line[..n].iter().any(|item| match item {
+                    Late::Signal(..) | Late::Write(..) => true,
+                    Late::Run(flight) => flight
+                        .order
+                        .iter()
+                        .any(|&i| !flight.lists[i].host().deferred().backs.is_empty()),
+                });
+                let elapsed_ms = defer_since.map_or(0, |t| t.elapsed().as_millis() as u64);
+                if should_defer_landing(
+                    line.waiters > 0,
+                    has_urgent,
+                    max_busy_fence,
+                    completed,
+                    line.lists,
+                    late_most(),
+                    host.card_results_low(),
+                    defer_count,
+                    elapsed_ms,
+                ) {
+                    if defer_since.is_none() {
+                        defer_since = Some(std::time::Instant::now());
+                    }
+                    defer_count += 1;
                     break Err(max_busy_fence);
                 }
-                deferred = false;
+                defer_count = 0;
+                defer_since = None;
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
                 line.in_hand = items
@@ -2369,22 +2524,26 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
+    let mut index: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
                 let range = (*address, *address + *len);
-                match back
-                    .iter_mut()
-                    .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
-                {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
+                let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+                match index.get(&ptr) {
+                    Some(&at) => back[at].1.push(range),
+                    None => {
+                        index.insert(ptr, back.len());
+                        back.push((shadow.clone(), vec![range]));
                     }
-                    None => back.push((shadow.clone(), vec![range])),
                 }
             }
+        }
+    }
+    for (_, ranges) in &mut back {
+        if ranges.len() > 1 {
+            ranges.sort_unstable();
+            ranges.dedup();
         }
     }
     back
@@ -2773,27 +2932,32 @@ impl Host {
             return None;
         }
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        let mut decl_index: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
                     && shadow.carded()
                 {
                     let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
+                    let ptr = Arc::as_ptr(shadow) as usize;
+                    match decl_index.get(&ptr) {
+                        Some(&at) => declared[at].1.push(range),
+                        None => {
+                            decl_index.insert(ptr, declared.len());
+                            declared.push((shadow.clone(), vec![range]));
                         }
-                        None => declared.push((shadow.clone(), vec![range])),
                     }
                 }
             }
         }
-        for (shadow, ranges) in &declared {
-            for &(from, to) in ranges {
+        for (shadow, ranges) in &mut declared {
+            let mut merged = Vec::new();
+            join_ranges(&mut merged, std::mem::take(ranges));
+            for &(from, to) in &merged {
                 shadow.card_prepare_write(from, to);
             }
+            *ranges = merged;
         }
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
         let sent_as = match order.as_mut() {
@@ -3044,6 +3208,7 @@ impl Host {
         drop(order);
         let mut plan = CardPlan {
             ranges: Vec::new(),
+            compares: Vec::new(),
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
@@ -3051,38 +3216,39 @@ impl Host {
             order_seq: sent_as,
         };
         let mut at = work.taken;
-        for (shadow, ranges) in &declared {
-            let mut sorted = ranges.clone();
-            sorted.sort_unstable();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for (from, to) in sorted {
-                match spans.last_mut() {
-                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                    _ => spans.push((from, to)),
-                }
-            }
+        for (shadow, spans) in &declared {
             let twin = shadow
                 .card_sides()
                 .is_some_and(|(before, _)| before.is_some());
-            for (from, to) in spans {
+            let mut shadow_spans: Vec<crate::shadow::CardSpan> = Vec::with_capacity(spans.len());
+            for &(from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
                     span,
+                });
+                shadow_spans.push(span);
+            }
+            // Coalesce overlapping/adjacent 64 KiB piece runs per shadow so each piece
+            // is hashed at most once per submission in `CARD_COMPARE`.
+            for run in crate::shadow::joined_piece_runs(shadow_spans) {
+                let compared = twin && u64::from(at + run.pieces) * 4 <= work.differs.2;
+                plan.compares.push(CardCompare {
+                    shadow: shadow.clone(),
+                    span: run,
                     at,
                     compared,
                 });
                 if compared {
-                    at += span.pieces;
+                    at += run.pieces;
                 }
             }
         }
         work.taken = at;
-        if plan.ranges.iter().any(|r| r.compared) {
+        if plan.compares.iter().any(|c| c.compared) {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!(
                     "no host list for the compare of host copies in the card's memory"
@@ -3111,25 +3277,25 @@ impl Host {
                         3,
                         work.differs.0.GetGPUVirtualAddress(),
                     );
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let Some((Some(before), size)) = r.shadow.card_sides() else {
+                    for c in plan.compares.iter().filter(|c| c.compared) {
+                        let Some((Some(before), size)) = c.shadow.card_sides() else {
                             continue;
                         };
                         let constants = [
-                            r.span.first,
-                            r.span.skew,
+                            c.span.first,
+                            c.span.skew,
                             size as u32,
-                            r.span.pieces,
-                            r.at * 4,
+                            c.span.pieces,
+                            c.at * 4,
                             if flown { 2 } else { 1 },
                         ];
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(
                             1,
-                            r.shadow.buffer.GetGPUVirtualAddress(),
+                            c.shadow.buffer.GetGPUVirtualAddress(),
                         );
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(c.span.pieces.div_ceil(64), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
@@ -3196,13 +3362,19 @@ impl Host {
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
+            let copy_fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            let copy_event = CreateEventW(None, false, false, None).ok()?;
             Some(RelayFetch {
                 list,
                 copy_list,
                 fence,
                 event,
                 sent: 0,
+                copy_fence,
+                copy_event,
+                copy_sent: 0,
                 buffer: None,
+                copy_buffer: None,
             })
         }
     }
@@ -3213,55 +3385,63 @@ impl Host {
         busy_shadows: &std::collections::HashSet<usize>,
         fetch: &mut Option<RelayFetch>,
     ) {
+        use std::sync::Arc;
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref()
                 .map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
-        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> =
-            Vec::new();
-        let mut total = 0u64;
+        // Collect declared `(lo, hi)` byte intervals per `(shadow_ptr, piece_idx)` and merge
+        // overlapping/adjacent sub-ranges within each 64 KiB piece so no byte is fetched or
+        // merged more than once per landing.
+        let mut by_piece: std::collections::HashMap<
+            (usize, u32),
+            (Arc<crate::shadow::Shadow>, Vec<(usize, usize)>),
+        > = std::collections::HashMap::new();
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
             // plans have run, and their dwords are given to no other plan
             // before these are done with (`card_done`).
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
-            let mut seen = std::collections::HashSet::new();
+            let mut plan_flagged: std::collections::HashSet<(usize, u32)> =
+                std::collections::HashSet::new();
             for plan in plans {
-                let flags: Vec<(usize, u32, bool)> = plan
-                    .ranges
-                    .iter()
-                    .flat_map(|r| {
-                        (0..r.span.pieces).map(move |p| {
-                            let flagged = !r.compared
-                                || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
-                            (
-                                std::sync::Arc::as_ptr(&r.shadow) as usize,
-                                r.span.first + p,
-                                flagged,
-                            )
-                        })
-                    })
-                    .collect();
-                let fetched = flagged_pieces(&flags);
-                for r in &plan.ranges {
-                    let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
-                    for p in 0..r.span.pieces {
-                        if !fetched.contains(&(copy, r.span.first + p)) {
-                            continue;
-                        }
-                        let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && seen.insert((copy, lo, hi)) {
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
+                plan_flagged.clear();
+                for cmp in &plan.compares {
+                    let copy = Arc::as_ptr(&cmp.shadow) as usize;
+                    for p in 0..cmp.span.pieces {
+                        if !cmp.compared
+                            || differs.get((cmp.at + p) as usize).is_none_or(|&d| d != 0)
+                        {
+                            plan_flagged.insert((copy, cmp.span.first + p));
                         }
                     }
                     crate::shadow::CARD_STATS[2]
-                        .fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+                        .fetch_add(u64::from(cmp.span.pieces), Ordering::Relaxed);
+                }
+                if plan_flagged.is_empty() {
+                    continue;
+                }
+                for r in &plan.ranges {
+                    let copy = Arc::as_ptr(&r.shadow) as usize;
+                    for p in 0..r.span.pieces {
+                        let piece_idx = r.span.first + p;
+                        if !plan_flagged.contains(&(copy, piece_idx)) {
+                            continue;
+                        }
+                        let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                        if lo < hi {
+                            by_piece
+                                .entry((copy, piece_idx))
+                                .or_insert_with(|| (r.shadow.clone(), Vec::new()))
+                                .1
+                                .push((lo, hi));
+                        }
+                    }
                 }
             }
         }
-        if pieces.is_empty() {
+        if by_piece.is_empty() {
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
             return;
         }
@@ -3273,106 +3453,173 @@ impl Host {
                 "no list, fence or event to fetch what shaders wrote to the card's memory (OATHKEEP_RELAY=1)"
             ));
         };
-        if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
-            let size = total.next_multiple_of(16 << 20);
-            f.buffer = self
-                .shared_buffer(size)
-                .map(|(buffer, data)| (buffer, data as usize, size));
-        }
-        let Some((buffer, data, _)) = f.buffer.clone() else {
-            fail(format_args!(
-                "no memory to fetch what shaders wrote to the card's memory ({total} bytes, OATHKEEP_RELAY=1)"
-            ));
-        };
         let landed_seq = plans.iter().map(|p| p.order_seq).max().unwrap_or(0);
         let can_copy_queue = self.copy_queue.is_some() && f.copy_list.is_some();
-        let mut fast = Vec::new();
-        let mut slow = Vec::new();
-        for piece in pieces {
-            let ptr = std::sync::Arc::as_ptr(&piece.0) as usize;
-            if can_copy_queue && !busy_shadows.contains(&ptr) {
-                fast.push(piece);
+        let mut fast: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
+        let mut slow: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
+        for ((ptr, _), (shadow, mut intervals)) in by_piece {
+            merge_piece_intervals(&mut intervals);
+            let target = if can_copy_queue && !busy_shadows.contains(&ptr) {
+                &mut fast
             } else {
-                slow.push(piece);
+                &mut slow
+            };
+            for (lo, hi) in intervals {
+                target.push((shadow.clone(), lo, hi, 0));
             }
         }
+        if fast.is_empty() && slow.is_empty() {
+            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            return;
+        }
+        fast.sort_unstable_by_key(|p| (Arc::as_ptr(&p.0) as usize, p.1));
+        slow.sort_unstable_by_key(|p| (Arc::as_ptr(&p.0) as usize, p.1));
+        let mut fast_total = 0u64;
+        for p in &mut fast {
+            p.3 = fast_total;
+            fast_total += (p.2 - p.1) as u64;
+        }
+        let mut slow_total = 0u64;
+        for p in &mut slow {
+            p.3 = slow_total;
+            slow_total += (p.2 - p.1) as u64;
+        }
+        let total = fast_total + slow_total;
+        let fast_buf = if fast_total > 0 {
+            if f.copy_buffer.as_ref().is_none_or(|b| b.2 < fast_total) {
+                let size = fast_total.next_multiple_of(4 << 20);
+                f.copy_buffer = self
+                    .read_back_mapped(size)
+                    .map(|(buffer, data)| (buffer, data as usize, size));
+            }
+            let Some((buffer, data, _)) = f.copy_buffer.clone() else {
+                fail(format_args!(
+                    "no memory to fetch what shaders wrote to the card's memory ({fast_total} bytes, OATHKEEP_RELAY=1)"
+                ));
+            };
+            Some((buffer, data))
+        } else {
+            None
+        };
+        let slow_buf = if slow_total > 0 {
+            if f.buffer.as_ref().is_none_or(|b| b.2 < slow_total) {
+                let size = slow_total.next_multiple_of(4 << 20);
+                f.buffer = self
+                    .read_back_mapped(size)
+                    .map(|(buffer, data)| (buffer, data as usize, size));
+            }
+            let Some((buffer, data, _)) = f.buffer.clone() else {
+                fail(format_args!(
+                    "no memory to fetch what shaders wrote to the card's memory ({slow_total} bytes, OATHKEEP_RELAY=1)"
+                ));
+            };
+            Some((buffer, data))
+        } else {
+            None
+        };
         let waiting = std::time::Instant::now();
         let mut waits = 0u64;
-        if !fast.is_empty() {
+        // Record and submit BOTH `fast` (copy queue) and `slow` (3D queue) before waiting
+        // on either so both hardware queues overlap when both are non-empty.
+        let fast_started = if !fast.is_empty() {
             let fast_start = std::time::Instant::now();
             let copy_queue = self.copy_queue.as_ref().unwrap();
             let (allocator, list) = f.copy_list.as_ref().unwrap().clone();
+            let (buffer, _) = fast_buf.as_ref().unwrap();
+            let copy_regions: Vec<(usize, usize, usize, u64)> = {
+                let mut shadow_by_ptr: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::new();
+                for (i, (s, ..)) in fast.iter().enumerate() {
+                    shadow_by_ptr.entry(Arc::as_ptr(s) as usize).or_insert(i);
+                }
+                let keyed: Vec<(usize, usize, usize, u64)> = fast
+                    .iter()
+                    .map(|(s, lo, hi, at)| (shadow_by_ptr[&(Arc::as_ptr(s) as usize)], *lo, *hi, *at))
+                    .collect();
+                coalesce_copy_regions(&keyed)
+            };
             {
                 let mut reading = RELAY_READING.lock().unwrap_or_else(|e| e.into_inner());
                 let set = reading.get_or_insert_with(Default::default);
                 for (shadow, ..) in &fast {
-                    set.insert(std::sync::Arc::as_ptr(shadow) as usize);
+                    set.insert(Arc::as_ptr(shadow) as usize);
                 }
             }
-            f.sent += 1;
-            let (fence, event, sent) = (f.fence.clone(), f.event, f.sent);
+            f.copy_sent += 1;
+            let (copy_fence, copy_sent) = (f.copy_fence.clone(), f.copy_sent);
             // SAFETY: the copy list's last run was waited for; landed flights
             // finished on `self.queue` so these buffers decayed to COMMON; no
             // pending flight writes to them; `RELAY_READING` blocks concurrent
             // `card_before` writes until the copy finishes.
-            let ran = unsafe {
+            let submitted = unsafe {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
-                    for (shadow, lo, hi, at) in &fast {
+                    for &(shadow_idx, lo, hi, at) in &copy_regions {
                         list.CopyBufferRegion(
-                            &buffer,
-                            *at,
-                            &shadow.buffer,
-                            *lo as u64,
-                            (*hi - *lo) as u64,
+                            buffer,
+                            at,
+                            &fast[shadow_idx].0.buffer,
+                            lo as u64,
+                            (hi - lo) as u64,
                         );
                     }
                     list.Close()?;
                     let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                     copy_queue.ExecuteCommandLists(&lists);
-                    copy_queue.Signal(&fence, sent)?;
-                    fence.SetEventOnCompletion(sent, event)?;
-                    WaitForSingleObject(event, INFINITE);
+                    copy_queue.Signal(&copy_fence, copy_sent)?;
                     Ok(())
                 })()
             };
-            {
-                let mut reading = RELAY_READING.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(set) = reading.as_mut() {
-                    set.clear();
+            if let Err(e) = submitted {
+                {
+                    let mut reading = RELAY_READING.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(set) = reading.as_mut() {
+                        set.clear();
+                    }
                 }
-            }
-            RELAY_READING_DONE.notify_all();
-            if let Err(e) = ran {
+                RELAY_READING_DONE.notify_all();
                 fail(format_args!(
                     "what shaders wrote to the card's memory could not be fetched on the copy queue ({e}, OATHKEEP_RELAY=1)"
                 ));
             }
-            RELAY_STATS[5].fetch_add(1, Ordering::Relaxed);
-            RELAY_STATS[6].fetch_add(fast_start.elapsed().as_micros() as u64, Ordering::Relaxed);
-            waits += 1;
-        }
+            Some((fast_start, copy_fence, f.copy_event, copy_sent))
+        } else {
+            None
+        };
         let mut slow_after = landed_seq;
-        if !slow.is_empty() {
+        let slow_started = if !slow.is_empty() {
             let slow_start = std::time::Instant::now();
             f.sent += 1;
             let ((allocator, list), fence, event, sent) =
                 (f.list.clone(), f.fence.clone(), f.event, f.sent);
+            let (buffer, _) = slow_buf.as_ref().unwrap();
+            let copy_regions: Vec<(usize, usize, usize, u64)> = {
+                let mut shadow_by_ptr: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::new();
+                for (i, (s, ..)) in slow.iter().enumerate() {
+                    shadow_by_ptr.entry(Arc::as_ptr(s) as usize).or_insert(i);
+                }
+                let keyed: Vec<(usize, usize, usize, u64)> = slow
+                    .iter()
+                    .map(|(s, lo, hi, at)| (shadow_by_ptr[&(Arc::as_ptr(s) as usize)], *lo, *hi, *at))
+                    .collect();
+                coalesce_copy_regions(&keyed)
+            };
             // SAFETY: the list's last run was waited for by this thread; live
             // buffers (the copies are held by the plans); the fence and the
             // event are this thread's.
-            let ran = unsafe {
+            let submitted = unsafe {
                 (|| -> windows::core::Result<u64> {
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
-                    for (shadow, lo, hi, at) in &slow {
+                    for &(shadow_idx, lo, hi, at) in &copy_regions {
                         list.CopyBufferRegion(
-                            &buffer,
-                            *at,
-                            &shadow.buffer,
-                            *lo as u64,
-                            (*hi - *lo) as u64,
+                            buffer,
+                            at,
+                            &slow[shadow_idx].0.buffer,
+                            lo as u64,
+                            (hi - lo) as u64,
                         );
                     }
                     list.Close()?;
@@ -3383,17 +3630,69 @@ impl Host {
                     drop(order);
                     self.card_sent();
                     self.queue.Signal(&fence, sent)?;
-                    fence.SetEventOnCompletion(sent, event)?;
-                    WaitForSingleObject(event, INFINITE);
                     Ok(after)
                 })()
             };
-            slow_after = match ran {
+            slow_after = match submitted {
                 Ok(after) => after,
-                Err(e) => fail(format_args!(
-                    "what shaders wrote to the card's memory could not be fetched ({e}, OATHKEEP_RELAY=1)"
-                )),
+                Err(e) => {
+                    if let Some((_, copy_fence, copy_event, copy_sent)) = &fast_started {
+                        // SAFETY: finish copy queue before failing so `RELAY_READING` is released.
+                        unsafe {
+                            let _ = copy_fence.SetEventOnCompletion(*copy_sent, *copy_event);
+                            WaitForSingleObject(*copy_event, INFINITE);
+                        }
+                        if let Some(set) =
+                            RELAY_READING.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+                        {
+                            set.clear();
+                        }
+                        RELAY_READING_DONE.notify_all();
+                    }
+                    fail(format_args!(
+                        "what shaders wrote to the card's memory could not be fetched ({e}, OATHKEEP_RELAY=1)"
+                    ));
+                }
             };
+            Some((slow_start, fence, event, sent))
+        } else {
+            None
+        };
+        if let Some((fast_start, copy_fence, copy_event, copy_sent)) = fast_started {
+            // SAFETY: copy queue fence and this thread's copy event.
+            let waited = unsafe {
+                copy_fence.SetEventOnCompletion(copy_sent, copy_event).map(|()| {
+                    WaitForSingleObject(copy_event, INFINITE);
+                })
+            };
+            {
+                let mut reading = RELAY_READING.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(set) = reading.as_mut() {
+                    set.clear();
+                }
+            }
+            RELAY_READING_DONE.notify_all();
+            if let Err(e) = waited {
+                fail(format_args!(
+                    "what shaders wrote to the card's memory could not be awaited on the copy queue ({e}, OATHKEEP_RELAY=1)"
+                ));
+            }
+            RELAY_STATS[5].fetch_add(1, Ordering::Relaxed);
+            RELAY_STATS[6].fetch_add(fast_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            waits += 1;
+        }
+        if let Some((slow_start, fence, event, sent)) = slow_started {
+            // SAFETY: 3D queue fence and this thread's event.
+            let waited = unsafe {
+                fence.SetEventOnCompletion(sent, event).map(|()| {
+                    WaitForSingleObject(event, INFINITE);
+                })
+            };
+            if let Err(e) = waited {
+                fail(format_args!(
+                    "what shaders wrote to the card's memory could not be awaited ({e}, OATHKEEP_RELAY=1)"
+                ));
+            }
             RELAY_STATS[7].fetch_add(1, Ordering::Relaxed);
             RELAY_STATS[8].fetch_add(slow_start.elapsed().as_micros() as u64, Ordering::Relaxed);
             waits += 1;
@@ -3408,59 +3707,91 @@ impl Host {
             CARD_STATS[5].fetch_add(waits, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut all_pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64, u64)> =
-            Vec::with_capacity(piece_count);
+        // Group pieces by shadow so parallel `wide_merge` workers never contend on
+        // the same shadow's `before`/`old` mutexes.
+        let fast_data = fast_buf.map_or(0, |(_, d)| d);
+        let slow_data = slow_buf.map_or(0, |(_, d)| d);
+        type MergePiece = (Arc<crate::shadow::Shadow>, usize, usize, usize, u64);
+        let mut by_shadow: Vec<(usize, Vec<MergePiece>)> = Vec::new();
+        let mut shadow_pos: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
         for (shadow, lo, hi, at) in fast {
-            all_pieces.push((shadow, lo, hi, at, landed_seq));
+            let ptr = Arc::as_ptr(&shadow) as usize;
+            let item = (shadow, lo, hi, fast_data + at as usize, landed_seq);
+            match shadow_pos.get(&ptr) {
+                Some(&idx) => by_shadow[idx].1.push(item),
+                None => {
+                    shadow_pos.insert(ptr, by_shadow.len());
+                    by_shadow.push((ptr, vec![item]));
+                }
+            }
         }
         for (shadow, lo, hi, at) in slow {
-            all_pieces.push((shadow, lo, hi, at, slow_after));
-        }
-        let written = if wide_merge() && all_pieces.len() >= 8 {
-            let total_written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let each = all_pieces.len().div_ceil(8);
-            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
-            let mut iter = all_pieces.into_iter();
-            loop {
-                let chunk: Vec<_> = iter.by_ref().take(each).collect();
-                if chunk.is_empty() {
-                    break;
+            let ptr = Arc::as_ptr(&shadow) as usize;
+            let item = (shadow, lo, hi, slow_data + at as usize, slow_after);
+            match shadow_pos.get(&ptr) {
+                Some(&idx) => by_shadow[idx].1.push(item),
+                None => {
+                    shadow_pos.insert(ptr, by_shadow.len());
+                    by_shadow.push((ptr, vec![item]));
                 }
-                let total_written = total_written.clone();
-                jobs.push(Box::new(move || {
-                    let mut title = Vec::new();
-                    let mut local = 0usize;
-                    for (shadow, lo, hi, at, after) in chunk {
-                        // SAFETY: the mapping of the fetched bytes, `total` of
-                        // them; the copy into it has run, and `wide_run` joins
-                        // before this function returns.
-                        let gpu = unsafe {
-                            std::slice::from_raw_parts(
-                                (data + at as usize) as *const u8,
-                                hi - lo,
-                            )
-                        };
-                        let merged = shadow.card_merge_relay(lo, gpu, after, &mut title);
-                        shadow.walls_merged(gpu.len(), merged);
-                        local += merged;
-                    }
-                    total_written.fetch_add(local, Ordering::Relaxed);
-                }));
             }
+        }
+        let written = if wide_merge() && by_shadow.len() >= 2 && piece_count >= 8 {
+            let total_written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let worker_count = by_shadow.len().min(8);
+            let mut buckets: Vec<Vec<MergePiece>> = (0..worker_count).map(|_| Vec::new()).collect();
+            let mut bucket_bytes = vec![0usize; worker_count];
+            by_shadow.sort_unstable_by(|a, b| {
+                let ba: usize = a.1.iter().map(|p| p.2 - p.1).sum();
+                let bb: usize = b.1.iter().map(|p| p.2 - p.1).sum();
+                bb.cmp(&ba)
+            });
+            for (_, group) in by_shadow {
+                let bytes: usize = group.iter().map(|p| p.2 - p.1).sum();
+                let dst = bucket_bytes
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, b)| **b)
+                    .map_or(0, |(i, _)| i);
+                bucket_bytes[dst] += bytes;
+                buckets[dst].extend(group);
+            }
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                .into_iter()
+                .filter(|b| !b.is_empty())
+                .map(|chunk| {
+                    let total_written = total_written.clone();
+                    Box::new(move || {
+                        let mut title = Vec::new();
+                        let mut local = 0usize;
+                        for (shadow, lo, hi, src, after) in chunk {
+                            // SAFETY: the mapping of the fetched bytes; the copy into it
+                            // has run, and `wide_run` joins before this function returns.
+                            let gpu = unsafe {
+                                std::slice::from_raw_parts(src as *const u8, hi - lo)
+                            };
+                            let merged = shadow.card_merge_relay(lo, gpu, after, &mut title);
+                            shadow.walls_merged(gpu.len(), merged);
+                            local += merged;
+                        }
+                        total_written.fetch_add(local, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
             crate::shadow::wide_run(jobs);
             total_written.load(Ordering::Relaxed)
         } else {
             let mut title = Vec::new();
             let mut written = 0;
-            for (shadow, lo, hi, at, after) in &all_pieces {
-                // SAFETY: the mapping of the fetched bytes, `total` of them;
-                // the copy into it has run.
-                let gpu = unsafe {
-                    std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo)
-                };
-                let merged = shadow.card_merge_relay(*lo, gpu, *after, &mut title);
-                shadow.walls_merged(gpu.len(), merged);
-                written += merged;
+            for (_, group) in by_shadow {
+                for (shadow, lo, hi, src, after) in group {
+                    // SAFETY: the mapping of the fetched bytes; the copy into it has run.
+                    let gpu = unsafe { std::slice::from_raw_parts(src as *const u8, hi - lo) };
+                    let merged = shadow.card_merge_relay(lo, gpu, after, &mut title);
+                    shadow.walls_merged(gpu.len(), merged);
+                    written += merged;
+                }
             }
             written
         };
@@ -3502,21 +3833,27 @@ impl Host {
                     flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 self.relay_card_back(&plans, busy_shadows, fetch);
                 let mut back: Vec<Declared> = Vec::new();
+                let mut back_index: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
-                        match back
-                            .iter_mut()
-                            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
-                        {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => back.push((shadow.clone(), ranges.clone())),
+                        if shadow.carded() {
+                            continue;
                         }
+                        let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+                        match back_index.get(&ptr) {
+                            Some(&at) => back[at].1.extend_from_slice(ranges),
+                            None => {
+                                back_index.insert(ptr, back.len());
+                                back.push((shadow.clone(), ranges.clone()));
+                            }
+                        }
+                    }
+                }
+                for (_, ranges) in &mut back {
+                    if ranges.len() > 1 {
+                        ranges.sort_unstable();
+                        ranges.dedup();
                     }
                 }
                 relay_hand_back(&back);
@@ -3605,33 +3942,85 @@ impl Host {
         let differs = unsafe {
             std::slice::from_raw_parts(work.differs.1 as *const u32, (work.differs.2 / 4) as usize)
         };
-        let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
-        for (i, r) in plan.ranges.iter().enumerate() {
-            for p in 0..r.span.pieces {
-                if r.compared && differs[(r.at + p) as usize] == 0 {
-                    continue;
-                }
-                let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
-                    pieces.push((i, lo, hi, total));
-                    total += (hi - lo) as u64;
+        let mut flagged: std::collections::HashSet<(usize, u32)> =
+            std::collections::HashSet::new();
+        for cmp in &plan.compares {
+            let copy = std::sync::Arc::as_ptr(&cmp.shadow) as usize;
+            for p in 0..cmp.span.pieces {
+                if !cmp.compared || differs.get((cmp.at + p) as usize).is_none_or(|&d| d != 0) {
+                    flagged.insert((copy, cmp.span.first + p));
                 }
             }
-            crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+            crate::shadow::CARD_STATS[2].fetch_add(u64::from(cmp.span.pieces), Ordering::Relaxed);
+        }
+        let mut by_piece: std::collections::HashMap<(usize, u32), (usize, Vec<(usize, usize)>)> =
+            std::collections::HashMap::new();
+        if !flagged.is_empty() {
+            for (i, r) in plan.ranges.iter().enumerate() {
+                let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                for p in 0..r.span.pieces {
+                    let piece_idx = r.span.first + p;
+                    if !flagged.contains(&(copy, piece_idx)) {
+                        continue;
+                    }
+                    let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                    if lo < hi {
+                        by_piece
+                            .entry((copy, piece_idx))
+                            .or_insert_with(|| (i, Vec::new()))
+                            .1
+                            .push((lo, hi));
+                    }
+                }
+            }
+        }
+        let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
+        for ((copy, _), (range_idx, mut intervals)) in by_piece {
+            merge_piece_intervals(&mut intervals);
+            for (lo, hi) in intervals {
+                if seen.insert((copy, lo, hi)) {
+                    pieces.push((range_idx, lo, hi, 0));
+                }
+            }
+        }
+        pieces.sort_unstable_by_key(|&(i, lo, _, _)| {
+            (std::sync::Arc::as_ptr(&plan.ranges[i].shadow) as usize, lo)
+        });
+        let mut total = 0u64;
+        for p in &mut pieces {
+            p.3 = total;
+            total += (p.2 - p.1) as u64;
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
-                let size = total.next_multiple_of(16 << 20);
+                let size = total.next_multiple_of(4 << 20);
                 work.fetched = self
-                    .shared_buffer(size)
+                    .read_back_mapped(size)
                     .map(|(buffer, data)| (buffer, data as usize, size));
             }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!(
                     "no memory to fetch what shaders wrote to the card's memory ({total} bytes)"
                 ));
+            };
+            let copy_regions: Vec<(usize, usize, usize, u64)> = {
+                let mut shadow_by_ptr: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::new();
+                for &(i, ..) in &pieces {
+                    shadow_by_ptr
+                        .entry(std::sync::Arc::as_ptr(&plan.ranges[i].shadow) as usize)
+                        .or_insert(i);
+                }
+                let keyed: Vec<(usize, usize, usize, u64)> = pieces
+                    .iter()
+                    .map(|&(i, lo, hi, at)| {
+                        let key = shadow_by_ptr
+                            [&(std::sync::Arc::as_ptr(&plan.ranges[i].shadow) as usize)];
+                        (key, lo, hi, at)
+                    })
+                    .collect();
+                coalesce_copy_regions(&keyed)
             };
             let waiting = std::time::Instant::now();
             let (allocator, list) = &work.fetch;
@@ -3641,7 +4030,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
+                    for &(i, lo, hi, at) in &copy_regions {
                         list.CopyBufferRegion(
                             fetched,
                             at,
@@ -3675,28 +4064,47 @@ impl Host {
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
-            if wide_merge() && pieces.len() >= 8 {
-                let fetched = *data;
+            let fetched_ptr = *data;
+            let mut by_shadow: Vec<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)>> =
+                Vec::new();
+            let mut shadow_pos: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
+            for &(i, lo, hi, at) in &pieces {
+                let shadow = plan.ranges[i].shadow.clone();
+                let ptr = std::sync::Arc::as_ptr(&shadow) as usize;
+                let item = (shadow, i, lo, hi, at);
+                match shadow_pos.get(&ptr) {
+                    Some(&idx) => by_shadow[idx].push(item),
+                    None => {
+                        shadow_pos.insert(ptr, by_shadow.len());
+                        by_shadow.push(vec![item]);
+                    }
+                }
+            }
+            if wide_merge() && by_shadow.len() >= 2 && pieces.len() >= 8 {
                 let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>> =
                     std::sync::Arc::new(
                         (0..plan.ranges.len())
                             .map(|_| std::sync::atomic::AtomicUsize::new(0))
                             .collect(),
                     );
-                let each = pieces.len().div_ceil(8);
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
-                    .chunks(each)
+                let worker_count = by_shadow.len().min(8);
+                let mut buckets: Vec<Vec<_>> = (0..worker_count).map(|_| Vec::new()).collect();
+                let mut bucket_bytes = vec![0usize; worker_count];
+                for group in by_shadow {
+                    let bytes: usize = group.iter().map(|p| p.3 - p.2).sum();
+                    let dst = bucket_bytes
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, b)| **b)
+                        .map_or(0, |(idx, _)| idx);
+                    bucket_bytes[dst] += bytes;
+                    buckets[dst].extend(group);
+                }
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                    .into_iter()
+                    .filter(|b| !b.is_empty())
                     .map(|chunk| {
-                        let chunk: Vec<(
-                            std::sync::Arc<crate::shadow::Shadow>,
-                            usize,
-                            usize,
-                            usize,
-                            u64,
-                        )> = chunk
-                            .iter()
-                            .map(|&(i, lo, hi, at)| (plan.ranges[i].shadow.clone(), i, lo, hi, at))
-                            .collect();
                         let counts = counts.clone();
                         Box::new(move || {
                             let mut title = Vec::new();
@@ -3706,7 +4114,7 @@ impl Host {
                                 // waits for this job.
                                 let gpu = unsafe {
                                     std::slice::from_raw_parts(
-                                        (fetched + at as usize) as *const u8,
+                                        (fetched_ptr + at as usize) as *const u8,
                                         hi - lo,
                                     )
                                 };
@@ -3723,15 +4131,20 @@ impl Host {
                 }
             } else {
                 let mut title = Vec::new();
-                for &(i, lo, hi, at) in &pieces {
-                    // SAFETY: the mapping of the fetched bytes, `total` of
-                    // them; the copy into it has run.
-                    let gpu = unsafe {
-                        std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo)
-                    };
-                    let merged = plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
-                    plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
-                    written[i] += merged;
+                for group in by_shadow {
+                    for (shadow, i, lo, hi, at) in group {
+                        // SAFETY: the mapping of the fetched bytes, `total` of
+                        // them; the copy into it has run.
+                        let gpu = unsafe {
+                            std::slice::from_raw_parts(
+                                (fetched_ptr + at as usize) as *const u8,
+                                hi - lo,
+                            )
+                        };
+                        let merged = shadow.card_merge(lo, gpu, &mut title);
+                        shadow.walls_merged(gpu.len(), merged);
+                        written[i] += merged;
+                    }
                 }
             }
         }
@@ -3932,6 +4345,8 @@ impl Host {
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
+                let mut back_index: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::new();
                 for item in &items {
                     let Late::Run(flight) = item else {
                         continue;
@@ -3940,19 +4355,20 @@ impl Host {
                         self.card_back(card, submitted, &mut seen);
                     }
                     for (shadow, ranges) in &flight.back {
-                        match back
-                            .iter_mut()
-                            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
-                        {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
+                        let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+                        match back_index.get(&ptr) {
+                            Some(&at) => back[at].1.extend_from_slice(ranges),
+                            None => {
+                                back_index.insert(ptr, back.len());
+                                back.push((shadow.clone(), ranges.clone()));
                             }
-                            None => back.push((shadow.clone(), ranges.clone())),
                         }
+                    }
+                }
+                for (_, ranges) in &mut back {
+                    if ranges.len() > 1 {
+                        ranges.sort_unstable();
+                        ranges.dedup();
                     }
                 }
                 hand_back(&back);
@@ -4018,18 +4434,25 @@ impl Host {
         }
         let behind = late && flying();
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let behind_sweep_ms = if available_commit().is_some_and(|c| c < (2560u64 << 20)) {
-            500
-        } else {
-            1500
-        };
         if !behind {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + behind_sweep_ms {
-            self.settle(&mut submitted, WHY_SYNC);
-            sweep();
-            SWEPT.store(now_ms(), Ordering::Relaxed);
+        } else if late_free_present() {
+            let now = now_ms();
+            let last_swept = SWEPT.load(Ordering::Relaxed);
+            if now > last_swept + 500 {
+                let behind_sweep_ms =
+                    if available_commit().is_some_and(|c| c < (2560u64 << 20)) {
+                        500
+                    } else {
+                        1500
+                    };
+                if now > last_swept + behind_sweep_ms {
+                    self.settle(&mut submitted, WHY_SYNC);
+                    sweep();
+                    SWEPT.store(now_ms(), Ordering::Relaxed);
+                }
+            }
         }
         let behind = late && flying();
         crate::descriptor::make_waiting();
@@ -5728,6 +6151,42 @@ mod safe_read_tests {
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
+
+    #[test]
+    fn write_mapped_writes_valid_and_skips_unmapped_holes() {
+        use windows_sys::Win32::System::Memory::*;
+        // SAFETY: own test reservation freed before return.
+        unsafe {
+            let base = VirtualAlloc(
+                std::ptr::null(),
+                0x3_0000,
+                MEM_RESERVE,
+                PAGE_NOACCESS,
+            )
+            .cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(
+                VirtualAlloc(base.cast(), 0x1_0000, MEM_COMMIT, PAGE_READWRITE),
+                base.cast()
+            );
+            assert_eq!(
+                VirtualAlloc(
+                    base.add(0x2_0000).cast(),
+                    0x1_0000,
+                    MEM_COMMIT,
+                    PAGE_READWRITE
+                ),
+                base.add(0x2_0000).cast()
+            );
+            let src: Vec<u8> = (0..0x3_0000).map(|i| (i * 13 + 5) as u8).collect();
+            super::write_mapped(base, src.as_ptr(), src.len());
+            let first = std::slice::from_raw_parts(base, 0x1_0000);
+            let third = std::slice::from_raw_parts(base.add(0x2_0000), 0x1_0000);
+            assert_eq!(first, &src[..0x1_0000]);
+            assert_eq!(third, &src[0x2_0000..]);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -5749,7 +6208,20 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if len == 0 {
+        return;
+    }
     let direct = direct_writes();
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    let (dst, src, len) = if direct && safe_read_on() {
+        let done = read_partial(src, dst, len);
+        if done == len {
+            return;
+        }
+        (dst.wrapping_add(done), src.wrapping_add(done), len - done)
+    } else {
+        (dst, src, len)
+    };
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
@@ -5826,6 +6298,71 @@ impl Host {
             Ok(()) => buffer,
             Err(e) => {
                 tracing::warn!(error = %e, size, "no read-back buffer");
+                None
+            }
+        }
+    }
+
+    fn read_back_mapped(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        MADE[2].fetch_add(1, Ordering::Relaxed);
+        MADE[3].fetch_add(size, Ordering::Relaxed);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        let make = |buffer: &mut Option<ID3D12Resource>, data: &mut *mut std::ffi::c_void| {
+            // SAFETY: plain creation and persistent mapping of a read-back buffer.
+            unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        b.Map(0, None, Some(data))
+                    })
+            }
+        };
+        let mut made = make(&mut buffer, &mut data);
+        if let Err(ref e) = made
+            && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+        {
+            reclaim_for_oom();
+            buffer = None;
+            data = std::ptr::null_mut();
+            made = make(&mut buffer, &mut data);
+            if made.is_ok() {
+                tracing::info!(size, "read-back buffer succeeded after reclaim_for_oom");
+            }
+        }
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no mapped read-back buffer");
+                // SAFETY: plain status query.
+                if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                    log_removal_context();
+                }
                 None
             }
         }
