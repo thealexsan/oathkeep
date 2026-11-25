@@ -37,7 +37,110 @@ struct Card {
     has_old: AtomicBool,
     dirty: Mutex<Vec<(usize, usize)>>,
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    hot_hashes: Mutex<std::collections::HashMap<usize, u128>>,
+    has_hot_hashes: AtomicBool,
     size: u64,
+}
+
+impl Card {
+    fn clear_hot_hashes(&self, from: usize, to: usize) {
+        if from >= to || !self.has_hot_hashes.load(Ordering::Acquire) {
+            return;
+        }
+        let mut map = self.hot_hashes.lock().unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return;
+        }
+        let first = from / PAGE;
+        let last = to.div_ceil(PAGE);
+        if last.saturating_sub(first) < map.len() {
+            for p in first..last {
+                map.remove(&p);
+            }
+        } else {
+            map.retain(|&p, _| p < first || p >= last);
+        }
+        if map.is_empty() {
+            self.has_hot_hashes.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn hot_page_hash(bytes: &[u8]) -> u128 {
+    const K0: u64 = 0x9e37_79b9_7f4a_7c15;
+    const K1: u64 = 0xbf58_476d_1ce4_e5b9;
+    const K2: u64 = 0x94d0_49bb_1331_11eb;
+    const K3: u64 = 0xd6e8_feb8_6659_fd93;
+    let mut a = (bytes.len() as u64).wrapping_mul(K0) ^ K1;
+    let mut b = (bytes.len() as u64).wrapping_mul(K2) ^ K3;
+    let mut c = K0 ^ K3;
+    let mut d = K1 ^ K2;
+    let mut chunks = bytes.chunks_exact(32);
+    for chunk in &mut chunks {
+        let w0 = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+        let w2 = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
+        let w3 = u64::from_le_bytes(chunk[24..32].try_into().unwrap());
+        a = (a ^ w0).wrapping_mul(K0).rotate_left(27);
+        b = (b ^ w1).wrapping_mul(K1).rotate_left(31);
+        c = (c ^ w2).wrapping_mul(K2).rotate_left(29);
+        d = (d ^ w3).wrapping_mul(K3).rotate_left(33);
+    }
+    for &byte in chunks.remainder() {
+        a = (a ^ u64::from(byte)).wrapping_mul(K0).rotate_left(11);
+        b = b.wrapping_add(a).wrapping_mul(K1);
+    }
+    let mix = |mut x: u64| {
+        x ^= x >> 30;
+        x = x.wrapping_mul(K1);
+        x ^= x >> 27;
+        x = x.wrapping_mul(K2);
+        x ^ (x >> 31)
+    };
+    let lo = mix(a ^ c.rotate_left(17) ^ d);
+    let hi = mix(b ^ d.rotate_left(23) ^ a ^ K0);
+    (u128::from(hi) << 64) | u128::from(lo)
+}
+
+pub(crate) fn merge_refresh_ranges(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    const MERGE_GAP: usize = 256 << 10;
+    const MAX_SPANS: usize = 32;
+    if from >= to {
+        return;
+    }
+    let mut lo = from;
+    let mut hi = to;
+    let mut first = ranges.len();
+    let mut last = 0usize;
+    let mut merged = false;
+    for (i, &(a, b)) in ranges.iter().enumerate() {
+        if hi.saturating_add(MERGE_GAP) >= a && lo <= b.saturating_add(MERGE_GAP) {
+            lo = lo.min(a);
+            hi = hi.max(b);
+            first = first.min(i);
+            last = i + 1;
+            merged = true;
+        }
+    }
+    if merged {
+        ranges.splice(first..last, [(lo, hi)]);
+        return;
+    }
+    let at = ranges.partition_point(|&(a, _)| a < lo);
+    ranges.insert(at, (lo, hi));
+    if ranges.len() > MAX_SPANS {
+        let mut best_i = 0usize;
+        let mut best_gap = usize::MAX;
+        for i in 0..ranges.len() - 1 {
+            let gap = ranges[i + 1].0.saturating_sub(ranges[i].1);
+            if gap < best_gap {
+                best_gap = gap;
+                best_i = i;
+            }
+        }
+        ranges[best_i].1 = ranges[best_i + 1].1;
+        ranges.remove(best_i + 1);
+    }
 }
 
 pub(crate) fn cards() -> bool {
@@ -2612,6 +2715,44 @@ impl Shadow {
         }
     }
 
+    fn hot_card_changed<'a>(
+        &self,
+        card: &'a Card,
+        hashes: &mut Option<std::sync::MutexGuard<'a, std::collections::HashMap<usize, u128>>>,
+        from: usize,
+        to: usize,
+    ) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return false;
+        }
+        let off = from - start;
+        let len = to - from;
+        if len != PAGE || !off.is_multiple_of(PAGE) {
+            return true;
+        }
+        thread_local! {
+            static CARD_HOT_BUF: std::cell::RefCell<[u8; PAGE]> = const { std::cell::RefCell::new([0u8; PAGE]) };
+        }
+        CARD_HOT_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            if !crate::host::read_into(from as *const u8, &mut buf[..]) {
+                return true;
+            }
+            let h = hot_page_hash(&buf[..]);
+            let map = hashes
+                .get_or_insert_with(|| card.hot_hashes.lock().unwrap_or_else(|e| e.into_inner()));
+            let key = off / PAGE;
+            if map.get(&key) == Some(&h) {
+                return false;
+            }
+            map.insert(key, h);
+            card.has_hot_hashes.store(true, Ordering::Release);
+            true
+        })
+    }
+
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -2626,20 +2767,44 @@ impl Shadow {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             let mut bytes = 0;
             let mut run: Option<(usize, usize)> = None;
+            let mut hot_run: Option<(usize, usize)> = None;
+            let mut card_hashes = None;
             for &(page, write) in written {
                 if page < base || page - base >= copied.len() {
                     continue;
                 }
                 let at = &mut copied[page - base];
                 if write == crate::watch::HOT_WRITE && *at != 0 {
-                    if let Some((first, prev)) = run.take() {
-                        bytes += self
-                            .copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
-                    }
                     if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                         *at = now;
                     }
-                    bytes += self.copy_hot((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                    if let Some(card) = &self.card {
+                        let p_from = (page * PAGE).max(from);
+                        let p_to = ((page + 1) * PAGE).min(to);
+                        if self.hot_card_changed(card, &mut card_hashes, p_from, p_to) {
+                            match hot_run {
+                                Some((first, prev)) if page == prev + 1 => {
+                                    hot_run = Some((first, page))
+                                }
+                                Some((first, prev)) => {
+                                    card_hashes = None;
+                                    bytes += self.copy_inner(
+                                        (first * PAGE).max(from),
+                                        ((prev + 1) * PAGE).min(to),
+                                        false,
+                                    );
+                                    hot_run = Some((page, page));
+                                }
+                                None => hot_run = Some((page, page)),
+                            }
+                        }
+                    } else {
+                        if let Some((first, prev)) = run.take() {
+                            bytes += self
+                                .copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
+                        }
+                        bytes += self.copy_hot((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                    }
                 } else if write > *at {
                     if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                         *at = now;
@@ -2647,6 +2812,7 @@ impl Shadow {
                     match run {
                         Some((first, prev)) if page == prev + 1 => run = Some((first, page)),
                         Some((first, prev)) => {
+                            card_hashes = None;
                             bytes += self
                                 .copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
                             run = Some((page, page));
@@ -2654,6 +2820,14 @@ impl Shadow {
                         None => run = Some((page, page)),
                     }
                 }
+            }
+            drop(card_hashes);
+            if let Some((first, prev)) = hot_run {
+                bytes += self.copy_inner(
+                    (first * PAGE).max(from),
+                    ((prev + 1) * PAGE).min(to),
+                    false,
+                );
             }
             if let Some((first, prev)) = run {
                 bytes += self.copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
@@ -2666,6 +2840,8 @@ impl Shadow {
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run): (usize, Option<usize>) = (0, None);
+        let mut hot_run: Option<(usize, usize)> = None;
+        let mut card_hashes = None;
         let mut newly_copied = 0u64;
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
@@ -2678,13 +2854,39 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             if write == crate::watch::HOT_WRITE && *at != 0 {
-                if let Some(first) = run.take() {
-                    bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
-                }
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
                 }
-                bytes += self.copy_hot((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                if let Some(card) = &self.card {
+                    if let Some(first) = run.take() {
+                        card_hashes = None;
+                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                    }
+                    let p_from = (page * PAGE).max(from);
+                    let p_to = ((page + 1) * PAGE).min(to);
+                    if self.hot_card_changed(card, &mut card_hashes, p_from, p_to) {
+                        match hot_run {
+                            Some((first, prev)) if page == prev + 1 => {
+                                hot_run = Some((first, page))
+                            }
+                            Some((first, prev)) => {
+                                card_hashes = None;
+                                bytes += self.copy_inner(
+                                    (first * PAGE).max(from),
+                                    ((prev + 1) * PAGE).min(to),
+                                    false,
+                                );
+                                hot_run = Some((page, page));
+                            }
+                            None => hot_run = Some((page, page)),
+                        }
+                    }
+                } else {
+                    if let Some(first) = run.take() {
+                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                    }
+                    bytes += self.copy_hot((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                }
             } else if *at == 0 || write > *at {
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     if *at == 0 && now != 0 {
@@ -2694,11 +2896,20 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
+                card_hashes = None;
                 bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
             }
         }
+        drop(card_hashes);
         if newly_copied > 0 {
             self.uncopied.fetch_sub(newly_copied, Ordering::Release);
+        }
+        if let Some((first, prev)) = hot_run {
+            bytes += self.copy_inner(
+                (first * PAGE).max(from),
+                ((prev + 1) * PAGE).min(to),
+                false,
+            );
         }
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
@@ -2750,6 +2961,10 @@ impl Shadow {
     }
 
     fn copy(&self, from: usize, to: usize) -> usize {
+        self.copy_inner(from, to, true)
+    }
+
+    fn copy_inner(&self, from: usize, to: usize, clear_hot: bool) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         if from >= to {
@@ -2757,6 +2972,9 @@ impl Shadow {
         }
         let (off_from, off_to) = (from - start, to - start);
         if let Some(card) = &self.card {
+            if clear_hot {
+                card.clear_hot_hashes(off_from, off_to);
+            }
             if card.has_old.load(Ordering::Acquire) {
                 let mut old = card.old.lock().unwrap_or_else(|e| e.into_inner());
                 for p in self.pieces(off_from, off_to) {
@@ -2821,6 +3039,7 @@ impl Shadow {
         if from >= to {
             return;
         }
+        card.clear_hot_hashes(from, to);
         let start = self.start as usize;
         let base = start / PAGE;
         let unwatched = self.watched.load(Ordering::Relaxed) == NOT_WATCHED;
@@ -3299,6 +3518,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     has_old: AtomicBool::new(false),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    hot_hashes: Mutex::default(),
+                    has_hot_hashes: AtomicBool::new(false),
                     size,
                 };
                 (on_card, std::ptr::null_mut(), Some(card))
@@ -3517,6 +3738,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 has_old: AtomicBool::new(false),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                hot_hashes: Mutex::default(),
+                has_hot_hashes: AtomicBool::new(false),
                 size: len,
             };
             (on_card, std::ptr::null_mut(), Some(card))
@@ -3676,6 +3899,42 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    #[test]
+    fn hot_page_hash_detects_single_bit_changes() {
+        use super::{PAGE, hot_page_hash};
+        let mut page = [0u8; PAGE];
+        let h0 = hot_page_hash(&page);
+        assert_eq!(h0, hot_page_hash(&page));
+        for at in [0, 7, 31, 32, 2048, PAGE - 1] {
+            page[at] ^= 1;
+            let h1 = hot_page_hash(&page);
+            assert_ne!(h0, h1, "byte {at}");
+            page[at] ^= 1;
+            assert_eq!(h0, hot_page_hash(&page));
+        }
+    }
+
+    #[test]
+    fn merge_refresh_ranges_keeps_far_spans_disjoint_and_coalesces_near() {
+        use super::merge_refresh_ranges;
+        let mut spans = Vec::new();
+        merge_refresh_ranges(&mut spans, 0x1000, 0x2000);
+        merge_refresh_ranges(&mut spans, 0x0a00_0000, 0x0a00_1000);
+        assert_eq!(spans, [(0x1000, 0x2000), (0x0a00_0000, 0x0a00_1000)]);
+
+        // Nearby range within 256 KiB merges into the first span without bridging to 160 MiB.
+        merge_refresh_ranges(&mut spans, 0x1_0000, 0x1_2000);
+        assert_eq!(spans, [(0x1000, 0x1_2000), (0x0a00_0000, 0x0a00_1000)]);
+
+        // Many far spans stay bounded at 32 entries.
+        for i in 0..40usize {
+            let base = (i + 1) * (1 << 20);
+            merge_refresh_ranges(&mut spans, base, base + 0x1000);
+        }
+        assert!(spans.len() <= 32);
+        assert!(spans.windows(2).all(|w| w[0].1 < w[1].0));
     }
 }
 

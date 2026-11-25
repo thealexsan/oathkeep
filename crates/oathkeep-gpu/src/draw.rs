@@ -1204,23 +1204,26 @@ impl State {
         let views = ranges.len() as u32;
         let mut spans: std::collections::HashMap<
             usize,
-            (std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+            (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>),
         > = std::collections::HashMap::new();
         for (shadow, from, to) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans
+            let entry = spans
                 .entry(key)
-                .or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
+                .or_insert_with(|| (shadow.clone(), Vec::new()));
+            crate::shadow::merge_refresh_ranges(&mut entry.1, *from as usize, *to as usize);
         }
         drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        let bytes: u64 = spans
+            .values()
+            .flat_map(|s| s.1.iter())
+            .map(|&(from, to)| (to - from) as u64)
+            .sum();
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> =
             std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
+        for (shadow, shadow_spans) in spans.values() {
             if shadow.is_in_place() {
                 list.keep(&shadow.buffer);
                 continue;
@@ -1241,7 +1244,9 @@ impl State {
                     }
                 }
             }
-            shadow.refresh(list, *from, to - from);
+            for &(from, to) in shadow_spans {
+                shadow.refresh(list, from as u64, (to - from) as u64);
+            }
         }
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);

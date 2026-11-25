@@ -5315,7 +5315,7 @@ fn wide_refresh() -> bool {
 
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     index: std::collections::HashMap<usize, usize>,
     textures: std::collections::HashSet<usize>,
     pending_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
@@ -5328,12 +5328,11 @@ impl Batch {
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
             Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                crate::shadow::merge_refresh_ranges(&mut self.refreshes[at].1, address, end);
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), vec![(address, end)]));
             }
         }
     }
@@ -5345,12 +5344,14 @@ impl Batch {
         else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, spans) = self.refreshes.swap_remove(at);
         if let Some(moved) = self.refreshes.get(at) {
             self.index
                 .insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        for (from, to) in spans {
+            Self::update(&shadow, from, to);
+        }
     }
 
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
@@ -5379,7 +5380,7 @@ impl Batch {
             .refreshes
             .iter()
             .filter(|r| !r.0.unwatched() && !r.0.guarded())
-            .map(|r| (r.1, r.2))
+            .flat_map(|r| r.1.iter().copied())
             .collect();
         for staging in &self.pending_textures {
             if let Some(range) = staging.watch_range() {
@@ -5403,8 +5404,10 @@ impl Batch {
                 let take = chunk_size.min(all.len());
                 let part: Vec<_> = all.drain(..take).collect();
                 jobs.push(Box::new(move || {
-                    for (shadow, from, to) in part {
-                        Self::update(&shadow, from, to);
+                    for (shadow, spans) in part {
+                        for (from, to) in spans {
+                            Self::update(&shadow, from, to);
+                        }
                     }
                 }));
             }
@@ -5415,8 +5418,10 @@ impl Batch {
                 Ordering::Relaxed,
             );
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for (shadow, spans) in self.refreshes.drain(..) {
+                for (from, to) in spans {
+                    Self::update(&shadow, from, to);
+                }
             }
         }
         if !self.pending_textures.is_empty() {
