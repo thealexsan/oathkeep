@@ -13,7 +13,7 @@ pub(crate) struct Shadow {
     gpu: u64,
     start: u64,
     len: u64,
-    copied: Mutex<Vec<u64>>,
+    copied: Mutex<CopiedState>,
     uncopied: AtomicU64,
     synced_at: AtomicU64,
     ever_written: AtomicBool,
@@ -31,13 +31,306 @@ pub(crate) struct Shadow {
     place: Option<(crate::inplace::PlaceHeap, u64)>,
 }
 
+const HOT_HASH_BLOCK: usize = 4096;
+const COPIED_CHUNK: usize = 64;
+
+struct CopiedState {
+    pages: Vec<u64>,
+    /// Per-64-page-chunk minimum timestamp (`0` iff any page in the chunk is uncopied).
+    chunk_min: Vec<u64>,
+    /// Per-64-page-chunk minimum non-zero timestamp (`u64::MAX` iff all pages are `0`).
+    chunk_min_nz: Vec<u64>,
+    /// Lazy floor applied to non-zero pages in a fully-copied chunk (`chunk_min[c] > 0`).
+    chunk_floor: Vec<u64>,
+}
+
+impl CopiedState {
+    fn new(pages: usize) -> Self {
+        let chunks = pages.div_ceil(COPIED_CHUNK);
+        Self {
+            pages: vec![0; pages],
+            chunk_min: vec![0; chunks],
+            chunk_min_nz: vec![u64::MAX; chunks],
+            chunk_floor: vec![0; chunks],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.pages.clear();
+        self.chunk_min.clear();
+        self.chunk_min_nz.clear();
+        self.chunk_floor.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    #[inline]
+    fn get(&self, idx: usize, global_synced: u64) -> u64 {
+        let v = self.pages[idx];
+        if v == 0 {
+            0
+        } else {
+            v.max(self.chunk_floor[idx / COPIED_CHUNK])
+                .max(global_synced)
+        }
+    }
+
+    /// Sets `pages[idx]` to at least `now` (if `now != 0`) without recomputing chunk summaries yet.
+    /// Returns `true` if the page transitioned from `0` to non-zero.
+    #[inline]
+    fn set_raw(&mut self, idx: usize, now: u64) -> bool {
+        if now == 0 {
+            return false;
+        }
+        let slot = &mut self.pages[idx];
+        let was_zero = *slot == 0;
+        if *slot < now {
+            *slot = now;
+        }
+        was_zero
+    }
+
+    fn recompute_chunk(&mut self, c: usize) {
+        let lo = c * COPIED_CHUNK;
+        let hi = (lo + COPIED_CHUNK).min(self.pages.len());
+        if lo >= hi {
+            return;
+        }
+        let floor = self.chunk_floor[c];
+        let mut min_all = u64::MAX;
+        let mut min_nz = u64::MAX;
+        for &raw in &self.pages[lo..hi] {
+            if raw == 0 {
+                min_all = 0;
+            } else {
+                let eff = raw.max(floor);
+                min_all = min_all.min(eff);
+                min_nz = min_nz.min(eff);
+            }
+        }
+        self.chunk_min[c] = if min_all == u64::MAX { 0 } else { min_all };
+        self.chunk_min_nz[c] = min_nz;
+    }
+
+    fn set_page(&mut self, idx: usize, now: u64) -> bool {
+        let was_zero = self.set_raw(idx, now);
+        if now != 0 {
+            self.recompute_chunk(idx / COPIED_CHUNK);
+        }
+        was_zero
+    }
+
+    /// Returns `(all_copied, since)` for page indices `lo..hi`.
+    /// - `all_copied` is `true` iff every page in `lo..hi` has been copied (`!= 0`).
+    /// - `since` is the minimum non-zero timestamp in `lo..hi`, or `u64::MAX` if all pages are `0`.
+    fn range_since(&self, lo: usize, hi: usize, global_synced: u64) -> (bool, u64) {
+        let hi = hi.min(self.pages.len());
+        if lo >= hi {
+            return (true, global_synced);
+        }
+        let mut all_copied = true;
+        let mut min_nz = u64::MAX;
+        let mut i = lo;
+
+        // Head partial chunk.
+        let first_chunk = i / COPIED_CHUNK;
+        let first_end = ((first_chunk + 1) * COPIED_CHUNK).min(hi);
+        if i % COPIED_CHUNK != 0 || first_end < (first_chunk + 1) * COPIED_CHUNK {
+            let floor = self.chunk_floor[first_chunk];
+            for &raw in &self.pages[i..first_end] {
+                if raw == 0 {
+                    all_copied = false;
+                } else {
+                    min_nz = min_nz.min(raw.max(floor));
+                }
+            }
+            i = first_end;
+        }
+
+        // Full middle chunks in O(1) per 4 MiB chunk.
+        while i + COPIED_CHUNK <= hi {
+            let c = i / COPIED_CHUNK;
+            let cm = self.chunk_min[c];
+            if cm == 0 {
+                all_copied = false;
+                let nz = self.chunk_min_nz[c];
+                if nz < min_nz {
+                    min_nz = nz;
+                }
+            } else if cm < min_nz {
+                min_nz = cm;
+            }
+            i += COPIED_CHUNK;
+        }
+
+        // Tail partial chunk.
+        if i < hi {
+            let c = i / COPIED_CHUNK;
+            let floor = self.chunk_floor[c];
+            for &raw in &self.pages[i..hi] {
+                if raw == 0 {
+                    all_copied = false;
+                } else {
+                    min_nz = min_nz.min(raw.max(floor));
+                }
+            }
+        }
+
+        if min_nz != u64::MAX {
+            min_nz = min_nz.max(global_synced);
+        }
+        (all_copied, min_nz)
+    }
+
+    /// Raises every already-copied (non-zero) page in `lo..hi` to at least `now`.
+    /// Never turns a `0` (uncopied) page into non-zero.
+    fn advance_synced(&mut self, lo: usize, hi: usize, now: u64) {
+        let hi = hi.min(self.pages.len());
+        if now == 0 || lo >= hi {
+            return;
+        }
+        let mut i = lo;
+        let first_chunk = i / COPIED_CHUNK;
+        let first_end = ((first_chunk + 1) * COPIED_CHUNK).min(hi);
+        if i % COPIED_CHUNK != 0 || first_end < (first_chunk + 1) * COPIED_CHUNK {
+            if self.chunk_min_nz[first_chunk] < now {
+                let mut touched = false;
+                for slot in &mut self.pages[i..first_end] {
+                    if *slot != 0 && *slot < now {
+                        *slot = now;
+                        touched = true;
+                    }
+                }
+                if touched {
+                    self.recompute_chunk(first_chunk);
+                }
+            }
+            i = first_end;
+        }
+
+        while i + COPIED_CHUNK <= hi {
+            let c = i / COPIED_CHUNK;
+            if self.chunk_min[c] > 0 {
+                if self.chunk_floor[c] < now {
+                    self.chunk_floor[c] = now;
+                }
+                if self.chunk_min[c] < now {
+                    self.chunk_min[c] = now;
+                }
+                if self.chunk_min_nz[c] < now {
+                    self.chunk_min_nz[c] = now;
+                }
+            } else if self.chunk_min_nz[c] < now {
+                let end = i + COPIED_CHUNK;
+                let mut touched = false;
+                for slot in &mut self.pages[i..end] {
+                    if *slot != 0 && *slot < now {
+                        *slot = now;
+                        touched = true;
+                    }
+                }
+                if touched {
+                    self.recompute_chunk(c);
+                }
+            }
+            i += COPIED_CHUNK;
+        }
+
+        if i < hi {
+            let c = i / COPIED_CHUNK;
+            if self.chunk_min_nz[c] < now {
+                let mut touched = false;
+                for slot in &mut self.pages[i..hi] {
+                    if *slot != 0 && *slot < now {
+                        *slot = now;
+                        touched = true;
+                    }
+                }
+                if touched {
+                    self.recompute_chunk(c);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn copied_page_count(&self) -> u64 {
+        let mut total = 0u64;
+        let len = self.pages.len();
+        for (c, &cm) in self.chunk_min.iter().enumerate() {
+            let lo = c * COPIED_CHUNK;
+            let hi = (lo + COPIED_CHUNK).min(len);
+            if cm > 0 {
+                total += (hi - lo) as u64;
+            } else if self.chunk_min_nz[c] != u64::MAX {
+                total += self.pages[lo..hi].iter().filter(|&&at| at != 0).count() as u64;
+            }
+        }
+        total
+    }
+
+    fn stale_pages_in(
+        &self,
+        base: usize,
+        global_synced: u64,
+        a: usize,
+        e: usize,
+        written: &[(usize, u64)],
+    ) -> Vec<usize> {
+        (a / PAGE..e.div_ceil(PAGE))
+            .filter(|&page| page >= base && page - base < self.pages.len())
+            .filter(|&page| match self.get(page - base, global_synced) {
+                0 => true,
+                at => written
+                    .binary_search_by_key(&page, |&(p, _)| p)
+                    .is_ok_and(|i| written[i].1 > at),
+            })
+            .collect()
+    }
+}
+
+fn full_page_range(
+    start: usize,
+    end: usize,
+    from: usize,
+    to: usize,
+    base: usize,
+    pages_len: usize,
+) -> (usize, usize) {
+    if from >= to || pages_len == 0 {
+        return (0, 0);
+    }
+    let first_p = from / PAGE;
+    let last_p = (to - 1) / PAGE;
+    let full_first = if (first_p * PAGE).max(start) >= from {
+        first_p
+    } else {
+        first_p + 1
+    };
+    let full_end = if ((last_p + 1) * PAGE).min(end) <= to {
+        last_p + 1
+    } else {
+        last_p
+    };
+    if full_first >= full_end {
+        return (0, 0);
+    }
+    let lo = full_first.saturating_sub(base).min(pages_len);
+    let hi = full_end.saturating_sub(base).min(pages_len);
+    (lo, hi)
+}
+
 struct Card {
     before: Mutex<Option<ID3D12Resource>>,
     old: Mutex<BTreeMap<usize, Vec<u8>>>,
     has_old: AtomicBool,
     dirty: Mutex<Vec<(usize, usize)>>,
     sent: Mutex<Vec<(usize, usize, u64)>>,
-    hot_hashes: Mutex<std::collections::HashMap<usize, u128>>,
+    /// Contiguous per-4 KiB sub-block hashes (`0` = cleared/unhashed, `h | 1` = hashed).
+    /// Lazily allocated to `len.div_ceil(HOT_HASH_BLOCK)` on first hot/rewrite check.
+    hot_hashes: Mutex<Vec<u128>>,
     has_hot_hashes: AtomicBool,
     size: u64,
 }
@@ -47,23 +340,62 @@ impl Card {
         if from >= to || !self.has_hot_hashes.load(Ordering::Acquire) {
             return;
         }
-        let mut map = self.hot_hashes.lock().unwrap_or_else(|e| e.into_inner());
-        if map.is_empty() {
+        let mut hashes = self.hot_hashes.lock().unwrap_or_else(|e| e.into_inner());
+        if hashes.is_empty() {
             return;
         }
-        let first = from / PAGE;
-        let last = to.div_ceil(PAGE);
-        if last.saturating_sub(first) < map.len() {
-            for p in first..last {
-                map.remove(&p);
+        let first = (from / HOT_HASH_BLOCK).min(hashes.len());
+        let last = to.div_ceil(HOT_HASH_BLOCK).min(hashes.len());
+        if first < last {
+            hashes[first..last].fill(0);
+            if first == 0 && last == hashes.len() {
+                self.has_hot_hashes.store(false, Ordering::Release);
             }
-        } else {
-            map.retain(|&p, _| p < first || p >= last);
-        }
-        if map.is_empty() {
-            self.has_hot_hashes.store(false, Ordering::Release);
         }
     }
+}
+
+/// Compares `bytes` (representing buffer-relative `off_from..off_from + bytes.len()`) against
+/// per-4 KiB `hashes`, updating changed slots and invoking `on_changed(off_a, off_b)` for each
+/// changed sub-range. Returns `true` if any slot hash was stored.
+fn diff_hot_card_blocks(
+    hashes: &mut [u128],
+    buf_len: usize,
+    off_from: usize,
+    bytes: &[u8],
+    mut on_changed: impl FnMut(usize, usize),
+) -> bool {
+    let off_to = off_from + bytes.len();
+    if off_from >= off_to {
+        return false;
+    }
+    let first_slot = off_from / HOT_HASH_BLOCK;
+    let last_slot = off_to.div_ceil(HOT_HASH_BLOCK).min(hashes.len());
+    let mut stored_any = false;
+    for (slot, hash_entry) in hashes.iter_mut().enumerate().take(last_slot).skip(first_slot) {
+        let slot_lo = slot * HOT_HASH_BLOCK;
+        let slot_hi = (slot_lo + HOT_HASH_BLOCK).min(buf_len);
+        let cov_lo = off_from.max(slot_lo);
+        let cov_hi = off_to.min(slot_hi);
+        if cov_lo >= cov_hi {
+            continue;
+        }
+        if cov_lo == slot_lo && cov_hi == slot_hi {
+            let h = hot_page_hash(&bytes[cov_lo - off_from..cov_hi - off_from]) | 1;
+            if *hash_entry == h {
+                continue;
+            }
+            *hash_entry = h;
+            stored_any = true;
+            on_changed(cov_lo, cov_hi);
+        } else {
+            // Partial sub-block update: clear the full-block hash so future full-block
+            // checks cannot mistakenly match stale bytes, and upload the partial slice.
+            *hash_entry = 0;
+            on_changed(cov_lo, cov_hi);
+        }
+    }
+    stored_any
 }
 
 fn hot_page_hash(bytes: &[u8]) -> u128 {
@@ -1706,6 +2038,7 @@ mod piece_tests {
     }
 }
 
+#[cfg(test)]
 fn stale_pages_in(
     base: usize,
     copied: &[u64],
@@ -1775,7 +2108,7 @@ pub(crate) fn window_use() -> [u64; 8] {
     let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
+        let pages = copied.copied_page_count();
         out[0] += (pages * PAGE as u64).min(s.len);
         if crate::host::references(&s.buffer) > 1 {
             out[1] += 1;
@@ -1996,7 +2329,7 @@ impl Shadow {
         let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
-        *shadow.copied.get_mut().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+        shadow.copied.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
@@ -2023,7 +2356,7 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(vec![0; pages as usize]),
+            copied: Mutex::new(CopiedState::new(pages as usize)),
             uncopied: AtomicU64::new(pages),
             synced_at: AtomicU64::new(0),
             ever_written: AtomicBool::new(false),
@@ -2443,10 +2776,17 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
+        let global_synced = if self.uncopied.load(Ordering::Acquire) == 0 {
+            self.synced_at.load(Ordering::Acquire)
+        } else {
+            0
+        };
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter()
             .any(|(a, e)| match crate::watch::asked(a, e) {
-                Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+                Some((_, written)) => !copied
+                    .stale_pages_in(base, global_synced, a, e, &written)
+                    .is_empty(),
                 None => true,
             })
     }
@@ -2500,8 +2840,13 @@ impl Shadow {
                 return true;
             };
             let stale: Vec<usize> = {
+                let global_synced = if self.uncopied.load(Ordering::Acquire) == 0 {
+                    self.synced_at.load(Ordering::Acquire)
+                } else {
+                    0
+                };
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+                copied.stale_pages_in(base, global_synced, a, e, &written)
             };
             for page in stale {
                 let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
@@ -2539,6 +2884,7 @@ impl Shadow {
                         }
                     }
                     for (c_from, c_to) in changed {
+                        card.clear_hot_hashes(c_from, c_to);
                         self.card_changed(c_from, c_to);
                     }
                 } else {
@@ -2569,11 +2915,8 @@ impl Shadow {
                 drop(before);
                 if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
                     let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(at) = copied.get_mut(page - base) {
-                        if *at == 0 && now != 0 {
-                            self.uncopied.fetch_sub(1, Ordering::Release);
-                        }
-                        *at = now;
+                    if page >= base && page - base < copied.len() && copied.set_page(page - base, now) {
+                        self.uncopied.fetch_sub(1, Ordering::Release);
                     }
                 }
             }
@@ -2618,10 +2961,24 @@ impl Shadow {
     fn update_free(&self, from: usize, to: usize) -> usize {
         let mode = self.watched.load(Ordering::Relaxed);
         if mode != NOT_WATCHED {
-            let since = if self.uncopied.load(Ordering::Acquire) == 0 {
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            let base = start / PAGE;
+            let full = from <= start && to >= end;
+            let uncopied_zero = self.uncopied.load(Ordering::Acquire) == 0;
+            let global_synced = if uncopied_zero {
                 self.synced_at.load(Ordering::Acquire)
             } else {
                 0
+            };
+            let (all_copied, since) = if uncopied_zero && full {
+                (true, global_synced)
+            } else if mode == WATCHED_GUARDED {
+                let lo = (from / PAGE).saturating_sub(base);
+                let hi = to.div_ceil(PAGE).saturating_sub(base);
+                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                copied.range_since(lo, hi, global_synced)
+            } else {
+                (uncopied_zero, 0)
             };
             let found = match mode {
                 WATCHED_GUARDED => crate::watch::writes_guarded_since(from, to, since),
@@ -2641,7 +2998,7 @@ impl Shadow {
                 },
             };
             if let Some((now, written)) = found {
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now, &written, all_copied, since);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -2715,104 +3072,201 @@ impl Shadow {
         }
     }
 
-    fn hot_card_changed<'a>(
+    /// Checks a page (or sub-page) range `from..to` of a Card buffer against per-4 KiB hashes,
+    /// returning coalesced virtual-address ranges that changed in `out` (at most 17 spans for a
+    /// `PAGE`-sized read, zero heap allocation).
+    fn hot_card_changed_ranges<'a>(
         &self,
         card: &'a Card,
-        hashes: &mut Option<std::sync::MutexGuard<'a, std::collections::HashMap<usize, u128>>>,
+        hashes: &mut Option<std::sync::MutexGuard<'a, Vec<u128>>>,
         from: usize,
         to: usize,
-    ) -> bool {
+        out: &mut [(usize, usize); 18],
+    ) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         if from >= to {
-            return false;
+            return 0;
         }
-        let off = from - start;
+        let off_from = from - start;
         let len = to - from;
-        if len != PAGE || !off.is_multiple_of(PAGE) {
-            return true;
+        let slots_needed = (self.len as usize).div_ceil(HOT_HASH_BLOCK);
+        if len > PAGE {
+            let guard =
+                hashes.get_or_insert_with(|| card.hot_hashes.lock().unwrap_or_else(|e| e.into_inner()));
+            if !guard.is_empty() {
+                let first = (off_from / HOT_HASH_BLOCK).min(guard.len());
+                let last = (off_from + len).div_ceil(HOT_HASH_BLOCK).min(guard.len());
+                if first < last {
+                    guard[first..last].fill(0);
+                }
+            }
+            out[0] = (from, to);
+            return 1;
         }
         thread_local! {
-            static CARD_HOT_BUF: std::cell::RefCell<[u8; PAGE]> = const { std::cell::RefCell::new([0u8; PAGE]) };
+            static CARD_HOT_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         CARD_HOT_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
-            if !crate::host::read_into(from as *const u8, &mut buf[..]) {
-                return true;
+            if buf.len() < PAGE {
+                buf.resize(PAGE, 0);
             }
-            let h = hot_page_hash(&buf[..]);
-            let map = hashes
-                .get_or_insert_with(|| card.hot_hashes.lock().unwrap_or_else(|e| e.into_inner()));
-            let key = off / PAGE;
-            if map.get(&key) == Some(&h) {
-                return false;
+            let slice = &mut buf[..len];
+            if !crate::host::read_into(from as *const u8, slice) {
+                let guard = hashes.get_or_insert_with(|| {
+                    card.hot_hashes.lock().unwrap_or_else(|e| e.into_inner())
+                });
+                if !guard.is_empty() {
+                    let first = (off_from / HOT_HASH_BLOCK).min(guard.len());
+                    let last = (off_from + len).div_ceil(HOT_HASH_BLOCK).min(guard.len());
+                    if first < last {
+                        guard[first..last].fill(0);
+                    }
+                }
+                out[0] = (from, to);
+                return 1;
             }
-            map.insert(key, h);
-            card.has_hot_hashes.store(true, Ordering::Release);
-            true
+            let guard = hashes.get_or_insert_with(|| {
+                card.hot_hashes.lock().unwrap_or_else(|e| e.into_inner())
+            });
+            if guard.len() < slots_needed {
+                guard.resize(slots_needed, 0);
+            }
+            let mut count = 0usize;
+            let stored = diff_hot_card_blocks(
+                guard,
+                self.len as usize,
+                off_from,
+                slice,
+                |cov_lo, cov_hi| {
+                    let a = start + cov_lo;
+                    let b = start + cov_hi;
+                    if count > 0 && out[count - 1].1 == a {
+                        out[count - 1].1 = b;
+                    } else if count < out.len() {
+                        out[count] = (a, b);
+                        count += 1;
+                    } else {
+                        out[count - 1].1 = out[count - 1].1.max(b);
+                    }
+                },
+            );
+            if stored {
+                card.has_hot_hashes.store(true, Ordering::Release);
+            }
+            count
         })
     }
 
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(
+        &self,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        all_copied_hint: bool,
+        since_hint: u64,
+    ) -> usize {
         let base = self.start as usize / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let full = from <= start && to >= end;
-        if self.uncopied.load(Ordering::Acquire) == 0 {
-            if written.is_empty() {
-                if full && now != 0 {
-                    self.synced_at.fetch_max(now, Ordering::Release);
-                }
+        let uncopied_zero = self.uncopied.load(Ordering::Acquire) == 0;
+        let all_copied = all_copied_hint || uncopied_zero;
+        if all_copied && written.is_empty() {
+            if now == 0 || now <= since_hint {
+                return 0;
+            }
+            if full && uncopied_zero {
+                self.synced_at.fetch_max(now, Ordering::Release);
                 return 0;
             }
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let (full_lo, full_hi) = full_page_range(start, end, from, to, base, copied.len());
+            copied.advance_synced(full_lo, full_hi, now);
+            return 0;
+        }
+        let global_synced = if uncopied_zero {
+            self.synced_at.load(Ordering::Acquire)
+        } else {
+            0
+        };
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let pages_len = copied.len();
+        let (full_lo, full_hi) = full_page_range(start, end, from, to, base, pages_len);
+        let lo_idx = (from / PAGE).saturating_sub(base).min(pages_len);
+        let hi_idx = to.div_ceil(PAGE).saturating_sub(base).min(pages_len);
+        let range_all_copied = all_copied || copied.range_since(lo_idx, hi_idx, global_synced).0;
+        if range_all_copied {
+            if written.is_empty() {
+                if now != 0 {
+                    if full && uncopied_zero {
+                        drop(copied);
+                        self.synced_at.fetch_max(now, Ordering::Release);
+                    } else {
+                        copied.advance_synced(full_lo, full_hi, now);
+                    }
+                }
+                return 0;
+            }
             let mut bytes = 0;
             let mut run: Option<(usize, usize)> = None;
             let mut hot_run: Option<(usize, usize)> = None;
             let mut card_hashes = None;
+            let mut dirty_chunk: Option<usize> = None;
+            let mut page_spans = [(0usize, 0usize); 18];
             for &(page, write) in written {
-                if page < base || page - base >= copied.len() {
+                if page < base || page - base >= pages_len {
                     continue;
                 }
-                let at = &mut copied[page - base];
-                if write == crate::watch::HOT_WRITE && *at != 0 {
-                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                        *at = now;
+                let idx = page - base;
+                let at = copied.get(idx, global_synced);
+                let is_hot = write == crate::watch::HOT_WRITE && at != 0;
+                let is_written = !is_hot && write > at;
+                if !is_hot && !is_written {
+                    continue;
+                }
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    copied.set_raw(idx, now);
+                    let c = idx / COPIED_CHUNK;
+                    if let Some(prev_c) = dirty_chunk
+                        && prev_c != c
+                    {
+                        copied.recompute_chunk(prev_c);
                     }
-                    if let Some(card) = &self.card {
-                        let p_from = (page * PAGE).max(from);
-                        let p_to = ((page + 1) * PAGE).min(to);
-                        if self.hot_card_changed(card, &mut card_hashes, p_from, p_to) {
-                            match hot_run {
-                                Some((first, prev)) if page == prev + 1 => {
-                                    hot_run = Some((first, page))
-                                }
-                                Some((first, prev)) => {
-                                    card_hashes = None;
-                                    bytes += self.copy_inner(
-                                        (first * PAGE).max(from),
-                                        ((prev + 1) * PAGE).min(to),
-                                        false,
-                                    );
-                                    hot_run = Some((page, page));
-                                }
-                                None => hot_run = Some((page, page)),
+                    dirty_chunk = Some(c);
+                }
+                if let Some(card) = &self.card {
+                    let p_from = (page * PAGE).max(from);
+                    let p_to = ((page + 1) * PAGE).min(to);
+                    let n_spans = self.hot_card_changed_ranges(
+                        card,
+                        &mut card_hashes,
+                        p_from,
+                        p_to,
+                        &mut page_spans,
+                    );
+                    for &(a, b) in &page_spans[..n_spans] {
+                        match hot_run {
+                            Some((r_from, r_to)) if a == r_to => hot_run = Some((r_from, b)),
+                            Some((r_from, r_to)) => {
+                                card_hashes = None;
+                                bytes += self.copy_inner(r_from, r_to, false);
+                                hot_run = Some((a, b));
                             }
+                            None => hot_run = Some((a, b)),
                         }
-                    } else {
-                        if let Some((first, prev)) = run.take() {
-                            bytes += self
-                                .copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
-                        }
-                        bytes += self.copy_hot((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
                     }
-                } else if write > *at {
-                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                        *at = now;
+                } else if is_hot {
+                    if let Some((first, prev)) = run.take() {
+                        bytes += self
+                            .copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
                     }
+                    bytes += self.copy_hot((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                } else {
                     match run {
                         Some((first, prev)) if page == prev + 1 => run = Some((first, page)),
                         Some((first, prev)) => {
-                            card_hashes = None;
                             bytes += self
                                 .copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
                             run = Some((page, page));
@@ -2821,28 +3275,33 @@ impl Shadow {
                     }
                 }
             }
+            if let Some(c) = dirty_chunk {
+                copied.recompute_chunk(c);
+            }
             drop(card_hashes);
-            if let Some((first, prev)) = hot_run {
-                bytes += self.copy_inner(
-                    (first * PAGE).max(from),
-                    ((prev + 1) * PAGE).min(to),
-                    false,
-                );
+            if let Some((r_from, r_to)) = hot_run {
+                bytes += self.copy_inner(r_from, r_to, false);
             }
             if let Some((first, prev)) = run {
                 bytes += self.copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
             }
-            if full && now != 0 {
-                self.synced_at.fetch_max(now, Ordering::Release);
+            if now != 0 {
+                if full && uncopied_zero {
+                    drop(copied);
+                    self.synced_at.fetch_max(now, Ordering::Release);
+                } else {
+                    copied.advance_synced(full_lo, full_hi, now);
+                }
             }
             return bytes;
         }
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run): (usize, Option<usize>) = (0, None);
         let mut hot_run: Option<(usize, usize)> = None;
         let mut card_hashes = None;
         let mut newly_copied = 0u64;
+        let mut dirty_chunk: Option<usize> = None;
+        let mut page_spans = [(0usize, 0usize); 18];
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -2852,47 +3311,74 @@ impl Shadow {
                 }
                 _ => 0,
             };
-            let at = &mut copied[page - base];
-            if write == crate::watch::HOT_WRITE && *at != 0 {
+            let idx = page - base;
+            let at = copied.get(idx, global_synced);
+            let is_card_recheck = self.card.is_some()
+                && at != 0
+                && (write == crate::watch::HOT_WRITE || write > at);
+            if is_card_recheck {
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
-                }
-                if let Some(card) = &self.card {
-                    if let Some(first) = run.take() {
-                        card_hashes = None;
-                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                    copied.set_raw(idx, now);
+                    let c = idx / COPIED_CHUNK;
+                    if let Some(prev_c) = dirty_chunk
+                        && prev_c != c
+                    {
+                        copied.recompute_chunk(prev_c);
                     }
-                    let p_from = (page * PAGE).max(from);
-                    let p_to = ((page + 1) * PAGE).min(to);
-                    if self.hot_card_changed(card, &mut card_hashes, p_from, p_to) {
-                        match hot_run {
-                            Some((first, prev)) if page == prev + 1 => {
-                                hot_run = Some((first, page))
-                            }
-                            Some((first, prev)) => {
-                                card_hashes = None;
-                                bytes += self.copy_inner(
-                                    (first * PAGE).max(from),
-                                    ((prev + 1) * PAGE).min(to),
-                                    false,
-                                );
-                                hot_run = Some((page, page));
-                            }
-                            None => hot_run = Some((page, page)),
+                    dirty_chunk = Some(c);
+                }
+                if let Some(first) = run.take() {
+                    card_hashes = None;
+                    bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                }
+                let card = self.card.as_ref().expect("checked is_some above");
+                let p_from = (page * PAGE).max(from);
+                let p_to = ((page + 1) * PAGE).min(to);
+                let n_spans = self.hot_card_changed_ranges(
+                    card,
+                    &mut card_hashes,
+                    p_from,
+                    p_to,
+                    &mut page_spans,
+                );
+                for &(a, b) in &page_spans[..n_spans] {
+                    match hot_run {
+                        Some((r_from, r_to)) if a == r_to => hot_run = Some((r_from, b)),
+                        Some((r_from, r_to)) => {
+                            card_hashes = None;
+                            bytes += self.copy_inner(r_from, r_to, false);
+                            hot_run = Some((a, b));
                         }
+                        None => hot_run = Some((a, b)),
                     }
-                } else {
-                    if let Some(first) = run.take() {
-                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
-                    }
-                    bytes += self.copy_hot((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
                 }
-            } else if *at == 0 || write > *at {
+            } else if write == crate::watch::HOT_WRITE && at != 0 {
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    if *at == 0 && now != 0 {
+                    copied.set_raw(idx, now);
+                    let c = idx / COPIED_CHUNK;
+                    if let Some(prev_c) = dirty_chunk
+                        && prev_c != c
+                    {
+                        copied.recompute_chunk(prev_c);
+                    }
+                    dirty_chunk = Some(c);
+                }
+                if let Some(first) = run.take() {
+                    bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                }
+                bytes += self.copy_hot((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+            } else if at == 0 || write > at {
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    if copied.set_raw(idx, now) {
                         newly_copied += 1;
                     }
-                    *at = now;
+                    let c = idx / COPIED_CHUNK;
+                    if let Some(prev_c) = dirty_chunk
+                        && prev_c != c
+                    {
+                        copied.recompute_chunk(prev_c);
+                    }
+                    dirty_chunk = Some(c);
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
@@ -2900,22 +3386,26 @@ impl Shadow {
                 bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
             }
         }
+        if let Some(c) = dirty_chunk {
+            copied.recompute_chunk(c);
+        }
         drop(card_hashes);
         if newly_copied > 0 {
             self.uncopied.fetch_sub(newly_copied, Ordering::Release);
         }
-        if let Some((first, prev)) = hot_run {
-            bytes += self.copy_inner(
-                (first * PAGE).max(from),
-                ((prev + 1) * PAGE).min(to),
-                false,
-            );
+        if let Some((r_from, r_to)) = hot_run {
+            bytes += self.copy_inner(r_from, r_to, false);
         }
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
         }
-        if full && now != 0 && self.uncopied.load(Ordering::Acquire) == 0 {
-            self.synced_at.fetch_max(now, Ordering::Release);
+        if now != 0 {
+            if full && self.uncopied.load(Ordering::Acquire) == 0 {
+                drop(copied);
+                self.synced_at.fetch_max(now, Ordering::Release);
+            } else {
+                copied.advance_synced(full_lo, full_hi, now);
+            }
         }
         bytes
     }
@@ -2951,11 +3441,10 @@ impl Shadow {
             let Some(first) = first_difference(slice, held) else {
                 return 0;
             };
-            let last = last_difference(slice, held).unwrap_or(first);
+            let last = first + last_difference(&slice[first..], &held[first..]).unwrap_or(0);
             let n = last + 1 - first;
             held[first..=last].copy_from_slice(&slice[first..=last]);
             self.changed(off + first, off + first + n);
-            self.card_changed(off + first, off + first + n);
             n
         })
     }
@@ -3053,6 +3542,7 @@ impl Shadow {
                 continue;
             }
             let (p_lo, p_hi) = self.piece(p);
+            card.clear_hot_hashes(p_lo, p_hi);
             let mut buf = vec![0u8; p_hi - p_lo];
             if unwatched {
                 if crate::host::read_into((start + p_lo) as *const u8, &mut buf) {
@@ -3065,7 +3555,7 @@ impl Shadow {
                     let last_page = (start + p_hi - 1) / PAGE;
                     let mut spans = Vec::new();
                     for page in first_page..=last_page {
-                        if copied.get(page - base).copied().unwrap_or(0) != 0 {
+                        if copied.pages.get(page - base).copied().unwrap_or(0) != 0 {
                             let lo = (page * PAGE).max(start + p_lo) - start;
                             let hi = ((page + 1) * PAGE).min(start + p_hi) - start;
                             if lo < hi {
@@ -3260,6 +3750,7 @@ impl Shadow {
             }
             (at, n, written)
         };
+        card.clear_hot_hashes(changed_at, changed_at + changed_n);
         self.card_changed(changed_at, changed_at + changed_n);
         written
     }
@@ -3318,6 +3809,7 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
+        card.clear_hot_hashes(at, at + n);
         crate::watch::writing(start + at, n);
         merge_race(
             as_read.as_deref(),
@@ -3935,6 +4427,166 @@ mod window_tests {
         }
         assert!(spans.len() <= 32);
         assert!(spans.windows(2).all(|w| w[0].1 < w[1].0));
+    }
+
+    #[test]
+    fn hot_hashes_vec_deduplicates_4k_subblocks_and_clears_ranges() {
+        use super::{Card, HOT_HASH_BLOCK, PAGE, diff_hot_card_blocks};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let len = PAGE + 1536; // non-page-aligned length (64 KiB + 1.5 KiB)
+        let slots = len.div_ceil(HOT_HASH_BLOCK);
+        let card = Card {
+            before: Mutex::default(),
+            old: Mutex::default(),
+            has_old: AtomicBool::new(false),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            hot_hashes: Mutex::new(vec![0u128; slots]),
+            has_hot_hashes: AtomicBool::new(false),
+            size: len as u64,
+        };
+        let mut mem: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+
+        // First scan populates every slot (including the partial tail slot) and marks all changed.
+        let mut changed = Vec::new();
+        {
+            let mut hashes = card.hot_hashes.lock().unwrap();
+            assert!(diff_hot_card_blocks(&mut hashes, len, 0, &mem, |a, b| {
+                changed.push((a, b));
+            }));
+            card.has_hot_hashes.store(true, Ordering::Release);
+            assert!(hashes.iter().all(|&h| h != 0 && (h & 1) == 1));
+        }
+        assert_eq!(changed.len(), slots);
+        assert_eq!(changed.first(), Some(&(0, HOT_HASH_BLOCK)));
+        assert_eq!(changed.last(), Some(&(PAGE, len)));
+
+        // Unchanged second scan emits zero ranges.
+        changed.clear();
+        {
+            let mut hashes = card.hot_hashes.lock().unwrap();
+            assert!(!diff_hot_card_blocks(&mut hashes, len, 0, &mem, |a, b| {
+                changed.push((a, b));
+            }));
+        }
+        assert!(changed.is_empty());
+
+        // Single-byte edit in 4 KiB slot 5 emits ONLY slot 5 (4 KiB out of 64 KiB).
+        mem[5 * HOT_HASH_BLOCK + 123] ^= 0x40;
+        changed.clear();
+        {
+            let mut hashes = card.hot_hashes.lock().unwrap();
+            assert!(diff_hot_card_blocks(&mut hashes, len, 0, &mem, |a, b| {
+                changed.push((a, b));
+            }));
+        }
+        assert_eq!(changed, [(5 * HOT_HASH_BLOCK, 6 * HOT_HASH_BLOCK)]);
+
+        // Partial sub-block refresh (256 bytes inside slot 2) clears slot 2's hash and emits only
+        // the partial range; next full scan re-hashes slot 2 even if bytes reverted.
+        let partial_off = 2 * HOT_HASH_BLOCK + 512;
+        changed.clear();
+        {
+            let mut hashes = card.hot_hashes.lock().unwrap();
+            diff_hot_card_blocks(
+                &mut hashes,
+                len,
+                partial_off,
+                &mem[partial_off..partial_off + 256],
+                |a, b| changed.push((a, b)),
+            );
+            assert_eq!(hashes[2], 0);
+            assert_ne!(hashes[3], 0);
+        }
+        assert_eq!(changed, [(partial_off, partial_off + 256)]);
+
+        // clear_hot_hashes zeroes only the overlapping slots.
+        card.clear_hot_hashes(4 * HOT_HASH_BLOCK + 10, 6 * HOT_HASH_BLOCK + 1);
+        {
+            let hashes = card.hot_hashes.lock().unwrap();
+            assert_ne!(hashes[3], 0);
+            assert_eq!(hashes[4], 0);
+            assert_eq!(hashes[5], 0);
+            assert_eq!(hashes[6], 0);
+            assert_ne!(hashes[7], 0);
+        }
+        assert!(card.has_hot_hashes.load(Ordering::Acquire));
+
+        // Full-range clear resets has_hot_hashes flag to false.
+        card.clear_hot_hashes(0, len);
+        assert!(!card.has_hot_hashes.load(Ordering::Acquire));
+        assert!(card.hot_hashes.lock().unwrap().iter().all(|&h| h == 0));
+    }
+
+    #[test]
+    fn copied_state_tracks_partial_ranges_lazy_floors_and_uncopied_holes() {
+        use super::{COPIED_CHUNK, CopiedState, PAGE, full_page_range};
+
+        let pages = COPIED_CHUNK * 3 + 10; // 202 pages spanning 4 chunks
+        let mut st = CopiedState::new(pages);
+
+        // Initially all uncopied -> (false, u64::MAX) so guarded watch can skip journal scan.
+        assert_eq!(st.range_since(0, pages, 0), (false, u64::MAX));
+        assert_eq!(st.range_since(10, 30, 0), (false, u64::MAX));
+
+        // Copy chunk 1 completely (pages 64..128) at ts=10, plus 5 pages in chunk 0 at ts=7.
+        for p in 64..128 {
+            assert!(st.set_raw(p, 10));
+        }
+        st.recompute_chunk(1);
+        for p in 10..15 {
+            assert!(st.set_page(p, 7));
+        }
+        // Duplicate set returns false and never decreases timestamp.
+        assert!(!st.set_page(10, 5));
+        assert_eq!(st.get(10, 0), 7);
+
+        // Fully copied sub-range inside a partially copied buffer reports all_copied=true!
+        assert_eq!(st.range_since(64, 128, 0), (true, 10));
+        assert_eq!(st.range_since(10, 15, 0), (true, 7));
+        // Mixed range (copied + uncopied) reports all_copied=false and min non-zero ts.
+        assert_eq!(st.range_since(0, 128, 0), (false, 7));
+        assert_eq!(st.range_since(100, 140, 0), (false, 10));
+
+        // advance_synced bumps full chunk 1 lazily via chunk_floor and bumps only non-zero pages
+        // in partial chunk 0, never turning 0s into non-zero!
+        st.advance_synced(10, 140, 25);
+        assert_eq!(st.range_since(64, 128, 0), (true, 25));
+        assert_eq!(st.range_since(10, 15, 0), (true, 25));
+        assert_eq!(st.get(0, 0), 0);
+        assert_eq!(st.get(128, 0), 0);
+        assert_eq!(st.get(80, 0), 25);
+
+        // stale_pages_in respects chunk_floor and global_synced.
+        let base = 0x100usize;
+        let at = |p: usize| p * PAGE;
+        let written = [(base + 80, 24), (base + 81, 26), (base + 128, 1)];
+        assert_eq!(
+            st.stale_pages_in(base, 0, at(base + 80), at(base + 82), &written),
+            vec![base + 81]
+        );
+        // With global_synced=30 (when uncopied==0), 26 is no longer stale.
+        assert!(
+            st.stale_pages_in(base, 30, at(base + 80), at(base + 82), &written)
+                .is_empty()
+        );
+        // Uncopied page 128 is always stale even with high global_synced.
+        assert_eq!(
+            st.stale_pages_in(base, 30, at(base + 128), at(base + 129), &written),
+            vec![base + 128]
+        );
+
+        // full_page_range excludes partially covered boundary pages.
+        let start = 0x10000usize;
+        let end = 0x40000usize;
+        assert_eq!(full_page_range(start, end, start, end, 1, 3), (0, 3));
+        assert_eq!(
+            full_page_range(start, end, start + 0x100, end - 0x100, 1, 3),
+            (1, 2)
+        );
+        assert_eq!(full_page_range(0, 0x20000, 0x100, 0x200, 0, 2), (0, 0));
     }
 }
 

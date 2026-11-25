@@ -195,6 +195,20 @@ impl IntervalSet {
         }
         count
     }
+
+    fn for_each_overlap(&self, first: usize, last: usize, mut f: impl FnMut(usize, usize)) {
+        if first >= last {
+            return;
+        }
+        if let Some((_, &e)) = self.0.range(..first).next_back()
+            && e > first
+        {
+            f(first, e.min(last));
+        }
+        for (&s, &e) in self.0.range(first..last) {
+            f(s, e.min(last));
+        }
+    }
 }
 
 struct Journal {
@@ -517,30 +531,42 @@ pub(crate) fn writes_guarded_since(
     let (guarded, hot) = written?;
     if guarded.is_empty() {
         let j = journal_read();
-        let mut out: Vec<(usize, u64)> = if since != 0 && j.asked <= since {
-            Vec::new()
-        } else {
-            j.written
-                .range(first..last)
-                .filter(|&(_, &w)| since == 0 || w > since)
-                .map(|(&p, &w)| (p, w))
-                .collect()
-        };
+        if since != 0 && j.asked <= since {
+            let out = if hot.is_empty() {
+                Vec::new()
+            } else {
+                hot.into_iter().map(|p| (p, HOT_WRITE)).collect()
+            };
+            return Some((j.asked, out));
+        }
+        let mut out: Vec<(usize, u64)> = j
+            .written
+            .range(first..last)
+            .filter(|&(_, &w)| since == 0 || w > since)
+            .map(|(&p, &w)| (p, w))
+            .collect();
         merge_hot(&mut out, &hot);
         return Some((j.asked, out));
     }
     let mut j = journal_write();
+    let prev_asked = j.asked;
     j.asked += 1;
     let now = j.asked;
-    for page in guarded {
+    for &page in &guarded {
         j.written.insert(page, now);
     }
-    let mut out: Vec<(usize, u64)> = j
-        .written
-        .range(first..last)
-        .filter(|&(_, &w)| since == 0 || w > since)
-        .map(|(&p, &w)| (p, w))
-        .collect();
+    let mut out: Vec<(usize, u64)> = if since >= now {
+        Vec::new()
+    } else if since != 0 && prev_asked <= since {
+        debug_assert!(guarded.windows(2).all(|w| w[0] < w[1]));
+        guarded.into_iter().map(|p| (p, now)).collect()
+    } else {
+        j.written
+            .range(first..last)
+            .filter(|&(_, &w)| since == 0 || w > since)
+            .map(|(&p, &w)| (p, w))
+            .collect()
+    };
     merge_hot(&mut out, &hot);
     Some((now, out))
 }
@@ -551,6 +577,8 @@ struct Guards {
     protected: IntervalSet,
     clean: IntervalSet,
     absent: IntervalSet,
+    /// Exact union `clean ∪ hot ∪ absent` (pairwise disjoint) for O(log n) fast-path checks.
+    accounted: IntervalSet,
     aliased: BTreeSet<usize>,
     recent_fault: BTreeMap<usize, u64>,
     hot: BTreeMap<usize, u64>,
@@ -560,6 +588,7 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     protected: IntervalSet::new(),
     clean: IntervalSet::new(),
     absent: IntervalSet::new(),
+    accounted: IntervalSet::new(),
     aliased: BTreeSet::new(),
     recent_fault: BTreeMap::new(),
     hot: BTreeMap::new(),
@@ -594,52 +623,22 @@ fn guard_with_hot(start: usize, end: usize) -> Option<(Vec<usize>, Vec<usize>)> 
         if g.clean.contains_range(first, last) {
             return Some((Vec::new(), Vec::new()));
         }
-        let has_hot = g.hot.range(first..last).next().is_some();
-        let known = has_hot || g.protected.overlaps(first, last) || g.absent.overlaps(first, last);
-        if known {
-            let gaps = g.clean.gaps_in(first, last);
-            if !gaps.is_empty() {
-                let mut all_covered = true;
-                let mut hot_pages = Vec::new();
-                'gaps: for &(a, b) in &gaps {
-                    if g.absent.contains_range(a, b) {
-                        continue;
-                    }
-                    if !has_hot {
-                        all_covered = false;
-                        break;
-                    }
-                    let has_absent = g.absent.overlaps(a, b);
-                    let mut cursor = a;
-                    for (&block, &until) in g.hot.range(a..b) {
-                        if block > cursor {
-                            if !has_absent || !g.absent.contains_range(cursor, block) {
-                                all_covered = false;
-                                break 'gaps;
-                            }
-                        }
-                        if until > frame {
-                            if !has_absent || !g.absent.contains(block) {
-                                hot_pages.push(block);
-                            }
-                            cursor = block + 1;
-                        } else if !has_absent || !g.absent.contains(block) {
-                            all_covered = false;
-                            break 'gaps;
-                        } else {
-                            cursor = block + 1;
-                        }
-                    }
-                    if cursor < b && (!has_absent || !g.absent.contains_range(cursor, b)) {
-                        all_covered = false;
-                        break 'gaps;
-                    }
-                }
-                if all_covered {
-                    return Some((Vec::new(), hot_pages));
+        if g.accounted.contains_range(first, last) {
+            let mut hot_pages = Vec::new();
+            let mut all_active = true;
+            for (&block, &until) in g.hot.range(first..last) {
+                if until > frame {
+                    hot_pages.push(block);
+                } else {
+                    all_active = false;
+                    break;
                 }
             }
+            if all_active {
+                return Some((Vec::new(), hot_pages));
+            }
         }
+        let known = g.accounted.overlaps(first, last) || g.protected.overlaps(first, last);
         drop(g);
         if !known && !is_view(start, end) {
             return None;
@@ -652,55 +651,67 @@ fn guard_with_hot(start: usize, end: usize) -> Option<(Vec<usize>, Vec<usize>)> 
     if g.clean.contains_range(first, last) {
         return Some((Vec::new(), Vec::new()));
     }
-    let mut written = Vec::new();
     let mut hot_pages = Vec::new();
-    let mut protected_runs = Vec::new();
-    let mut uncommitted_until = first;
-    for (gap_first, gap_last) in g.clean.gaps_in(first, last) {
-        let mut run: Option<usize> = None;
-        let mut block = gap_first;
-        while block < gap_last {
-            if let Some(&until) = g.hot.get(&block) {
-                if until > frame {
-                    if let Some(from) = run.take() {
-                        protect_here(&mut g, from, block);
-                        protected_runs.push((from, block));
-                    }
-                    hot_pages.push(block);
-                    block += 1;
-                    continue;
-                }
-                g.hot.remove(&block);
-            }
-            if g.absent.contains(block) {
+    let mut expired_hot = Vec::new();
+    for (&block, &until) in g.hot.range(first..last) {
+        if until > frame {
+            hot_pages.push(block);
+        } else {
+            expired_hot.push(block);
+        }
+    }
+    for block in expired_hot {
+        g.hot.remove(&block);
+        g.accounted.remove(block);
+    }
+    if g.accounted.contains_range(first, last) {
+        return Some((Vec::new(), hot_pages));
+    }
+    if g.absent.overlaps(first, last) {
+        let mut newly_committed: Vec<(usize, usize)> = Vec::new();
+        let mut uncommitted_until = first;
+        g.absent.for_each_overlap(first, last, |a, b| {
+            let mut block = a;
+            while block < b {
                 if block >= uncommitted_until {
                     uncommitted_until = uncommitted_end(block);
                 }
                 if block < uncommitted_until {
-                    if let Some(from) = run.take() {
-                        protect_here(&mut g, from, block);
-                        protected_runs.push((from, block));
+                    block = uncommitted_until.min(b);
+                } else {
+                    match newly_committed.last_mut() {
+                        Some(last_run) if last_run.1 == block => last_run.1 = block + 1,
+                        _ => newly_committed.push((block, block + 1)),
                     }
-                    block = uncommitted_until.min(gap_last);
-                    continue;
+                    block += 1;
                 }
-                g.absent.remove(block);
             }
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(block) {
-                if let Some(from) = run.take() {
-                    protect_here(&mut g, from, block);
-                    protected_runs.push((from, block));
-                }
-                g.clean.insert(block);
-            } else {
-                run.get_or_insert(block);
-            }
-            block += 1;
+        });
+        for (a, b) in newly_committed {
+            g.absent.remove_range(a, b);
+            g.accounted.remove_range(a, b);
         }
-        if let Some(from) = run.take() {
-            protect_here(&mut g, from, gap_last);
-            protected_runs.push((from, gap_last));
+    }
+    let mut written = Vec::new();
+    let mut protected_runs = Vec::new();
+    for (gap_first, gap_last) in g.accounted.gaps_in(first, last) {
+        written.extend(gap_first * BLOCK / PAGE..gap_last * BLOCK / PAGE);
+        if !g.protected.overlaps(gap_first, gap_last) {
+            protect_here(&mut g, gap_first, gap_last);
+            protected_runs.push((gap_first, gap_last));
+        } else {
+            let mut already = Vec::new();
+            g.protected.for_each_overlap(gap_first, gap_last, |a, b| {
+                already.push((a, b));
+            });
+            for (a, b) in g.protected.gaps_in(gap_first, gap_last) {
+                protect_here(&mut g, a, b);
+                protected_runs.push((a, b));
+            }
+            for (a, b) in already {
+                g.clean.insert_range(a, b);
+                g.accounted.insert_range(a, b);
+            }
         }
     }
     if !protected_runs.is_empty() {
@@ -863,6 +874,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.insert_range(from, to);
         g.clean.insert_range(from, to);
+        g.accounted.insert_range(from, to);
     };
     if set(from, to) {
         note(g, from, to);
@@ -882,6 +894,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
             if raw_end > block {
                 g.absent.insert_range(block, raw_end);
+                g.accounted.insert_range(block, raw_end);
                 block = raw_end;
             } else {
                 block += 1;
@@ -899,6 +912,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
                 note(g, single, single + 1);
             } else if single < uncommitted_end(single) {
                 g.absent.insert(single);
+                g.accounted.insert(single);
             }
         }
         block = reg_end;
@@ -981,8 +995,12 @@ fn open_fault(g: &mut Guards, at: usize) -> bool {
         if become_hot {
             let until = frame.saturating_add(HOT_FRAMES);
             g.hot.insert(block, until);
+            g.accounted.insert(block);
             for alias in aliases {
-                g.hot.insert(alias, until);
+                if alias != block && !g.absent.contains(alias) && !g.clean.contains(alias) {
+                    g.hot.insert(alias, until);
+                    g.accounted.insert(alias);
+                }
             }
         }
     }
@@ -1000,7 +1018,10 @@ fn open_here_count(g: &mut Guards, start: usize, end: usize) -> u64 {
     if spans.is_empty() {
         return 0;
     }
-    g.clean.remove_range(first, last);
+    let clean_removed = g.clean.remove_range(first, last);
+    for (a, b) in clean_removed {
+        g.accounted.remove_range(a, b);
+    }
     let mut blocks = 0u64;
     for (a, b) in spans {
         blocks += (b - a) as u64;
@@ -1052,7 +1073,11 @@ pub fn title_memory_committed(at: usize, len: usize) {
     if !guards_read().absent.overlaps(first, last) {
         return;
     }
-    guards().absent.remove_range(first, last);
+    let mut g = guards();
+    let removed = g.absent.remove_range(first, last);
+    for (a, b) in removed {
+        g.accounted.remove_range(a, b);
+    }
 }
 
 pub fn writing(at: usize, len: usize) {
@@ -1061,7 +1086,17 @@ pub fn writing(at: usize, len: usize) {
     {
         commit(at, len);
     }
-    open(&mut guards(), at, at.saturating_add(len));
+    let end = at.saturating_add(len);
+    if at < end {
+        let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+        let needs_open = {
+            let g = guards_read();
+            g.protected.overlaps(first, last) || g.aliased.range(first..last).next().is_some()
+        };
+        if needs_open {
+            open(&mut guards(), at, end);
+        }
+    }
     crate::descriptor::host::remapped(at, len);
 }
 
@@ -1101,13 +1136,13 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         }
     }
     {
-        let mut g = guards();
-        let guarded = g.protected.count_in(at / BLOCK, end.div_ceil(BLOCK));
+        let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+        let guarded = guards_read().protected.count_in(first, last);
         if pages {
             WRITTEN[2].fetch_add(guarded, Relaxed);
         }
         if mode & 1 != 0 && guarded != 0 {
-            open(&mut g, at, end);
+            open(&mut guards(), at, end);
         }
     }
     crate::descriptor::host::page_written(at, len);
@@ -1119,6 +1154,16 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     }
     let ranges = crate::inplace::views_of_section(section, offset, len);
     if ranges.is_empty() {
+        return;
+    }
+    let needs_open = {
+        let g = guards_read();
+        ranges.iter().any(|&(at, n)| {
+            let end = at.saturating_add(n);
+            at < end && g.protected.overlaps(at / BLOCK, end.div_ceil(BLOCK))
+        })
+    };
+    if !needs_open {
         return;
     }
     let mut g = guards();
@@ -1203,11 +1248,25 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
     crate::inplace::views_gone(at, len);
     crate::inplace::title_memory_freeing(at, len);
-    let mut g = guards();
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if first >= last {
+        return;
+    }
+    let has_any = {
+        let g = guards_read();
+        g.accounted.overlaps(first, last)
+            || g.protected.overlaps(first, last)
+            || g.aliased.range(first..last).next().is_some()
+            || g.recent_fault.range(first..last).next().is_some()
+    };
+    if !has_any {
+        return;
+    }
+    let mut g = guards();
     g.absent.remove_range(first, last);
     g.protected.remove_range(first, last);
     g.clean.remove_range(first, last);
+    g.accounted.remove_range(first, last);
     let aliased: Vec<usize> = g.aliased.range(first..last).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
@@ -1239,11 +1298,18 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
-        let mut g = guards();
-        if open_fault(&mut g, at) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            return EXCEPTION_CONTINUE_EXECUTION;
+        let block = at / BLOCK;
+        let tracked = {
+            let g = guards_read();
+            g.protected.contains(block) || g.aliased.contains(&block)
+        };
+        if tracked {
+            let mut g = guards();
+            if open_fault(&mut g, at) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
         }
         if writable(at) {
             EXCEPTION_CONTINUE_EXECUTION
@@ -1259,11 +1325,18 @@ fn install() {
 }
 
 pub fn try_open_write(at: usize) -> bool {
-    let mut g = guards();
-    if open_fault(&mut g, at) {
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-        return true;
+    let block = at / BLOCK;
+    let tracked = {
+        let g = guards_read();
+        g.protected.contains(block) || g.aliased.contains(&block)
+    };
+    if tracked {
+        let mut g = guards();
+        if open_fault(&mut g, at) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            return true;
+        }
     }
     writable(at)
 }
@@ -1810,6 +1883,102 @@ mod tests {
         assert_eq!(set.count_in(10, 20), 4);
         assert_eq!(set.remove_range(10, 25), vec![(10, 12), (18, 25)]);
         assert_eq!(set.count_in(0, 40), 10);
+
+        let mut overlaps = Vec::new();
+        set.for_each_overlap(7, 28, |a, b| overlaps.push((a, b)));
+        assert_eq!(overlaps, vec![(7, 10), (25, 28)]);
+    }
+
+    #[test]
+    fn accounted_invariant_and_writes_guarded_since_fast_paths() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a dedicated 3-block pagefile view owned by this test.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (3 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 3 * BLOCK);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            view
+        };
+        let start = view.Value as usize;
+        let end = start + 3 * BLOCK;
+        let b0 = start / BLOCK;
+        let b1 = b0 + 1;
+        let b2 = b0 + 2;
+
+        // Initial guard with since=u64::MAX protects blocks and skips journal scan.
+        let (ts0, w0) = writes_guarded_since(start, end, u64::MAX).unwrap();
+        assert!(w0.is_empty());
+        {
+            let g = guards_read();
+            assert!(g.clean.contains_range(b0, b2 + 1));
+            assert!(g.accounted.contains_range(b0, b2 + 1));
+        }
+
+        // Subsequent check with since=ts0 returns empty immediately.
+        let (ts1, w1) = writes_guarded_since(start, end, ts0).unwrap();
+        assert!(ts1 >= ts0);
+        assert!(w1.is_empty());
+
+        // Fault block 0 once, then re-guard with since=ts1 -> fast path returns only b0.
+        // SAFETY: committed mapped view memory.
+        unsafe { (start as *mut u8).write_volatile(1) };
+        let (ts2, w2) = writes_guarded_since(start, end, ts1).unwrap();
+        assert!(ts2 > ts1);
+        assert_eq!(w2, vec![(b0, ts2)]);
+
+        // Fault block 0 a second time -> enters hot cooldown; accounted still covers b0..=b2.
+        // SAFETY: committed mapped view memory.
+        unsafe { (start as *mut u8).write_volatile(2) };
+        let (ts3, w3) = writes_guarded_since(start, end, ts2).unwrap();
+        assert_eq!(w3, vec![(b0, HOT_WRITE)]);
+        {
+            let g = guards_read();
+            assert!(!g.clean.contains(b0));
+            assert!(g.hot.contains_key(&b0));
+            assert!(g.clean.contains_range(b1, b2 + 1));
+            assert!(g.accounted.contains_range(b0, b2 + 1));
+        }
+
+        // Fast path with since=ts3 still preserves HOT_WRITE for b0.
+        let (ts4, w4) = writes_guarded_since(start, end, ts3).unwrap();
+        assert!(ts4 >= ts3);
+        assert_eq!(w4, vec![(b0, HOT_WRITE)]);
+
+        // `writing()` on hot block b0 stays open without disturbing b1..=b2;
+        // `writing()` on protected block b2 opens b2 and removes it from clean & accounted.
+        writing(start, 16);
+        assert!(guards_read().clean.contains_range(b1, b2 + 1));
+        writing(start + 2 * BLOCK, 16);
+        {
+            let g = guards_read();
+            assert!(!g.clean.contains(b2));
+            assert!(!g.accounted.contains(b2));
+            assert!(g.accounted.contains_range(b0, b2));
+        }
+
+        // Remap cleans all guard sets including accounted.
+        title_memory_remapped(start, 3 * BLOCK);
+        {
+            let g = guards_read();
+            assert!(!g.accounted.overlaps(b0, b2 + 1));
+            assert!(!g.clean.overlaps(b0, b2 + 1));
+            assert!(!g.protected.overlaps(b0, b2 + 1));
+            assert!(g.hot.range(b0..=b2).next().is_none());
+        }
+        // SAFETY: unmap our test view.
+        unsafe { UnmapViewOfFile(view) };
     }
 }
 
