@@ -902,7 +902,7 @@ fn workers() -> &'static Workers {
     });
     STARTED.call_once(|| {
         let n = std::thread::available_parallelism()
-            .map_or(4, |n| n.get() / 4)
+            .map_or(4, |n| n.get() / 2)
             .clamp(2, 6);
         for i in 0..n {
             let _ = std::thread::Builder::new()

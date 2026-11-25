@@ -547,8 +547,27 @@ impl Layout {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
-        let mut runs = Vec::new();
-        if !linear {
+        if linear {
+            for z in 0..depth {
+                let (s, _) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                for y in 0..m.height {
+                    let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
+                    copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
+                }
+            }
+            return Ok(());
+        }
+        thread_local! {
+            static RUNS: std::cell::RefCell<Vec<(usize, usize, usize)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+            static DIV_OFFSETS: std::cell::RefCell<Vec<usize>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        RUNS.with(|runs_cell| {
+            let mut runs = runs_cell.borrow_mut();
+            runs.clear();
             let mut first_linear = 0;
             let mut first_tiled = self.column(m, 0) as usize;
             for x in 1..m.width {
@@ -561,38 +580,60 @@ impl Layout {
                 }
             }
             runs.push((first_tiled, first_linear, bytes - first_linear));
-        }
-        let (body, last) = runs.split_at(runs.len().saturating_sub(1));
-        let chunk_size = body.first().map(|run| run.2).filter(|&size| {
-            body.iter()
-                .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
-        });
-        for z in 0..depth {
-            let (s, inner) = self.split(first + z);
-            let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
-                if linear {
-                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
-                    copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
-                } else {
-                    let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    match chunk_size {
-                        Some(8) if tiled_row.is_multiple_of(8) => {
-                            copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        Some(16) if tiled_row.is_multiple_of(16) => {
-                            copy_runs::<16, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        Some(32) if tiled_row.is_multiple_of(32) => {
-                            copy_runs::<32, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        _ => copy_runs::<0, DETILE>(src, dst, body, tiled_row, linear_row),
-                    }
-                    copy_runs::<0, DETILE>(src, dst, last, tiled_row, linear_row);
+            let (body, last) = runs.split_at(runs.len().saturating_sub(1));
+            let chunk_size = body.first().map(|run| run.2).filter(|&size| {
+                matches!(size, 8 | 16 | 32)
+                    && body
+                        .iter()
+                        .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
+            });
+            DIV_OFFSETS.with(|div_cell| {
+                let mut div_offsets = div_cell.borrow_mut();
+                if let Some(size) = chunk_size {
+                    div_offsets.clear();
+                    div_offsets.extend(body.iter().map(|&(offset, ..)| offset / size));
                 }
-            }
-        }
+                for z in 0..depth {
+                    let (s, inner) = self.split(first + z);
+                    let base = u64::from(s) * self.slice_size + m.offset;
+                    for y in 0..m.height {
+                        let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                        let tiled_row = (base + self.row(m, y, inner)) as usize;
+                        match chunk_size {
+                            Some(8) if tiled_row.is_multiple_of(8) => {
+                                copy_runs_div::<8, DETILE>(
+                                    src,
+                                    dst,
+                                    &div_offsets,
+                                    tiled_row / 8,
+                                    linear_row,
+                                )
+                            }
+                            Some(16) if tiled_row.is_multiple_of(16) => {
+                                copy_runs_div::<16, DETILE>(
+                                    src,
+                                    dst,
+                                    &div_offsets,
+                                    tiled_row / 16,
+                                    linear_row,
+                                )
+                            }
+                            Some(32) if tiled_row.is_multiple_of(32) => {
+                                copy_runs_div::<32, DETILE>(
+                                    src,
+                                    dst,
+                                    &div_offsets,
+                                    tiled_row / 32,
+                                    linear_row,
+                                )
+                            }
+                            _ => copy_runs::<0, DETILE>(src, dst, body, tiled_row, linear_row),
+                        }
+                        copy_runs::<0, DETILE>(src, dst, last, tiled_row, linear_row);
+                    }
+                }
+            });
+        });
         Ok(())
     }
 }
@@ -610,6 +651,32 @@ fn copy_run<const DETILE: bool>(
         (linear, tiled)
     };
     dst[to..][..len].copy_from_slice(&src[from..][..len]);
+}
+
+fn copy_runs_div<const N: usize, const DETILE: bool>(
+    src: &[u8],
+    dst: &mut [u8],
+    div_offsets: &[usize],
+    tiled_row_div: usize,
+    linear_row: usize,
+) {
+    if DETILE {
+        let tiled = src.as_chunks::<N>().0;
+        let linear = dst[linear_row..][..div_offsets.len() * N]
+            .as_chunks_mut::<N>()
+            .0;
+        for (out, &div_offset) in linear.iter_mut().zip(div_offsets) {
+            *out = tiled[tiled_row_div + div_offset];
+        }
+    } else {
+        let tiled = dst.as_chunks_mut::<N>().0;
+        let linear = src[linear_row..][..div_offsets.len() * N]
+            .as_chunks::<N>()
+            .0;
+        for (input, &div_offset) in linear.iter().zip(div_offsets) {
+            tiled[tiled_row_div + div_offset] = *input;
+        }
+    }
 }
 
 fn copy_runs<const N: usize, const DETILE: bool>(

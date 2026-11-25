@@ -1180,6 +1180,32 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     })
 }
 
+pub(crate) struct SendDrop<T>(pub(crate) T);
+
+// SAFETY: D3D12 COM objects and our host wrappers are free-threaded and may be
+// released on a background thread once no command list references them.
+unsafe impl<T> Send for SendDrop<T> {}
+
+pub(crate) fn defer_drop<T: Send + 'static>(value: T) {
+    static DROPPER: OnceLock<Option<std::sync::mpsc::Sender<Box<dyn Send>>>> = OnceLock::new();
+    let tx = DROPPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn Send>>();
+        match std::thread::Builder::new()
+            .name("oathkeep-drop".into())
+            .spawn(move || {
+                while let Ok(item) = rx.recv() {
+                    drop(item);
+                }
+            }) {
+            Ok(_) => Some(tx),
+            Err(_) => None,
+        }
+    });
+    if let Some(tx) = tx {
+        let _ = tx.send(Box::new(value));
+    }
+}
+
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
         return;
@@ -1206,7 +1232,9 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
             }
         }
     }
-    drop(freed);
+    if !freed.is_empty() {
+        defer_drop(SendDrop(freed));
+    }
 }
 
 struct CardWork {
@@ -2842,17 +2870,54 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu =
-                unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
-        }
+        let written = if wide_merge() && pieces.len() >= 8 {
+            let total_written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let each = pieces.len().div_ceil(8);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+            let mut iter = pieces.into_iter();
+            loop {
+                let chunk: Vec<_> = iter.by_ref().take(each).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                let total_written = total_written.clone();
+                jobs.push(Box::new(move || {
+                    let mut title = Vec::new();
+                    let mut local = 0usize;
+                    for (shadow, lo, hi, at) in chunk {
+                        // SAFETY: the mapping of the fetched bytes, `total` of
+                        // them; the copy into it has run, and `wide_run` joins
+                        // before this function returns.
+                        let gpu = unsafe {
+                            std::slice::from_raw_parts(
+                                (data + at as usize) as *const u8,
+                                hi - lo,
+                            )
+                        };
+                        let merged = shadow.card_merge_relay(lo, gpu, after, &mut title);
+                        shadow.walls_merged(gpu.len(), merged);
+                        local += merged;
+                    }
+                    total_written.fetch_add(local, Ordering::Relaxed);
+                }));
+            }
+            crate::shadow::wide_run(jobs);
+            total_written.load(Ordering::Relaxed)
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0;
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe {
+                    std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo)
+                };
+                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                shadow.walls_merged(gpu.len(), merged);
+                written += merged;
+            }
+            written
+        };
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         crate::shadow::relay_fetched(after);
     }
@@ -3939,18 +4004,37 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
-        self.states
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.pipelines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let old_deferred = std::mem::take(&mut *self.deferred());
+        let old_states =
+            std::mem::take(&mut *self.states.lock().unwrap_or_else(|e| e.into_inner()));
+        let old_twins = std::mem::take(&mut *self.twins.lock().unwrap_or_else(|e| e.into_inner()));
+        let old_pipelines =
+            std::mem::take(&mut *self.pipelines.lock().unwrap_or_else(|e| e.into_inner()));
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let old_notes = std::mem::take(&mut *self.notes.lock().unwrap_or_else(|e| e.into_inner()));
+        let has_deferred = !old_deferred.copies.is_empty()
+            || !old_deferred.uploads.is_empty()
+            || !old_deferred.kept.is_empty()
+            || !old_deferred.backs.is_empty()
+            || !old_deferred.refreshed.is_empty()
+            || !old_deferred.textures.is_empty()
+            || !old_deferred.writes.is_empty();
+        if has_deferred
+            || !old_states.is_empty()
+            || !old_twins.is_empty()
+            || !old_pipelines.is_empty()
+        {
+            defer_drop(SendDrop((
+                old_deferred,
+                old_states,
+                old_twins,
+                old_pipelines,
+            )));
+        }
+        #[cfg(feature = "diagnostics")]
+        if !old_notes.is_empty() {
+            defer_drop(old_notes);
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -4557,7 +4641,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        batch.pending_textures.push(staging.clone());
                     }
                     continue;
                 }
@@ -4578,6 +4662,7 @@ struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     index: std::collections::HashMap<usize, usize>,
     textures: std::collections::HashSet<usize>,
+    pending_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Batch {
@@ -4668,6 +4753,27 @@ impl Batch {
         }
         if ahead {
             crate::watch::ask_ahead_done();
+        }
+        if !self.pending_textures.is_empty() {
+            if self.pending_textures.len() >= 4 {
+                let started = std::time::Instant::now();
+                let before = PREPARING[2].load(Ordering::Relaxed);
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = self
+                    .pending_textures
+                    .drain(..)
+                    .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+                    .collect();
+                crate::shadow::wide_run(jobs);
+                let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+                PREPARING[2].fetch_sub(
+                    summed.saturating_sub(started.elapsed().as_micros() as u64),
+                    Ordering::Relaxed,
+                );
+            } else {
+                for staging in self.pending_textures.drain(..) {
+                    staging.refresh();
+                }
+            }
         }
     }
 }

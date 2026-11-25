@@ -14,7 +14,8 @@ macro_rules! once {
 }
 
 pub(crate) struct Staging {
-    buffer: ID3D12Resource,
+    buffer: Option<ID3D12Resource>,
+    capacity: u64,
     #[cfg(feature = "diagnostics")]
     size: u64,
     data: *mut u8,
@@ -30,6 +31,7 @@ pub(crate) struct Staging {
     used: std::sync::atomic::AtomicU64,
     on_demand: bool,
     detiled: std::sync::atomic::AtomicU32,
+    zeroed_mips: std::sync::atomic::AtomicU32,
     judged: [std::sync::atomic::AtomicU64; 2],
     waiting: std::sync::atomic::AtomicU64,
 }
@@ -281,11 +283,89 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 static STAGED: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+const STAGING_POOL_MAX_BUF: u64 = 16 << 20;
+
+struct PooledStaging {
+    buffer: ID3D12Resource,
+    data: usize,
+    capacity: u64,
+}
+
+// SAFETY: D3D12 upload buffers and their persistent mappings are free-threaded
+// once no command list references them.
+unsafe impl Send for PooledStaging {}
+
+struct StagingPool {
+    kept: Vec<PooledStaging>,
+    bytes: u64,
+}
+
+static STAGING_POOL: Mutex<StagingPool> = Mutex::new(StagingPool {
+    kept: Vec::new(),
+    bytes: 0,
+});
+
+fn staging_pool_max_bytes() -> u64 {
+    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("OATHKEEP_STAGING_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(64)
+            << 20
+    })
+}
+
+fn staging_bucket(size: u64) -> u64 {
+    if size <= STAGING_POOL_MAX_BUF {
+        size.max(64 << 10).next_power_of_two().min(STAGING_POOL_MAX_BUF)
+    } else {
+        size
+    }
+}
+
+fn take_staging_buffer(
+    host: &crate::host::Host,
+    total: u64,
+) -> Option<(ID3D12Resource, *mut u8, u64, bool)> {
+    let bucket = staging_bucket(total);
+    if bucket <= STAGING_POOL_MAX_BUF && staging_pool_max_bytes() > 0 {
+        let mut pool = STAGING_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = pool.kept.iter().rposition(|b| b.capacity == bucket) {
+            let item = pool.kept.swap_remove(at);
+            pool.bytes -= item.capacity;
+            return Some((item.buffer, item.data as *mut u8, item.capacity, false));
+        }
+    }
+    let (buffer, data) = host.upload_buffer(bucket)?;
+    Some((buffer, data, bucket, true))
+}
+
+fn give_staging_buffer(buffer: ID3D12Resource, data: usize, capacity: u64) {
+    let max_bytes = staging_pool_max_bytes();
+    if capacity <= STAGING_POOL_MAX_BUF && max_bytes > 0 {
+        let mut pool = STAGING_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.bytes + capacity <= max_bytes {
+            pool.bytes += capacity;
+            pool.kept.push(PooledStaging {
+                buffer,
+                data,
+                capacity,
+            });
+            return;
+        }
+    }
+    crate::host::defer_drop(crate::host::SendDrop(buffer));
+}
+
 impl Drop for Staging {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        if let Some(buffer) = self.buffer.take() {
+            give_staging_buffer(buffer, self.data as usize, self.capacity);
+        }
     }
 }
 
@@ -319,7 +399,18 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let avail = crate::host::available_physical_ram();
+    if avail.is_some_and(|b| b < (2 << 30)) {
+        let drained = {
+            let mut pool = STAGING_POOL.lock().unwrap_or_else(|e| e.into_inner());
+            pool.bytes = 0;
+            std::mem::take(&mut pool.kept)
+        };
+        if !drained.is_empty() {
+            crate::host::defer_drop(crate::host::SendDrop(drained));
+        }
+    }
+    let idle_ms = crate::host::ram_idle_ms(avail);
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
@@ -483,12 +574,15 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
+    let Some(staging_buffer) = staging.buffer.as_ref() else {
+        return;
+    };
     for (i, footprint) in staging.footprints.iter().enumerate() {
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe { (staging_buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
@@ -521,7 +615,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+            pResource: unsafe { std::mem::transmute_copy(staging_buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: *footprint,
@@ -774,12 +868,18 @@ impl Staging {
             && let Some((now, written)) =
                 waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
+            static HASH_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let hash_every = *HASH_EVERY.get_or_init(|| {
+                std::env::var("OATHKEEP_TEXTURE_HASH_EVERY")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map_or(32, |n| n.max(1))
+            });
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current()
                 .wrapping_add((start >> 16) as u64)
-                .is_multiple_of(HASH_EVERY);
+                .is_multiple_of(hash_every);
             if unwritten && !turn {
                 return 0;
             }
@@ -895,27 +995,52 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
-            let f = footprint.Footprint;
-            let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
-            if mip < 32 && held & (1 << mip) == 0 {
-                linear.fill(0);
-                continue;
-            }
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
-            }
+        thread_local! {
+            static DETILE_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        use std::sync::atomic::Ordering::Relaxed;
+        DETILE_BUF.with(|buf_cell| {
+            let mut buf = buf_cell.borrow_mut();
+            for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+                let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+                let f = footprint.Footprint;
+                let pitch = f.RowPitch as usize;
+                let len = pitch * rows as usize * f.Depth as usize;
+                let dst_ptr = unsafe { self.data.add(footprint.Offset as usize) };
+                if mip < 32 && held & (1 << mip) == 0 {
+                    if self.zeroed_mips.load(Relaxed) & (1 << mip) == 0 {
+                        // SAFETY: the subresource's part of the mapped staging buffer.
+                        unsafe { std::ptr::write_bytes(dst_ptr, 0, len) };
+                        self.zeroed_mips.fetch_or(1 << mip, Relaxed);
+                    }
+                    continue;
+                }
+                if mip < 32 {
+                    self.zeroed_mips.fetch_and(!(1 << mip), Relaxed);
+                }
+                if buf.len() < len {
+                    buf.resize(len, 0);
+                }
+                if let Err(e) = self.layout.detile(
+                    tiled,
+                    mip,
+                    slice,
+                    &mut buf[..len],
+                    pitch,
+                    pitch * rows as usize,
+                ) {
+                    tracing::warn!(?e, mip, slice, "texture not detiled");
+                    return;
+                }
+                // SAFETY: `buf[..len]` is valid cached RAM and `dst_ptr` points to
+                // `len` bytes inside the persistently mapped WC upload buffer.
+                unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), dst_ptr, len) };
+            }
+            if buf.capacity() > (16 << 20) {
+                buf.clear();
+                buf.shrink_to(4 << 20);
+            }
+        });
     }
 }
 
@@ -1156,18 +1281,21 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    let (buffer, data, capacity, fresh) = take_staging_buffer(host, total)?;
+    if fresh {
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
-        buffer,
+        buffer: Some(buffer),
+        capacity,
         #[cfg(feature = "diagnostics")]
         size: total,
         data,
@@ -1183,6 +1311,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
+        zeroed_mips: std::sync::atomic::AtomicU32::new(if fresh { u32::MAX } else { 0 }),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
     });
