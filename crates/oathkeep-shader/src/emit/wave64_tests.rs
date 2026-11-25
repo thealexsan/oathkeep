@@ -274,12 +274,20 @@ fn a_wave_or_inside_a_lane_branch_needs_the_branch_wave_wide() {
         (0xBF88_0000, "s_cbranch_execz"),
         (0xBF84_0000, "s_cbranch_scc0"),
     ] {
-        a_wave_or_inside(skip, name);
+        a_wave_or_inside(skip, name, 64);
     }
 }
 
-fn a_wave_or_inside(skip: u32, name: &str) {
-    let native = program(skip);
+#[test]
+fn a_wave_or_inside_a_lane_branch_works_in_a_multi_wave_group() {
+    a_wave_or_inside(0xBF88_0000, "s_cbranch_execz", 128);
+}
+
+fn a_wave_or_inside(skip: u32, name: &str, threads: u32) {
+    let mut native = program(skip);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.threads = [threads, 1, 1];
+    }
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let branch = (0..p.blocks.len())
         .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == name))

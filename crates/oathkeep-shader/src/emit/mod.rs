@@ -235,7 +235,7 @@ pub fn emit(
                 }
             }
         }
-        let wide_on = std::env::var_os("OATHKEEP_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("OATHKEEP_WAVE_WIDE").is_none_or(|v| v != "0");
         for exact in [true, false] {
             if !exact {
                 let deep_on = std::env::var_os("OATHKEEP_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
@@ -258,7 +258,7 @@ pub fn emit(
                         forms[0].1.as_ref().map(|f| &f.0),
                         Some(p),
                     ];
-                    if let Some(base) = bases.into_iter().flatten().next() {
+                    for base in bases.into_iter().flatten() {
                         let again = widen(c, native, base, why);
                         report("wave-wide branches", &again);
                         if done(&again) {
@@ -374,7 +374,11 @@ fn widen(
     };
     match native.io {
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs)
+            if {
+                let g = cs.threads.iter().product::<u32>();
+                g >= 64 && g.is_multiple_of(64)
+            } => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);

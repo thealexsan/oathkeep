@@ -2966,8 +2966,8 @@ pub(crate) fn find_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
         }
     }
     let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-    let (cell, _) = window_of(address, end, WINDOW);
-    map.range((cell, 0)..=(address, u64::MAX))
+    let from = address.saturating_sub(WINDOW);
+    map.range((from, 0)..=(address, u64::MAX))
         .find(|((start, bytes), _)| *start <= address && *start + *bytes >= end)
         .map(|(_, s)| s.clone())
 }
@@ -3158,15 +3158,23 @@ static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
+    let search_from = address.saturating_sub(WINDOW);
     let named = {
-        let grid = window_of(address, end, if unsized_ask { WINDOW } else { window() });
-        if !unsized_ask && crate::inplace::level() >= 3 {
-            let page = window_of(address, end, 64 << 10);
-            if page != grid
-                && !crate::inplace::section_run_in_place(grid.0, grid.1)
-                && crate::inplace::section_run_in_place(page.0, page.1)
+        let grid_size = if unsized_ask { WINDOW } else { window() };
+        let grid = window_of(address, end, grid_size);
+        if crate::inplace::level() >= 3 && !crate::inplace::section_run_in_place(grid.0, grid.1) {
+            if let Some((rs, rl, next_mapped)) =
+                crate::inplace::section_run_around(address, end, grid_size)
+                && (!unsized_ask || (rs + rl).saturating_sub(address) >= (256 << 10) || !next_mapped)
             {
-                page
+                (rs, rl)
+            } else if !unsized_ask {
+                let page = window_of(address, end, 64 << 10);
+                if page != grid && crate::inplace::section_run_in_place(page.0, page.1) {
+                    page
+                } else {
+                    grid
+                }
             } else {
                 grid
             }
@@ -3175,7 +3183,26 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         }
     };
     let pick = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| {
-        if unsized_ask && tails() {
+        if unsized_ask && crate::inplace::level() >= 3 {
+            let there = map
+                .range((search_from, 0)..=(address, u64::MAX))
+                .filter(|((start, bytes), _)| {
+                    *start <= address
+                        && *start + *bytes >= end
+                        && (*start + *bytes).saturating_sub(address) >= (256 << 10)
+                })
+                .map(|(key, _)| *key);
+            if let Some(found) = holder(there, address, end) {
+                return found;
+            }
+            if tails() && !crate::inplace::section_run_in_place(named.0, named.1) {
+                let there = map
+                    .range((cell, 0)..=(address, u64::MAX))
+                    .map(|(key, _)| *key);
+                return longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end));
+            }
+            named
+        } else if unsized_ask && tails() {
             let there = map
                 .range((cell, 0)..=(address, u64::MAX))
                 .map(|(key, _)| *key);
@@ -3183,7 +3210,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         } else if (fine() || crate::inplace::level() >= 3) && !unsized_ask {
             let _ = any;
             let there = map
-                .range((cell, 0)..=(address, u64::MAX))
+                .range((search_from, 0)..=(address, u64::MAX))
                 .map(|(key, _)| *key);
             holder(there, address, end).unwrap_or(named)
         } else {

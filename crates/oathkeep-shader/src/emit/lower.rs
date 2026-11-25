@@ -188,6 +188,7 @@ struct Lower<'a> {
     clane: Option<V>,
     pair: Option<V>,
     halves: Option<u32>,
+    group_slot: Option<u32>,
     wave_base: Option<V>,
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
     mask_data: MaskData,
@@ -1056,6 +1057,7 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         let mut halves: Option<u32> = None;
+        let mut group_slot: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1167,6 +1169,10 @@ impl<'a> Lower<'a> {
             if wave == 32 && x.native.wave64 {
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
+                if !x.st.wide.is_empty() && group > 64 {
+                    group_slot = Some(s.lds_dwords);
+                    s.lds_dwords += 1;
+                }
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1311,6 +1317,7 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            group_slot,
             wave_base: None,
             flat: None,
             no_barrier,
@@ -3399,6 +3406,26 @@ impl<'a> Lower<'a> {
             .op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
         self.s.flags |= flags::WAVE_OPS;
         let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
+        if let Some(slot) = self.group_slot {
+            let lds = self.s.lds();
+            let k = self.s.m.i32(slot);
+            let z = self.s.m.i32(0);
+            let ptr = self.s.m.element(c, lds, k);
+            self.s.m.store(c, ptr, z);
+            self.group_sync(c);
+            let ptr = self.s.m.element(c, lds, k);
+            let _ = self.s.m.atomic(c, Rmw::Or, ptr, some);
+            self.group_sync(c);
+            let ptr = self.s.m.element(c, lds, k);
+            let all_waves = self.s.m.load(c, ptr);
+            self.group_sync(c);
+            return Ok(self.s.m.cmp(
+                c,
+                if any { pred::NE } else { pred::EQ },
+                all_waves,
+                z,
+            ));
+        }
         let (lo, hi) = self.exchange_halves(c, some);
         let c = self.cur;
         let both = self.s.m.bin(c, Bin::Or, lo, hi);
@@ -5076,103 +5103,130 @@ impl<'a> Lower<'a> {
                 .find_map(|(s, _)| use_of(*s))
         };
         let use_at = use_of(site).or_else(twin);
-        let Some((at, first)) = use_at else {
-            if self.x.res.lane_copied.contains(&site)
-                && let Some(a) = self.scalar.get(&site).copied()
-            {
-                for k in 0..count {
-                    let x = self.s.m.i32(a.offset / 4 + k);
-                    self.write(inst, Reg::S(code + k as u8), x, None);
+        let (first, uav, props, image, used) = match use_at {
+            Some((at, first)) => {
+                let src = Source::Loaded { load: site, first };
+                let used = self.used_kind(&src);
+                let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+                let un = ui.name();
+                let uav = un.contains("store")
+                    || un.contains("atomic")
+                    || used.is_some_and(|u| u.kind == ResourceType::Uav);
+                let u = if uav { 0x1000 } else { 0 };
+                let (props, image) = match &ui.fields {
+                    Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
+                    Fields::Image { dim, .. } => {
+                        let kind = match dim {
+                            0 => 1,
+                            1 => 2,
+                            2 => 4,
+                            4 => 6,
+                            5 => 7,
+                            _ => return Err("an image dimension (cube or MSAA)"),
+                        };
+                        ((kind | u, 0x409), Some(kind))
+                    }
+                    Fields::Buffer { idxen, format, .. } => {
+                        let stride = used.map_or(0, |u| u.stride);
+                        let props = if un.starts_with("buffer_load_format")
+                            || un.starts_with("buffer_store_format")
+                        {
+                            (10 | u, 0x409)
+                        } else if *idxen
+                            && format.is_none()
+                            && stride >= 4
+                            && stride.is_multiple_of(4)
+                        {
+                            (12 | u, stride)
+                        } else {
+                            (11 | u, 0)
+                        };
+                        if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                            self.stale.extend(inst.writes.iter().map(|w| w.1));
+                            return Err("a constant buffer's descriptor read as data");
+                        }
+                        (props, None)
+                    }
+                    Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
+                        ((11, 0), None)
+                    }
+                    Fields::Smem { .. } => {
+                        self.stale.extend(inst.writes.iter().map(|w| w.1));
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    _ => return Err("a scalar memory read as data"),
+                };
+                (first, uav, props, image, used)
+            }
+            None => {
+                if self.x.res.lane_copied.contains(&site)
+                    && let Some(a) = self.scalar.get(&site).copied()
+                {
+                    for k in 0..count {
+                        let x = self.s.m.i32(a.offset / 4 + k);
+                        self.write(inst, Reg::S(code + k as u8), x, None);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            let sampler = x.res.descriptors.iter().any(|d| {
-                d.role == Role::Sampler
-                    && d.source
-                        .leaves()
-                        .into_iter()
-                        .any(|l| matches!(*l, Source::Loaded { load, .. } if load == site))
-            });
-            if sampler {
-                self.stale.extend(inst.writes.iter().map(|w| w.1));
-                return Err("a sampler's descriptor read as data");
-            }
-            if count <= 4
-                && let Some((lo, hi)) = self.view_address(site)
-            {
-                for k in 0..count {
-                    let reg = Reg::S(code + k as u8);
-                    match k {
-                        0 => self.write(inst, reg, lo, None),
-                        1 => self.write(inst, reg, hi, None),
-                        _ => {
-                            if let Some(v) = inst.write(reg) {
-                                self.vals.insert(v, Val::Missing(OTHER));
-                                self.stale.insert(v);
+                let sampler = x.res.descriptors.iter().any(|d| {
+                    d.role == Role::Sampler
+                        && d.source
+                            .leaves()
+                            .into_iter()
+                            .any(|l| matches!(*l, Source::Loaded { load, .. } if load == site))
+                });
+                if sampler {
+                    self.stale.extend(inst.writes.iter().map(|w| w.1));
+                    return Err("a sampler's descriptor read as data");
+                }
+                if count <= 4
+                    && let Some((lo, hi)) = self.view_address(site)
+                {
+                    for k in 0..count {
+                        let reg = Reg::S(code + k as u8);
+                        match k {
+                            0 => self.write(inst, reg, lo, None),
+                            1 => self.write(inst, reg, hi, None),
+                            _ => {
+                                if let Some(v) = inst.write(reg) {
+                                    self.vals.insert(v, Val::Missing(OTHER));
+                                    self.stale.insert(v);
+                                }
                             }
                         }
                     }
+                    return Ok(());
                 }
-                return Ok(());
+                if count == 8
+                    && let Some(a) = address
+                    && matches!(
+                        x.native.layout.get(a.param).map(|p| p.root),
+                        Some(RootType::Table | RootType::ResourceHeap)
+                    )
+                {
+                    let src = Source::Loaded {
+                        load: site,
+                        first: 0,
+                    };
+                    let used = self.used_kind(&src);
+                    let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+                    let u = if uav { 0x1000 } else { 0 };
+                    (0, uav, (2 | u, 0x409), Some(2), used)
+                } else {
+                    if std::env::var_os("OATHKEEP_DESC_WHY").is_some() {
+                        eprintln!(
+                            "DESC-WHY {:#x} {} scalar={:?} lane_copied={}",
+                            inst.machine.offset,
+                            inst.name(),
+                            address,
+                            self.x.res.lane_copied.contains(&site)
+                        );
+                    }
+                    return Err("a descriptor read only as data");
+                }
             }
-            if std::env::var_os("OATHKEEP_DESC_WHY").is_some() {
-                eprintln!(
-                    "DESC-WHY {:#x} {} scalar={:?} lane_copied={}",
-                    inst.machine.offset,
-                    inst.name(),
-                    address,
-                    self.x.res.lane_copied.contains(&site)
-                );
-            }
-            return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
-            }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    self.stale.extend(inst.writes.iter().map(|w| w.1));
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                (props, None)
-            }
-            Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
-                ((11, 0), None)
-            }
-            Fields::Smem { .. } => {
-                self.stale.extend(inst.writes.iter().map(|w| w.1));
-                return Err("a constant buffer's descriptor read as data");
-            }
-            _ => return Err("a scalar memory read as data"),
-        };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;

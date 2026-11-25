@@ -81,6 +81,84 @@ pub(crate) fn section_run_in_place(start: u64, len: u64) -> bool {
     }
 }
 
+pub(crate) fn section_run_around(
+    address: u64,
+    end: u64,
+    max_len: u64,
+) -> Option<(u64, u64, bool)> {
+    if level() < 3 || max_len < K64 as u64 {
+        return None;
+    }
+    let at = (address & !(K64 as u64 - 1)) as usize;
+    let need_end = end.max(address.saturating_add(1)).next_multiple_of(K64 as u64) as usize;
+    if need_end <= at || (need_end - at) as u64 > max_len {
+        return None;
+    }
+    let v = views_read();
+    let (&base, &(bytes, section, offset)) = v
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, view)| *base + view.0 > at)?;
+    let (sec_size, committed) = v
+        .sections
+        .iter()
+        .find(|s| s.0 == section)
+        .map(|s| (s.1, s.2))?;
+    if !committed {
+        return None;
+    }
+    let mut run_start = base;
+    let mut run_off = offset;
+    let mut run_end = base.saturating_add(bytes);
+    // Extend forward through contiguous mappings of the same section.
+    while let Some(&(next_bytes, next_sec, next_off)) = v.views.get(&run_end) {
+        if next_sec != section || next_off != run_off + (run_end - run_start) as u64 {
+            break;
+        }
+        run_end = run_end.saturating_add(next_bytes);
+    }
+    // Extend backward through contiguous mappings of the same section.
+    while let Some((&prev_base, &(prev_bytes, prev_sec, prev_off))) =
+        v.views.range(..run_start).next_back()
+    {
+        if prev_base.saturating_add(prev_bytes) != run_start
+            || prev_sec != section
+            || prev_off.saturating_add(prev_bytes as u64) != run_off
+        {
+            break;
+        }
+        run_start = prev_base;
+        run_off = prev_off;
+    }
+    if run_end < need_end {
+        return None;
+    }
+    // Clamp the span to `max_len` around `[at, need_end)` while preserving as
+    // much forward headroom from `at` as possible.
+    if (run_end - run_start) as u64 > max_len {
+        let cap = max_len as usize;
+        let new_start = if run_end - at <= cap {
+            run_end - cap
+        } else {
+            run_end = at + cap;
+            at
+        };
+        run_off = run_off.saturating_add((new_start - run_start) as u64);
+        run_start = new_start;
+    }
+    let final_len = (run_end - run_start) as u64;
+    if run_off.checked_add(final_len).is_none_or(|e| e > sec_size) {
+        return None;
+    }
+    let next_mapped = v
+        .views
+        .range(..=run_end)
+        .next_back()
+        .is_some_and(|(b, view)| *b + view.0 > run_end);
+    Some((run_start as u64, final_len, next_mapped))
+}
+
 fn section_heap(
     host: &crate::host::Host,
     section: usize,
@@ -97,7 +175,7 @@ fn section_heap(
             };
         }
     }
-    const SHARED_HEADROOM: u64 = 2048 << 20;
+    const SHARED_HEADROOM: u64 = 1024 << 20;
     if SECTION_BYTES.load(Ordering::Relaxed).saturating_add(size) > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return Err(None);
