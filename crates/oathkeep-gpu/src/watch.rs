@@ -6,6 +6,19 @@ const KERNEL_PAGE: usize = 4096;
 pub(crate) const HOT_WRITE: u64 = u64::MAX;
 const DEFAULT_HOT_FRAMES: u64 = 48;
 const HOT_WINDOW_FRAMES: u64 = 16;
+const MAX_COOL_BACKOFF: u8 = 6;
+
+static WRITE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn write_epoch() -> u64 {
+    WRITE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[inline]
+fn bump_write_epoch() {
+    WRITE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
 
 fn hot_frames() -> u64 {
     static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -342,6 +355,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 }
 
 pub(crate) fn ask_once_end() {
+    bump_write_epoch();
     let mut j = journal_write();
     if j.kept {
         j.kept = false;
@@ -350,8 +364,12 @@ pub(crate) fn ask_once_end() {
 }
 
 pub(crate) fn wrote(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    bump_write_epoch();
     let mut j = journal_write();
-    if !j.kept || len == 0 {
+    if !j.kept {
         return;
     }
     j.asked += 1;
@@ -530,7 +548,7 @@ pub(crate) fn writes_guarded_since(
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     #[cfg(feature = "diagnostics")]
     let guarding = std::time::Instant::now();
-    let written = guard_with_hot(first * PAGE, last * PAGE);
+    let written = guard_with_hot_fast(first * PAGE, last * PAGE);
     #[cfg(feature = "diagnostics")]
     {
         let us = guarding.elapsed().as_micros() as u64;
@@ -539,7 +557,29 @@ pub(crate) fn writes_guarded_since(
         crate::copystat::add(crate::copystat::C::WatchUs, us);
         slow(us);
     }
-    let (guarded, hot) = written?;
+    let (guarded, hot) = match written? {
+        GuardHot::HotOnly(pairs) => {
+            let j = journal_read();
+            if since != 0 && j.asked <= since {
+                return Some((j.asked, pairs));
+            }
+            let mut out: Vec<(usize, u64)> = j
+                .written
+                .range(first..last)
+                .filter(|&(_, &w)| since == 0 || w > since)
+                .map(|(&p, &w)| (p, w))
+                .collect();
+            if !pairs.is_empty() {
+                if out.is_empty() {
+                    return Some((j.asked, pairs));
+                }
+                let hot: Vec<usize> = pairs.into_iter().map(|(p, _)| p).collect();
+                merge_hot(&mut out, &hot);
+            }
+            return Some((j.asked, out));
+        }
+        GuardHot::Guarded { guarded, hot } => (guarded, hot),
+    };
     if guarded.is_empty() {
         let j = journal_read();
         if since != 0 && j.asked <= since {
@@ -593,6 +633,9 @@ struct Guards {
     aliased: BTreeSet<usize>,
     recent_fault: BTreeMap<usize, u64>,
     hot: BTreeMap<usize, u64>,
+    /// Number of times a block has been cooled/expired from `hot`, used for exponential
+    /// backoff (`hot_frames() << cool_count.min(MAX_COOL_BACKOFF)`) when it re-faults into hot.
+    cool_count: BTreeMap<usize, u8>,
 }
 
 static GUARDS: RwLock<Guards> = RwLock::new(Guards {
@@ -603,6 +646,7 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     aliased: BTreeSet::new(),
     recent_fault: BTreeMap::new(),
     hot: BTreeMap::new(),
+    cool_count: BTreeMap::new(),
 });
 
 fn guards_read() -> std::sync::RwLockReadGuard<'static, Guards> {
@@ -624,7 +668,23 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     Some(guarded)
 }
 
+enum GuardHot {
+    HotOnly(Vec<(usize, u64)>),
+    Guarded {
+        guarded: Vec<usize>,
+        hot: Vec<usize>,
+    },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn guard_with_hot(start: usize, end: usize) -> Option<(Vec<usize>, Vec<usize>)> {
+    match guard_with_hot_fast(start, end)? {
+        GuardHot::HotOnly(pairs) => Some((Vec::new(), pairs.into_iter().map(|(p, _)| p).collect())),
+        GuardHot::Guarded { guarded, hot } => Some((guarded, hot)),
+    }
+}
+
+fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ask = *ASK.get_or_init(|| std::env::var_os("OATHKEEP_GUARD_ASK").is_some_and(|v| v == "1"));
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -632,21 +692,24 @@ fn guard_with_hot(start: usize, end: usize) -> Option<(Vec<usize>, Vec<usize>)> 
     if !ask {
         let g = guards_read();
         if g.clean.contains_range(first, last) {
-            return Some((Vec::new(), Vec::new()));
+            return Some(GuardHot::HotOnly(Vec::new()));
         }
         if g.accounted.contains_range(first, last) {
+            if g.hot.is_empty() {
+                return Some(GuardHot::HotOnly(Vec::new()));
+            }
             let mut hot_pages = Vec::new();
             let mut all_active = true;
             for (&block, &until) in g.hot.range(first..last) {
                 if until > frame {
-                    hot_pages.push(block);
+                    hot_pages.push((block, HOT_WRITE));
                 } else {
                     all_active = false;
                     break;
                 }
             }
             if all_active {
-                return Some((Vec::new(), hot_pages));
+                return Some(GuardHot::HotOnly(hot_pages));
             }
         }
         let known = g.accounted.overlaps(first, last) || g.protected.overlaps(first, last);
@@ -660,23 +723,31 @@ fn guard_with_hot(start: usize, end: usize) -> Option<(Vec<usize>, Vec<usize>)> 
     install();
     let mut g = guards();
     if g.clean.contains_range(first, last) {
-        return Some((Vec::new(), Vec::new()));
+        return Some(GuardHot::HotOnly(Vec::new()));
     }
     let mut hot_pages = Vec::new();
     let mut expired_hot = Vec::new();
-    for (&block, &until) in g.hot.range(first..last) {
-        if until > frame {
-            hot_pages.push(block);
-        } else {
-            expired_hot.push(block);
+    if !g.hot.is_empty() {
+        for (&block, &until) in g.hot.range(first..last) {
+            if until > frame {
+                hot_pages.push(block);
+            } else {
+                expired_hot.push(block);
+            }
         }
     }
     for block in expired_hot {
         g.hot.remove(&block);
         g.accounted.remove(block);
+        g.cool_count
+            .entry(block)
+            .and_modify(|c| *c = c.saturating_add(1).min(MAX_COOL_BACKOFF))
+            .or_insert(1);
     }
     if g.accounted.contains_range(first, last) {
-        return Some((Vec::new(), hot_pages));
+        return Some(GuardHot::HotOnly(
+            hot_pages.into_iter().map(|p| (p, HOT_WRITE)).collect(),
+        ));
     }
     if g.absent.overlaps(first, last) {
         let mut newly_committed: Vec<(usize, usize)> = Vec::new();
@@ -728,7 +799,10 @@ fn guard_with_hot(start: usize, end: usize) -> Option<(Vec<usize>, Vec<usize>)> 
     if !protected_runs.is_empty() {
         protect_aliases(&mut g, &protected_runs);
     }
-    Some((written, hot_pages))
+    Some(GuardHot::Guarded {
+        guarded: written,
+        hot: hot_pages,
+    })
 }
 
 fn is_view(start: usize, end: usize) -> bool {
@@ -965,6 +1039,10 @@ pub(crate) fn cool_hot(blocks: &[usize]) -> usize {
         g.hot.remove(&block);
         g.accounted.remove(block);
         g.recent_fault.remove(&block);
+        g.cool_count
+            .entry(block)
+            .and_modify(|c| *c = c.saturating_add(1).min(MAX_COOL_BACKOFF))
+            .or_insert(1);
     }
     let mut runs: Vec<(usize, usize)> = Vec::new();
     for &block in &cooled {
@@ -1041,6 +1119,7 @@ fn open_fault(g: &mut Guards, at: usize) -> bool {
     if !opened {
         return false;
     }
+    bump_write_epoch();
     if hot_enabled() {
         let block = at / BLOCK;
         let frame = crate::frame::current();
@@ -1060,12 +1139,27 @@ fn open_fault(g: &mut Guards, at: usize) -> bool {
             }
         }
         if become_hot {
-            let until = frame.saturating_add(hot_frames());
+            let block_shift = g
+                .cool_count
+                .get(&block)
+                .copied()
+                .unwrap_or(0)
+                .min(MAX_COOL_BACKOFF);
+            let until = frame.saturating_add(hot_frames().saturating_mul(1u64 << block_shift));
             g.hot.insert(block, until);
             g.accounted.insert(block);
             for alias in aliases {
                 if alias != block && !g.absent.contains(alias) && !g.clean.contains(alias) {
-                    g.hot.insert(alias, until);
+                    let alias_shift = g
+                        .cool_count
+                        .get(&alias)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(block_shift)
+                        .min(MAX_COOL_BACKOFF);
+                    let alias_until =
+                        frame.saturating_add(hot_frames().saturating_mul(1u64 << alias_shift));
+                    g.hot.insert(alias, alias_until);
                     g.accounted.insert(alias);
                 }
             }
@@ -1136,6 +1230,7 @@ pub fn title_memory_committed(at: usize, len: usize) {
     if len == 0 {
         return;
     }
+    bump_write_epoch();
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     if !guards_read().absent.overlaps(first, last) {
         return;
@@ -1148,10 +1243,11 @@ pub fn title_memory_committed(at: usize, len: usize) {
 }
 
 pub fn writing(at: usize, len: usize) {
-    if len > 0
-        && let Some(commit) = COMMIT_TITLE_MEMORY.get()
-    {
-        commit(at, len);
+    if len > 0 {
+        bump_write_epoch();
+        if let Some(commit) = COMMIT_TITLE_MEMORY.get() {
+            commit(at, len);
+        }
     }
     let end = at.saturating_add(len);
     if at < end {
@@ -1191,6 +1287,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    bump_write_epoch();
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -1312,6 +1409,7 @@ pub fn wait_if_title_memory_remapping() -> bool {
 }
 
 pub fn title_memory_remapped(at: usize, len: usize) {
+    bump_write_epoch();
     crate::descriptor::host::remapped(at, len);
     crate::inplace::views_gone(at, len);
     crate::inplace::title_memory_freeing(at, len);
@@ -1325,6 +1423,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             || g.protected.overlaps(first, last)
             || g.aliased.range(first..last).next().is_some()
             || g.recent_fault.range(first..last).next().is_some()
+            || g.cool_count.range(first..last).next().is_some()
     };
     if !has_any {
         return;
@@ -1345,6 +1444,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let recent_keys: Vec<usize> = g.recent_fault.range(first..last).map(|(&k, _)| k).collect();
     for block in recent_keys {
         g.recent_fault.remove(&block);
+    }
+    let cool_keys: Vec<usize> = g.cool_count.range(first..last).map(|(&k, _)| k).collect();
+    for block in cool_keys {
+        g.cool_count.remove(&block);
     }
 }
 
@@ -2306,6 +2409,100 @@ mod mapping_tests {
         assert_eq!(guard_with_hot(start, end), Some((vec![], vec![])));
 
         title_memory_remapped(start, 4 * BLOCK);
+        // SAFETY: unmap our test view.
+        unsafe { UnmapViewOfFile(view) };
+    }
+
+    #[test]
+    fn cooling_backoff_doubles_hot_duration_and_resets_on_remap() {
+        use super::{
+            BLOCK, MAX_COOL_BACKOFF, cool_hot, guard_with_hot, guards_read, hot_frames,
+            title_memory_remapped,
+        };
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+        };
+        // SAFETY: a dedicated 1-block pagefile view owned by this test.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            view
+        };
+        let start = view.Value as usize;
+        let end = start + BLOCK;
+        let b0 = start / BLOCK;
+        let base_hot = hot_frames();
+
+        let promote_to_hot = |val: u8| {
+            let _ = guard_with_hot(start, end).unwrap();
+            // SAFETY: committed mapped view memory.
+            unsafe { (start as *mut u8).write_volatile(val) };
+            let _ = guard_with_hot(start, end).unwrap();
+            // SAFETY: committed mapped view memory.
+            unsafe { (start as *mut u8).write_volatile(val.wrapping_add(1)) };
+            let (guarded, hot) = guard_with_hot(start, end).unwrap();
+            assert!(guarded.is_empty());
+            assert_eq!(hot, vec![b0]);
+        };
+
+        // First promotion: cool_count = 0 -> duration = 1x hot_frames.
+        promote_to_hot(1);
+        let frame = crate::frame::current();
+        assert_eq!(guards_read().hot.get(&b0).copied(), Some(frame + base_hot));
+        assert_eq!(guards_read().cool_count.get(&b0).copied(), None);
+
+        // Cool once -> cool_count = 1 -> next promotion lasts 2x hot_frames.
+        assert_eq!(cool_hot(&[b0]), 1);
+        assert_eq!(guards_read().cool_count.get(&b0).copied(), Some(1));
+        let _ = guard_with_hot(start, end).unwrap();
+        promote_to_hot(10);
+        let frame = crate::frame::current();
+        assert_eq!(
+            guards_read().hot.get(&b0).copied(),
+            Some(frame + base_hot * 2)
+        );
+
+        // Cool a second time -> cool_count = 2 -> next promotion lasts 4x hot_frames.
+        assert_eq!(cool_hot(&[b0]), 1);
+        assert_eq!(guards_read().cool_count.get(&b0).copied(), Some(2));
+        let _ = guard_with_hot(start, end).unwrap();
+        promote_to_hot(20);
+        let frame = crate::frame::current();
+        assert_eq!(
+            guards_read().hot.get(&b0).copied(),
+            Some(frame + base_hot * 4)
+        );
+
+        // Repeated cooling saturates at MAX_COOL_BACKOFF.
+        for step in 0..=MAX_COOL_BACKOFF {
+            let _ = cool_hot(&[b0]);
+            let _ = guard_with_hot(start, end).unwrap();
+            promote_to_hot(30 + step * 2);
+        }
+        assert_eq!(
+            guards_read().cool_count.get(&b0).copied(),
+            Some(MAX_COOL_BACKOFF)
+        );
+        let frame = crate::frame::current();
+        assert_eq!(
+            guards_read().hot.get(&b0).copied(),
+            Some(frame + base_hot * (1u64 << MAX_COOL_BACKOFF))
+        );
+
+        // Remap resets cool_count cleanly.
+        title_memory_remapped(start, BLOCK);
+        assert_eq!(guards_read().cool_count.get(&b0).copied(), None);
         // SAFETY: unmap our test view.
         unsafe { UnmapViewOfFile(view) };
     }
