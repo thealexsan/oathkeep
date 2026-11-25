@@ -4,9 +4,11 @@ use std::sync::RwLock;
 pub(crate) const PAGE: usize = 64 << 10;
 const KERNEL_PAGE: usize = 4096;
 pub(crate) const HOT_WRITE: u64 = u64::MAX;
-const DEFAULT_HOT_FRAMES: u64 = 4;
+const DEFAULT_HOT_FRAMES: u64 = 6;
 const DEFAULT_HOT_FAULTS: u16 = 4;
+const HOT_STREAK_GAP: u64 = 2;
 const MAX_COOL_BACKOFF: u8 = 1;
+pub(crate) const CLEAN_EPOCH_SHARDS: usize = 4;
 
 static GLOBAL_WRITE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RANGED_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -334,6 +336,14 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
 });
 
 static JOURNAL_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static JOURNAL_ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[inline]
+fn bump_journal_asked(j: &mut Journal, delta: u64) -> u64 {
+    j.asked += delta;
+    JOURNAL_ASKED.fetch_max(j.asked, std::sync::atomic::Ordering::Release);
+    j.asked
+}
 
 fn journal_read() -> std::sync::RwLockReadGuard<'static, Journal> {
     JOURNAL.read().unwrap_or_else(|e| e.into_inner())
@@ -361,8 +371,8 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if j.kept {
         return;
     }
-    j.asked += 1;
-    j.ahead_asked = j.asked;
+    let now = bump_journal_asked(j, 1);
+    j.ahead_asked = now;
     j.ahead.clear();
     let mut i = 0;
     while i < pieces.len() {
@@ -421,8 +431,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     let mut j = journal_write();
     let j = &mut *j;
     if j.ahead.is_empty() {
-        j.asked += 1;
-        j.ahead_asked = j.asked;
+        let now = bump_journal_asked(j, 1);
+        j.ahead_asked = now;
     }
     for &(start, end) in ranges {
         if start >= end {
@@ -475,13 +485,17 @@ fn wrote_journal_only(at: usize, len: usize) {
     if !j.kept {
         return;
     }
-    j.asked += 1;
-    let now = j.asked;
+    let now = bump_journal_asked(&mut j, 1);
     j.guarded_asked = now;
-    WROTE_JOURNAL_ASKED.fetch_max(now, std::sync::atomic::Ordering::Release);
     j.ahead_asked = now;
+    let mut prev_shard = usize::MAX;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
+        let s = shard_of(page);
+        if s != prev_shard {
+            SHARD_GUARDED_ASKED[s].fetch_max(now, std::sync::atomic::Ordering::Release);
+            prev_shard = s;
+        }
     }
 }
 
@@ -616,8 +630,7 @@ pub(crate) fn writes_kind(
                 add(C::WatchUs, started.elapsed().as_micros() as u64);
                 slow(started.elapsed().as_micros() as u64);
             }
-            j.asked += 1;
-            let now = j.asked;
+            let now = bump_journal_asked(j, 1);
             for k in 0..count {
                 let page = j.found[k] / PAGE;
                 j.written.insert(page, now);
@@ -657,7 +670,7 @@ pub(crate) fn writes_guarded_since_with_clean(
     start: usize,
     end: usize,
     since: u64,
-) -> Option<(u64, Vec<(usize, u64)>, Option<[u64; 2]>)> {
+) -> Option<(u64, Vec<(usize, u64)>, Option<[u64; CLEAN_EPOCH_SHARDS]>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     #[cfg(feature = "diagnostics")]
     let guarding = std::time::Instant::now();
@@ -673,6 +686,12 @@ pub(crate) fn writes_guarded_since_with_clean(
     let (guard_hot, clean_epochs) = written?;
     let (guarded, hot) = match guard_hot {
         GuardHot::HotOnly(pairs) => {
+            if since != 0 && all_shards_guarded_asked_le(first, last, since) {
+                let now = JOURNAL_ASKED
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .max(since);
+                return Some((now, pairs, clean_epochs));
+            }
             let j = journal_read();
             if since != 0 && j.guarded_asked <= since {
                 return Some((j.asked, pairs, clean_epochs));
@@ -695,6 +714,17 @@ pub(crate) fn writes_guarded_since_with_clean(
         GuardHot::Guarded { guarded, hot } => (guarded, hot),
     };
     if guarded.is_empty() {
+        if since != 0 && all_shards_guarded_asked_le(first, last, since) {
+            let out = if hot.is_empty() {
+                Vec::new()
+            } else {
+                hot.into_iter().map(|p| (p, HOT_WRITE)).collect()
+            };
+            let now = JOURNAL_ASKED
+                .load(std::sync::atomic::Ordering::Acquire)
+                .max(since);
+            return Some((now, out, clean_epochs));
+        }
         let j = journal_read();
         if since != 0 && j.guarded_asked <= since {
             let out = if hot.is_empty() {
@@ -714,9 +744,9 @@ pub(crate) fn writes_guarded_since_with_clean(
         return Some((j.asked, out, clean_epochs));
     }
     let mut j = journal_write();
-    let prev_guarded = j.guarded_asked;
-    j.asked += 1;
-    let now = j.asked;
+    let shards_clean_before = since != 0
+        && (j.guarded_asked <= since || all_shards_guarded_asked_le(first, last, since));
+    let now = bump_journal_asked(&mut j, 1);
     j.guarded_asked = now;
     let mut prev_shard = usize::MAX;
     for &page in &guarded {
@@ -729,7 +759,7 @@ pub(crate) fn writes_guarded_since_with_clean(
     }
     let mut out: Vec<(usize, u64)> = if since >= now {
         Vec::new()
-    } else if since != 0 && prev_guarded <= since {
+    } else if shards_clean_before {
         debug_assert!(guarded.windows(2).all(|w| w[0] < w[1]));
         guarded.into_iter().map(|p| (p, now)).collect()
     } else {
@@ -783,6 +813,9 @@ impl Guards {
         let entry = self.recent_fault.entry(block).or_insert((frame, 0));
         if entry.0 == frame {
             entry.1 = entry.1.saturating_add(1);
+        } else if frame > entry.0 && frame <= entry.0.saturating_add(HOT_STREAK_GAP) {
+            entry.0 = frame;
+            entry.1 = entry.1.saturating_add(1);
         } else {
             *entry = (frame, 1);
         }
@@ -796,8 +829,6 @@ const SHARD_SHIFT: usize = 10;
 
 static GUARDS: [RwLock<Guards>; GUARD_SHARDS] =
     [const { RwLock::new(Guards::new()) }; GUARD_SHARDS];
-static WROTE_JOURNAL_ASKED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
 static SHARD_GUARDED_ASKED: [std::sync::atomic::AtomicU64; GUARD_SHARDS] =
     [const { std::sync::atomic::AtomicU64::new(1) }; GUARD_SHARDS];
 static SHARD_CLEAN_EPOCH: [std::sync::atomic::AtomicU64; GUARD_SHARDS] =
@@ -811,6 +842,28 @@ fn bump_shard_clean_epoch(shard: usize) {
 #[inline]
 fn shard_of(block: usize) -> usize {
     (block >> SHARD_SHIFT) & (GUARD_SHARDS - 1)
+}
+
+#[inline]
+fn all_shards_guarded_asked_le(first: usize, last: usize, since: u64) -> bool {
+    if first >= last {
+        return true;
+    }
+    let s_first = first >> SHARD_SHIFT;
+    let s_last = (last - 1) >> SHARD_SHIFT;
+    if s_last - s_first >= GUARD_SHARDS {
+        return SHARD_GUARDED_ASKED
+            .iter()
+            .all(|a| a.load(std::sync::atomic::Ordering::Acquire) <= since);
+    }
+    for s in s_first..=s_last {
+        if SHARD_GUARDED_ASKED[s & (GUARD_SHARDS - 1)].load(std::sync::atomic::Ordering::Acquire)
+            > since
+        {
+            return false;
+        }
+    }
+    true
 }
 
 #[inline]
@@ -829,57 +882,49 @@ pub(crate) fn single_shard_for_range(start: usize, end: usize) -> Option<usize> 
 }
 
 #[inline]
-fn shard_pair_for_range(start: usize, end: usize) -> Option<([usize; 2], usize)> {
+fn shards_for_range(start: usize, end: usize) -> Option<([usize; CLEAN_EPOCH_SHARDS], usize)> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     if first >= last {
-        return Some(([0, 0], 0));
+        return Some(([0; CLEAN_EPOCH_SHARDS], 0));
     }
     let s_first = first >> SHARD_SHIFT;
     let s_last = (last - 1) >> SHARD_SHIFT;
-    if s_last - s_first >= 2 {
+    let count = (s_last - s_first) + 1;
+    if count > CLEAN_EPOCH_SHARDS {
         return None;
     }
-    let s0 = s_first & (GUARD_SHARDS - 1);
-    if s_first == s_last {
-        Some(([s0, 0], 1))
-    } else {
-        let s1 = s_last & (GUARD_SHARDS - 1);
-        Some(([s0, s1], 2))
+    let mut shards = [0usize; CLEAN_EPOCH_SHARDS];
+    for (slot, s) in shards.iter_mut().take(count).enumerate() {
+        *s = (s_first + slot) & (GUARD_SHARDS - 1);
     }
+    Some((shards, count))
 }
 
 #[inline]
 pub(crate) fn guarded_clean_epochs_match(
     start: usize,
     end: usize,
-    epochs: [u64; 2],
+    epochs: [u64; CLEAN_EPOCH_SHARDS],
     since: u64,
 ) -> bool {
     use std::sync::atomic::Ordering::Acquire;
     if since == 0 || epochs[0] == 0 {
         return false;
     }
-    if WROTE_JOURNAL_ASKED.load(Acquire) > since {
-        return false;
-    }
-    let Some(([s0, s1], count)) = shard_pair_for_range(start, end) else {
+    let Some((shards, count)) = shards_for_range(start, end) else {
         return false;
     };
-    if count == 0 {
-        return true;
+    for slot in 0..count {
+        let ep = epochs[slot];
+        let s = shards[slot];
+        if ep == 0
+            || SHARD_CLEAN_EPOCH[s].load(Acquire) != ep
+            || SHARD_GUARDED_ASKED[s].load(Acquire) > since
+        {
+            return false;
+        }
     }
-    if SHARD_CLEAN_EPOCH[s0].load(Acquire) != epochs[0]
-        || SHARD_GUARDED_ASKED[s0].load(Acquire) > since
-    {
-        return false;
-    }
-    if count == 2 {
-        epochs[1] != 0
-            && SHARD_CLEAN_EPOCH[s1].load(Acquire) == epochs[1]
-            && SHARD_GUARDED_ASKED[s1].load(Acquire) <= since
-    } else {
-        true
-    }
+    true
 }
 
 #[inline]
@@ -887,7 +932,6 @@ pub(crate) fn guarded_single_shard_epoch_matches(shard: usize, epoch: u64, since
     use std::sync::atomic::Ordering::Acquire;
     since != 0
         && epoch != 0
-        && WROTE_JOURNAL_ASKED.load(Acquire) <= since
         && SHARD_CLEAN_EPOCH[shard].load(Acquire) == epoch
         && SHARD_GUARDED_ASKED[shard].load(Acquire) <= since
 }
@@ -943,7 +987,10 @@ fn guard_with_hot(start: usize, end: usize) -> Option<(Vec<usize>, Vec<usize>)> 
     }
 }
 
-fn guard_with_hot_fast(start: usize, end: usize) -> Option<(GuardHot, Option<[u64; 2]>)> {
+fn guard_with_hot_fast(
+    start: usize,
+    end: usize,
+) -> Option<(GuardHot, Option<[u64; CLEAN_EPOCH_SHARDS]>)> {
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ask = *ASK.get_or_init(|| std::env::var_os("OATHKEEP_GUARD_ASK").is_some_and(|v| v == "1"));
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -960,7 +1007,7 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<(GuardHot, Option<[u6
     let mut fast_hot_pairs: Vec<(usize, u64)> = Vec::new();
     let mut span_count = 0usize;
     let mut clean_ok = !ask;
-    let mut clean_epochs = [0u64; 2];
+    let mut clean_epochs = [0u64; CLEAN_EPOCH_SHARDS];
     if !ask {
         #[cfg(feature = "diagnostics")]
         let t_read = std::time::Instant::now();
@@ -970,7 +1017,7 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<(GuardHot, Option<[u6
         for_each_shard_span(first, last, |shard, a, b| {
             let slot = span_count;
             span_count += 1;
-            if slot >= 2 {
+            if slot >= CLEAN_EPOCH_SHARDS {
                 clean_ok = false;
             }
             let g = guards_read_shard(shard);
@@ -1055,7 +1102,7 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<(GuardHot, Option<[u6
                     );
                 }
             }
-            let epochs = (clean_ok && span_count <= 2).then_some(clean_epochs);
+            let epochs = (clean_ok && span_count <= CLEAN_EPOCH_SHARDS).then_some(clean_epochs);
             return Some((GuardHot::HotOnly(fast_hot_pairs), epochs));
         }
         if !known && !is_view(start, end) {
@@ -1129,7 +1176,7 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<(GuardHot, Option<[u6
             t_wlock.elapsed().as_micros() as u64,
         );
         if g.clean.contains_range(a, b) {
-            if clean_ok && slot < 2 {
+            if clean_ok && slot < CLEAN_EPOCH_SHARDS {
                 clean_epochs[slot] =
                     SHARD_CLEAN_EPOCH[shard].load(std::sync::atomic::Ordering::Acquire);
             }
@@ -1195,7 +1242,7 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<(GuardHot, Option<[u6
             }
         }
         if g.accounted.contains_range(a, b) {
-            if clean_ok && slot < 2 && g.clean.contains_range(a, b) {
+            if clean_ok && slot < CLEAN_EPOCH_SHARDS && g.clean.contains_range(a, b) {
                 clean_epochs[slot] =
                     SHARD_CLEAN_EPOCH[shard].load(std::sync::atomic::Ordering::Acquire);
             } else {
@@ -1225,7 +1272,7 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<(GuardHot, Option<[u6
                 }
             }
         }
-        if clean_ok && slot < 2 && g.clean.contains_range(a, b) {
+        if clean_ok && slot < CLEAN_EPOCH_SHARDS && g.clean.contains_range(a, b) {
             clean_epochs[slot] =
                 SHARD_CLEAN_EPOCH[shard].load(std::sync::atomic::Ordering::Acquire);
         } else {
@@ -1272,7 +1319,7 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<(GuardHot, Option<[u6
             t_alias.elapsed().as_micros() as u64,
         );
     }
-    let epochs = (clean_ok && span_count <= 2).then_some(clean_epochs);
+    let epochs = (clean_ok && span_count <= CLEAN_EPOCH_SHARDS).then_some(clean_epochs);
     if written.is_empty() {
         Some((
             GuardHot::HotOnly(hot_pages.into_iter().map(|p| (p, HOT_WRITE)).collect()),
@@ -3311,7 +3358,7 @@ mod mapping_tests {
         // `j.guarded_asked`: `writes_guarded_since` must still fast-path and return only hot `b0`.
         let bumped_since = {
             let mut j = journal_write();
-            j.asked += 5;
+            super::bump_journal_asked(&mut j, 5);
             since
         };
         let (now, pages) = writes_guarded_since(start, end, bumped_since).unwrap();
@@ -3386,10 +3433,24 @@ mod mapping_tests {
         assert!(!guarded_clean_epochs_match(start, end, ep0, ts0));
 
         // Re-guarding returns fresh epochs and bumps this shard's guarded_asked.
-        let (ts1, w1, ep1) = writes_guarded_since_with_clean(start, end, ts0).unwrap();
+        let (mut ts1, w1, ep1) = writes_guarded_since_with_clean(start, end, ts0).unwrap();
         assert_eq!(w1.len(), 1);
-        let ep1 = ep1.expect("re-protected clean epochs");
+        let mut ep1 = ep1.expect("re-protected clean epochs");
         assert!(!guarded_clean_epochs_match(start, end, ep1, ts0));
+
+        // Ensure clean epochs settle if a parallel test touched this shard, then verify an
+        // unrelated shard's guarded_asked bump does NOT invalidate this shard's clean epochs.
+        for _ in 0..8 {
+            if guarded_clean_epochs_match(start, end, ep1, ts1) {
+                break;
+            }
+            let (ts_retry, _, ep_retry) = writes_guarded_since_with_clean(start, end, ts1).unwrap();
+            ts1 = ts_retry;
+            ep1 = ep_retry.expect("clean epochs on retry");
+        }
+        let other_shard = (shard + 3) & (super::GUARD_SHARDS - 1);
+        super::SHARD_GUARDED_ASKED[other_shard].fetch_max(ts1 + 1, Ordering::Release);
+        assert!(guarded_clean_epochs_match(start, end, ep1, ts1));
 
         // Remap bumps shard clean epoch again.
         let before_remap = super::SHARD_CLEAN_EPOCH[shard].load(Ordering::Acquire);

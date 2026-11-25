@@ -671,6 +671,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        if !srv && shadow.ever_written() {
+            list.uav_barrier_if_dirty();
+        }
         return Some(gpu);
     }
     if shadow.is_gpu_active(list, address, len) {
@@ -3019,15 +3022,25 @@ impl State {
                     let u = &used[idx];
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if u.kind == ResourceType::Cbv {
-                        if direct_cbv()
-                            && let Some(View::Constant(address, size)) =
-                                crate::descriptor::view(handle)
-                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                        if let Some(View::Constant(address, size)) = crate::descriptor::view(handle)
                         {
-                            let gpu = shadow.gpu(address);
-                            let aligned = size.next_multiple_of(256);
-                            if gpu % 256 == 0 && shadow.left(address) >= u64::from(aligned) {
-                                shadow.refresh(list, address, u64::from(size));
+                            let size_u64 = u64::from(size);
+                            let existing = crate::shadow::find_existing(address, size_u64);
+                            let gpu_active = existing
+                                .as_ref()
+                                .is_some_and(|s| s.is_gpu_active(list, address, size_u64));
+                            if (direct_cbv() || gpu_active)
+                                && let Some(shadow) =
+                                    existing.or_else(|| crate::shadow::find(address, size_u64))
+                            {
+                                let gpu = shadow.gpu(address);
+                                let aligned = size.next_multiple_of(256);
+                                if gpu % 256 == 0 && shadow.left(address) >= u64::from(aligned) {
+                                    shadow.refresh(list, address, size_u64);
+                                    if gpu_active {
+                                        list.uav_barrier_if_dirty();
+                                    }
+                                }
                             }
                         }
                         continue;
@@ -3058,7 +3071,7 @@ impl State {
                 self.scratch_made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            let mut cacheable = true;
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -3098,6 +3111,7 @@ impl State {
                                     size_u64,
                                     256,
                                 ) {
+                                    cacheable = false;
                                     host.constant_at_kept(index, scratch_gpu, size, scratch);
                                     continue;
                                 }
@@ -3137,6 +3151,9 @@ impl State {
                         }
                     }
                 }
+            }
+            if cacheable {
+                self.fresh_tables.insert(key, first);
             }
             self.scratch_made.push((slot, first * 32));
         }

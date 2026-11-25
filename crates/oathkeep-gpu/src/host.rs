@@ -2382,14 +2382,6 @@ fn flying() -> bool {
     line.settling || line.pending_copies > 0 || line.line.iter().any(|l| matches!(l, Late::Run(_)))
 }
 
-pub(crate) fn written_in_flight(address: usize, len: usize) -> bool {
-    if len == 0 {
-        return false;
-    }
-    let line = line();
-    !line.written.is_empty() && touches(&line.written, address, address.saturating_add(len))
-}
-
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     let written = {
         let line = line();
@@ -6921,14 +6913,6 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
-    }
-
-    pub(crate) fn touches_gpu_write(&self, address: usize, len: usize) -> bool {
-        let end = address.saturating_add(len);
-        self.deferred().copies.iter().any(|step| match step {
-            Step::GpuWrite(_, at, n) => *at < end && at.saturating_add(*n) > address,
-            _ => false,
-        })
     }
 
     pub(crate) fn defer_read_back(
