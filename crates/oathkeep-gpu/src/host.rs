@@ -2189,6 +2189,20 @@ mod relay_tests {
         assert_eq!(total_by_shadow, [25, 40]);
         assert!(plan_upload_chunks::<usize>(&[], 16).is_empty());
     }
+
+    #[test]
+    fn copy_wait_slots_and_split_overlapping_spans_behave_as_expected() {
+        use super::{COPY_WAIT_SLOTS, split_overlapping_spans};
+        assert!(COPY_WAIT_SLOTS >= 8);
+        let mut spans = vec![(0x1000, 0x2000), (0x4000, 0x5000)];
+        // Disjoint write does not disturb spans.
+        assert!(split_overlapping_spans(&mut spans, 0x2000, 0x4000).is_empty());
+        assert_eq!(spans, vec![(0x1000, 0x2000), (0x4000, 0x5000)]);
+        // Overlapping write splits cleanly.
+        let hit = split_overlapping_spans(&mut spans, 0x1800, 0x4800);
+        assert_eq!(hit, vec![(0x1800, 0x2000), (0x4000, 0x4800)]);
+        assert_eq!(spans, vec![(0x1000, 0x1800), (0x4800, 0x5000)]);
+    }
 }
 
 fn late_most() -> usize {
@@ -2237,6 +2251,7 @@ struct Line {
     line: Vec<Late>,
     written: Vec<(usize, usize)>,
     pending_written: Vec<(usize, usize)>,
+    pending_writes: Vec<(usize, crate::queue::Written, usize)>,
     pending_copies: usize,
     lists: usize,
     target: u64,
@@ -2255,6 +2270,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
     written: Vec::new(),
     pending_written: Vec::new(),
+    pending_writes: Vec::new(),
     pending_copies: 0,
     lists: 0,
     target: 0,
@@ -2441,6 +2457,7 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
             .in_hand
             .iter()
             .map(|(at, what, n)| (at, what, n))
+            .chain(line.pending_writes.iter().map(|(at, what, n)| (at, what, n)))
             .chain(line.line.iter().filter_map(|item| match item {
                 Late::Write(at, what, n) => Some((at, what, n)),
                 _ => None,
@@ -2585,7 +2602,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
 }
 
-const COPY_WAIT_SLOTS: usize = 3;
+const COPY_WAIT_SLOTS: usize = 8;
 
 struct PendingCopyFetch {
     copy_sent: u64,
@@ -2597,6 +2614,7 @@ struct PendingCopyFetch {
     min_after: u64,
     written_ranges: Vec<(usize, usize)>,
     deferred_done: Vec<Declared>,
+    deferred_sync: Vec<Late>,
 }
 
 struct CopyWaitSlot {
@@ -2642,6 +2660,20 @@ impl RelayFetch {
         let mut merged = Vec::new();
         join_ranges(&mut merged, ranges);
         merged
+    }
+
+    fn pending_deferred_writes(&self) -> Vec<(usize, crate::queue::Written, usize)> {
+        let mut writes = Vec::new();
+        for &idx in &self.pending_order {
+            if let Some(p) = &self.copy_wait_slots[idx].pending {
+                for item in &p.deferred_sync {
+                    if let Late::Write(at, what, bytes) = item {
+                        writes.push((*at, *what, *bytes));
+                    }
+                }
+            }
+        }
+        writes
     }
 
     fn safe_fetched_seq(&self) -> u64 {
@@ -4112,10 +4144,12 @@ impl Host {
     fn sync_line_pending(f: &RelayFetch, notify: bool) {
         let pending_copies = f.pending_order.len();
         let pending_written = f.pending_written_ranges();
+        let pending_writes = f.pending_deferred_writes();
         {
             let mut line = line();
             line.pending_copies = pending_copies;
             line.pending_written = pending_written;
+            line.pending_writes = pending_writes;
             rebuild_line_written(&mut line);
         }
         if notify {
@@ -4185,6 +4219,15 @@ impl Host {
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         for (shadow, ranges) in pending.deferred_done {
             shadow.copy_back_done(&ranges);
+        }
+        for item in pending.deferred_sync {
+            match item {
+                Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                Late::Signal(fence, value) => {
+                    crate::fence::set(fence as crate::object::This, value)
+                }
+                Late::Run(_) => {}
+            }
         }
         true
     }
@@ -4450,44 +4493,52 @@ impl Host {
             by_piece.into_iter().collect();
         sorted_pieces.sort_unstable_by_key(|&((ptr, piece_idx), _)| (ptr, piece_idx));
 
-        // SAFETY: plain fence query.
-        let completed_3d = unsafe { self.fence.GetCompletedValue() };
+        // Filter pieces outside `queue_sync()` so `VirtualQuery` and `card.dirty`/`sent`
+        // locks never stall 3D queue submissions; then lock `queue_sync()` briefly with a
+        // fresh `completed_3d` only to partition into `fast_now` vs `fast_wait`.
         let skip_uncommitted = relay_skip_uncommitted();
         let mut readable_cache = ReadableCache::default();
         let mut skipped_pieces = 0u64;
         let mut skipped_bytes = 0u64;
+        let mut live_pieces: Vec<(usize, Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        for ((ptr, _), (shadow, mut intervals)) in sorted_pieces {
+            merge_piece_intervals(&mut intervals);
+            let s_start = shadow.span().0 as usize;
+            for (lo, hi) in intervals {
+                let len = hi - lo;
+                if !shadow.card_has_old_piece(lo, len)
+                    || shadow.card_piece_is_superseded(lo, hi, landed_seq)
+                    || (skip_uncommitted && !readable_cache.any_readable(s_start + lo, len))
+                {
+                    skipped_pieces += 1;
+                    skipped_bytes += len as u64;
+                    continue;
+                }
+                live_pieces.push((ptr, shadow.clone(), lo, hi));
+            }
+        }
         let mut fast_now: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
         let mut fast_wait: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
         let mut slow: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        {
-            let guard = queue_sync();
-            for ((ptr, _), (shadow, mut intervals)) in sorted_pieces {
-                merge_piece_intervals(&mut intervals);
-                let s_start = shadow.span().0 as usize;
-                let target = if can_copy_queue {
+        if !live_pieces.is_empty() {
+            if can_copy_queue {
+                // SAFETY: plain fence query.
+                let completed_3d = unsafe { self.fence.GetCompletedValue() };
+                let guard = queue_sync();
+                for (ptr, shadow, lo, hi) in live_pieces {
                     let busy = busy_shadows.contains(&ptr)
                         || guard
                             .as_ref()
                             .is_some_and(|sync| sync.is_shadow_busy(ptr, completed_3d));
                     if busy && can_split_copy {
-                        &mut fast_wait
+                        fast_wait.push((shadow, lo, hi, 0));
                     } else {
-                        &mut fast_now
+                        fast_now.push((shadow, lo, hi, 0));
                     }
-                } else {
-                    &mut slow
-                };
-                for (lo, hi) in intervals {
-                    let len = hi - lo;
-                    if !shadow.card_has_old_piece(lo, len)
-                        || shadow.card_piece_is_superseded(lo, hi, landed_seq)
-                        || (skip_uncommitted && !readable_cache.any_readable(s_start + lo, len))
-                    {
-                        skipped_pieces += 1;
-                        skipped_bytes += len as u64;
-                        continue;
-                    }
-                    target.push((shadow.clone(), lo, hi, 0));
+                }
+            } else {
+                for (_, shadow, lo, hi) in live_pieces {
+                    slow.push((shadow, lo, hi, 0));
                 }
             }
         }
@@ -4720,6 +4771,7 @@ impl Host {
                 min_after,
                 written_ranges,
                 deferred_done: Vec::new(),
+                deferred_sync: Vec::new(),
             });
             f.pending_order.push_back(slot_idx);
             RELAY_STATS[11].fetch_add(1, Ordering::Relaxed);
@@ -4867,10 +4919,13 @@ impl Host {
         has_waiters: bool,
     ) {
         let landing = std::time::Instant::now();
-        let has_sync_items = items
-            .iter()
-            .any(|l| matches!(l, Late::Write(..) | Late::Signal(..)));
-        let must_drain = has_waiters || has_sync_items;
+        // Only force synchronous draining of in-flight deferred copy fetches when a thread
+        // is actively waiting (`settle_for_present`, `settle_for_fence`, `wait_for_value`).
+        // Otherwise, attach `Late::Write`/`Late::Signal` to the newest pending copy slot so
+        // strict GPU-writeback-before-signal visibility is preserved without stalling the
+        // relay thread on a later 3D flight.
+        let must_drain = has_waiters;
+        let had_flights;
         {
             let flights: Vec<&Flight> = items
                 .iter()
@@ -4879,7 +4934,8 @@ impl Host {
                     _ => None,
                 })
                 .collect();
-            if !flights.is_empty() {
+            had_flights = !flights.is_empty();
+            if had_flights {
                 // SAFETY: a plain query.
                 if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
                     let runs: Vec<&HostList> = flights
@@ -4948,12 +5004,16 @@ impl Host {
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
-        // Guarantee all deferred copy fetches are merged into title memory before any
-        // fence signal or bottom-of-pipe write becomes visible to title threads.
-        if has_sync_items && let Some(f) = fetch.as_mut() && f.has_pending() {
+        if let Some(f) = fetch.as_mut()
+            && f.has_pending()
+            && (must_drain || !had_flights)
+        {
             let n = f.pending_order.len();
-            self.drain_pending_slots(f, n, true, false);
+            self.drain_pending_slots(f, n, must_drain, false);
         }
+        let defer_sync_slot = fetch
+            .as_ref()
+            .and_then(|f| f.pending_order.back().copied());
         let mut last = 0;
         let mut landed = Vec::new();
         for item in items {
@@ -4968,9 +5028,21 @@ impl Host {
                     }
                     landed.push((flight.lists, flight.order));
                 }
-                Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                Late::Signal(fence, value) => {
-                    crate::fence::set(fence as crate::object::This, value)
+                sync_item @ (Late::Write(..) | Late::Signal(..)) => {
+                    if let Some(slot_idx) = defer_sync_slot
+                        && let Some(f) = fetch.as_mut()
+                        && let Some(pending) = f.copy_wait_slots[slot_idx].pending.as_mut()
+                    {
+                        pending.deferred_sync.push(sync_item);
+                    } else {
+                        match sync_item {
+                            Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                            Late::Signal(fence, value) => {
+                                crate::fence::set(fence as crate::object::This, value)
+                            }
+                            Late::Run(_) => {}
+                        }
+                    }
                 }
             }
         }
@@ -4980,15 +5052,21 @@ impl Host {
         }
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
-        let (pending_copies, pending_written) = fetch.as_ref().map_or((0, Vec::new()), |f| {
-            (f.pending_order.len(), f.pending_written_ranges())
-        });
+        let (pending_copies, pending_written, pending_writes) =
+            fetch.as_ref().map_or((0, Vec::new(), Vec::new()), |f| {
+                (
+                    f.pending_order.len(),
+                    f.pending_written_ranges(),
+                    f.pending_deferred_writes(),
+                )
+            });
         {
             let mut line = line();
             line.landed.extend(landed);
             line.in_hand.clear();
             line.pending_copies = pending_copies;
             line.pending_written = pending_written;
+            line.pending_writes = pending_writes;
             rebuild_line_written(&mut line);
             line.settling = false;
             line.poke = true;
@@ -6877,39 +6955,62 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        let mut total_copied = 0u64;
+        let mut copy_us = 0u64;
+        #[cfg(feature = "diagnostics")]
+        let mut copy_count = 0u64;
+        #[cfg(feature = "diagnostics")]
+        let mut refresh_count = 0u64;
+        #[cfg(feature = "diagnostics")]
+        let mut refresh_bytes = 0u64;
+        let mut remapped_spans: Vec<(usize, usize)> = Vec::new();
+        let mut copy_run_start: Option<std::time::Instant> = None;
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
-            let copied = match step {
+            match step {
                 &Step::Copy(dst, src, len) => {
+                    copy_run_start.get_or_insert_with(std::time::Instant::now);
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
+                        copy_count += 1;
                     }
                     batch.title_written_range(dst, len);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    copy_mapped_deferred(dst as *mut u8, src as *const u8, len);
                     crate::watch::wrote_after_writing(dst, len);
-                    len
+                    if len > 0 {
+                        let end = dst.saturating_add(len);
+                        match remapped_spans.last_mut() {
+                            Some(last) if last.1 == dst => last.1 = end,
+                            _ => remapped_spans.push((dst, end)),
+                        }
+                    }
+                    total_copied += len as u64;
                 }
                 &Step::Fill(dst, src, len) => {
+                    copy_run_start.get_or_insert_with(std::time::Instant::now);
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
+                        copy_count += 1;
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
+                    total_copied += len as u64;
                 }
                 Step::Refresh(shadow, address, len) => {
+                    if let Some(t) = copy_run_start.take() {
+                        copy_us += t.elapsed().as_micros() as u64;
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Refreshes, 1);
-                        add(C::RefreshBytes, *len as u64);
+                        refresh_count += 1;
+                        refresh_bytes += *len as u64;
                     }
                     batch.add(shadow, *address, *len);
-                    continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
+                    if let Some(t) = copy_run_start.take() {
+                        copy_us += t.elapsed().as_micros() as u64;
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
@@ -6922,9 +7023,11 @@ impl HostList {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
-                    continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
+                    if let Some(t) = copy_run_start.take() {
+                        copy_us += t.elapsed().as_micros() as u64;
+                    }
                     batch.flush_one_range(shadow, *address, address.saturating_add(*len));
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
@@ -6934,22 +7037,46 @@ impl HostList {
                         add(C::GpuWrites, 1);
                         add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
                     }
-                    continue;
                 }
                 Step::Texture(staging) => {
+                    if let Some(t) = copy_run_start.take() {
+                        copy_us += t.elapsed().as_micros() as u64;
+                    }
                     let (start, len) = staging.memory();
                     if batch.texture_due_range(staging, start, len) {
                         batch.push_pending_texture(staging.clone(), start, len);
                     }
-                    continue;
                 }
                 Step::AfterTextures(work) => {
+                    if let Some(t) = copy_run_start.take() {
+                        copy_us += t.elapsed().as_micros() as u64;
+                    }
                     batch.after_textures.push(work.clone());
-                    continue;
                 }
-            };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
+        }
+        if let Some(t) = copy_run_start.take() {
+            copy_us += t.elapsed().as_micros() as u64;
+        }
+        if !remapped_spans.is_empty() {
+            crate::descriptor::host::remapped_batch(&remapped_spans);
+        }
+        if copy_us > 0 {
+            PREPARING[0].fetch_add(copy_us, Ordering::Relaxed);
+        }
+        if total_copied > 0 {
+            PREPARING[1].fetch_add(total_copied, Ordering::Relaxed);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            if copy_count > 0 {
+                add(C::Copies, copy_count);
+                add(C::CopyBytes, total_copied);
+            }
+            if refresh_count > 0 {
+                add(C::Refreshes, refresh_count);
+                add(C::RefreshBytes, refresh_bytes);
+            }
         }
     }
 }
@@ -6968,7 +7095,7 @@ struct Batch {
     textures: std::collections::HashMap<usize, (usize, usize)>,
     textures_min: usize,
     textures_max: usize,
-    pending_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
+    pending_textures: Vec<(usize, usize, std::sync::Arc<crate::texture::Staging>)>,
     pending_tex_min: usize,
     pending_tex_max: usize,
     after_textures: Vec<std::sync::Arc<dyn Fn() + Send + Sync>>,
@@ -7102,7 +7229,7 @@ impl Batch {
             self.pending_tex_min = self.pending_tex_min.min(start);
             self.pending_tex_max = self.pending_tex_max.max(end);
         }
-        self.pending_textures.push(staging);
+        self.pending_textures.push((start, end, staging));
     }
 
     fn title_written(&mut self) {
@@ -7121,6 +7248,13 @@ impl Batch {
             let mut overlapping_shadows = Vec::new();
             let mut i = 0;
             while i < self.refreshes.len() {
+                let spans = &self.refreshes[i].1;
+                if let (Some(&(lo, _)), Some(&(_, hi))) = (spans.first(), spans.last())
+                    && (lo >= end || hi <= dst)
+                {
+                    i += 1;
+                    continue;
+                }
                 let overlapping = split_overlapping_spans(&mut self.refreshes[i].1, dst, end);
                 if !overlapping.is_empty() {
                     if self.refreshes[i].1.is_empty() {
@@ -7157,10 +7291,9 @@ impl Batch {
             let mut overlapping_textures = Vec::new();
             let mut i = 0;
             while i < self.pending_textures.len() {
-                let (t_start, t_len) = self.pending_textures[i].memory();
-                let t_end = t_start.saturating_add(t_len);
+                let (t_start, t_end, _) = self.pending_textures[i];
                 if t_start < end && t_end > dst {
-                    overlapping_textures.push(self.pending_textures.swap_remove(i));
+                    overlapping_textures.push(self.pending_textures.swap_remove(i).2);
                 } else {
                     i += 1;
                 }
@@ -7195,7 +7328,7 @@ impl Batch {
             .filter(|r| !r.0.unwatched() && !r.0.guarded())
             .flat_map(|r| r.1.iter().copied())
             .collect();
-        for staging in &self.pending_textures {
+        for (_, _, staging) in &self.pending_textures {
             if let Some(range) = staging.watch_range() {
                 ranges.push(range);
             }
@@ -7244,7 +7377,9 @@ impl Batch {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .pending_textures
                     .drain(..)
-                    .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+                    .map(|(_, _, staging)| {
+                        Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>
+                    })
                     .collect();
                 crate::shadow::wide_run(jobs);
                 let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
@@ -7253,7 +7388,7 @@ impl Batch {
                     Ordering::Relaxed,
                 );
             } else {
-                for staging in self.pending_textures.drain(..) {
+                for (_, _, staging) in self.pending_textures.drain(..) {
                     staging.refresh();
                 }
             }
@@ -7265,6 +7400,62 @@ impl Batch {
             crate::watch::ask_ahead_done();
         }
     }
+}
+
+/// Fast path for `Step::Copy` in `run_deferred`: records write range and opens page guards
+/// without locking `COMMIT_TITLE_MEMORY` or `descriptor::host::REMAPPED` up front; commits
+/// title memory lazily only if `read_partial` faults on an uncommitted page.
+fn copy_mapped_deferred(dst: *mut u8, src: *const u8, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    match crate::copystat::mode() {
+        1 => {
+            // SAFETY: timing only: the caller vouches for the source.
+            unsafe { std::ptr::copy(src, dst, len) };
+            return;
+        }
+        2 => return,
+        _ => {}
+    }
+    if len == 0 {
+        return;
+    }
+    static ASK: OnceLock<bool> = OnceLock::new();
+    let ask_first =
+        *ASK.get_or_init(|| std::env::var_os("OATHKEEP_COPY_ASK").is_some_and(|v| v == "1"));
+    if ask_first && !crate::texture::committed(dst, len) {
+        return;
+    }
+    crate::watch::writing_copy(dst as usize, len);
+    #[cfg(feature = "diagnostics")]
+    let moved = std::time::Instant::now();
+    let mut done = read_partial(src, dst, len);
+    if done < len {
+        // Lazily demand-commit the remaining destination range and retry once.
+        crate::watch::commit_title_memory((dst as usize).saturating_add(done), len - done);
+        done += read_partial(src.wrapping_add(done), dst.wrapping_add(done), len - done);
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::MoveUs,
+        moved.elapsed().as_micros() as u64,
+    );
+    if done == len {
+        return;
+    }
+    if !ask_first && !crate::texture::committed(dst, len) {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+    #[cfg(feature = "diagnostics")]
+    let sparse = std::time::Instant::now();
+    let (src, dst, len) = (src.wrapping_add(done), dst.wrapping_add(done), len - done);
+    read_pieces(src, dst, len);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::SparseUs,
+        sparse.elapsed().as_micros() as u64,
+    );
 }
 
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {

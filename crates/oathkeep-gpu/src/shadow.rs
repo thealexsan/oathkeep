@@ -491,6 +491,13 @@ impl HotPageQuiet {
         self.last_quiet_frame = 0;
     }
 
+    #[inline]
+    fn mark_changed(&mut self, frame: u64) {
+        self.last_changed = frame.saturating_add(1);
+        self.quiet_frames = 0;
+        self.last_quiet_frame = 0;
+    }
+
     /// Updates quiet-page state for one 64 KiB page on `frame`.
     /// Returns `true` when the page has been unchanged across `cool_after << cool_count`
     /// distinct frames and should be cooled (removed from `watch` hot set).
@@ -4789,7 +4796,7 @@ impl Shadow {
             return 0;
         }
         card.clear_hot_hashes(at, at + n);
-        crate::watch::writing(start + at, n);
+        crate::watch::writing_gpu_back(start + at, n);
         merge_race(
             as_read.as_deref(),
             (self.start, self.len),
@@ -4942,11 +4949,27 @@ impl Shadow {
                         }
                     }
                 }
+                if !guard.quiet.is_empty() {
+                    let frame = crate::frame::current();
+                    let base = start / PAGE;
+                    for &(a, b) in &spans {
+                        let q_lo = ((start + a) / PAGE)
+                            .saturating_sub(base)
+                            .min(guard.quiet.len());
+                        let q_hi = (start + b)
+                            .div_ceil(PAGE)
+                            .saturating_sub(base)
+                            .min(guard.quiet.len());
+                        for q in &mut guard.quiet[q_lo..q_hi] {
+                            q.mark_changed(frame);
+                        }
+                    }
+                }
                 card.has_hot_hashes.store(true, Ordering::Release);
             }
         }
         for (a, b) in coalesce_watch_spans(start, &spans) {
-            crate::watch::writing(start + a, b - a);
+            crate::watch::writing_gpu_back(start + a, b - a);
         }
 
         let copy_span = (self.start, self.len);
@@ -5288,9 +5311,11 @@ fn merge_relay_chunk(
                 continue;
             }
             let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
-            scratch.clear();
-            scratch.resize(n, 0);
-            let mapped = crate::host::read_into((start + diff_at) as *const u8, &mut scratch);
+            if scratch.len() < n {
+                scratch.resize(n, 0);
+            }
+            let scratch_slice = &mut scratch[..n];
+            let mapped = crate::host::read_into((start + diff_at) as *const u8, scratch_slice);
             if !mapped {
                 for &(a, b) in &active {
                     let (a, b) = (a - diff_at, b - diff_at);
@@ -5299,15 +5324,18 @@ fn merge_relay_chunk(
                 stats.add(RELAY_OUT_UNMAPPED, gpu_len as u64);
                 continue;
             }
-            let as_read = record_race.then(|| scratch.clone());
+            let as_read = record_race.then(|| scratch_slice.to_vec());
             let full_active = active.len() == 1 && active[0] == (diff_at, diff_at + n);
-            if full_active && scratch[..] == held[..] {
+            if full_active && scratch_slice[..] == held[..] {
                 held.copy_from_slice(gpu);
                 stats.add(RELAY_OUT_WRITTEN, n as u64);
+                // Point to `held` (cached system RAM inside `old_map`, locked for the
+                // entire `card_merge_relay_batch` and disjoint across items) instead of
+                // re-reading `gpu` from the `D3D12_HEAP_TYPE_READBACK` mapping.
                 writes.push(RelayPendingWrite {
                     at: diff_at,
                     len: n,
-                    src: RelayWriteSrc::Gpu(gpu.as_ptr() as usize),
+                    src: RelayWriteSrc::Gpu(held.as_ptr() as usize),
                     as_read,
                 });
                 let diff_end = diff_at + n;
@@ -5319,8 +5347,9 @@ fn merge_relay_chunk(
                 if first_full < last_full {
                     let mut b_at = first_full;
                     while b_at < last_full {
-                        let h = hot_page_hash(&gpu[b_at - diff_at..b_at - diff_at + HOT_HASH_BLOCK])
-                            | 1;
+                        let h =
+                            hot_page_hash(&held[b_at - diff_at..b_at - diff_at + HOT_HASH_BLOCK])
+                                | 1;
                         hash_updates.push((b_at / HOT_HASH_BLOCK, h));
                         b_at += HOT_HASH_BLOCK;
                     }
@@ -5333,7 +5362,7 @@ fn merge_relay_chunk(
             let mut changed = false;
             for &(a, b) in &active {
                 let (a, b) = (a - diff_at, b - diff_at);
-                changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut scratch[a..b]);
+                changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut scratch_slice[a..b]);
             }
             if !changed {
                 stats.add(RELAY_OUT_ALREADY_EQUAL, gpu_len as u64);
@@ -5341,7 +5370,7 @@ fn merge_relay_chunk(
             }
             stats.add(RELAY_OUT_WRITTEN, n as u64);
             let arena_off = arena.len();
-            arena.extend_from_slice(&scratch);
+            arena.extend_from_slice(scratch_slice);
             writes.push(RelayPendingWrite {
                 at: diff_at,
                 len: n,

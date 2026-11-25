@@ -18,7 +18,7 @@ pub(crate) struct HostHeap {
     sampler: bool,
     made_keys: Vec<std::sync::atomic::AtomicU64>,
     made_locks: Box<[Mutex<std::collections::HashMap<u32, u64>>; MADE_LOCK_STRIPES]>,
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    kept: Box<[Mutex<Vec<Option<ID3D12Resource>>>; MADE_LOCK_STRIPES]>,
     has_kept: Vec<std::sync::atomic::AtomicU64>,
     is_buffer: Vec<std::sync::atomic::AtomicU64>,
     in_texture_queue: Vec<std::sync::atomic::AtomicU64>,
@@ -585,6 +585,36 @@ pub(crate) fn remapped(at: usize, len: usize) {
         ranges.clear();
     }
     ranges.push((start, end));
+}
+
+pub(crate) fn remapped_batch(spans: &[(usize, usize)]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const MOST: usize = 1 << 15;
+    if spans.is_empty() {
+        return;
+    }
+    let lo = SPANNED[0].load(Relaxed);
+    let hi = SPANNED[1].load(Relaxed);
+    let mut ranges = None;
+    for &(at, end) in spans {
+        let (start, end) = (at as u64, end as u64);
+        if end <= lo || start >= hi {
+            continue;
+        }
+        let guard = ranges.get_or_insert_with(|| REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        STALE[1].fetch_add(1, Relaxed);
+        if let Some(last) = guard.last_mut()
+            && last.1 == start
+        {
+            last.1 = end;
+            continue;
+        }
+        if guard.len() >= MOST {
+            STALE[2].fetch_add(guard.len() as u64, Relaxed);
+            guard.clear();
+        }
+        guard.push((start, end));
+    }
 }
 
 const TABLED_FRAMES: u64 = 240;
@@ -1367,7 +1397,17 @@ impl HostHeap {
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
             made_locks: Box::new(std::array::from_fn(|_| Mutex::default())),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: {
+                let total_slots = (count + extra) as usize;
+                Box::new(std::array::from_fn(|stripe| {
+                    let stripe_len = if total_slots > stripe {
+                        (total_slots - stripe).div_ceil(MADE_LOCK_STRIPES)
+                    } else {
+                        0
+                    };
+                    Mutex::new(vec![None; stripe_len])
+                }))
+            },
             has_kept: bit_words(count + extra),
             is_buffer: bit_words(if sampler { 0 } else { count }),
             in_texture_queue: bit_words(if sampler { 0 } else { count }),
@@ -1978,7 +2018,18 @@ impl HostHeap {
         std::mem::take(&mut *changed).into_iter().collect()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<u32> {
+        self.note_buffer_inner(index, view, seen, true)
+    }
+
+    fn note_buffer_inner(
+        &self,
+        index: u32,
+        view: Option<&View>,
+        seen: bool,
+        notify_changed: bool,
+    ) -> Vec<u32> {
         if self.sampler {
             return Vec::new();
         }
@@ -2064,19 +2115,22 @@ impl HostHeap {
                     .write_volatile(stride.unwrap_or(0))
             };
         }
+        let was_buffer = bit_get(&self.is_buffer, index);
         let was = if stride.is_some() {
-            bit_set(&self.is_buffer, index, true);
-            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-            buffers.insert(index);
+            if !was_buffer {
+                bit_set(&self.is_buffer, index, true);
+                let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+                buffers.insert(index);
+            }
             true
-        } else if bit_get(&self.is_buffer, index) {
+        } else if was_buffer {
             bit_set(&self.is_buffer, index, false);
             let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
             buffers.remove(&index)
         } else {
             false
         };
-        if was {
+        if was && notify_changed {
             self.changed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2104,14 +2158,41 @@ impl HostHeap {
             return;
         }
         let mut retired = Vec::new();
-        {
-            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(slots) = kept.get_mut(kept_start as usize..kept_end as usize) {
-                for (offset, slot) in slots.iter_mut().enumerate() {
-                    if let Some(old) = slot.take() {
-                        bit_set(&self.has_kept, kept_start + offset as u32, false);
+        let span_len = (kept_end - kept_start) as usize;
+        if span_len <= MADE_LOCK_STRIPES {
+            for idx in kept_start..kept_end {
+                if !bit_get(&self.has_kept, idx) {
+                    continue;
+                }
+                let stripe = idx as usize % MADE_LOCK_STRIPES;
+                let pos = idx as usize / MADE_LOCK_STRIPES;
+                let mut kept = self.kept[stripe].lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(slot) = kept.get_mut(pos)
+                    && let Some(old) = slot.take()
+                {
+                    bit_set(&self.has_kept, idx, false);
+                    retired.push(old);
+                }
+            }
+        } else {
+            for stripe in 0..MADE_LOCK_STRIPES {
+                let rem = kept_start as usize % MADE_LOCK_STRIPES;
+                let delta = (stripe + MADE_LOCK_STRIPES - rem) % MADE_LOCK_STRIPES;
+                let first_idx = kept_start as usize + delta;
+                if first_idx >= kept_end as usize {
+                    continue;
+                }
+                let mut kept = self.kept[stripe].lock().unwrap_or_else(|e| e.into_inner());
+                let mut idx = first_idx;
+                while idx < kept_end as usize {
+                    if bit_get(&self.has_kept, idx as u32)
+                        && let Some(slot) = kept.get_mut(idx / MADE_LOCK_STRIPES)
+                        && let Some(old) = slot.take()
+                    {
+                        bit_set(&self.has_kept, idx as u32, false);
                         retired.push(old);
                     }
+                    idx += MADE_LOCK_STRIPES;
                 }
             }
         }
@@ -2142,10 +2223,12 @@ impl HostHeap {
         if !present && !bit_get(&self.has_kept, index) {
             return;
         }
+        let stripe = index as usize % MADE_LOCK_STRIPES;
+        let pos = index as usize / MADE_LOCK_STRIPES;
         let mut unchanged = None;
         let old = {
-            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(slot) = kept.get_mut(index as usize) {
+            let mut kept = self.kept[stripe].lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = kept.get_mut(pos) {
                 if let (Some(cur), Some(new)) = (slot.as_ref(), resource.as_ref())
                     && windows::core::Interface::as_raw(cur)
                         == windows::core::Interface::as_raw(new)
@@ -2315,6 +2398,7 @@ impl HostHeap {
         index: u32,
         handle: u64,
         for_draw: bool,
+        notify_changed: bool,
     ) -> Option<(
         View,
         Option<std::sync::Arc<crate::shadow::Shadow>>,
@@ -2360,9 +2444,9 @@ impl HostHeap {
                 if cur != 0 {
                     self.made_keys[index as usize].store(0, std::sync::atomic::Ordering::Release);
                     self.make_null(index);
-                    let _ = self.note_buffer(index, None, false);
+                    let _ = self.note_buffer_inner(index, None, false, notify_changed);
                 } else if for_draw {
-                    let _ = self.note_buffer(index, None, false);
+                    let _ = self.note_buffer_inner(index, None, false, notify_changed);
                 }
                 return None;
             };
@@ -2377,7 +2461,7 @@ impl HostHeap {
                 let already_deferred_buffer =
                     for_draw && view.is_buffer() && deferred.remove(&index) == Some(key);
                 if !already_deferred_buffer {
-                    stale = self.note_buffer(index, Some(&view), for_draw);
+                    stale = self.note_buffer_inner(index, Some(&view), for_draw, notify_changed);
                 }
                 let waiting = if for_draw {
                     None
@@ -2439,7 +2523,7 @@ impl HostHeap {
     }
 
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
-        self.mirror_inner(index, handle, for_draw)
+        self.mirror_inner(index, handle, for_draw, true)
             .map(|(view, ..)| view)
     }
 
@@ -2467,7 +2551,11 @@ impl HostHeap {
     }
 
     pub(crate) fn mirror_buffer(&self, index: u32, handle: u64) -> Option<MirroredBuffer> {
-        let (view, made_shadow, _, kept_raw, freshly_made) = self.mirror_inner(index, handle, true)?;
+        // Called from `heap_buffers`, which immediately updates its own `BufferSpanCache`
+        // for `index`, so pass `notify_changed = false` to avoid locking `self.changed`
+        // and self-requeueing `index` for the next frame.
+        let (view, made_shadow, _, kept_raw, freshly_made) =
+            self.mirror_inner(index, handle, true, false)?;
         let copy = buffer_copy_with_hint(&view, made_shadow);
         #[cfg(feature = "diagnostics")]
         let shows = copy.as_ref().and_then(|(shadow, _, _)| {
@@ -2487,7 +2575,8 @@ impl HostHeap {
     }
 
     pub(crate) fn mirror_texture(&self, index: u32, handle: u64) -> Option<(View, Option<View>)> {
-        let (view, _, made_placed, _, freshly_made) = self.mirror_inner(index, handle, true)?;
+        let (view, _, made_placed, _, freshly_made) =
+            self.mirror_inner(index, handle, true, true)?;
         let placed = if freshly_made {
             made_placed
         } else {
@@ -2498,8 +2587,10 @@ impl HostHeap {
 
     #[cfg(feature = "diagnostics")]
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        let shown = kept.get(index as usize)?.as_ref()?;
+        let stripe = index as usize % MADE_LOCK_STRIPES;
+        let pos = index as usize / MADE_LOCK_STRIPES;
+        let kept = self.kept[stripe].lock().unwrap_or_else(|e| e.into_inner());
+        let shown = kept.get(pos)?.as_ref()?;
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
     }
 
@@ -4043,5 +4134,56 @@ mod tests {
         // Calling room brings the `Held` slot back due immediately.
         assert_eq!(heap.texture_slots_room(14), 1);
         assert_eq!(heap.texture_slots_due(14, 16).0.len(), 3);
+    }
+
+    #[test]
+    fn host_heap_sharded_kept_and_note_buffer_skip_self_requeue() {
+        let Some(heap) = HostHeap::new(false, 136) else {
+            return;
+        };
+        let Some(host) = host() else {
+            return;
+        };
+        let Some((buf_a, _)) = host.shared_buffer(256) else {
+            return;
+        };
+        let Some((buf_b, _)) = host.shared_buffer(256) else {
+            return;
+        };
+        // Store resources across multiple 64-slot stripes (0, 64, 128, and dynamic slots).
+        let dyn_start = heap.count;
+        heap.keep(0, Some(buf_a.clone()));
+        heap.keep(64, Some(buf_b.clone()));
+        heap.keep(128, Some(buf_a.clone()));
+        heap.keep(dyn_start + 1, Some(buf_a.clone()));
+        heap.keep(dyn_start + 65, Some(buf_b.clone()));
+        #[cfg(feature = "diagnostics")]
+        {
+            assert_eq!(heap.shows(0, &buf_a), Some(true));
+            assert_eq!(heap.shows(64, &buf_b), Some(true));
+            assert_eq!(heap.shows(128, &buf_a), Some(true));
+            assert_eq!(heap.shows(dyn_start + 65, &buf_b), Some(true));
+        }
+        // Releasing a dynamic range spanning > 64 slots clears all stripes cleanly.
+        heap.release(dyn_start, 70);
+        assert!(!bit_get(&heap.has_kept, dyn_start + 1));
+        assert!(!bit_get(&heap.has_kept, dyn_start + 65));
+        assert!(bit_get(&heap.has_kept, 0));
+        assert!(bit_get(&heap.has_kept, 64));
+
+        // `note_buffer_inner` with `notify_changed = false` records buffer membership
+        // without re-queueing the slot into `self.changed`.
+        let mut raw_desc = [0u32; 14];
+        raw_desc[0] = 1; // buffer resource
+        let mut srv_desc = [0u32; 16];
+        srv_desc[0] = 0; // format = UNKNOWN
+        srv_desc[1] = 1; // dimension = BUFFER
+        srv_desc[6] = 16; // structure byte stride
+        let view = View::Placed(false, raw_desc, srv_desc);
+        let _ = heap.note_buffer_inner(7, Some(&view), true, false);
+        assert!(heap.buffer_slots().contains(&7));
+        assert!(heap.buffer_changes().is_empty());
+        let _ = heap.note_buffer_inner(7, Some(&view), false, true);
+        assert_eq!(heap.buffer_changes(), vec![7]);
     }
 }

@@ -17,7 +17,7 @@ pub(crate) struct WriteStamp {
     pub(crate) ranged: u64,
 }
 
-const WRITE_RANGE_LOG_CAP: usize = 4096;
+const WRITE_RANGE_LOG_CAP: usize = 16384;
 
 struct WriteRangeLog {
     seq: u64,
@@ -300,6 +300,11 @@ impl IntervalSet {
 
 struct Journal {
     asked: u64,
+    /// Monotonic counter bumped ONLY when guarded pages or `wrote_journal_only` entries
+    /// are inserted into `written` (never bumped by `GetWriteWatch` on `MEM_PRIVATE`
+    /// buffers), so `writes_guarded_since` skips BTreeMap range scans when no guarded
+    /// write happened since `since`.
+    guarded_asked: u64,
     written: BTreeMap<usize, u64>,
     found: Vec<usize>,
     ahead: Vec<(usize, usize)>,
@@ -309,6 +314,7 @@ struct Journal {
 
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     asked: 1,
+    guarded_asked: 1,
     written: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
@@ -460,6 +466,7 @@ fn wrote_journal_only(at: usize, len: usize) {
     }
     j.asked += 1;
     let now = j.asked;
+    j.guarded_asked = now;
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
@@ -646,7 +653,7 @@ pub(crate) fn writes_guarded_since(
     let (guarded, hot) = match written? {
         GuardHot::HotOnly(pairs) => {
             let j = journal_read();
-            if since != 0 && j.asked <= since {
+            if since != 0 && j.guarded_asked <= since {
                 return Some((j.asked, pairs));
             }
             let mut out: Vec<(usize, u64)> = j
@@ -668,7 +675,7 @@ pub(crate) fn writes_guarded_since(
     };
     if guarded.is_empty() {
         let j = journal_read();
-        if since != 0 && j.asked <= since {
+        if since != 0 && j.guarded_asked <= since {
             let out = if hot.is_empty() {
                 Vec::new()
             } else {
@@ -686,15 +693,16 @@ pub(crate) fn writes_guarded_since(
         return Some((j.asked, out));
     }
     let mut j = journal_write();
-    let prev_asked = j.asked;
+    let prev_guarded = j.guarded_asked;
     j.asked += 1;
     let now = j.asked;
+    j.guarded_asked = now;
     for &page in &guarded {
         j.written.insert(page, now);
     }
     let mut out: Vec<(usize, u64)> = if since >= now {
         Vec::new()
-    } else if since != 0 && prev_asked <= since {
+    } else if since != 0 && prev_guarded <= since {
         debug_assert!(guarded.windows(2).all(|w| w[0] < w[1]));
         guarded.into_iter().map(|p| (p, now)).collect()
     } else {
@@ -1214,10 +1222,10 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     open_and_aliases(g, start, end).0
 }
 
-fn open_and_aliases(g: &mut Guards, start: usize, end: usize) -> (bool, Vec<usize>) {
-    let any = open_here(g, start, end);
+fn open_and_aliases_spans(g: &mut Guards, start: usize, end: usize) -> (Vec<(usize, usize)>, Vec<usize>) {
+    let mut opened = open_here_spans(g, start, end);
     if start >= end || g.aliased.is_empty() {
-        return (any, Vec::new());
+        return (opened, Vec::new());
     }
     let aliased: Vec<usize> = g
         .aliased
@@ -1225,7 +1233,7 @@ fn open_and_aliases(g: &mut Guards, start: usize, end: usize) -> (bool, Vec<usiz
         .copied()
         .collect();
     if aliased.is_empty() {
-        return (any, Vec::new());
+        return (opened, Vec::new());
     }
     for &block in &aliased {
         g.aliased.remove(&block);
@@ -1235,14 +1243,22 @@ fn open_and_aliases(g: &mut Guards, start: usize, end: usize) -> (bool, Vec<usiz
         g.aliased.remove(&alias);
     }
     for (a, b) in other_runs {
-        #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-        let opened = open_here_count(g, a.saturating_mul(BLOCK), b.saturating_mul(BLOCK));
+        let alias_opened = open_here_spans(g, a.saturating_mul(BLOCK), b.saturating_mul(BLOCK));
         #[cfg(feature = "diagnostics")]
-        if opened > 0 {
-            ALIASES[1].fetch_add(opened, std::sync::atomic::Ordering::Relaxed);
+        {
+            let count: u64 = alias_opened.iter().map(|&(lo, hi)| (hi - lo) as u64).sum();
+            if count > 0 {
+                ALIASES[1].fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+            }
         }
+        opened.extend(alias_opened);
     }
-    (any, all)
+    (opened, all)
+}
+
+fn open_and_aliases(g: &mut Guards, start: usize, end: usize) -> (bool, Vec<usize>) {
+    let (opened, all) = open_and_aliases_spans(g, start, end);
+    (!opened.is_empty(), all)
 }
 
 fn open_fault(g: &mut Guards, at: usize) -> bool {
@@ -1316,23 +1332,21 @@ fn open_fault(g: &mut Guards, at: usize) -> bool {
 }
 
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
-    open_here_count(g, start, end) > 0
+    !open_here_spans(g, start, end).is_empty()
 }
 
-fn open_here_count(g: &mut Guards, start: usize, end: usize) -> u64 {
+fn open_here_spans(g: &mut Guards, start: usize, end: usize) -> Vec<(usize, usize)> {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let spans = g.protected.remove_range(first, last);
     if spans.is_empty() {
-        return 0;
+        return spans;
     }
     let clean_removed = g.clean.remove_range(first, last);
     for (a, b) in clean_removed {
         g.accounted.remove_range(a, b);
     }
-    let mut blocks = 0u64;
-    for (a, b) in spans {
-        blocks += (b - a) as u64;
+    for &(a, b) in &spans {
         let mut old = 0;
         // SAFETY: blocks we made read-only.
         if unsafe {
@@ -1352,7 +1366,15 @@ fn open_here_count(g: &mut Guards, start: usize, end: usize) -> u64 {
             }
         }
     }
-    blocks
+    spans
+}
+
+pub(crate) fn commit_title_memory(at: usize, len: usize) {
+    if len > 0
+        && let Some(commit) = COMMIT_TITLE_MEMORY.get()
+    {
+        commit(at, len);
+    }
 }
 
 static COMMIT_TITLE_MEMORY: std::sync::OnceLock<fn(usize, usize)> = std::sync::OnceLock::new();
@@ -1415,6 +1437,71 @@ pub fn writing(at: usize, len: usize) {
         }
     }
     crate::descriptor::host::remapped(at, len);
+}
+
+/// Fast path for deferred `Step::Copy` writes: records the write range and opens any
+/// page guards, deferring `COMMIT_TITLE_MEMORY` to the rare unmapped-page fallback and
+/// letting the caller batch `descriptor::host::remapped_batch`.
+pub(crate) fn writing_copy(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    record_written_range(at, end);
+    let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+    let needs_open = {
+        let g = guards_read();
+        g.protected.overlaps(first, last) || g.aliased.range(first..last).next().is_some()
+    };
+    if needs_open {
+        open(&mut guards(), at, end);
+    }
+}
+
+/// Opens guarded blocks for GPU-to-title readback merges and promotes opened blocks
+/// directly into `g.hot` + `g.accounted` so the next `writes_guarded_since` check does
+/// not immediately `VirtualProtect(PAGE_READONLY)` + `protect_aliases` ping-pong them.
+/// Does not call `descriptor::host::remapped` (card buffer writebacks are not texture remaps).
+pub(crate) fn writing_gpu_back(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    record_written_range(at, end);
+    if let Some(commit) = COMMIT_TITLE_MEMORY.get() {
+        commit(at, len);
+    }
+    let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+    let needs_open = {
+        let g = guards_read();
+        g.protected.overlaps(first, last) || g.aliased.range(first..last).next().is_some()
+    };
+    if needs_open {
+        let mut g = guards();
+        let (opened_spans, _) = open_and_aliases_spans(&mut g, at, end);
+        if hot_enabled() && !opened_spans.is_empty() {
+            let frame = crate::frame::current();
+            for (a, b) in opened_spans {
+                for block in a..b {
+                    if !g.absent.contains(block)
+                        && !g.clean.contains(block)
+                        && !g.partly.contains(block)
+                    {
+                        let shift = g
+                            .cool_count
+                            .get(&block)
+                            .copied()
+                            .unwrap_or(0)
+                            .min(MAX_COOL_BACKOFF);
+                        let until =
+                            frame.saturating_add(hot_frames().saturating_mul(1u64 << shift));
+                        g.hot.insert(block, until);
+                        g.accounted.insert(block);
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn page_writes() -> u8 {
@@ -2658,6 +2745,77 @@ mod mapping_tests {
         // Remap resets cool_count cleanly.
         title_memory_remapped(start, BLOCK);
         assert_eq!(guards_read().cool_count.get(&b0).copied(), None);
+        // SAFETY: unmap our test view.
+        unsafe { UnmapViewOfFile(view) };
+    }
+
+    #[test]
+    fn writing_gpu_back_promotes_opened_blocks_to_hot_and_guarded_asked_fast_paths() {
+        use super::{
+            BLOCK, HOT_WRITE, guards_read, journal_write, title_memory_remapped,
+            writes_guarded_since, writing_gpu_back,
+        };
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+        };
+        // SAFETY: anonymous pagefile-backed section for testing.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (BLOCK * 2) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK * 2);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            view
+        };
+        let start = view.Value as usize;
+        let end = start + BLOCK * 2;
+        let b0 = start / BLOCK;
+        let b1 = b0 + 1;
+
+        // Guard both blocks clean.
+        let (since, _) = writes_guarded_since(start, end, 0).unwrap();
+        assert!(guards_read().protected.contains(b0));
+        assert!(guards_read().protected.contains(b1));
+
+        // GPU writeback to block 0 opens it and promotes it directly into `g.hot` + `g.accounted`
+        // so the next `writes_guarded_since` does not re-protect it.
+        writing_gpu_back(start, BLOCK);
+        {
+            let g = guards_read();
+            assert!(!g.protected.contains(b0));
+            assert!(g.hot.contains_key(&b0));
+            assert!(g.accounted.contains(b0));
+            assert!(g.protected.contains(b1));
+        }
+
+        // Simulate `GetWriteWatch` on a private buffer bumping `j.asked` without bumping
+        // `j.guarded_asked`: `writes_guarded_since` must still fast-path and return only hot `b0`.
+        let bumped_since = {
+            let mut j = journal_write();
+            j.asked += 5;
+            since
+        };
+        let (now, pages) = writes_guarded_since(start, end, bumped_since).unwrap();
+        assert!(now > bumped_since);
+        assert_eq!(pages, vec![(b0, HOT_WRITE)]);
+        // Block 0 must still be hot (not re-protected).
+        assert!(!guards_read().protected.contains(b0));
+        assert!(guards_read().hot.contains_key(&b0));
+
+        title_memory_remapped(start, BLOCK * 2);
+        {
+            let mut j = journal_write();
+            j.written.remove(&b0);
+            j.written.remove(&b1);
+        }
         // SAFETY: unmap our test view.
         unsafe { UnmapViewOfFile(view) };
     }
