@@ -4,8 +4,19 @@ use std::sync::RwLock;
 pub(crate) const PAGE: usize = 64 << 10;
 const KERNEL_PAGE: usize = 4096;
 pub(crate) const HOT_WRITE: u64 = u64::MAX;
-const HOT_FRAMES: u64 = 256;
+const DEFAULT_HOT_FRAMES: u64 = 48;
 const HOT_WINDOW_FRAMES: u64 = 16;
+
+fn hot_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("OATHKEEP_HOT_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_HOT_FRAMES)
+    })
+}
 
 fn hot_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -855,6 +866,10 @@ fn protect_alias_span(g: &mut Guards, a: usize, b: usize) {
 }
 
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
+    protect_range(g, from, to, true);
+}
+
+fn protect_range(g: &mut Guards, from: usize, to: usize, mark_clean: bool) {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect,
         VirtualQuery,
@@ -873,8 +888,10 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.insert_range(from, to);
-        g.clean.insert_range(from, to);
-        g.accounted.insert_range(from, to);
+        if mark_clean {
+            g.clean.insert_range(from, to);
+            g.accounted.insert_range(from, to);
+        }
     };
     if set(from, to) {
         note(g, from, to);
@@ -917,6 +934,56 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         }
         block = reg_end;
     }
+}
+
+/// Removes quiet blocks from `g.hot` and re-arms their page guards (`PAGE_READONLY`)
+/// without marking them `g.clean` yet so the next `guard_with_hot` check catches any
+/// write that raced before `VirtualProtect` and then promotes them to `g.clean` with
+/// zero extra syscalls.
+pub(crate) fn cool_hot(blocks: &[usize]) -> usize {
+    if blocks.is_empty() {
+        return 0;
+    }
+    {
+        let g = guards_read();
+        if g.hot.is_empty() || !blocks.iter().any(|b| g.hot.contains_key(b)) {
+            return 0;
+        }
+    }
+    let mut g = guards();
+    let mut cooled: Vec<usize> = blocks
+        .iter()
+        .copied()
+        .filter(|b| g.hot.contains_key(b))
+        .collect();
+    if cooled.is_empty() {
+        return 0;
+    }
+    cooled.sort_unstable();
+    cooled.dedup();
+    for &block in &cooled {
+        g.hot.remove(&block);
+        g.accounted.remove(block);
+        g.recent_fault.remove(&block);
+    }
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &block in &cooled {
+        match runs.last_mut() {
+            Some(last) if last.1 == block => last.1 = block + 1,
+            _ => runs.push((block, block + 1)),
+        }
+    }
+    let mut protected_runs: Vec<(usize, usize)> = Vec::new();
+    for (from, to) in runs {
+        for (a, b) in g.protected.gaps_in(from, to) {
+            protect_range(&mut g, a, b, false);
+            protected_runs.push((a, b));
+        }
+    }
+    if !protected_runs.is_empty() {
+        protect_aliases(&mut g, &protected_runs);
+    }
+    cooled.len()
 }
 
 fn uncommitted_end(block: usize) -> usize {
@@ -993,7 +1060,7 @@ fn open_fault(g: &mut Guards, at: usize) -> bool {
             }
         }
         if become_hot {
-            let until = frame.saturating_add(HOT_FRAMES);
+            let until = frame.saturating_add(hot_frames());
             g.hot.insert(block, until);
             g.accounted.insert(block);
             for alias in aliases {
@@ -2099,6 +2166,146 @@ mod mapping_tests {
         // Remap clears hot state cleanly.
         title_memory_remapped(start, 2 * BLOCK);
         assert!(!guards_read().hot.contains_key(&block0));
+        // SAFETY: unmap our test view.
+        unsafe { UnmapViewOfFile(view) };
+    }
+
+    #[test]
+    fn cool_hot_rearms_guard_and_clears_hot_state() {
+        use super::{BLOCK, cool_hot, guard_with_hot, guards_read, title_memory_remapped, writable};
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+        };
+        // SAFETY: a dedicated 3-block pagefile view owned by this test.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (3 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 3 * BLOCK);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            view
+        };
+        let start = view.Value as usize;
+        let end = start + 3 * BLOCK;
+        let b0 = start / BLOCK;
+        let b1 = b0 + 1;
+        let b2 = b0 + 2;
+
+        assert_eq!(guard_with_hot(start, end), Some((vec![b0, b1, b2], vec![])));
+        // Fault b0 and b1 twice to promote both to hot.
+        // SAFETY: committed mapped view memory.
+        unsafe {
+            (start as *mut u8).write_volatile(1);
+            ((start + BLOCK) as *mut u8).write_volatile(1);
+        }
+        assert_eq!(guard_with_hot(start, end), Some((vec![b0, b1], vec![])));
+        // SAFETY: committed mapped view memory.
+        unsafe {
+            (start as *mut u8).write_volatile(2);
+            ((start + BLOCK) as *mut u8).write_volatile(2);
+        }
+        assert_eq!(guard_with_hot(start, end), Some((vec![], vec![b0, b1])));
+        assert!(writable(start));
+        assert!(writable(start + BLOCK));
+
+        // Cool only b0; b1 stays hot and b2 stays clean.
+        assert_eq!(cool_hot(&[b0, b2]), 1);
+        assert_eq!(cool_hot(&[b0]), 0);
+        {
+            let g = guards_read();
+            assert!(!g.hot.contains_key(&b0));
+            assert!(g.protected.contains(b0));
+            assert!(!g.clean.contains(b0));
+            assert!(!g.accounted.contains(b0));
+            assert!(g.hot.contains_key(&b1));
+            assert!(g.clean.contains(b2));
+            assert!(g.accounted.contains(b2));
+        }
+        assert!(!writable(start));
+        assert!(writable(start + BLOCK));
+
+        // Next guard reports b0 once (catching any raced write) and promotes b0 to clean.
+        assert_eq!(guard_with_hot(start, end), Some((vec![b0], vec![b1])));
+        {
+            let g = guards_read();
+            assert!(g.clean.contains(b0));
+            assert!(g.accounted.contains(b0));
+        }
+        // Subsequent guard skips b0 completely while b1 remains hot.
+        assert_eq!(guard_with_hot(start, end), Some((vec![], vec![b1])));
+
+        // Writing b0 once after cooling does not immediately re-enter hot (recent_fault cleared).
+        // SAFETY: committed mapped view memory.
+        unsafe { (start as *mut u8).write_volatile(3) };
+        assert_eq!(guard_with_hot(start, end), Some((vec![b0], vec![b1])));
+        assert!(!guards_read().hot.contains_key(&b0));
+        assert_eq!(guard_with_hot(start, end), Some((vec![], vec![b1])));
+
+        title_memory_remapped(start, 3 * BLOCK);
+        // SAFETY: unmap our test view.
+        unsafe { UnmapViewOfFile(view) };
+    }
+
+    #[test]
+    fn cool_hot_coalesces_contiguous_runs_and_catches_raced_write() {
+        use super::{BLOCK, cool_hot, guard_with_hot, guards_read, title_memory_remapped, writable};
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+        };
+        // SAFETY: a dedicated 4-block pagefile view owned by this test.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (4 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 4 * BLOCK);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            view
+        };
+        let start = view.Value as usize;
+        let end = start + 4 * BLOCK;
+        let blocks: Vec<usize> = (0..4).map(|i| start / BLOCK + i).collect();
+
+        assert_eq!(guard_with_hot(start, end), Some((blocks.clone(), vec![])));
+        for round in 1u8..=2 {
+            for i in 0..4 {
+                // SAFETY: committed mapped view memory.
+                unsafe { ((start + i * BLOCK) as *mut u8).write_volatile(round) };
+            }
+            let _ = guard_with_hot(start, end).unwrap();
+        }
+        assert_eq!(guard_with_hot(start, end), Some((vec![], blocks.clone())));
+
+        // Simulate a write racing right before cool_hot arms PAGE_READONLY.
+        // SAFETY: committed mapped view memory, currently hot/writable.
+        unsafe { ((start + 2 * BLOCK) as *mut u8).write_volatile(99) };
+        assert_eq!(cool_hot(&[blocks[3], blocks[1], blocks[0], blocks[2], blocks[1]]), 4);
+        for i in 0..4 {
+            assert!(!writable(start + i * BLOCK));
+        }
+        assert!(guards_read().hot.range(blocks[0]..=blocks[3]).next().is_none());
+
+        // Single transition verification reports all 4 blocks once, so the raced write is seen,
+        // and the next check is completely clean.
+        assert_eq!(guard_with_hot(start, end), Some((blocks.clone(), vec![])));
+        assert_eq!(guard_with_hot(start, end), Some((vec![], vec![])));
+
+        title_memory_remapped(start, 4 * BLOCK);
         // SAFETY: unmap our test view.
         unsafe { UnmapViewOfFile(view) };
     }

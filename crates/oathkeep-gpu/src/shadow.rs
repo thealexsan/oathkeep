@@ -322,15 +322,92 @@ fn full_page_range(
     (lo, hi)
 }
 
+const DEFAULT_HOT_COOL_FRAMES: u32 = 4;
+const PARALLEL_CARD_PAGES: usize = 16;
+const PARALLEL_UNWATCHED_BYTES: usize = 1 << 20;
+const MAX_CARD_SCAN_CHUNKS: usize = 6;
+
+fn hot_cool_frames() -> u32 {
+    static FRAMES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("OATHKEEP_HOT_COOL_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(DEFAULT_HOT_COOL_FRAMES)
+    })
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct HotPageQuiet {
+    /// `frame + 1` of the last frame on which this 64 KiB page had changed bytes (`0` = untracked).
+    last_changed: u64,
+    /// Number of distinct frames after `last_changed` with 0 changed bytes on a full-page hot check.
+    quiet_frames: u32,
+    /// `frame + 1` of the most recent quiet frame counted.
+    last_quiet_frame: u64,
+}
+
+impl HotPageQuiet {
+    /// Updates quiet-page state for one 64 KiB page on `frame`.
+    /// Returns `true` when the page has been unchanged across `cool_after` distinct frames
+    /// and should be cooled (removed from `watch` hot set).
+    #[inline]
+    fn record(
+        &mut self,
+        frame: u64,
+        changed: bool,
+        is_hot: bool,
+        full_page: bool,
+        cool_after: u32,
+    ) -> bool {
+        let f1 = frame.saturating_add(1);
+        if changed {
+            self.last_changed = f1;
+            self.quiet_frames = 0;
+            self.last_quiet_frame = 0;
+            return false;
+        }
+        if !is_hot || !full_page || cool_after == 0 {
+            return false;
+        }
+        if self.last_changed == 0 {
+            self.last_changed = f1;
+            self.quiet_frames = 0;
+            self.last_quiet_frame = 0;
+            return false;
+        }
+        if f1 > self.last_changed && f1 != self.last_quiet_frame {
+            self.last_quiet_frame = f1;
+            self.quiet_frames = self.quiet_frames.saturating_add(1);
+        }
+        if self.quiet_frames >= cool_after
+            && f1.saturating_sub(self.last_changed) >= u64::from(cool_after)
+        {
+            *self = Self::default();
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Default)]
+struct HotHashes {
+    /// Contiguous per-4 KiB sub-block hashes (`0` = cleared/unhashed, `h | 1` = hashed).
+    slots: Vec<u128>,
+    /// Per-64 KiB page quiet tracking for adaptive hot-page cooling.
+    quiet: Vec<HotPageQuiet>,
+}
+
 struct Card {
     before: Mutex<Option<ID3D12Resource>>,
     old: Mutex<BTreeMap<usize, Vec<u8>>>,
     has_old: AtomicBool,
     dirty: Mutex<Vec<(usize, usize)>>,
     sent: Mutex<Vec<(usize, usize, u64)>>,
-    /// Contiguous per-4 KiB sub-block hashes (`0` = cleared/unhashed, `h | 1` = hashed).
-    /// Lazily allocated to `len.div_ceil(HOT_HASH_BLOCK)` on first hot/rewrite check.
-    hot_hashes: Mutex<Vec<u128>>,
+    /// Contiguous per-4 KiB sub-block hashes (`0` = cleared/unhashed, `h | 1` = hashed)
+    /// plus per-64 KiB page quiet tracking for adaptive hot-page cooling.
+    /// Lazily allocated on first hot/rewrite/unwatched check.
+    hot_hashes: Mutex<HotHashes>,
     has_hot_hashes: AtomicBool,
     size: u64,
 }
@@ -341,14 +418,24 @@ impl Card {
             return;
         }
         let mut hashes = self.hot_hashes.lock().unwrap_or_else(|e| e.into_inner());
-        if hashes.is_empty() {
+        if hashes.slots.is_empty() {
             return;
         }
-        let first = (from / HOT_HASH_BLOCK).min(hashes.len());
-        let last = to.div_ceil(HOT_HASH_BLOCK).min(hashes.len());
+        let first = (from / HOT_HASH_BLOCK).min(hashes.slots.len());
+        let last = to.div_ceil(HOT_HASH_BLOCK).min(hashes.slots.len());
         if first < last {
-            hashes[first..last].fill(0);
-            if first == 0 && last == hashes.len() {
+            hashes.slots[first..last].fill(0);
+            if !hashes.quiet.is_empty() {
+                let q_first = (from / PAGE).min(hashes.quiet.len());
+                let q_last = to
+                    .div_ceil(PAGE)
+                    .saturating_add(1)
+                    .min(hashes.quiet.len());
+                if q_first < q_last {
+                    hashes.quiet[q_first..q_last].fill(HotPageQuiet::default());
+                }
+            }
+            if first == 0 && last == hashes.slots.len() {
                 self.has_hot_hashes.store(false, Ordering::Release);
             }
         }
@@ -356,10 +443,11 @@ impl Card {
 }
 
 /// Compares `bytes` (representing buffer-relative `off_from..off_from + bytes.len()`) against
-/// per-4 KiB `hashes`, updating changed slots and invoking `on_changed(off_a, off_b)` for each
-/// changed sub-range. Returns `true` if any slot hash was stored.
-fn diff_hot_card_blocks(
+/// a slice `hashes` starting at 4 KiB slot index `slot_base`, updating changed slots and invoking
+/// `on_changed(off_a, off_b)` for each changed sub-range. Returns `true` if any slot hash was stored.
+fn diff_hot_card_blocks_at(
     hashes: &mut [u128],
+    slot_base: usize,
     buf_len: usize,
     off_from: usize,
     bytes: &[u8],
@@ -370,9 +458,13 @@ fn diff_hot_card_blocks(
         return false;
     }
     let first_slot = off_from / HOT_HASH_BLOCK;
-    let last_slot = off_to.div_ceil(HOT_HASH_BLOCK).min(hashes.len());
+    let last_slot = off_to.div_ceil(HOT_HASH_BLOCK).min(slot_base + hashes.len());
+    if first_slot < slot_base || first_slot >= last_slot {
+        return false;
+    }
     let mut stored_any = false;
-    for (slot, hash_entry) in hashes.iter_mut().enumerate().take(last_slot).skip(first_slot) {
+    for slot in first_slot..last_slot {
+        let hash_entry = &mut hashes[slot - slot_base];
         let slot_lo = slot * HOT_HASH_BLOCK;
         let slot_hi = (slot_lo + HOT_HASH_BLOCK).min(buf_len);
         let cov_lo = off_from.max(slot_lo);
@@ -398,40 +490,548 @@ fn diff_hot_card_blocks(
     stored_any
 }
 
-fn hot_page_hash(bytes: &[u8]) -> u128 {
-    const K0: u64 = 0x9e37_79b9_7f4a_7c15;
-    const K1: u64 = 0xbf58_476d_1ce4_e5b9;
-    const K2: u64 = 0x94d0_49bb_1331_11eb;
-    const K3: u64 = 0xd6e8_feb8_6659_fd93;
-    let mut a = (bytes.len() as u64).wrapping_mul(K0) ^ K1;
-    let mut b = (bytes.len() as u64).wrapping_mul(K2) ^ K3;
-    let mut c = K0 ^ K3;
-    let mut d = K1 ^ K2;
-    let mut chunks = bytes.chunks_exact(32);
-    for chunk in &mut chunks {
-        let w0 = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-        let w1 = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
-        let w2 = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
-        let w3 = u64::from_le_bytes(chunk[24..32].try_into().unwrap());
-        a = (a ^ w0).wrapping_mul(K0).rotate_left(27);
-        b = (b ^ w1).wrapping_mul(K1).rotate_left(31);
-        c = (c ^ w2).wrapping_mul(K2).rotate_left(29);
-        d = (d ^ w3).wrapping_mul(K3).rotate_left(33);
+#[cfg(test)]
+fn diff_hot_card_blocks(
+    hashes: &mut [u128],
+    buf_len: usize,
+    off_from: usize,
+    bytes: &[u8],
+    on_changed: impl FnMut(usize, usize),
+) -> bool {
+    diff_hot_card_blocks_at(hashes, 0, buf_len, off_from, bytes, on_changed)
+}
+
+const HASH_K0: u64 = 0x9e37_79b9_7f4a_7c15;
+const HASH_K1: u64 = 0xbf58_476d_1ce4_e5b9;
+const HASH_K2: u64 = 0x94d0_49bb_1331_11eb;
+const HASH_K3: u64 = 0xd6e8_feb8_6659_fd93;
+const HASH_M_LO: [u64; 4] = [0x9e37_79b1, 0x85eb_ca77, 0xc2b2_ae3d, 0xa7d4_eb2f];
+const HASH_M_HI: [u64; 4] = [0x94d0_49bb, 0xbf58_476d, 0xd6e8_feb9, 0xb54a_d69b];
+
+#[inline]
+fn hot_page_hash_init(len: usize) -> [u64; 16] {
+    let l = len as u64;
+    let s0 = l.wrapping_mul(HASH_K0) ^ HASH_K1;
+    let s1 = l.wrapping_mul(HASH_K2) ^ HASH_K3;
+    [
+        s0 ^ HASH_K0,
+        s1 ^ HASH_K1,
+        s0 ^ HASH_K2,
+        s1 ^ HASH_K3,
+        s0.rotate_left(7) ^ HASH_K1,
+        s1.rotate_left(11) ^ HASH_K2,
+        s0.rotate_left(13) ^ HASH_K3,
+        s1.rotate_left(17) ^ HASH_K0,
+        s0.rotate_left(19) ^ HASH_K2,
+        s1.rotate_left(23) ^ HASH_K3,
+        s0.rotate_left(29) ^ HASH_K0,
+        s1.rotate_left(31) ^ HASH_K1,
+        s0.rotate_left(37) ^ HASH_K3,
+        s1.rotate_left(41) ^ HASH_K0,
+        s0.rotate_left(43) ^ HASH_K1,
+        s1.rotate_left(47) ^ HASH_K2,
+    ]
+}
+
+#[inline]
+fn hot_page_hash_finish(mut acc: [u64; 16], rem: &[u8]) -> u128 {
+    let mut words = rem.chunks_exact(8);
+    for (i, chunk) in (&mut words).enumerate() {
+        let w = u64::from_le_bytes(chunk.try_into().unwrap());
+        let lane = i & 15;
+        let t = acc[lane] ^ w;
+        let p_lo = (t & 0xffff_ffff).wrapping_mul(HASH_M_LO[lane & 3]);
+        let p_hi = (t >> 32).wrapping_mul(HASH_M_HI[lane & 3]);
+        acc[lane] = p_lo.wrapping_add(p_hi.rotate_left(32));
     }
-    for &byte in chunks.remainder() {
-        a = (a ^ u64::from(byte)).wrapping_mul(K0).rotate_left(11);
-        b = b.wrapping_add(a).wrapping_mul(K1);
+    let mut tail_a = acc[0];
+    let mut tail_b = acc[1];
+    for &byte in words.remainder() {
+        tail_a = (tail_a ^ u64::from(byte))
+            .wrapping_mul(HASH_K0)
+            .rotate_left(11);
+        tail_b = tail_b.wrapping_add(tail_a).wrapping_mul(HASH_K1);
+    }
+    acc[0] = tail_a;
+    acc[1] = tail_b;
+    let mut lo = HASH_K0;
+    let mut hi = HASH_K1;
+    for (i, &v) in acc.iter().enumerate() {
+        let mul = HASH_K2.wrapping_add((i as u64).wrapping_mul(HASH_K0)) | 1;
+        let m = v.wrapping_mul(mul);
+        lo = (lo ^ m).wrapping_mul(HASH_K1).rotate_left(27);
+        hi = (hi ^ m.rotate_left(19)).wrapping_mul(HASH_K3).rotate_left(31);
     }
     let mix = |mut x: u64| {
         x ^= x >> 30;
-        x = x.wrapping_mul(K1);
+        x = x.wrapping_mul(HASH_K1);
         x ^= x >> 27;
-        x = x.wrapping_mul(K2);
+        x = x.wrapping_mul(HASH_K2);
         x ^ (x >> 31)
     };
-    let lo = mix(a ^ c.rotate_left(17) ^ d);
-    let hi = mix(b ^ d.rotate_left(23) ^ a ^ K0);
+    let lo = mix(lo ^ hi.rotate_left(17));
+    let hi = mix(hi ^ lo.rotate_left(23) ^ HASH_K0);
     (u128::from(hi) << 64) | u128::from(lo)
+}
+
+fn hot_page_hash_scalar(bytes: &[u8]) -> u128 {
+    let mut acc = hot_page_hash_init(bytes.len());
+    let mut chunks = bytes.chunks_exact(128);
+    for chunk in &mut chunks {
+        for lane in 0..16 {
+            let off = lane * 8;
+            let w = u64::from_le_bytes(chunk[off..off + 8].try_into().unwrap());
+            let t = acc[lane] ^ w;
+            let p_lo = (t & 0xffff_ffff).wrapping_mul(HASH_M_LO[lane & 3]);
+            let p_hi = (t >> 32).wrapping_mul(HASH_M_HI[lane & 3]);
+            acc[lane] = p_lo.wrapping_add(p_hi.rotate_left(32));
+        }
+    }
+    hot_page_hash_finish(acc, chunks.remainder())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hot_page_hash_avx2(bytes: &[u8]) -> u128 {
+    use std::arch::x86_64::*;
+    let mut acc = hot_page_hash_init(bytes.len());
+    // SAFETY: `acc` holds 16 u64s and `HASH_M_LO`/`HASH_M_HI` hold 4 u64s each; unaligned loads are valid.
+    let mut a0 = unsafe { _mm256_loadu_si256(acc.as_ptr().cast()) };
+    let mut a1 = unsafe { _mm256_loadu_si256(acc.as_ptr().add(4).cast()) };
+    let mut a2 = unsafe { _mm256_loadu_si256(acc.as_ptr().add(8).cast()) };
+    let mut a3 = unsafe { _mm256_loadu_si256(acc.as_ptr().add(12).cast()) };
+    let k_lo = unsafe { _mm256_loadu_si256(HASH_M_LO.as_ptr().cast()) };
+    let k_hi = unsafe { _mm256_loadu_si256(HASH_M_HI.as_ptr().cast()) };
+
+    macro_rules! step {
+        ($reg:ident, $ptr:expr) => {{
+            // SAFETY: `$ptr` points to 32 readable bytes inside the 128-byte chunk.
+            let v = unsafe { _mm256_loadu_si256(($ptr).cast()) };
+            let t = _mm256_xor_si256($reg, v);
+            let t_hi = _mm256_srli_epi64::<32>(t);
+            let p_lo = _mm256_mul_epu32(t, k_lo);
+            let p_hi = _mm256_mul_epu32(t_hi, k_hi);
+            let p_hi_rot = _mm256_shuffle_epi32::<0xB1>(p_hi);
+            $reg = _mm256_add_epi64(p_lo, p_hi_rot);
+        }};
+    }
+
+    let mut chunks = bytes.chunks_exact(128);
+    for chunk in &mut chunks {
+        let ptr = chunk.as_ptr();
+        step!(a0, ptr);
+        step!(a1, ptr.add(32));
+        step!(a2, ptr.add(64));
+        step!(a3, ptr.add(96));
+    }
+    // SAFETY: `acc` holds 16 u64s; unaligned stores are valid.
+    unsafe {
+        _mm256_storeu_si256(acc.as_mut_ptr().cast(), a0);
+        _mm256_storeu_si256(acc.as_mut_ptr().add(4).cast(), a1);
+        _mm256_storeu_si256(acc.as_mut_ptr().add(8).cast(), a2);
+        _mm256_storeu_si256(acc.as_mut_ptr().add(12).cast(), a3);
+    }
+    hot_page_hash_finish(acc, chunks.remainder())
+}
+
+fn hot_page_hash(bytes: &[u8]) -> u128 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static HAS_AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if bytes.len() >= 128 && *HAS_AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+        {
+            // SAFETY: runtime check confirmed AVX2 support on this CPU.
+            return unsafe { hot_page_hash_avx2(bytes) };
+        }
+    }
+    hot_page_hash_scalar(bytes)
+}
+
+thread_local! {
+    static CARD_HOT_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[inline]
+fn push_coalesced_span(out: &mut Vec<(usize, usize)>, a: usize, b: usize) {
+    if a >= b {
+        return;
+    }
+    match out.last_mut() {
+        Some(last) if a == last.1 => last.1 = b,
+        _ => out.push((a, b)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_card_pages_chunk(
+    pages: &[(usize, bool)],
+    start: usize,
+    buf_len: usize,
+    from: usize,
+    to: usize,
+    base: usize,
+    frame: u64,
+    cool_after: u32,
+    slot_base: usize,
+    slots: &mut [u128],
+    quiet_base: usize,
+    quiet: &mut [HotPageQuiet],
+) -> (Vec<(usize, usize)>, Vec<usize>, bool) {
+    let end = start + buf_len;
+    let mut changed_spans: Vec<(usize, usize)> = Vec::new();
+    let mut cool_blocks: Vec<usize> = Vec::new();
+    let mut stored_any = false;
+    CARD_HOT_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < PAGE {
+            buf.resize(PAGE, 0);
+        }
+        for &(page, is_hot) in pages {
+            let page_lo = (page * PAGE).max(start);
+            let page_hi = ((page + 1) * PAGE).min(end);
+            let p_from = page_lo.max(from);
+            let p_to = page_hi.min(to);
+            if p_from >= p_to {
+                continue;
+            }
+            let off_from = p_from - start;
+            let len = p_to - p_from;
+            let full_page = p_from == page_lo && p_to == page_hi;
+            let mut page_changed = false;
+            if len > PAGE || !crate::host::read_into(p_from as *const u8, &mut buf[..len]) {
+                let s_lo = (off_from / HOT_HASH_BLOCK).saturating_sub(slot_base);
+                let s_hi = (off_from + len)
+                    .div_ceil(HOT_HASH_BLOCK)
+                    .saturating_sub(slot_base)
+                    .min(slots.len());
+                if s_lo < s_hi {
+                    slots[s_lo..s_hi].fill(0);
+                }
+                push_coalesced_span(&mut changed_spans, p_from, p_to);
+                page_changed = true;
+            } else {
+                let stored = diff_hot_card_blocks_at(
+                    slots,
+                    slot_base,
+                    buf_len,
+                    off_from,
+                    &buf[..len],
+                    |cov_lo, cov_hi| {
+                        page_changed = true;
+                        push_coalesced_span(&mut changed_spans, start + cov_lo, start + cov_hi);
+                    },
+                );
+                stored_any |= stored;
+            }
+            let idx = page - base;
+            if idx >= quiet_base
+                && let Some(q) = quiet.get_mut(idx - quiet_base)
+                && q.record(frame, page_changed, is_hot, full_page, cool_after)
+            {
+                cool_blocks.push(page);
+            }
+        }
+    });
+    (changed_spans, cool_blocks, stored_any)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_card_pages_into(
+    card: &Card,
+    start: usize,
+    buf_len: usize,
+    from: usize,
+    to: usize,
+    pages: &[(usize, bool)],
+    frame: u64,
+    cool_after: u32,
+) -> (Vec<(usize, usize)>, Vec<usize>) {
+    let end = start + buf_len;
+    let (from, to) = (from.max(start), to.min(end));
+    if from >= to || pages.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let base = start / PAGE;
+    let pages_len = end.div_ceil(PAGE).saturating_sub(base);
+    let owned_pages;
+    let pages = if pages.windows(2).all(|w| w[0].0 < w[1].0)
+        && pages.iter().all(|&(p, _)| p >= base && p - base < pages_len)
+    {
+        pages
+    } else {
+        let mut sorted: Vec<(usize, bool)> = pages
+            .iter()
+            .copied()
+            .filter(|&(p, _)| p >= base && p - base < pages_len)
+            .collect();
+        sorted.sort_unstable_by_key(|&(p, _)| p);
+        let mut deduped: Vec<(usize, bool)> = Vec::with_capacity(sorted.len());
+        for (p, is_hot) in sorted {
+            match deduped.last_mut() {
+                Some(last) if last.0 == p => last.1 |= is_hot,
+                _ => deduped.push((p, is_hot)),
+            }
+        }
+        owned_pages = deduped;
+        &owned_pages
+    };
+    if pages.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let slots_needed = buf_len.div_ceil(HOT_HASH_BLOCK);
+    let mut guard = card.hot_hashes.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = &mut *guard;
+    if guard.slots.len() < slots_needed {
+        guard.slots.resize(slots_needed, 0);
+    }
+    if guard.quiet.len() < pages_len {
+        guard.quiet.resize(pages_len, HotPageQuiet::default());
+    }
+    let use_parallel = pages.len() >= PARALLEL_CARD_PAGES && start.is_multiple_of(HOT_HASH_BLOCK);
+    if !use_parallel {
+        let (changed, cool, stored) = scan_card_pages_chunk(
+            pages,
+            start,
+            buf_len,
+            from,
+            to,
+            base,
+            frame,
+            cool_after,
+            0,
+            &mut guard.slots,
+            0,
+            &mut guard.quiet,
+        );
+        if stored {
+            card.has_hot_hashes.store(true, Ordering::Release);
+        }
+        return (changed, cool);
+    }
+    let n_chunks = MAX_CARD_SCAN_CHUNKS.min(pages.len() / 2).max(2);
+    let chunk_pages = pages.len().div_ceil(n_chunks);
+    let page_chunks: Vec<&[(usize, bool)]> = pages.chunks(chunk_pages).collect();
+    let actual_chunks = page_chunks.len();
+    let mut results: Vec<(Vec<(usize, usize)>, Vec<usize>, bool)> =
+        vec![(Vec::new(), Vec::new(), false); actual_chunks];
+    let mut jobs: Vec<Job> = Vec::with_capacity(actual_chunks);
+    let mut rem_slots: &mut [u128] = &mut guard.slots[..];
+    let mut cur_slot_base = 0usize;
+    let mut rem_quiet: &mut [HotPageQuiet] = &mut guard.quiet[..];
+    let mut cur_quiet_base = 0usize;
+    let results_base = results.as_mut_ptr() as usize;
+
+    for (i, &pchunk) in page_chunks.iter().enumerate() {
+        let (my_slots, my_slot_base, my_quiet, my_quiet_base) = if i + 1 < actual_chunks {
+            let next_page = page_chunks[i + 1][0].0;
+            let split_slot = (((next_page * PAGE).max(start) - start) / HOT_HASH_BLOCK)
+                .clamp(cur_slot_base, cur_slot_base + rem_slots.len());
+            let (s_left, s_right) = rem_slots.split_at_mut(split_slot - cur_slot_base);
+            let sb = cur_slot_base;
+            cur_slot_base = split_slot;
+            rem_slots = s_right;
+
+            let split_quiet = (next_page - base).clamp(cur_quiet_base, cur_quiet_base + rem_quiet.len());
+            let (q_left, q_right) = rem_quiet.split_at_mut(split_quiet - cur_quiet_base);
+            let qb = cur_quiet_base;
+            cur_quiet_base = split_quiet;
+            rem_quiet = q_right;
+            (s_left, sb, q_left, qb)
+        } else {
+            let sb = cur_slot_base;
+            let qb = cur_quiet_base;
+            (
+                std::mem::take(&mut rem_slots),
+                sb,
+                std::mem::take(&mut rem_quiet),
+                qb,
+            )
+        };
+        let pages_ptr = pchunk.as_ptr() as usize;
+        let pages_count = pchunk.len();
+        let slots_ptr = my_slots.as_mut_ptr() as usize;
+        let slots_count = my_slots.len();
+        let quiet_ptr = my_quiet.as_mut_ptr() as usize;
+        let quiet_count = my_quiet.len();
+        jobs.push(Box::new(move || {
+            // SAFETY: `wide_leaf` joins all jobs before `pages`, `guard.slots`, `guard.quiet`,
+            // and `results` are dropped; `split_at_mut` guarantees disjoint mutable slices per job.
+            let (p_slice, s_slice, q_slice, out_slot) = unsafe {
+                (
+                    std::slice::from_raw_parts(pages_ptr as *const (usize, bool), pages_count),
+                    std::slice::from_raw_parts_mut(slots_ptr as *mut u128, slots_count),
+                    std::slice::from_raw_parts_mut(quiet_ptr as *mut HotPageQuiet, quiet_count),
+                    &mut *(results_base as *mut (Vec<(usize, usize)>, Vec<usize>, bool)).add(i),
+                )
+            };
+            *out_slot = scan_card_pages_chunk(
+                p_slice,
+                start,
+                buf_len,
+                from,
+                to,
+                base,
+                frame,
+                cool_after,
+                my_slot_base,
+                s_slice,
+                my_quiet_base,
+                q_slice,
+            );
+        }));
+    }
+    wide_leaf(jobs);
+
+    let mut changed_spans: Vec<(usize, usize)> = Vec::new();
+    let mut cool_blocks: Vec<usize> = Vec::new();
+    let mut stored_any = false;
+    for (spans, cool, stored) in results {
+        for (a, b) in spans {
+            push_coalesced_span(&mut changed_spans, a, b);
+        }
+        cool_blocks.extend(cool);
+        stored_any |= stored;
+    }
+    if stored_any {
+        card.has_hot_hashes.store(true, Ordering::Release);
+    }
+    (changed_spans, cool_blocks)
+}
+
+fn scan_unwatched_card_chunk(
+    start: usize,
+    buf_len: usize,
+    off_from: usize,
+    off_to: usize,
+    slot_base: usize,
+    slots: &mut [u128],
+) -> (Vec<(usize, usize)>, bool) {
+    let mut changed_spans: Vec<(usize, usize)> = Vec::new();
+    let mut stored_any = false;
+    CARD_HOT_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < PAGE {
+            buf.resize(PAGE, 0);
+        }
+        let mut cur = off_from;
+        while cur < off_to {
+            let next_aligned = ((cur / HOT_HASH_BLOCK) + (PAGE / HOT_HASH_BLOCK)) * HOT_HASH_BLOCK;
+            let step_end = next_aligned.min(off_to);
+            let len = step_end - cur;
+            if !crate::host::read_into((start + cur) as *const u8, &mut buf[..len]) {
+                let s_lo = (cur / HOT_HASH_BLOCK).saturating_sub(slot_base);
+                let s_hi = step_end
+                    .div_ceil(HOT_HASH_BLOCK)
+                    .saturating_sub(slot_base)
+                    .min(slots.len());
+                if s_lo < s_hi {
+                    slots[s_lo..s_hi].fill(0);
+                }
+                push_coalesced_span(&mut changed_spans, start + cur, start + step_end);
+            } else {
+                let stored = diff_hot_card_blocks_at(
+                    slots,
+                    slot_base,
+                    buf_len,
+                    cur,
+                    &buf[..len],
+                    |cov_lo, cov_hi| {
+                        push_coalesced_span(&mut changed_spans, start + cov_lo, start + cov_hi);
+                    },
+                );
+                stored_any |= stored;
+            }
+            cur = step_end;
+        }
+    });
+    (changed_spans, stored_any)
+}
+
+fn scan_unwatched_card_into(
+    card: &Card,
+    start: usize,
+    buf_len: usize,
+    from: usize,
+    to: usize,
+) -> Vec<(usize, usize)> {
+    let (from, to) = (from.max(start), to.min(start + buf_len));
+    if from >= to {
+        return Vec::new();
+    }
+    let off_from = from - start;
+    let off_to = to - start;
+    let len = to - from;
+    let slots_needed = buf_len.div_ceil(HOT_HASH_BLOCK);
+    let mut guard = card.hot_hashes.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = &mut *guard;
+    if guard.slots.len() < slots_needed {
+        guard.slots.resize(slots_needed, 0);
+    }
+    if len < PARALLEL_UNWATCHED_BYTES {
+        let (spans, stored) =
+            scan_unwatched_card_chunk(start, buf_len, off_from, off_to, 0, &mut guard.slots);
+        if stored {
+            card.has_hot_hashes.store(true, Ordering::Release);
+        }
+        return spans;
+    }
+    let first_slot = off_from / HOT_HASH_BLOCK;
+    let last_slot = off_to.div_ceil(HOT_HASH_BLOCK).min(guard.slots.len());
+    let n_slots = last_slot.saturating_sub(first_slot);
+    if n_slots < 2 {
+        let (spans, stored) =
+            scan_unwatched_card_chunk(start, buf_len, off_from, off_to, 0, &mut guard.slots);
+        if stored {
+            card.has_hot_hashes.store(true, Ordering::Release);
+        }
+        return spans;
+    }
+    let n_chunks = MAX_CARD_SCAN_CHUNKS.min(n_slots).max(2);
+    let chunk_slots = n_slots.div_ceil(n_chunks);
+    let actual_chunks = n_slots.div_ceil(chunk_slots);
+    let mut results: Vec<(Vec<(usize, usize)>, bool)> = vec![(Vec::new(), false); actual_chunks];
+    let mut jobs: Vec<Job> = Vec::with_capacity(actual_chunks);
+    let mut rem_slots = &mut guard.slots[first_slot..last_slot];
+    let mut cur_slot = first_slot;
+    let results_base = results.as_mut_ptr() as usize;
+
+    for i in 0..actual_chunks {
+        let take = chunk_slots.min(rem_slots.len());
+        let (my_slots, rest) = rem_slots.split_at_mut(take);
+        let s_lo = cur_slot;
+        let s_hi = cur_slot + take;
+        cur_slot = s_hi;
+        rem_slots = rest;
+        let c_off_lo = off_from.max(s_lo * HOT_HASH_BLOCK);
+        let c_off_hi = off_to.min(s_hi * HOT_HASH_BLOCK);
+        let slots_ptr = my_slots.as_mut_ptr() as usize;
+        let slots_count = my_slots.len();
+        jobs.push(Box::new(move || {
+            // SAFETY: `wide_leaf` joins all jobs before `guard.slots` and `results` are dropped;
+            // `split_at_mut` guarantees disjoint mutable slices per job.
+            let (s_slice, out_slot) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(slots_ptr as *mut u128, slots_count),
+                    &mut *(results_base as *mut (Vec<(usize, usize)>, bool)).add(i),
+                )
+            };
+            *out_slot = scan_unwatched_card_chunk(start, buf_len, c_off_lo, c_off_hi, s_lo, s_slice);
+        }));
+    }
+    wide_leaf(jobs);
+
+    let mut changed_spans: Vec<(usize, usize)> = Vec::new();
+    let mut stored_any = false;
+    for (spans, stored) in results {
+        for (a, b) in spans {
+            push_coalesced_span(&mut changed_spans, a, b);
+        }
+        stored_any |= stored;
+    }
+    if stored_any {
+        card.has_hot_hashes.store(true, Ordering::Release);
+    }
+    changed_spans
 }
 
 pub(crate) fn merge_refresh_ranges(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
@@ -1429,6 +2029,73 @@ fn wide(jobs: Vec<Job>) {
 
 pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
+}
+
+/// Runs pure leaf jobs in parallel on the shared `workers()` pool without ever popping
+/// unrelated jobs on the calling thread, preventing re-entrant lock deadlocks when called
+/// from inside an outer `wide_run` or while holding per-shadow locks.
+fn wide_leaf(jobs: Vec<Job>) {
+    if jobs.len() < 2 {
+        for job in jobs {
+            job();
+        }
+        return;
+    }
+    struct LeafBatch {
+        queue: Mutex<std::collections::VecDeque<Job>>,
+        rem: (Mutex<usize>, std::sync::Condvar),
+    }
+    let count = jobs.len();
+    let batch = Arc::new(LeafBatch {
+        queue: Mutex::new(std::collections::VecDeque::from(jobs)),
+        rem: (Mutex::new(count), std::sync::Condvar::new()),
+    });
+    let workers = workers();
+    {
+        let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..count - 1 {
+            let batch = batch.clone();
+            queue.push_back(Box::new(move || {
+                loop {
+                    let job = batch
+                        .queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pop_front();
+                    let Some(job) = job else {
+                        break;
+                    };
+                    job();
+                    let mut rem = batch.rem.0.lock().unwrap_or_else(|e| e.into_inner());
+                    *rem -= 1;
+                    if *rem == 0 {
+                        batch.rem.1.notify_all();
+                    }
+                }
+            }));
+        }
+    }
+    workers.more.notify_all();
+    loop {
+        let job = batch
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        let Some(job) = job else {
+            break;
+        };
+        job();
+        let mut rem = batch.rem.0.lock().unwrap_or_else(|e| e.into_inner());
+        *rem -= 1;
+        if *rem == 0 {
+            batch.rem.1.notify_all();
+        }
+    }
+    let mut rem = batch.rem.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *rem > 0 {
+        rem = batch.rem.1.wait(rem).unwrap_or_else(|e| e.into_inner());
+    }
 }
 
 const WIDE_JOB: usize = 1 << 20;
@@ -3010,6 +3677,17 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
+        if let Some(card) = &self.card {
+            let copied = self.diff_unwatched_card(card, from, to);
+            self.refresh_check(from, to);
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Checked, (to - from) as u64);
+                add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+            }
+            return copied;
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
@@ -3072,91 +3750,32 @@ impl Shadow {
         }
     }
 
-    /// Checks a page (or sub-page) range `from..to` of a Card buffer against per-4 KiB hashes,
-    /// returning coalesced virtual-address ranges that changed in `out` (at most 17 spans for a
-    /// `PAGE`-sized read, zero heap allocation).
-    fn hot_card_changed_ranges<'a>(
+    fn scan_card_pages(
         &self,
-        card: &'a Card,
-        hashes: &mut Option<std::sync::MutexGuard<'a, Vec<u128>>>,
+        card: &Card,
         from: usize,
         to: usize,
-        out: &mut [(usize, usize); 18],
-    ) -> usize {
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (from.max(start), to.min(end));
-        if from >= to {
-            return 0;
+        pages: &[(usize, bool)],
+    ) -> (Vec<(usize, usize)>, Vec<usize>) {
+        scan_card_pages_into(
+            card,
+            self.start as usize,
+            self.len as usize,
+            from,
+            to,
+            pages,
+            crate::frame::current(),
+            hot_cool_frames(),
+        )
+    }
+
+    fn diff_unwatched_card(&self, card: &Card, from: usize, to: usize) -> usize {
+        let spans = scan_unwatched_card_into(card, self.start as usize, self.len as usize, from, to);
+        let mut copied = 0usize;
+        for (a, b) in spans {
+            copied += self.copy_inner(a, b, false);
         }
-        let off_from = from - start;
-        let len = to - from;
-        let slots_needed = (self.len as usize).div_ceil(HOT_HASH_BLOCK);
-        if len > PAGE {
-            let guard =
-                hashes.get_or_insert_with(|| card.hot_hashes.lock().unwrap_or_else(|e| e.into_inner()));
-            if !guard.is_empty() {
-                let first = (off_from / HOT_HASH_BLOCK).min(guard.len());
-                let last = (off_from + len).div_ceil(HOT_HASH_BLOCK).min(guard.len());
-                if first < last {
-                    guard[first..last].fill(0);
-                }
-            }
-            out[0] = (from, to);
-            return 1;
-        }
-        thread_local! {
-            static CARD_HOT_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-        }
-        CARD_HOT_BUF.with(|cell| {
-            let mut buf = cell.borrow_mut();
-            if buf.len() < PAGE {
-                buf.resize(PAGE, 0);
-            }
-            let slice = &mut buf[..len];
-            if !crate::host::read_into(from as *const u8, slice) {
-                let guard = hashes.get_or_insert_with(|| {
-                    card.hot_hashes.lock().unwrap_or_else(|e| e.into_inner())
-                });
-                if !guard.is_empty() {
-                    let first = (off_from / HOT_HASH_BLOCK).min(guard.len());
-                    let last = (off_from + len).div_ceil(HOT_HASH_BLOCK).min(guard.len());
-                    if first < last {
-                        guard[first..last].fill(0);
-                    }
-                }
-                out[0] = (from, to);
-                return 1;
-            }
-            let guard = hashes.get_or_insert_with(|| {
-                card.hot_hashes.lock().unwrap_or_else(|e| e.into_inner())
-            });
-            if guard.len() < slots_needed {
-                guard.resize(slots_needed, 0);
-            }
-            let mut count = 0usize;
-            let stored = diff_hot_card_blocks(
-                guard,
-                self.len as usize,
-                off_from,
-                slice,
-                |cov_lo, cov_hi| {
-                    let a = start + cov_lo;
-                    let b = start + cov_hi;
-                    if count > 0 && out[count - 1].1 == a {
-                        out[count - 1].1 = b;
-                    } else if count < out.len() {
-                        out[count] = (a, b);
-                        count += 1;
-                    } else {
-                        out[count - 1].1 = out[count - 1].1.max(b);
-                    }
-                },
-            );
-            if stored {
-                card.has_hot_hashes.store(true, Ordering::Release);
-            }
-            count
-        })
+        copied
     }
 
     fn copy_stale(
@@ -3209,12 +3828,63 @@ impl Shadow {
                 }
                 return 0;
             }
+            if let Some(card) = &self.card {
+                let mut recheck_pages: Vec<(usize, bool)> = Vec::new();
+                let mut dirty_chunk: Option<usize> = None;
+                for &(page, write) in written {
+                    if page < base || page - base >= pages_len {
+                        continue;
+                    }
+                    let idx = page - base;
+                    let at = copied.get(idx, global_synced);
+                    let is_hot = write == crate::watch::HOT_WRITE && at != 0;
+                    let is_written = !is_hot && write > at;
+                    if !is_hot && !is_written {
+                        continue;
+                    }
+                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                        copied.set_raw(idx, now);
+                        let c = idx / COPIED_CHUNK;
+                        if let Some(prev_c) = dirty_chunk
+                            && prev_c != c
+                        {
+                            copied.recompute_chunk(prev_c);
+                        }
+                        dirty_chunk = Some(c);
+                    }
+                    recheck_pages.push((page, is_hot));
+                }
+                if let Some(c) = dirty_chunk {
+                    copied.recompute_chunk(c);
+                }
+                let mut bytes = 0;
+                let mut cool_blocks = Vec::new();
+                if !recheck_pages.is_empty() {
+                    let (changed_spans, cool) = self.scan_card_pages(card, from, to, &recheck_pages);
+                    cool_blocks = cool;
+                    for (r_from, r_to) in changed_spans {
+                        bytes += self.copy_inner(r_from, r_to, false);
+                    }
+                }
+                if now != 0 {
+                    if full && uncopied_zero {
+                        drop(copied);
+                        self.synced_at.fetch_max(now, Ordering::Release);
+                    } else {
+                        copied.advance_synced(full_lo, full_hi, now);
+                        drop(copied);
+                    }
+                } else {
+                    drop(copied);
+                }
+                if !cool_blocks.is_empty() {
+                    crate::watch::cool_hot(&cool_blocks);
+                }
+                return bytes;
+            }
             let mut bytes = 0;
             let mut run: Option<(usize, usize)> = None;
-            let mut hot_run: Option<(usize, usize)> = None;
-            let mut card_hashes = None;
             let mut dirty_chunk: Option<usize> = None;
-            let mut page_spans = [(0usize, 0usize); 18];
             for &(page, write) in written {
                 if page < base || page - base >= pages_len {
                     continue;
@@ -3236,28 +3906,7 @@ impl Shadow {
                     }
                     dirty_chunk = Some(c);
                 }
-                if let Some(card) = &self.card {
-                    let p_from = (page * PAGE).max(from);
-                    let p_to = ((page + 1) * PAGE).min(to);
-                    let n_spans = self.hot_card_changed_ranges(
-                        card,
-                        &mut card_hashes,
-                        p_from,
-                        p_to,
-                        &mut page_spans,
-                    );
-                    for &(a, b) in &page_spans[..n_spans] {
-                        match hot_run {
-                            Some((r_from, r_to)) if a == r_to => hot_run = Some((r_from, b)),
-                            Some((r_from, r_to)) => {
-                                card_hashes = None;
-                                bytes += self.copy_inner(r_from, r_to, false);
-                                hot_run = Some((a, b));
-                            }
-                            None => hot_run = Some((a, b)),
-                        }
-                    }
-                } else if is_hot {
+                if is_hot {
                     if let Some((first, prev)) = run.take() {
                         bytes += self
                             .copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
@@ -3278,10 +3927,6 @@ impl Shadow {
             if let Some(c) = dirty_chunk {
                 copied.recompute_chunk(c);
             }
-            drop(card_hashes);
-            if let Some((r_from, r_to)) = hot_run {
-                bytes += self.copy_inner(r_from, r_to, false);
-            }
             if let Some((first, prev)) = run {
                 bytes += self.copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
             }
@@ -3295,13 +3940,91 @@ impl Shadow {
             }
             return bytes;
         }
+        if let Some(card) = &self.card {
+            let mut writes = written.iter().peekable();
+            let mut uncopied_runs: Vec<(usize, usize)> = Vec::new();
+            let mut recheck_pages: Vec<(usize, bool)> = Vec::new();
+            let mut newly_copied = 0u64;
+            let mut dirty_chunk: Option<usize> = None;
+            let last = (to - 1) / PAGE;
+            for page in from / PAGE..=last {
+                let write = match writes.peek() {
+                    Some(&&(p, w)) if p == page => {
+                        writes.next();
+                        w
+                    }
+                    _ => 0,
+                };
+                let idx = page - base;
+                let at = copied.get(idx, global_synced);
+                if at != 0 && (write == crate::watch::HOT_WRITE || write > at) {
+                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                        copied.set_raw(idx, now);
+                        let c = idx / COPIED_CHUNK;
+                        if let Some(prev_c) = dirty_chunk
+                            && prev_c != c
+                        {
+                            copied.recompute_chunk(prev_c);
+                        }
+                        dirty_chunk = Some(c);
+                    }
+                    recheck_pages.push((page, write == crate::watch::HOT_WRITE));
+                } else if at == 0 {
+                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                        if copied.set_raw(idx, now) {
+                            newly_copied += 1;
+                        }
+                        let c = idx / COPIED_CHUNK;
+                        if let Some(prev_c) = dirty_chunk
+                            && prev_c != c
+                        {
+                            copied.recompute_chunk(prev_c);
+                        }
+                        dirty_chunk = Some(c);
+                    }
+                    let p_from = (page * PAGE).max(from);
+                    let p_to = ((page + 1) * PAGE).min(to);
+                    push_coalesced_span(&mut uncopied_runs, p_from, p_to);
+                }
+            }
+            if let Some(c) = dirty_chunk {
+                copied.recompute_chunk(c);
+            }
+            if newly_copied > 0 {
+                self.uncopied.fetch_sub(newly_copied, Ordering::Release);
+            }
+            let mut bytes = 0;
+            for (r_from, r_to) in uncopied_runs {
+                bytes += self.copy(r_from, r_to);
+            }
+            let mut cool_blocks = Vec::new();
+            if !recheck_pages.is_empty() {
+                let (changed_spans, cool) = self.scan_card_pages(card, from, to, &recheck_pages);
+                cool_blocks = cool;
+                for (r_from, r_to) in changed_spans {
+                    bytes += self.copy_inner(r_from, r_to, false);
+                }
+            }
+            if now != 0 {
+                if full && self.uncopied.load(Ordering::Acquire) == 0 {
+                    drop(copied);
+                    self.synced_at.fetch_max(now, Ordering::Release);
+                } else {
+                    copied.advance_synced(full_lo, full_hi, now);
+                    drop(copied);
+                }
+            } else {
+                drop(copied);
+            }
+            if !cool_blocks.is_empty() {
+                crate::watch::cool_hot(&cool_blocks);
+            }
+            return bytes;
+        }
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run): (usize, Option<usize>) = (0, None);
-        let mut hot_run: Option<(usize, usize)> = None;
-        let mut card_hashes = None;
         let mut newly_copied = 0u64;
         let mut dirty_chunk: Option<usize> = None;
-        let mut page_spans = [(0usize, 0usize); 18];
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -3313,46 +4036,7 @@ impl Shadow {
             };
             let idx = page - base;
             let at = copied.get(idx, global_synced);
-            let is_card_recheck = self.card.is_some()
-                && at != 0
-                && (write == crate::watch::HOT_WRITE || write > at);
-            if is_card_recheck {
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    copied.set_raw(idx, now);
-                    let c = idx / COPIED_CHUNK;
-                    if let Some(prev_c) = dirty_chunk
-                        && prev_c != c
-                    {
-                        copied.recompute_chunk(prev_c);
-                    }
-                    dirty_chunk = Some(c);
-                }
-                if let Some(first) = run.take() {
-                    card_hashes = None;
-                    bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
-                }
-                let card = self.card.as_ref().expect("checked is_some above");
-                let p_from = (page * PAGE).max(from);
-                let p_to = ((page + 1) * PAGE).min(to);
-                let n_spans = self.hot_card_changed_ranges(
-                    card,
-                    &mut card_hashes,
-                    p_from,
-                    p_to,
-                    &mut page_spans,
-                );
-                for &(a, b) in &page_spans[..n_spans] {
-                    match hot_run {
-                        Some((r_from, r_to)) if a == r_to => hot_run = Some((r_from, b)),
-                        Some((r_from, r_to)) => {
-                            card_hashes = None;
-                            bytes += self.copy_inner(r_from, r_to, false);
-                            hot_run = Some((a, b));
-                        }
-                        None => hot_run = Some((a, b)),
-                    }
-                }
-            } else if write == crate::watch::HOT_WRITE && at != 0 {
+            if write == crate::watch::HOT_WRITE && at != 0 {
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     copied.set_raw(idx, now);
                     let c = idx / COPIED_CHUNK;
@@ -3382,19 +4066,14 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                card_hashes = None;
                 bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
             }
         }
         if let Some(c) = dirty_chunk {
             copied.recompute_chunk(c);
         }
-        drop(card_hashes);
         if newly_copied > 0 {
             self.uncopied.fetch_sub(newly_copied, Ordering::Release);
-        }
-        if let Some((r_from, r_to)) = hot_run {
-            bytes += self.copy_inner(r_from, r_to, false);
         }
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
@@ -4395,17 +5074,36 @@ mod window_tests {
 
     #[test]
     fn hot_page_hash_detects_single_bit_changes() {
-        use super::{PAGE, hot_page_hash};
+        use super::{PAGE, hot_page_hash, hot_page_hash_scalar};
         let mut page = [0u8; PAGE];
         let h0 = hot_page_hash(&page);
         assert_eq!(h0, hot_page_hash(&page));
-        for at in [0, 7, 31, 32, 2048, PAGE - 1] {
+        assert_eq!(h0, hot_page_hash_scalar(&page));
+        for at in [0, 7, 31, 32, 63, 64, 127, 128, 2048, PAGE - 1] {
             page[at] ^= 1;
             let h1 = hot_page_hash(&page);
             assert_ne!(h0, h1, "byte {at}");
+            assert_eq!(h1, hot_page_hash_scalar(&page), "scalar/avx2 match at {at}");
             page[at] ^= 1;
             assert_eq!(h0, hot_page_hash(&page));
         }
+        // Check AVX2 vs scalar equivalence across unaligned/short/long sizes and block swaps.
+        for len in [0usize, 1, 7, 8, 31, 63, 64, 127, 128, 129, 255, 256, 4096, 4103] {
+            let buf: Vec<u8> = (0..len).map(|i| (i * 73 + 19) as u8).collect();
+            assert_eq!(
+                hot_page_hash(&buf),
+                hot_page_hash_scalar(&buf),
+                "len {len}"
+            );
+        }
+        let mut swapped = vec![0u8; 256];
+        for (i, b) in swapped.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(29).wrapping_add(3);
+        }
+        let orig = hot_page_hash(&swapped);
+        let (a, b) = swapped.split_at_mut(128);
+        a.swap_with_slice(b);
+        assert_ne!(orig, hot_page_hash(&swapped), "128-byte block swap must change hash");
     }
 
     #[test]
@@ -4431,7 +5129,7 @@ mod window_tests {
 
     #[test]
     fn hot_hashes_vec_deduplicates_4k_subblocks_and_clears_ranges() {
-        use super::{Card, HOT_HASH_BLOCK, PAGE, diff_hot_card_blocks};
+        use super::{Card, HOT_HASH_BLOCK, HotHashes, PAGE, diff_hot_card_blocks};
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -4443,7 +5141,10 @@ mod window_tests {
             has_old: AtomicBool::new(false),
             dirty: Mutex::default(),
             sent: Mutex::default(),
-            hot_hashes: Mutex::new(vec![0u128; slots]),
+            hot_hashes: Mutex::new(HotHashes {
+                slots: vec![0u128; slots],
+                quiet: Vec::new(),
+            }),
             has_hot_hashes: AtomicBool::new(false),
             size: len as u64,
         };
@@ -4453,11 +5154,11 @@ mod window_tests {
         let mut changed = Vec::new();
         {
             let mut hashes = card.hot_hashes.lock().unwrap();
-            assert!(diff_hot_card_blocks(&mut hashes, len, 0, &mem, |a, b| {
+            assert!(diff_hot_card_blocks(&mut hashes.slots, len, 0, &mem, |a, b| {
                 changed.push((a, b));
             }));
             card.has_hot_hashes.store(true, Ordering::Release);
-            assert!(hashes.iter().all(|&h| h != 0 && (h & 1) == 1));
+            assert!(hashes.slots.iter().all(|&h| h != 0 && (h & 1) == 1));
         }
         assert_eq!(changed.len(), slots);
         assert_eq!(changed.first(), Some(&(0, HOT_HASH_BLOCK)));
@@ -4467,7 +5168,7 @@ mod window_tests {
         changed.clear();
         {
             let mut hashes = card.hot_hashes.lock().unwrap();
-            assert!(!diff_hot_card_blocks(&mut hashes, len, 0, &mem, |a, b| {
+            assert!(!diff_hot_card_blocks(&mut hashes.slots, len, 0, &mem, |a, b| {
                 changed.push((a, b));
             }));
         }
@@ -4478,7 +5179,7 @@ mod window_tests {
         changed.clear();
         {
             let mut hashes = card.hot_hashes.lock().unwrap();
-            assert!(diff_hot_card_blocks(&mut hashes, len, 0, &mem, |a, b| {
+            assert!(diff_hot_card_blocks(&mut hashes.slots, len, 0, &mem, |a, b| {
                 changed.push((a, b));
             }));
         }
@@ -4491,14 +5192,14 @@ mod window_tests {
         {
             let mut hashes = card.hot_hashes.lock().unwrap();
             diff_hot_card_blocks(
-                &mut hashes,
+                &mut hashes.slots,
                 len,
                 partial_off,
                 &mem[partial_off..partial_off + 256],
                 |a, b| changed.push((a, b)),
             );
-            assert_eq!(hashes[2], 0);
-            assert_ne!(hashes[3], 0);
+            assert_eq!(hashes.slots[2], 0);
+            assert_ne!(hashes.slots[3], 0);
         }
         assert_eq!(changed, [(partial_off, partial_off + 256)]);
 
@@ -4506,18 +5207,221 @@ mod window_tests {
         card.clear_hot_hashes(4 * HOT_HASH_BLOCK + 10, 6 * HOT_HASH_BLOCK + 1);
         {
             let hashes = card.hot_hashes.lock().unwrap();
-            assert_ne!(hashes[3], 0);
-            assert_eq!(hashes[4], 0);
-            assert_eq!(hashes[5], 0);
-            assert_eq!(hashes[6], 0);
-            assert_ne!(hashes[7], 0);
+            assert_ne!(hashes.slots[3], 0);
+            assert_eq!(hashes.slots[4], 0);
+            assert_eq!(hashes.slots[5], 0);
+            assert_eq!(hashes.slots[6], 0);
+            assert_ne!(hashes.slots[7], 0);
         }
         assert!(card.has_hot_hashes.load(Ordering::Acquire));
 
         // Full-range clear resets has_hot_hashes flag to false.
         card.clear_hot_hashes(0, len);
         assert!(!card.has_hot_hashes.load(Ordering::Acquire));
-        assert!(card.hot_hashes.lock().unwrap().iter().all(|&h| h == 0));
+        assert!(card.hot_hashes.lock().unwrap().slots.iter().all(|&h| h == 0));
+    }
+
+    #[test]
+    fn parallel_hot_card_diff_and_adaptive_cooling() {
+        use super::{
+            Card, HOT_HASH_BLOCK, PAGE, scan_card_pages_into,
+        };
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicBool;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        const N_PAGES: usize = 32; // >= PARALLEL_CARD_PAGES (16) -> exercises parallel wide_leaf path
+        const LEN: usize = N_PAGES * PAGE;
+        // SAFETY: 64 KiB-aligned allocation owned by this test and freed at the end.
+        let ptr = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            ) as *mut u8
+        };
+        assert!(!ptr.is_null());
+        let start = ptr as usize;
+        assert_eq!(start % PAGE, 0);
+        // SAFETY: committed allocation of `LEN` bytes.
+        let mem = unsafe { std::slice::from_raw_parts_mut(ptr, LEN) };
+        for (i, b) in mem.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(41).wrapping_add(7)) as u8;
+        }
+
+        let card = Card {
+            before: Mutex::default(),
+            old: Mutex::default(),
+            has_old: AtomicBool::new(false),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            hot_hashes: Mutex::default(),
+            has_hot_hashes: AtomicBool::new(false),
+            size: LEN as u64,
+        };
+        let base = start / PAGE;
+        let all_hot: Vec<(usize, bool)> = (0..N_PAGES).map(|i| (base + i, true)).collect();
+
+        // Initial parallel pass hashes all 32 pages and emits one coalesced full span; nothing cools.
+        let (spans, cool) =
+            scan_card_pages_into(&card, start, LEN, start, start + LEN, &all_hot, 10, 4);
+        assert_eq!(spans, [(start, start + LEN)]);
+        assert!(cool.is_empty());
+
+        // Multiple unchanged checks on the SAME frame (frame 10) emit 0 spans and do NOT cool.
+        for _ in 0..5 {
+            let (spans, cool) =
+                scan_card_pages_into(&card, start, LEN, start, start + LEN, &all_hot, 10, 4);
+            assert!(spans.is_empty());
+            assert!(cool.is_empty());
+        }
+
+        // Modify adjacent 4 KiB blocks across a parallel chunk boundary (last 4 KiB of page 5 and
+        // first 4 KiB of page 6) plus one isolated block in page 29 on frame 11.
+        mem[6 * PAGE - 17] ^= 0x80;
+        mem[6 * PAGE + 19] ^= 0x40;
+        mem[29 * PAGE + 3 * HOT_HASH_BLOCK + 5] ^= 0x01;
+        let (spans, cool) =
+            scan_card_pages_into(&card, start, LEN, start, start + LEN, &all_hot, 11, 4);
+        assert_eq!(
+            spans,
+            [
+                (start + 6 * PAGE - HOT_HASH_BLOCK, start + 6 * PAGE + HOT_HASH_BLOCK),
+                (
+                    start + 29 * PAGE + 3 * HOT_HASH_BLOCK,
+                    start + 29 * PAGE + 4 * HOT_HASH_BLOCK
+                ),
+            ]
+        );
+        assert!(cool.is_empty());
+
+        // Frames 12 and 13 unchanged: quiet count reaches 3 for unchanged pages (< 4), 2 for pages 5,6,29.
+        for frame in [12u64, 13] {
+            let (spans, cool) =
+                scan_card_pages_into(&card, start, LEN, start, start + LEN, &all_hot, frame, 4);
+            assert!(spans.is_empty());
+            assert!(cool.is_empty());
+        }
+
+        // Frame 14 unchanged: all pages except 5, 6, 29 have been quiet for 4 distinct frames -> cooled!
+        let (spans, cool) =
+            scan_card_pages_into(&card, start, LEN, start, start + LEN, &all_hot, 14, 4);
+        assert!(spans.is_empty());
+        let expected_cool: Vec<usize> = (0..N_PAGES)
+            .filter(|&i| !matches!(i, 5 | 6 | 29))
+            .map(|i| base + i)
+            .collect();
+        assert_eq!(cool, expected_cool);
+
+        // Partial-page check on page 5 on frame 15 must NOT cool page 5.
+        let partial_hot = [(base + 5, true)];
+        let (spans, cool) = scan_card_pages_into(
+            &card,
+            start,
+            LEN,
+            start + 5 * PAGE,
+            start + 5 * PAGE + HOT_HASH_BLOCK,
+            &partial_hot,
+            15,
+            4,
+        );
+        assert!(spans.is_empty());
+        assert!(cool.is_empty());
+
+        // Full-page check on pages 5, 6, 29 on frame 15 cools them (4 quiet frames: 12,13,14,15).
+        let remaining_hot = [(base + 5, true), (base + 6, true), (base + 29, true)];
+        let (spans, cool) =
+            scan_card_pages_into(&card, start, LEN, start, start + LEN, &remaining_hot, 15, 4);
+        assert!(spans.is_empty());
+        assert_eq!(cool, [base + 5, base + 6, base + 29]);
+
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn unwatched_card_diff_skips_unchanged_and_parallelizes_large_buffers() {
+        use super::{Card, HOT_HASH_BLOCK, PAGE, scan_unwatched_card_into};
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicBool;
+
+        // 2 MiB + 1536 bytes (>= PARALLEL_UNWATCHED_BYTES, non-4 KiB aligned tail).
+        let len = (2 << 20) + 1536;
+        let mut mem: Vec<u8> = (0..len).map(|i| (i * 53 + 17) as u8).collect();
+        let start = mem.as_ptr() as usize;
+        let card = Card {
+            before: Mutex::default(),
+            old: Mutex::default(),
+            has_old: AtomicBool::new(false),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            hot_hashes: Mutex::default(),
+            has_hot_hashes: AtomicBool::new(false),
+            size: len as u64,
+        };
+
+        // First scan hashes everything in parallel and emits one coalesced full span.
+        let spans = scan_unwatched_card_into(&card, start, len, start, start + len);
+        assert_eq!(spans, [(start, start + len)]);
+
+        // Unchanged frame emits 0 ranges (0 bytes uploaded).
+        let spans = scan_unwatched_card_into(&card, start, len, start, start + len);
+        assert!(spans.is_empty());
+
+        // Mutate one byte near the start, two adjacent 4 KiB blocks in the middle, and the tail.
+        let mid_block = 200 * HOT_HASH_BLOCK;
+        mem[42] ^= 0x10;
+        mem[mid_block - 1] ^= 0x20;
+        mem[mid_block + 3] ^= 0x04;
+        mem[len - 1] ^= 0x01;
+        let spans = scan_unwatched_card_into(&card, start, len, start, start + len);
+        assert_eq!(
+            spans,
+            [
+                (start, start + HOT_HASH_BLOCK),
+                (start + mid_block - HOT_HASH_BLOCK, start + mid_block + HOT_HASH_BLOCK),
+                (start + (2 << 20), start + len),
+            ]
+        );
+
+        // Next unchanged frame emits 0 ranges again.
+        assert!(scan_unwatched_card_into(&card, start, len, start, start + len).is_empty());
+
+        // clear_hot_hashes invalidates only the cleared sub-range for the next unwatched scan.
+        card.clear_hot_hashes(PAGE, PAGE + 2 * HOT_HASH_BLOCK);
+        let spans = scan_unwatched_card_into(&card, start, len, start, start + len);
+        assert_eq!(spans, [(start + PAGE, start + PAGE + 2 * HOT_HASH_BLOCK)]);
+
+        // Sequential sub-1 MiB path also deduplicates unchanged reads.
+        let small_len = 2 * PAGE;
+        let mut small_mem: Vec<u8> = (0..small_len).map(|i| (i * 13 + 5) as u8).collect();
+        let small_start = small_mem.as_ptr() as usize;
+        let small_card = Card {
+            before: Mutex::default(),
+            old: Mutex::default(),
+            has_old: AtomicBool::new(false),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            hot_hashes: Mutex::default(),
+            has_hot_hashes: AtomicBool::new(false),
+            size: small_len as u64,
+        };
+        assert_eq!(
+            scan_unwatched_card_into(&small_card, small_start, small_len, small_start, small_start + small_len),
+            [(small_start, small_start + small_len)]
+        );
+        assert!(
+            scan_unwatched_card_into(&small_card, small_start, small_len, small_start, small_start + small_len)
+                .is_empty()
+        );
+        small_mem[PAGE + 100] ^= 0xff;
+        assert_eq!(
+            scan_unwatched_card_into(&small_card, small_start, small_len, small_start, small_start + small_len),
+            [(small_start + PAGE, small_start + PAGE + HOT_HASH_BLOCK)]
+        );
     }
 
     #[test]
