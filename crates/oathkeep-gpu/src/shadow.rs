@@ -1675,25 +1675,21 @@ pub(crate) fn window_use() -> [u64; 8] {
 }
 
 pub(crate) fn let_go_idle() {
-    const IDLE_FRAMES: u64 = 4;
     let gone: Vec<Arc<Shadow>> = {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
             return;
         }
-        let avail = match (
-            crate::host::available_physical_ram(),
-            crate::host::available_commit(),
-        ) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        let idle_ms = crate::host::ram_idle_ms(avail);
+        let avail_phys = crate::host::available_physical_ram();
+        let avail_commit = crate::host::available_commit();
+        let idle_ms = crate::host::ram_idle_ms(avail_phys)
+            .min(crate::host::commit_idle_ms(avail_commit));
+        let idle_frames = crate::host::commit_idle_frames(avail_commit);
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, idle_frames)
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)

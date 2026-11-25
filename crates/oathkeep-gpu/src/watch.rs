@@ -4,8 +4,8 @@ use std::sync::RwLock;
 pub(crate) const PAGE: usize = 64 << 10;
 const KERNEL_PAGE: usize = 4096;
 pub(crate) const HOT_WRITE: u64 = u64::MAX;
-const HOT_FRAMES: u64 = 64;
-const HOT_WINDOW_FRAMES: u64 = 4;
+const HOT_FRAMES: u64 = 256;
+const HOT_WINDOW_FRAMES: u64 = 16;
 
 fn hot_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -640,6 +640,7 @@ fn guard_with_hot(start: usize, end: usize) -> Option<(Vec<usize>, Vec<usize>)> 
     }
     let mut written = Vec::new();
     let mut hot_pages = Vec::new();
+    let mut protected_runs = Vec::new();
     let mut uncommitted_until = first;
     for (gap_first, gap_last) in g.clean.gaps_in(first, last) {
         let mut run: Option<usize> = None;
@@ -648,7 +649,8 @@ fn guard_with_hot(start: usize, end: usize) -> Option<(Vec<usize>, Vec<usize>)> 
             if let Some(&until) = g.hot.get(&block) {
                 if until > frame {
                     if let Some(from) = run.take() {
-                        protect(&mut g, from, block);
+                        protect_here(&mut g, from, block);
+                        protected_runs.push((from, block));
                     }
                     hot_pages.push(block);
                     block += 1;
@@ -662,7 +664,8 @@ fn guard_with_hot(start: usize, end: usize) -> Option<(Vec<usize>, Vec<usize>)> 
                 }
                 if block < uncommitted_until {
                     if let Some(from) = run.take() {
-                        protect(&mut g, from, block);
+                        protect_here(&mut g, from, block);
+                        protected_runs.push((from, block));
                     }
                     block = uncommitted_until.min(gap_last);
                     continue;
@@ -672,7 +675,8 @@ fn guard_with_hot(start: usize, end: usize) -> Option<(Vec<usize>, Vec<usize>)> 
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(block) {
                 if let Some(from) = run.take() {
-                    protect(&mut g, from, block);
+                    protect_here(&mut g, from, block);
+                    protected_runs.push((from, block));
                 }
                 g.clean.insert(block);
             } else {
@@ -681,8 +685,12 @@ fn guard_with_hot(start: usize, end: usize) -> Option<(Vec<usize>, Vec<usize>)> 
             block += 1;
         }
         if let Some(from) = run.take() {
-            protect(&mut g, from, gap_last);
+            protect_here(&mut g, from, gap_last);
+            protected_runs.push((from, gap_last));
         }
+    }
+    if !protected_runs.is_empty() {
+        protect_aliases(&mut g, &protected_runs);
     }
     Some((written, hot_pages))
 }
@@ -717,25 +725,44 @@ fn is_view(start: usize, end: usize) -> bool {
     }
 }
 
-fn protect(g: &mut Guards, from: usize, to: usize) {
-    protect_here(g, from, to);
-    if !view_guard() {
+fn protect_aliases(g: &mut Guards, runs: &[(usize, usize)]) {
+    if !view_guard() || runs.is_empty() {
         return;
     }
-    let (all, other_runs, count) = crate::inplace::alias_blocks_between(
-        from.saturating_mul(BLOCK),
-        to.saturating_mul(BLOCK),
-        MANY_VIEWS,
-    );
-    if count == 0 {
+    let mut all_other_runs: Vec<(usize, usize)> = Vec::new();
+    let mut total_count = 0u64;
+    for &(from, to) in runs {
+        let (all, other_runs, count) = crate::inplace::alias_blocks_between(
+            from.saturating_mul(BLOCK),
+            to.saturating_mul(BLOCK),
+            MANY_VIEWS,
+        );
+        if count == 0 {
+            continue;
+        }
+        total_count += count;
+        for alias in all {
+            g.aliased.insert(alias);
+        }
+        all_other_runs.extend(other_runs);
+    }
+    if total_count == 0 {
         return;
     }
     #[cfg(feature = "diagnostics")]
-    ALIASES[0].fetch_add(count, std::sync::atomic::Ordering::Relaxed);
-    for alias in all {
-        g.aliased.insert(alias);
+    ALIASES[0].fetch_add(total_count, std::sync::atomic::Ordering::Relaxed);
+    if all_other_runs.len() > 1 {
+        all_other_runs.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(all_other_runs.len());
+        for (a, b) in all_other_runs {
+            match merged.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        all_other_runs = merged;
     }
-    for (a, b) in other_runs {
+    for (a, b) in all_other_runs {
         protect_alias_range(g, a, b);
     }
 }
@@ -922,10 +949,22 @@ fn open_fault(g: &mut Guards, at: usize) -> bool {
     if hot_enabled() {
         let block = at / BLOCK;
         let frame = crate::frame::current();
-        if let Some(prev) = g.recent_fault.insert(block, frame)
-            && frame >= prev
-            && frame.saturating_sub(prev) <= HOT_WINDOW_FRAMES
-        {
+        let mut become_hot = g
+            .recent_fault
+            .insert(block, frame)
+            .is_some_and(|prev| frame >= prev && frame.saturating_sub(prev) <= HOT_WINDOW_FRAMES);
+        for &alias in &aliases {
+            if alias != block
+                && g.recent_fault
+                    .insert(alias, frame)
+                    .is_some_and(|prev| {
+                        frame >= prev && frame.saturating_sub(prev) <= HOT_WINDOW_FRAMES
+                    })
+            {
+                become_hot = true;
+            }
+        }
+        if become_hot {
             let until = frame.saturating_add(HOT_FRAMES);
             g.hot.insert(block, until);
             for alias in aliases {

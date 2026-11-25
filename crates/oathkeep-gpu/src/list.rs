@@ -192,10 +192,15 @@ const IDLE_MOST: (usize, u64) = (32, 64 << 20);
 
 #[cfg(windows)]
 pub(crate) fn trim_idle() {
+    trim_idle_to(8);
+}
+
+#[cfg(windows)]
+pub(crate) fn trim_idle_to(keep: usize) {
     let mut dropped = Vec::new();
     {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        while idle.0.len() > 8 {
+        while idle.0.len() > keep {
             if let Some(entry) = idle.0.pop() {
                 idle.1 = idle.1.saturating_sub(entry.1);
                 dropped.push(entry);
@@ -663,11 +668,19 @@ const UAV_BARRIER: Barrier = Barrier {
 
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
-    if let Some(list) = record_host(this)
-        && !barriers.is_null()
-    {
+    if count > 0 && !barriers.is_null() {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        const BEGIN_ONLY: u32 = 1;
+        if barriers
+            .iter()
+            .all(|b| b.kind == 0 && b.flags & BEGIN_ONLY != 0)
+        {
+            return 0;
+        }
+        let Some(list) = record_host(this) else {
+            return 0;
+        };
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))

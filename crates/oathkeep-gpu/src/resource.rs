@@ -1168,7 +1168,7 @@ fn commit_headroom() -> u64 {
         std::env::var("OATHKEEP_COMMIT_HEADROOM_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(2048)
+            .unwrap_or(3072)
             << 20
     })
 }
@@ -1176,7 +1176,7 @@ fn commit_headroom() -> u64 {
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    const FLOOR: u64 = 2 << 30;
+    const FLOOR: u64 = 512 << 20;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     let headroom = commit_headroom();
     if headroom > 0
@@ -1194,12 +1194,14 @@ pub(crate) fn room() -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    if filled < FLOOR {
-        return true;
-    }
+    let pct = room_percent();
     match crate::host::host().and_then(|h| h.video_memory()) {
         Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() < budget / 100 * room_percent()
+            if used + crate::shadow::card_room_kept() < budget / 100 * pct {
+                true
+            } else {
+                pct >= 90 && filled < FLOOR
+            }
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -1467,13 +1469,14 @@ pub(crate) fn card_accounting(
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
+    let avail_commit = crate::host::available_commit();
     let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()))
-        .min(crate::host::commit_idle_ms(crate::host::available_commit()));
+        .min(crate::host::commit_idle_ms(avail_commit));
+    let idle_frames = crate::host::commit_idle_frames(avail_commit);
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
     for &at in all.iter() {
@@ -1486,7 +1489,7 @@ pub(crate) fn let_go_idle() {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });

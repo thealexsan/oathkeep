@@ -94,22 +94,39 @@ pub(crate) fn available_commit() -> Option<u64> {
 }
 
 pub(crate) fn commit_idle_ms(avail_commit: Option<u64>) -> u64 {
-    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
     const NORMAL_MS: u64 = 5_000;
-    const MODERATE_MS: u64 = 2_500;
-    const HIGH_MS: u64 = 1_000;
-    const CRITICAL_MS: u64 = 500;
+    const ELEVATED_MS: u64 = 3_000;
+    const MODERATE_MS: u64 = 1_500;
+    const HIGH_MS: u64 = 500;
+    const CRITICAL_MS: u64 = 100;
     let Some(avail) = avail_commit else {
         return NORMAL_MS;
     };
-    if avail < 2 * GIB {
+    if avail < 1536 * MIB {
         CRITICAL_MS
-    } else if avail < 3 * GIB {
+    } else if avail < 2560 * MIB {
         HIGH_MS
-    } else if avail < 4 * GIB {
+    } else if avail < 3584 * MIB {
         MODERATE_MS
+    } else if avail < 4608 * MIB {
+        ELEVATED_MS
     } else {
         NORMAL_MS
+    }
+}
+
+pub(crate) fn commit_idle_frames(avail_commit: Option<u64>) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    let Some(avail) = avail_commit else {
+        return 4;
+    };
+    if avail < 1536 * MIB {
+        1
+    } else if avail < 2560 * MIB {
+        2
+    } else {
+        4
     }
 }
 
@@ -170,9 +187,15 @@ fn sweep() {
         return;
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let avail_commit = available_commit();
+    let interval = if avail_commit.is_some_and(|c| c < (2560u64 << 20)) {
+        250
+    } else {
+        1000
+    };
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
+    if now < last + interval
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
@@ -183,9 +206,16 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
-    if available_commit().is_some_and(|c| c < (3u64 << 30)) {
-        crate::list::trim_idle();
-        trim_prelude_pool(4);
+    if let Some(avail) = avail_commit
+        && avail < (3u64 << 30)
+    {
+        if avail < (2u64 << 30) {
+            crate::list::trim_idle_to(4);
+            trim_prelude_pool(2);
+        } else {
+            crate::list::trim_idle();
+            trim_prelude_pool(4);
+        }
     }
 }
 
@@ -3765,10 +3795,15 @@ impl Host {
         }
         let behind = late && flying();
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let behind_sweep_ms = if available_commit().is_some_and(|c| c < (2560u64 << 20)) {
+            500
+        } else {
+            1500
+        };
         if !behind {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + behind_sweep_ms {
             self.settle(&mut submitted, WHY_SYNC);
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
@@ -6562,5 +6597,21 @@ mod batch {
         assert_eq!(ram_idle_ms(Some(2 * gib - 1)), 2_000);
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn commit_idle_thresholds_scale_with_pressure() {
+        use super::{commit_idle_frames, commit_idle_ms};
+        let mib = 1024 * 1024;
+        assert_eq!(commit_idle_ms(None), 5_000);
+        assert_eq!(commit_idle_ms(Some(5000 * mib)), 5_000);
+        assert_eq!(commit_idle_ms(Some(4000 * mib)), 3_000);
+        assert_eq!(commit_idle_ms(Some(3000 * mib)), 1_500);
+        assert_eq!(commit_idle_ms(Some(2000 * mib)), 500);
+        assert_eq!(commit_idle_ms(Some(1000 * mib)), 100);
+        assert_eq!(commit_idle_frames(None), 4);
+        assert_eq!(commit_idle_frames(Some(3000 * mib)), 4);
+        assert_eq!(commit_idle_frames(Some(2000 * mib)), 2);
+        assert_eq!(commit_idle_frames(Some(1000 * mib)), 1);
     }
 }
