@@ -1539,6 +1539,7 @@ enum Step {
     Host(Box<dyn Fn() + Send>),
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     Texture(std::sync::Arc<crate::texture::Staging>),
+    AfterTextures(std::sync::Arc<dyn Fn() + Send + Sync>),
 }
 
 #[derive(Default)]
@@ -1834,7 +1835,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::AfterTextures(_) => {}
             }
         }
     }
@@ -5222,6 +5223,12 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    pub(crate) fn defer_after_textures(&self, work: impl Fn() + Send + Sync + 'static) {
+        self.deferred()
+            .copies
+            .push(Step::AfterTextures(std::sync::Arc::new(work)));
+    }
+
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
@@ -5290,6 +5297,10 @@ impl HostList {
                     }
                     continue;
                 }
+                Step::AfterTextures(work) => {
+                    batch.after_textures.push(work.clone());
+                    continue;
+                }
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
@@ -5308,6 +5319,7 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     textures: std::collections::HashSet<usize>,
     pending_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
+    after_textures: Vec<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Batch {
@@ -5427,6 +5439,9 @@ impl Batch {
                     staging.refresh();
                 }
             }
+        }
+        for work in self.after_textures.drain(..) {
+            work();
         }
         if ahead {
             crate::watch::ask_ahead_done();

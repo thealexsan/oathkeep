@@ -664,7 +664,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     {
         let staging = staging.clone();
-        list.defer_host(move || {
+        list.defer_after_textures(move || {
             staging.uploaded.store(true, Relaxed);
             staging.dirty.store(false, Relaxed);
         });
@@ -679,7 +679,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         return;
     };
     list.defer_texture(staging.clone());
-    list.defer_host(move || {
+    list.defer_after_textures(move || {
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting.store(
             if waiting {

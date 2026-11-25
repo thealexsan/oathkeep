@@ -1416,7 +1416,7 @@ impl State {
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
         }
-        let room = crate::resource::room();
+        let mut room = crate::resource::speculative_room();
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
@@ -1475,9 +1475,19 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        let mut checked_spent = SPENT.load(Ordering::Relaxed);
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            let spent_now = SPENT.load(Ordering::Relaxed);
+            if spent_now >= bytes_at_most || began.elapsed() > span {
                 break;
+            }
+            if room && spent_now.saturating_sub(checked_spent) >= (16 << 20) {
+                checked_spent = spent_now;
+                room = crate::resource::speculative_room();
+                if !room {
+                    HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
+                    once!("textures picked by index: the card has no room for more; they wait");
+                }
             }
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {

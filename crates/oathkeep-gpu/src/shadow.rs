@@ -116,6 +116,13 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
+    let headroom = crate::resource::commit_headroom();
+    if headroom > 0
+        && let Some(avail) = crate::host::available_commit()
+        && avail < headroom.saturating_add(1024 << 20)
+    {
+        return None;
+    }
     let tenths = if card_room_kept_on() { 9 } else { 8 };
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * tenths
@@ -153,6 +160,13 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     }
     let host = host()?;
     if !host.card_ready() {
+        return None;
+    }
+    let headroom = crate::resource::commit_headroom();
+    if headroom > 0
+        && let Some(avail) = crate::host::available_commit()
+        && avail < headroom.saturating_add(1024 << 20)
+    {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
@@ -3333,7 +3347,8 @@ fn window() -> u64 {
     *GRID.get_or_init(|| {
         let kb = std::env::var("OATHKEEP_WINDOW_KB")
             .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok());
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .or(Some(1024));
         grid(kb)
     })
 }

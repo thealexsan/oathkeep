@@ -317,9 +317,9 @@ fn compile_limit() -> usize {
     let Some(avail) = crate::host::available_commit() else {
         return max;
     };
-    if avail < (2u64 << 30) {
+    if avail < (2560u64 << 20) {
         1
-    } else if avail < (3584u64 << 20) {
+    } else if avail < (4096u64 << 20) {
         max.min(2)
     } else {
         max
@@ -347,7 +347,7 @@ impl ActiveCompile {
             active.1 += 1;
         }
         drop(active);
-        if crate::host::available_commit().is_some_and(|c| c < (1024u64 << 20)) {
+        if crate::host::available_commit().is_some_and(|c| c < (1536u64 << 20)) {
             static LAST_RECLAIM: Mutex<Option<Instant>> = Mutex::new(None);
             let should = {
                 let mut last = LAST_RECLAIM.lock().unwrap_or_else(|e| e.into_inner());

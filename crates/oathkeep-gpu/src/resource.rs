@@ -1162,15 +1162,27 @@ pub(crate) fn host_made<'a>(
 }
 
 #[cfg(windows)]
-fn commit_headroom() -> u64 {
+pub(crate) fn commit_headroom() -> u64 {
     static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| {
         std::env::var("OATHKEEP_COMMIT_HEADROOM_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(1536)
+            .unwrap_or(2048)
             << 20
     })
+}
+
+#[cfg(windows)]
+pub(crate) fn speculative_room() -> bool {
+    let headroom = commit_headroom();
+    if headroom > 0
+        && let Some(avail) = crate::host::available_commit()
+        && avail < headroom.saturating_add(1024 << 20)
+    {
+        return false;
+    }
+    room()
 }
 
 #[cfg(windows)]

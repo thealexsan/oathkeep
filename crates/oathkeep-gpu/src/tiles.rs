@@ -14,7 +14,7 @@ pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("OATHKEEP_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        if std::env::var_os("OATHKEEP_LEVELS_ON_DEMAND").is_some_and(|v| v == "0") {
             return false;
         }
         let Some(host) = host() else {
@@ -35,7 +35,7 @@ pub(crate) fn wanted() -> bool {
             tier,
             on,
             floor_kb = floor() >> 10,
-            "host copies of title textures take the card's memory level by level (OATHKEEP_LEVELS_ON_DEMAND=1)"
+            "host copies of title textures take the card's memory level by level (OATHKEEP_LEVELS_ON_DEMAND=0: off)"
         );
         on
     })
@@ -47,7 +47,7 @@ pub(crate) fn floor() -> u64 {
         std::env::var("OATHKEEP_LEVELS_MIN_KB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(1 << 20, |kb| kb.max(64) << 10)
+            .map_or(128 << 10, |kb| kb.max(64) << 10)
     })
 }
 
