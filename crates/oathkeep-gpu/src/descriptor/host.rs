@@ -9,6 +9,7 @@ use crate::host::host;
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    gpu: u64,
     step: u32,
     count: u32,
     dynamic: u32,
@@ -18,7 +19,9 @@ pub(crate) struct HostHeap {
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
     has_kept: Vec<std::sync::atomic::AtomicU64>,
     is_buffer: Vec<std::sync::atomic::AtomicU64>,
-    next: Mutex<(u32, Vec<bool>)>,
+    in_texture_queue: Vec<std::sync::atomic::AtomicU64>,
+    in_placed: Vec<std::sync::atomic::AtomicU64>,
+    next: Mutex<DynamicSlots>,
     free: std::sync::atomic::AtomicU32,
     too_long: std::sync::atomic::AtomicU32,
     strides: Option<(ID3D12Resource, u64, usize)>,
@@ -27,6 +30,153 @@ pub(crate) struct HostHeap {
     textures: Mutex<TextureQueue>,
     tabled: Vec<std::sync::atomic::AtomicU32>,
     placed: std::sync::Arc<Mutex<Spans>>,
+}
+
+#[inline]
+fn bit_mask(lo: u32, hi: u32) -> u64 {
+    let width = hi - lo;
+    let ones = if width >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    };
+    ones << lo
+}
+
+struct DynamicSlots {
+    cursor: u32,
+    count: u32,
+    words: Vec<u64>,
+}
+
+impl DynamicSlots {
+    fn new(count: u32) -> Self {
+        let word_count = (count as usize).div_ceil(64);
+        let mut words = vec![0u64; word_count];
+        let rem = count & 63;
+        if rem != 0
+            && let Some(last) = words.last_mut()
+        {
+            *last = !((1u64 << rem) - 1);
+        }
+        Self {
+            cursor: 0,
+            count,
+            words,
+        }
+    }
+
+    fn find_run(&self, start: u32, end: u32, n: u32) -> Option<u32> {
+        if start >= end || end - start < n {
+            return None;
+        }
+        if n == 1 {
+            let mut word_idx = (start as usize) >> 6;
+            let bit = start & 63;
+            let mut w = self.words[word_idx] | ((1u64 << bit) - 1);
+            loop {
+                if w != u64::MAX {
+                    let pos = (word_idx as u32) * 64 + (!w).trailing_zeros();
+                    return (pos < end).then_some(pos);
+                }
+                word_idx += 1;
+                if word_idx * 64 >= end as usize || word_idx >= self.words.len() {
+                    return None;
+                }
+                w = self.words[word_idx];
+            }
+        }
+        let mut run_start = start;
+        let mut run = 0u32;
+        let mut pos = start;
+        while pos < end {
+            let word_idx = (pos as usize) >> 6;
+            let bit = pos & 63;
+            let word = self.words[word_idx];
+            if bit == 0 {
+                if word == 0 {
+                    let avail = (end - pos).min(64);
+                    if run == 0 {
+                        run_start = pos;
+                    }
+                    run += avail;
+                    if run >= n {
+                        return Some(run_start);
+                    }
+                    pos += avail;
+                    continue;
+                }
+                if word == u64::MAX {
+                    run = 0;
+                    pos = (pos + 64).min(end);
+                    continue;
+                }
+            }
+            let shifted = word >> bit;
+            let bits_left = (64 - bit).min(end - pos);
+            if shifted & 1 == 0 {
+                let zeros = shifted.trailing_zeros().min(bits_left);
+                if run == 0 {
+                    run_start = pos;
+                }
+                run += zeros;
+                if run >= n {
+                    return Some(run_start);
+                }
+                pos += zeros;
+            } else {
+                let ones = (!shifted).trailing_zeros().min(bits_left);
+                run = 0;
+                pos += ones;
+            }
+        }
+        None
+    }
+
+    fn alloc(&mut self, n: u32) -> Option<u32> {
+        if n == 0 || n > self.count {
+            return None;
+        }
+        let first = self.find_run(self.cursor, self.count, n).or_else(|| {
+            if self.cursor == 0 {
+                None
+            } else {
+                let wrap_end = self.cursor.saturating_add(n - 1).min(self.count);
+                self.find_run(0, wrap_end, n)
+            }
+        })?;
+        let mut pos = first;
+        let end = first + n;
+        while pos < end {
+            let word_idx = (pos as usize) >> 6;
+            let lo = pos & 63;
+            let hi = (end - pos).min(64 - lo) + lo;
+            self.words[word_idx] |= bit_mask(lo, hi);
+            pos += hi - lo;
+        }
+        self.cursor = (first + n) % self.count;
+        Some(first)
+    }
+
+    fn free(&mut self, first: u32, n: u32) -> u32 {
+        let end = first.saturating_add(n).min(self.count);
+        if first >= end {
+            return 0;
+        }
+        let mut given = 0u32;
+        let mut pos = first;
+        while pos < end {
+            let word_idx = (pos as usize) >> 6;
+            let lo = pos & 63;
+            let hi = (end - pos).min(64 - lo) + lo;
+            let mask = bit_mask(lo, hi);
+            let w = &mut self.words[word_idx];
+            given += (*w & mask).count_ones();
+            *w &= !mask;
+            pos += hi - lo;
+        }
+        given
+    }
 }
 
 fn bit_words(count: u32) -> Vec<std::sync::atomic::AtomicU64> {
@@ -52,6 +202,27 @@ fn bit_set(bits: &[std::sync::atomic::AtomicU64], index: u32, on: bool) {
             w.fetch_and(!mask, std::sync::atomic::Ordering::Release);
         }
     }
+}
+
+fn bit_any_in_range(bits: &[std::sync::atomic::AtomicU64], start: u32, end: u32) -> bool {
+    if start >= end {
+        return false;
+    }
+    let mut pos = start;
+    while pos < end {
+        let word_idx = (pos as usize) >> 6;
+        let lo = pos & 63;
+        let hi = (end - pos).min(64 - lo) + lo;
+        let mask = bit_mask(lo, hi);
+        if bits
+            .get(word_idx)
+            .is_some_and(|w| w.load(std::sync::atomic::Ordering::Acquire) & mask != 0)
+        {
+            return true;
+        }
+        pos += hi - lo;
+    }
+    false
 }
 
 fn coalesce_u64_ranges(ranges: &mut Vec<(u64, u64)>) {
@@ -117,12 +288,16 @@ pub(crate) fn levels_changed(start: u64) {
 
 static WAITING: Mutex<std::collections::BTreeMap<u64, u64>> =
     Mutex::new(std::collections::BTreeMap::new());
+static WAITING_OLDEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn levels_waiting(start: u64) {
-    WAITING
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(start, crate::host::moment());
+    let now = crate::host::moment().max(1);
+    let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+    let was_empty = waiting.is_empty();
+    waiting.insert(start, now);
+    if was_empty {
+        WAITING_OLDEST.store(now, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[derive(Default)]
@@ -425,6 +600,14 @@ fn tabled_out() -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DueSlot {
+    pub(crate) index: u32,
+    pub(crate) write: u64,
+    pub(crate) mapped: u64,
+    pub(crate) checked: Option<(u64, u64, u64, u8, u64)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
     due: u64,
     written: u64,
@@ -711,6 +894,59 @@ impl TextureQueue {
         order
     }
 
+    #[inline]
+    fn make_due_slot(&self, index: u32, write: u64) -> DueSlot {
+        match self.slots.get(&index) {
+            Some(w) => DueSlot {
+                index,
+                write,
+                mapped: w.mapped,
+                checked: (w.checked.2 != 0).then_some(w.checked),
+            },
+            None => DueSlot {
+                index,
+                write,
+                mapped: 0,
+                checked: None,
+            },
+        }
+    }
+
+    fn due_batch_into(&self, frame: u64, max: usize, out: &mut Vec<DueSlot>) {
+        out.clear();
+        if max == 0 {
+            return;
+        }
+        let no_unpromoted = frame >= self.ready_until
+            && self.future.first().is_none_or(|&(due, _)| due > frame);
+        if no_unpromoted {
+            let cap = max.min(self.ready_again.len() + self.ready_fresh.len());
+            out.reserve(cap.saturating_sub(out.capacity()));
+            for (&write, &index) in self.ready_again.iter().rev().take(max) {
+                out.push(self.make_due_slot(index, write));
+            }
+            if out.len() < max {
+                let mut fresh = self.ready_fresh.iter();
+                while out.len() < max {
+                    let Some((&write, &index)) = fresh.next_back() else {
+                        break;
+                    };
+                    out.push(self.make_due_slot(index, write));
+                    if out.len() < max {
+                        let Some((&write, &index)) = fresh.next() else {
+                            break;
+                        };
+                        out.push(self.make_due_slot(index, write));
+                    }
+                }
+            }
+            return;
+        }
+        for (index, write) in self.due(frame, max) {
+            out.push(self.make_due_slot(index, write));
+        }
+    }
+
     fn all_due(&self, frame: u64) -> Vec<(u32, bool)> {
         let mut out = Vec::new();
         for &index in self.ready_again.values().chain(self.ready_fresh.values()) {
@@ -730,11 +966,14 @@ impl TextureQueue {
         out
     }
 
-    fn done(&mut self, index: u32, write: u64) {
+    fn done(&mut self, index: u32, write: u64) -> bool {
         if self.slots.get(&index).is_some_and(|w| w.write == write) {
             let old = self.slots.remove(&index).unwrap();
             self.index_remove(index, old);
             self.held.remove(&index);
+            true
+        } else {
+            false
         }
     }
 
@@ -813,13 +1052,6 @@ impl TextureQueue {
         }
     }
 
-    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.slots
-            .get(&index)
-            .map(|w| w.checked)
-            .filter(|c| c.2 != 0)
-    }
-
     fn changed(&mut self, index: u32, frame: u64, due: u64) {
         self.writes += 1;
         let write = self.writes;
@@ -839,6 +1071,7 @@ impl TextureQueue {
         self.index_insert(index, w);
     }
 
+    #[cfg(test)]
     fn mapped(&self, index: u32) -> u64 {
         self.slots.get(&index).map_or(0, |w| w.mapped)
     }
@@ -1088,6 +1321,7 @@ impl HostHeap {
         let h = HostHeap {
             heap,
             cpu,
+            gpu,
             step,
             count,
             dynamic: extra,
@@ -1099,8 +1333,10 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             has_kept: bit_words(count + extra),
             is_buffer: bit_words(if sampler { 0 } else { count }),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+            in_texture_queue: bit_words(if sampler { 0 } else { count }),
+            in_placed: bit_words(if sampler { 0 } else { count }),
+            next: Mutex::new(DynamicSlots::new(if sampler { 0 } else { extra })),
+            free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
@@ -1200,29 +1436,13 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-        let n = n as usize;
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = if enough { guard.alloc(n) } else { None };
         let Some(first) = found else {
             if enough {
                 self.too_long
-                    .fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_min(n, std::sync::atomic::Ordering::Relaxed);
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -1241,11 +1461,9 @@ impl HostHeap {
             crate::copystat::C::DynamicNs,
             started.elapsed().as_nanos() as u64,
         );
-        taken[first..first + n].fill(true);
         self.free
-            .fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
-        Some(self.count + first as u32)
+            .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+        Some(self.count + first)
     }
 
     pub(crate) fn count(&self) -> u32 {
@@ -1260,6 +1478,7 @@ impl HostHeap {
         self.strides.as_ref().map(|s| &s.0)
     }
 
+    #[cfg(test)]
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         textures.promote(frame);
@@ -1273,6 +1492,24 @@ impl HostHeap {
         )
     }
 
+    pub(crate) fn texture_slots_due_batch(
+        &self,
+        frame: u64,
+        max: usize,
+        promote_and_census: bool,
+        out: &mut Vec<DueSlot>,
+    ) -> Option<[u64; 5]> {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let census = if promote_and_census {
+            textures.promote(frame);
+            Some(textures.census(frame))
+        } else {
+            None
+        };
+        textures.due_batch_into(frame, max, out);
+        census
+    }
+
     pub(crate) fn texture_slots_all_due(&self, frame: u64) -> Vec<(u32, bool)> {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         textures.all_due(frame)
@@ -1282,7 +1519,11 @@ impl HostHeap {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         match again {
             Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
-            None => textures.done(index, write),
+            None => {
+                if textures.done(index, write) {
+                    bit_set(&self.in_texture_queue, index, false);
+                }
+            }
         }
     }
 
@@ -1299,13 +1540,6 @@ impl HostHeap {
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         textures.recheck(index, write, due, at, print, looks, uploaded);
-    }
-
-    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.textures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .checked(index)
     }
 
     pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64) {
@@ -1325,13 +1559,6 @@ impl HostHeap {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .room(frame)
-    }
-
-    pub(crate) fn texture_slot_mapped(&self, index: u32) -> u64 {
-        self.textures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .mapped(index)
     }
 
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
@@ -1364,6 +1591,7 @@ impl HostHeap {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
+            bit_set(&self.in_texture_queue, slot, true);
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
         slots.len()
@@ -1415,6 +1643,7 @@ impl HostHeap {
         }
         for &slot in &slots {
             textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
+            bit_set(&self.in_texture_queue, slot, true);
         }
         [held, slots.len(), slots.len()]
     }
@@ -1442,20 +1671,36 @@ impl HostHeap {
         if self.sampler {
             return 0;
         }
+        let oldest = WAITING_OLDEST.load(std::sync::atomic::Ordering::Acquire);
+        if oldest == 0 || !crate::host::long_ago(oldest, 1000, 2) {
+            return 0;
+        }
         let starts: Vec<u64> = {
             let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
             if waiting.is_empty() {
+                WAITING_OLDEST.store(0, std::sync::atomic::Ordering::Release);
                 return 0;
             }
-            let starts: Vec<u64> = waiting
-                .iter()
-                .filter(|&(_, &since)| crate::host::long_ago(since, 1000, 2))
-                .map(|(&start, _)| start)
-                .take(Self::WAITING_A_PASS)
-                .collect();
+            let mut starts = Vec::new();
+            let mut next_oldest = u64::MAX;
+            for (&start, &since) in waiting.iter() {
+                if starts.len() < Self::WAITING_A_PASS && crate::host::long_ago(since, 1000, 2) {
+                    starts.push(start);
+                } else if since < next_oldest {
+                    next_oldest = since;
+                }
+            }
             for start in &starts {
                 waiting.remove(start);
             }
+            let updated_oldest = if waiting.is_empty() {
+                0
+            } else if next_oldest == u64::MAX {
+                oldest
+            } else {
+                next_oldest
+            };
+            WAITING_OLDEST.store(updated_oldest, std::sync::atomic::Ordering::Release);
             starts
         };
         if starts.is_empty() {
@@ -1474,6 +1719,7 @@ impl HostHeap {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
+            bit_set(&self.in_texture_queue, slot, true);
         }
         crate::tiles::STATS[10].fetch_add(slots.len() as u64, std::sync::atomic::Ordering::Relaxed);
         slots.len()
@@ -1525,6 +1771,13 @@ impl HostHeap {
     }
 
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
+        if self
+            .made_keys
+            .get(index as usize)
+            .is_none_or(|s| s.load(std::sync::atomic::Ordering::Acquire) == 0)
+        {
+            return false;
+        }
         let mut deferred = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self
             .made_keys
@@ -1579,9 +1832,10 @@ impl HostHeap {
         }
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
-            if tabled_out() {
+            if tabled_out() && bit_get(&self.in_texture_queue, index) {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
                 if textures.remove(index) {
+                    bit_set(&self.in_texture_queue, index, false);
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }
@@ -1610,8 +1864,8 @@ impl HostHeap {
         let lately =
             stamp != 0 && u64::from(now.wrapping_sub(stamp & !TABLED_READ)) <= TABLED_FRAMES;
         let read_now = seen && stamp == now | TABLED_READ;
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             let due = if lately && !seen {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 frame + TABLED_GRACE
@@ -1619,8 +1873,12 @@ impl HostHeap {
                 0
             };
             textures.written(index, frame, due, seen);
-        } else {
-            textures.remove(index);
+            bit_set(&self.in_texture_queue, index, true);
+        } else if bit_get(&self.in_texture_queue, index) {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            if textures.remove(index) {
+                bit_set(&self.in_texture_queue, index, false);
+            }
         }
     }
 
@@ -1651,10 +1909,11 @@ impl HostHeap {
             }
             _ => false,
         };
-        self.queue_texture(index, texture, seen, crate::frame::current());
+        let frame = crate::frame::current();
+        self.queue_texture(index, texture, seen, frame);
         let placed_view = match view {
             Some(View::Placed(false, resource, desc))
-                if resource[0] != 1 && !self.tabled_lately(index, crate::frame::current()) =>
+                if resource[0] != 1 && !self.tabled_lately(index, frame) =>
             {
                 Some((
                     resource,
@@ -1664,32 +1923,47 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        let stale = if let Some((resource, start, first)) = placed_view {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            let span = placed_view.and_then(|(resource, start, first)| {
-                Some((start, start.saturating_add(placed.bytes(resource)?), first))
-            });
+            let span = placed
+                .bytes(resource)
+                .map(|bytes| (start, start.saturating_add(bytes), first));
             match span {
                 Some((start, end, first)) => {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
                     let stale = placed.note(index, start, end, !seen);
+                    for &slot in &stale {
+                        bit_set(&self.in_placed, slot, false);
+                    }
+                    let present = placed.by_slot.contains_key(&index);
+                    bit_set(&self.in_placed, index, present);
                     placed.shows(index, first);
                     stale
                 }
                 None => {
                     placed.forget(index);
+                    bit_set(&self.in_placed, index, false);
                     Vec::new()
                 }
             }
+        } else if bit_get(&self.in_placed, index) {
+            let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            placed.forget(index);
+            bit_set(&self.in_placed, index, false);
+            Vec::new()
+        } else {
+            Vec::new()
         };
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             for &slot in &stale {
-                textures.remove(slot);
+                if textures.remove(slot) {
+                    bit_set(&self.in_texture_queue, slot, false);
+                }
             }
         }
         let stride = view.and_then(view_stride);
@@ -1729,26 +2003,34 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        let end = at.saturating_add(n).min(self.dynamic);
+        {
+            let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+            let given = guard.free(at, end.saturating_sub(at));
             self.free
                 .fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long
                 .store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
         }
-        drop(guard);
-        let base = self.count as usize;
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slots) = kept.get_mut(base + at as usize..base + end) {
-            for (offset, slot) in slots.iter_mut().enumerate() {
-                if let Some(old) = slot.take() {
-                    bit_set(&self.has_kept, (base + at as usize + offset) as u32, false);
-                    crate::host::retire(old);
+        let kept_start = self.count + at;
+        let kept_end = self.count + end;
+        if !bit_any_in_range(&self.has_kept, kept_start, kept_end) {
+            return;
+        }
+        let mut retired = Vec::new();
+        {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slots) = kept.get_mut(kept_start as usize..kept_end as usize) {
+                for (offset, slot) in slots.iter_mut().enumerate() {
+                    if let Some(old) = slot.take() {
+                        bit_set(&self.has_kept, kept_start + offset as u32, false);
+                        retired.push(old);
+                    }
                 }
             }
+        }
+        for old in retired {
+            crate::host::retire(old);
         }
     }
 
@@ -1771,12 +2053,20 @@ impl HostHeap {
 
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let present = resource.is_some();
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
-            bit_set(&self.has_kept, index, present);
-            if let Some(old) = std::mem::replace(slot, resource) {
-                crate::host::retire(old);
+        if !present && !bit_get(&self.has_kept, index) {
+            return;
+        }
+        let old = {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = kept.get_mut(index as usize) {
+                bit_set(&self.has_kept, index, present);
+                std::mem::replace(slot, resource)
+            } else {
+                None
             }
+        };
+        if let Some(old) = old {
+            crate::host::retire(old);
         }
     }
 
@@ -1863,10 +2153,8 @@ impl HostHeap {
     }
 
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
     }
 
@@ -3381,5 +3669,71 @@ mod tests {
         ];
         coalesce_u64_ranges(&mut ranges);
         assert_eq!(ranges, [(0x1000, 0x3000), (0x4000, 0x6000)]);
+    }
+
+    #[test]
+    fn texture_queue_batched_due_returns_metadata_and_drains_incrementally() {
+        let mut q = TextureQueue::default();
+        for i in 0..10u32 {
+            q.written(100 + i, 1, 0, false);
+        }
+        q.promote(5);
+        let initial = q.due(5, 10);
+        let (partly_idx, partly_w) = initial[0];
+        let (recheck_idx, recheck_w) = initial[1];
+        q.partly(partly_idx, partly_w, 5, 8192);
+        q.recheck(recheck_idx, recheck_w, 5, (0x1000, 4096), 0xdeadbeef, 2, 1);
+
+        let mut batch = Vec::new();
+        let mut seen = Vec::new();
+        loop {
+            q.due_batch_into(5, 3, &mut batch);
+            if batch.is_empty() {
+                break;
+            }
+            assert!(batch.len() <= 3);
+            for slot in &batch {
+                if slot.index == partly_idx {
+                    assert_eq!(slot.mapped, 8192);
+                    assert_eq!(slot.checked, None);
+                } else if slot.index == recheck_idx {
+                    assert_eq!(slot.mapped, 0);
+                    assert_eq!(slot.checked, Some((0x1000, 4096, 0xdeadbeef, 2, 1)));
+                } else {
+                    assert_eq!(slot.mapped, 0);
+                    assert_eq!(slot.checked, None);
+                }
+                seen.push(slot.index);
+                assert!(q.done(slot.index, slot.write));
+            }
+        }
+        assert_eq!(seen.len(), 10);
+        // `again` slots (`recheck_idx`, `partly_idx`) are served ahead of fresh slots.
+        assert!(seen[..2].contains(&partly_idx));
+        assert!(seen[..2].contains(&recheck_idx));
+        assert_eq!(q.census(5)[1], 0);
+    }
+
+    #[test]
+    fn dynamic_slots_bitset_handles_word_boundaries_and_wraparound() {
+        let mut d = DynamicSlots::new(130);
+        assert_eq!(d.alloc(0), None);
+        assert_eq!(d.alloc(131), None);
+        // Allocate across 64-bit word boundaries.
+        assert_eq!(d.alloc(60), Some(0));
+        assert_eq!(d.alloc(10), Some(60));
+        assert_eq!(d.alloc(60), Some(70));
+        assert_eq!(d.alloc(1), None);
+        // Free a span straddling word 0/1 boundary and a small span at 0.
+        assert_eq!(d.free(58, 14), 14);
+        assert_eq!(d.free(58, 14), 0);
+        assert_eq!(d.alloc(14), Some(58));
+        // Free a run that straddles cursor (cursor is now 72).
+        assert_eq!(d.free(70, 6), 6);
+        assert_eq!(d.alloc(6), Some(70));
+        // Free single slot at the very end (index 129, non-multiple-of-64 tail).
+        assert_eq!(d.free(129, 10), 1);
+        assert_eq!(d.alloc(1), Some(129));
+        assert_eq!(d.alloc(1), None);
     }
 }
