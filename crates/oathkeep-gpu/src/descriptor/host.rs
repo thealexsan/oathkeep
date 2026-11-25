@@ -1466,6 +1466,26 @@ impl HostHeap {
         };
     }
 
+    pub(crate) fn constant_at_kept(
+        &self,
+        index: u32,
+        gpu: u64,
+        size: u32,
+        buffer: ID3D12Resource,
+    ) {
+        self.keep(index, Some(buffer));
+        let Some(host) = host() else { return };
+        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: gpu,
+            SizeInBytes: size.next_multiple_of(256),
+        };
+        // SAFETY: a slot of our heap; the buffer is kept in `self.kept`.
+        unsafe {
+            host.device
+                .CreateConstantBufferView(Some(&desc), self.cpu(index))
+        };
+    }
+
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,

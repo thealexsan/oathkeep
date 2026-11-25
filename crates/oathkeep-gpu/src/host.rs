@@ -1422,8 +1422,8 @@ static LINE_LANDED: std::sync::Condvar = std::sync::Condvar::new();
 
 static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 
-static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static RELAY_STATS: [std::sync::atomic::AtomicU64; 9] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 9];
 
 fn landable(line: &[Option<u64>], completed: u64) -> usize {
     line.iter()
@@ -1872,11 +1872,13 @@ fn relay_worker() {
         ));
     };
     let mut fetch: Option<RelayFetch> = None;
+    let mut deferred = false;
     loop {
         let next = {
             let mut line = line();
             loop {
                 if line.line.is_empty() {
+                    deferred = false;
                     line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
@@ -1894,6 +1896,50 @@ fn relay_worker() {
                 if n == 0 {
                     break Err(fences[0].unwrap_or(0));
                 }
+                let mut busy_shadows = std::collections::HashSet::new();
+                let mut max_busy_fence = 0u64;
+                if n < line.line.len() {
+                    let mut landed_card_shadows = std::collections::HashSet::new();
+                    for item in &line.line[..n] {
+                        if let Late::Run(flight) = item
+                            && let Some(card) = &flight.card
+                        {
+                            for r in &card.ranges {
+                                landed_card_shadows
+                                    .insert(std::sync::Arc::as_ptr(&r.shadow) as usize);
+                            }
+                        }
+                    }
+                    for item in &line.line[n..] {
+                        if let Late::Run(flight) = item
+                            && let Some(card) = &flight.card
+                        {
+                            let mut touches_landed = false;
+                            for r in &card.ranges {
+                                let ptr = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                                busy_shadows.insert(ptr);
+                                if landed_card_shadows.contains(&ptr) {
+                                    touches_landed = true;
+                                }
+                            }
+                            for s in &card._synced {
+                                let ptr = std::sync::Arc::as_ptr(s) as usize;
+                                busy_shadows.insert(ptr);
+                                if landed_card_shadows.contains(&ptr) {
+                                    touches_landed = true;
+                                }
+                            }
+                            if touches_landed && flight.fence > max_busy_fence {
+                                max_busy_fence = flight.fence;
+                            }
+                        }
+                    }
+                }
+                if !deferred && max_busy_fence > completed {
+                    deferred = true;
+                    break Err(max_busy_fence);
+                }
+                deferred = false;
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
                 line.in_hand = items
@@ -1903,19 +1949,6 @@ fn relay_worker() {
                         _ => None,
                     })
                     .collect();
-                let mut busy_shadows = std::collections::HashSet::new();
-                for item in &line.line {
-                    if let Late::Run(flight) = item
-                        && let Some(card) = &flight.card
-                    {
-                        for r in &card.ranges {
-                            busy_shadows.insert(std::sync::Arc::as_ptr(&r.shadow) as usize);
-                        }
-                        for s in &card._synced {
-                            busy_shadows.insert(std::sync::Arc::as_ptr(s) as usize);
-                        }
-                    }
-                }
                 break Ok((items, busy_shadows));
             }
         };
@@ -2042,12 +2075,16 @@ fn late_line(frames: f64) {
         tracing::info!(
             "the relay per frame (OATHKEEP_RELAY=1): {:.1} flights landed in {:.1} landings by the thread that copies back, \
              beside the submitting thread; that thread waited {:.1} ms for the card with nothing to land and {:.1} ms for \
-             fetches of card copies' pieces, and was {:.1} ms landing in all (the frame line's \"copying back\" is its time; \
-             \"settles\" above are waits of other threads for it)",
+             fetches of card copies' pieces (copy queue {:.1}x {:.1} ms, 3D queue {:.1}x {:.1} ms), and was {:.1} ms landing in all \
+             (the frame line's \"copying back\" is its time; \"settles\" above are waits of other threads for it)",
             r[1],
             r[0],
             r[2] / 1000.0,
             r[3] / 1000.0,
+            r[5],
+            r[6] / 1000.0,
+            r[7],
+            r[8] / 1000.0,
             r[4] / 1000.0,
         );
     }
@@ -2921,6 +2958,7 @@ impl Host {
         let waiting = std::time::Instant::now();
         let mut waits = 0u64;
         if !fast.is_empty() {
+            let fast_start = std::time::Instant::now();
             let copy_queue = self.copy_queue.as_ref().unwrap();
             let (allocator, list) = f.copy_list.as_ref().unwrap().clone();
             {
@@ -2970,10 +3008,13 @@ impl Host {
                     "what shaders wrote to the card's memory could not be fetched on the copy queue ({e}, OATHKEEP_RELAY=1)"
                 ));
             }
+            RELAY_STATS[5].fetch_add(1, Ordering::Relaxed);
+            RELAY_STATS[6].fetch_add(fast_start.elapsed().as_micros() as u64, Ordering::Relaxed);
             waits += 1;
         }
         let mut slow_after = landed_seq;
         if !slow.is_empty() {
+            let slow_start = std::time::Instant::now();
             f.sent += 1;
             let ((allocator, list), fence, event, sent) =
                 (f.list.clone(), f.fence.clone(), f.event, f.sent);
@@ -3012,6 +3053,8 @@ impl Host {
                     "what shaders wrote to the card's memory could not be fetched ({e}, OATHKEEP_RELAY=1)"
                 )),
             };
+            RELAY_STATS[7].fetch_add(1, Ordering::Relaxed);
+            RELAY_STATS[8].fetch_add(slow_start.elapsed().as_micros() as u64, Ordering::Relaxed);
             waits += 1;
         }
         let us = waiting.elapsed().as_micros() as u64;
@@ -3660,6 +3703,7 @@ impl Host {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
                         && !shadow.unwatched()
+                        && !shadow.guarded()
                     {
                         let span = spans
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
@@ -4891,7 +4935,7 @@ impl Batch {
             let ranges: Vec<(usize, usize)> = self
                 .refreshes
                 .iter()
-                .filter(|r| !r.0.unwatched())
+                .filter(|r| !r.0.unwatched() && !r.0.guarded())
                 .map(|r| (r.1, r.2))
                 .collect();
             crate::watch::ask_ahead(&ranges);

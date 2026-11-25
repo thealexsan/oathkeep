@@ -267,6 +267,11 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+fn direct_cbv() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_DIRECT_CBV").is_none_or(|v| v != "0"))
+}
+
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -2184,8 +2189,22 @@ impl State {
                 (table, n, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in entries.iter() {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
+                    if u.kind == ResourceType::Cbv {
+                        if direct_cbv()
+                            && let Some(View::Constant(address, size)) =
+                                crate::descriptor::view(handle)
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                        {
+                            let gpu = shadow.gpu(address);
+                            let aligned = size.next_multiple_of(256);
+                            if gpu % 256 == 0 && shadow.left(address) >= u64::from(aligned) {
+                                shadow.refresh(list, address, u64::from(size));
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
                     }
@@ -2217,6 +2236,17 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if direct_cbv()
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                        {
+                            let gpu = shadow.gpu(address);
+                            let aligned = size.next_multiple_of(256);
+                            if gpu % 256 == 0 && shadow.left(address) >= u64::from(aligned) {
+                                shadow.refresh(list, address, u64::from(size));
+                                host.constant_at_kept(index, gpu, size, shadow.buffer.clone());
+                                continue;
+                            }
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;

@@ -14,6 +14,7 @@ pub(crate) struct Shadow {
     start: u64,
     len: u64,
     copied: Mutex<Vec<u64>>,
+    uncopied: AtomicU64,
     watched: AtomicU8,
     pending: Mutex<Vec<(usize, usize)>>,
     flights: Mutex<Flights>,
@@ -783,7 +784,9 @@ fn give_back(v: Vec<u8>) {
     });
 }
 
+const WATCHED_KERNEL: u8 = 1;
 const NOT_WATCHED: u8 = 2;
+const WATCHED_GUARDED: u8 = 3;
 
 const DIFF_CHUNK: usize = 32;
 
@@ -1760,6 +1763,10 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    pub(crate) fn guarded(&self) -> bool {
+        self.watched.load(Ordering::Relaxed) == WATCHED_GUARDED
+    }
+
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
@@ -1797,6 +1804,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            uncopied: AtomicU64::new(pages),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -2241,13 +2249,30 @@ impl Shadow {
         if busy.is_empty() {
             return false;
         }
-        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+        let mode = self.watched.load(Ordering::Relaxed);
+        if mode == NOT_WATCHED {
             return true;
         }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
         for (a, e) in busy {
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let Some((now, written)) = (match mode {
+                WATCHED_GUARDED => crate::watch::writes_guarded(a, e),
+                WATCHED_KERNEL => crate::watch::writes(a, e, true),
+                _ => match crate::watch::writes_kind(a, e, true) {
+                    Some((now, written, kind)) => {
+                        self.watched.store(
+                            match kind {
+                                crate::watch::WatchKind::WriteWatch => WATCHED_KERNEL,
+                                crate::watch::WatchKind::Guarded => WATCHED_GUARDED,
+                            },
+                            Ordering::Relaxed,
+                        );
+                        Some((now, written))
+                    }
+                    None => None,
+                },
+            }) else {
                 return true;
             };
             let stale: Vec<usize> = {
@@ -2311,6 +2336,9 @@ impl Shadow {
                 if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
                     let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(at) = copied.get_mut(page - base) {
+                        if *at == 0 && now != 0 {
+                            self.uncopied.fetch_sub(1, Ordering::Release);
+                        }
                         *at = now;
                     }
                 }
@@ -2354,9 +2382,26 @@ impl Shadow {
     }
 
     fn update_free(&self, from: usize, to: usize) -> usize {
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
-                self.watched.store(1, Ordering::Relaxed);
+        let mode = self.watched.load(Ordering::Relaxed);
+        if mode != NOT_WATCHED {
+            let found = match mode {
+                WATCHED_GUARDED => crate::watch::writes_guarded(from, to),
+                WATCHED_KERNEL => crate::watch::writes(from, to, true),
+                _ => match crate::watch::writes_kind(from, to, true) {
+                    Some((now, written, kind)) => {
+                        self.watched.store(
+                            match kind {
+                                crate::watch::WatchKind::WriteWatch => WATCHED_KERNEL,
+                                crate::watch::WatchKind::Guarded => WATCHED_GUARDED,
+                            },
+                            Ordering::Relaxed,
+                        );
+                        Some((now, written))
+                    }
+                    None => None,
+                },
+            };
+            if let Some((now, written)) = found {
                 let copied = self.copy_stale(from, to, now, &written);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
@@ -2430,9 +2475,43 @@ impl Shadow {
 
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        if self.uncopied.load(Ordering::Acquire) == 0 {
+            if written.is_empty() {
+                return 0;
+            }
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let mut bytes = 0;
+            let mut run: Option<(usize, usize)> = None;
+            for &(page, write) in written {
+                if page < base || page - base >= copied.len() {
+                    continue;
+                }
+                let at = &mut copied[page - base];
+                if write > *at {
+                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                        *at = now;
+                    }
+                    match run {
+                        Some((first, prev)) if page == prev + 1 => run = Some((first, page)),
+                        Some((first, prev)) => {
+                            bytes += self
+                                .copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
+                            run = Some((page, page));
+                        }
+                        None => run = Some((page, page)),
+                    }
+                }
+            }
+            if let Some((first, prev)) = run {
+                bytes += self.copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
+            }
+            return bytes;
+        }
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
+        let mut newly_copied = 0u64;
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -2444,14 +2523,19 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    if *at == 0 && now != 0 {
+                        newly_copied += 1;
+                    }
                     *at = now;
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
                 bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
             }
+        }
+        if newly_copied > 0 {
+            self.uncopied.fetch_sub(newly_copied, Ordering::Release);
         }
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));

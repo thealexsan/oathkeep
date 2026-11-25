@@ -545,7 +545,7 @@ pub(crate) struct PlacedFootprint {
     width: u32,
     height: u32,
     depth: u32,
-    row_pitch: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {

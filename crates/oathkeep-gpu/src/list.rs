@@ -839,18 +839,57 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
-            };
-            list.defer_fill(staging, data, bytes as usize);
-            from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
-            #[cfg(feature = "diagnostics")]
+            static DIRECT_TEX_COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let direct = *DIRECT_TEX_COPY
+                .get_or_init(|| std::env::var_os("OATHKEEP_DIRECT_TEX_COPY").is_none_or(|v| v != "0"));
+            if direct
+                && let Some(shadow) = crate::shadow::find(data as u64, bytes)
+                && let off = shadow.offset(data as u64)
+                && off % 512 == 0
+                && from.footprint.row_pitch % 256 == 0
+                && shadow.left(data as u64) >= bytes
             {
-                // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                shadow.refresh(list, data as u64, bytes);
+                list.keep(&shadow.buffer);
+                // SAFETY: an open list; ensures any prior shader UAV write in this
+                // list is visible before CopyTextureRegion reads `shadow.buffer`.
+                unsafe {
+                    use windows::Win32::Graphics::Direct3D12::{
+                        D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
+                        D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                        D3D12_RESOURCE_UAV_BARRIER,
+                    };
+                    list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                pResource: std::mem::ManuallyDrop::new(None),
+                            }),
+                        },
+                    }]);
+                }
+                from.resource = shadow.buffer.as_raw().cast_const().cast();
+                from.footprint.offset = off;
+                #[cfg(feature = "diagnostics")]
+                {
+                    read = Some((shadow.gpu(data as u64), bytes));
+                }
+                _upload = shadow.buffer.clone();
+            } else {
+                let Some((buffer, staging)) = list.upload(host, bytes) else {
+                    return;
+                };
+                list.defer_fill(staging, data, bytes as usize);
+                from.resource = buffer.as_raw().cast_const().cast();
+                from.footprint.offset = 0;
+                #[cfg(feature = "diagnostics")]
+                {
+                    // SAFETY: a live buffer.
+                    read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                }
+                _upload = buffer;
             }
-            _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
