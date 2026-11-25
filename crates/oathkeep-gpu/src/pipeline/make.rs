@@ -302,8 +302,21 @@ impl ActiveCompile {
         }
         *active += 1;
         drop(active);
-        if crate::host::available_commit().is_some_and(|c| c < (1536u64 << 20)) {
-            crate::host::reclaim_for_oom();
+        if crate::host::available_commit().is_some_and(|c| c < (1024u64 << 20)) {
+            static LAST_RECLAIM: Mutex<Option<Instant>> = Mutex::new(None);
+            let should = {
+                let mut last = LAST_RECLAIM.lock().unwrap_or_else(|e| e.into_inner());
+                let now = Instant::now();
+                if last.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(5)) {
+                    *last = Some(now);
+                    true
+                } else {
+                    false
+                }
+            };
+            if should {
+                crate::host::reclaim_for_oom();
+            }
         }
         ActiveCompile
     }

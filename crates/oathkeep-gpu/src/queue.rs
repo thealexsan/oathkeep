@@ -496,8 +496,11 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
 pub(crate) struct Plane {
     token: u64,
     count: u32,
+    _pad: u32,
     resources: *const This,
+    _rest: [u64; 6],
 }
+const _: () = assert!(std::mem::size_of::<Plane>() == 72);
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
     execute(this, count, lists);
 }
@@ -698,51 +701,78 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
+        let plane_count = (planes as usize).min(4);
+        let mut active = Vec::with_capacity(plane_count);
+        for i in 0..plane_count {
+            // SAFETY: the title passes `planes` plane descriptions (`72` bytes each).
+            let plane = unsafe { &*plane_parameters.add(i) };
+            if plane.count > 0 && !plane.resources.is_null() {
+                // SAFETY: the plane lists `count` resources.
+                let resource = unsafe { *plane.resources };
+                if let Some(texture) = crate::resource::host_resource(resource) {
+                    active.push((resource, texture));
+                }
+            }
+        }
         static LOGGED_PLANES: AtomicU64 = AtomicU64::new(0);
-        let key = (u64::from(planes) << 32) | u64::from(plane.count);
-        if LOGGED_PLANES.swap(key, Ordering::Relaxed) != key {
-            let mut extra = String::new();
-            if plane.count > 1 {
-                for i in 0..plane.count.min(4) as usize {
-                    // SAFETY: `plane.count` resources are present.
-                    let r = unsafe { *plane.resources.add(i) };
-                    extra.push_str(&format!(" p0[{i}]={r:?}"));
-                }
-            }
-            if planes > 1 {
-                // SAFETY: probe first 16 u64 words to observe plane stride.
-                let words = unsafe { std::slice::from_raw_parts(plane_parameters.cast::<u64>(), 16) };
-                for (i, w) in words.iter().enumerate() {
-                    extra.push_str(&format!(" w{i}={w:#x}"));
-                }
-            }
+        let key = (u64::from(planes) << 32) | (active.len() as u64);
+        if !active.is_empty() && LOGGED_PLANES.swap(key, Ordering::Relaxed) != key {
+            let summary: Vec<String> = active
+                .iter()
+                .enumerate()
+                .map(|(i, (r, tex))| {
+                    // SAFETY: live host resource.
+                    let desc = unsafe { tex.GetDesc() };
+                    format!(
+                        "p{i}={r:?} ({}x{} f{})",
+                        desc.Width, desc.Height, desc.Format.0
+                    )
+                })
+                .collect();
             tracing::info!(
                 frame,
                 planes,
-                count = plane.count,
-                resource = ?resource,
-                extra = %extra,
+                active = active.len(),
+                layout = %summary.join(", "),
                 "PresentX plane layout"
             );
         }
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        if active.len() == 1 {
+            let (resource, texture) = &active[0];
+            const COPY_SOURCE: u32 = 0x800;
+            let state = crate::resource::host_transition(*resource, COPY_SOURCE)
+                .map_or(COPY_SOURCE, |(_, before)| before);
+            let shown = host.present(texture, state, frame);
+            crate::resource::host_transition(*resource, state);
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, *resource, state, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown;
+        } else if active.len() >= 2 {
+            const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+            let mut states = Vec::with_capacity(active.len());
+            for &(resource, _) in &active {
+                let before = crate::resource::host_transition(resource, PIXEL_SHADER_RESOURCE)
+                    .map_or(PIXEL_SHADER_RESOURCE, |(_, before)| before);
+                states.push(before);
+            }
+            let inputs: Vec<(_, u32)> = active
+                .iter()
+                .zip(states.iter().copied())
+                .map(|((_, tex), st)| (*tex, st))
+                .collect();
+            let shown = host.present_planes(&inputs, frame);
+            for (&(resource, _), state) in active.iter().zip(states.iter().copied()) {
+                crate::resource::host_transition(resource, state);
+            }
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, active[0].0, states[0], shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown;
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
@@ -965,5 +995,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[test]
+    fn present_plane_stride_matches_console_layout() {
+        assert_eq!(std::mem::size_of::<Plane>(), 72);
+        assert_eq!(std::mem::offset_of!(Plane, token), 0);
+        assert_eq!(std::mem::offset_of!(Plane, count), 8);
+        assert_eq!(std::mem::offset_of!(Plane, resources), 16);
     }
 }
