@@ -71,9 +71,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         // Diagnostics, in the budget buffer's next words: the largest
         // group count a mesh record asked for, and the groups asked in all.
-        uint was;
-        budget.InterlockedMax(4, g.x, was);
-        budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+        if (g.x > 0) {
+            uint was;
+            budget.InterlockedMax(4, g.x, was);
+            budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+        }
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;

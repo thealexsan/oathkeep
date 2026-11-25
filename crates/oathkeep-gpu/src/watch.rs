@@ -35,6 +35,21 @@ impl IntervalSet {
             .is_some_and(|(_, &end)| end >= last)
     }
 
+    fn overlaps(&self, first: usize, last: usize) -> bool {
+        if first >= last {
+            return false;
+        }
+        if self
+            .0
+            .range(..=first)
+            .next_back()
+            .is_some_and(|(_, &end)| end > first)
+        {
+            return true;
+        }
+        self.0.range(first..last).next().is_some()
+    }
+
     fn insert(&mut self, block: usize) {
         self.insert_range(block, block.saturating_add(1));
     }
@@ -525,7 +540,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         if g.clean.contains_range(first, last) {
             return Some(Vec::new());
         }
-        let known = g.protected.contains(first) || g.absent.contains(first);
+        let known = g.protected.overlaps(first, last) || g.absent.overlaps(first, last);
         if known {
             let gaps = g.clean.gaps_in(first, last);
             if !gaps.is_empty() && gaps.iter().all(|&(a, b)| g.absent.contains_range(a, b)) {
@@ -616,26 +631,21 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
-    for (base, bytes) in
-        crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK))
-    {
-        let first = (base / BLOCK).max(from);
-        let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
-        for block in first..last {
-            let shown = crate::inplace::pages_of(block * BLOCK);
-            if shown.len() < 2 || shown.len() > MANY_VIEWS {
-                continue;
-            }
-            #[cfg(feature = "diagnostics")]
-            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for alias in shown {
-                let alias = alias / BLOCK;
-                g.aliased.insert(alias);
-                if alias != block {
-                    protect_alias(g, alias);
-                }
-            }
-        }
+    let (all, other_runs, count) = crate::inplace::alias_blocks_between(
+        from.saturating_mul(BLOCK),
+        to.saturating_mul(BLOCK),
+        MANY_VIEWS,
+    );
+    if count == 0 {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    ALIASES[0].fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    for alias in all {
+        g.aliased.insert(alias);
+    }
+    for (a, b) in other_runs {
+        protect_alias_range(g, a, b);
     }
 }
 
@@ -650,20 +660,38 @@ fn view_guard() -> bool {
 pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-fn protect_alias(g: &mut Guards, block: usize) {
+fn protect_alias_range(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    if g.protected.contains(block) {
-        return;
-    }
-    let mut old = 0;
-    // SAFETY: title view memory; only its protection changes.
-    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
-        g.protected.insert(block);
+    for (a, b) in g.protected.gaps_in(from, to) {
+        let mut old = 0;
+        // SAFETY: title view memory; only its protection changes.
+        if unsafe {
+            VirtualProtect(
+                (a * BLOCK) as *const _,
+                (b - a) * BLOCK,
+                PAGE_READONLY,
+                &mut old,
+            ) != 0
+        } {
+            g.protected.insert_range(a, b);
+            continue;
+        }
+        for block in a..b {
+            // SAFETY: fallback per block if the span crosses a view boundary.
+            if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) }
+                != 0
+            {
+                g.protected.insert(block);
+            }
+        }
     }
 }
 
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{
+        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect,
+        VirtualQuery,
+    };
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
@@ -684,12 +712,40 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         note(g, from, to);
         return;
     }
-    for block in from..to {
-        if set(block, block + 1) {
-            note(g, block, block + 1);
-        } else if block < uncommitted_end(block) {
-            g.absent.insert(block);
+    let mut block = from;
+    while block < to {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+        let raw_end = if n != 0 {
+            ((info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK).min(to)
+        } else {
+            block
+        };
+        if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
+            if raw_end > block {
+                g.absent.insert_range(block, raw_end);
+                block = raw_end;
+            } else {
+                block += 1;
+            }
+            continue;
         }
+        let reg_end = raw_end.max(block + 1);
+        if set(block, reg_end) {
+            note(g, block, reg_end);
+            block = reg_end;
+            continue;
+        }
+        for single in block..reg_end {
+            if set(single, single + 1) {
+                note(g, single, single + 1);
+            } else if single < uncommitted_end(single) {
+                g.absent.insert(single);
+            }
+        }
+        block = reg_end;
     }
 }
 
@@ -718,28 +774,42 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
-    for block in aliased {
+    if aliased.is_empty() {
+        return any;
+    }
+    for &block in &aliased {
         g.aliased.remove(&block);
-        for alias in crate::inplace::pages_of(block * BLOCK) {
-            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
-                #[cfg(feature = "diagnostics")]
-                ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            g.aliased.remove(&(alias / BLOCK));
+    }
+    let (all, other_runs) = crate::inplace::alias_spans_of_blocks(&aliased);
+    for alias in all {
+        g.aliased.remove(&alias);
+    }
+    for (a, b) in other_runs {
+        #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+        let opened = open_here_count(g, a.saturating_mul(BLOCK), b.saturating_mul(BLOCK));
+        #[cfg(feature = "diagnostics")]
+        if opened > 0 {
+            ALIASES[1].fetch_add(opened, std::sync::atomic::Ordering::Relaxed);
         }
     }
     any
 }
 
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
+    open_here_count(g, start, end) > 0
+}
+
+fn open_here_count(g: &mut Guards, start: usize, end: usize) -> u64 {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let spans = g.protected.remove_range(first, last);
     if spans.is_empty() {
-        return false;
+        return 0;
     }
     g.clean.remove_range(first, last);
+    let mut blocks = 0u64;
     for (a, b) in spans {
+        blocks += (b - a) as u64;
         let mut old = 0;
         // SAFETY: blocks we made read-only.
         if unsafe {
@@ -759,7 +829,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
             }
         }
     }
-    true
+    blocks
 }
 
 pub fn writing(at: usize, len: usize) {

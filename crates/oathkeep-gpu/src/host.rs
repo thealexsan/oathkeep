@@ -670,7 +670,7 @@ pub(crate) struct HostList {
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
     prelude: OnceLock<Option<Prelude>>,
     pipelines: Mutex<std::collections::BTreeSet<String>>,
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    budget: OnceLock<Option<ID3D12Resource>>,
     indirect_args: Mutex<Option<(ID3D12Resource, u64, bool)>>,
     uav_dirty: std::sync::atomic::AtomicBool,
     _alive: Counted,
@@ -4762,30 +4762,37 @@ impl HostList {
     }
 
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
+        static ZERO: OnceLock<Option<ID3D12Resource>> = OnceLock::new();
+        let buffer = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
+                let b = host()?.uav_buffer(256)?;
+                name(&b, || "indirect budget".into());
+                Some(b)
             })
             .as_ref()?;
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
+            let zero = ZERO
+                .get_or_init(|| {
+                    let (b, data) = host()?.upload_buffer(256)?;
+                    name(&b, || "indirect budget zero".into());
+                    // SAFETY: a freshly mapped 256-byte upload buffer.
+                    unsafe { std::ptr::write_bytes(data, 0, 256) };
+                    Some(b)
+                })
+                .as_ref()?;
             deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped words, written before it runs.
-            // The words after the budget hold what the clamp noted about the
-            // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all): taken, then zeroed.
-            deferred.copies.push(Step::Host(Box::new(move || unsafe {
-                let words = at as *mut u32;
-                let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
-                MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
-                MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
-                    words.add(k).write_volatile(0);
-                }
-            })));
+            // SAFETY: an open command list, a zeroed 256-byte upload buffer,
+            // and a 256-byte DEFAULT UAV buffer starting in COMMON.
+            unsafe {
+                self.list.CopyBufferRegion(buffer, 0, zero, 0, 256);
+                self.list.ResourceBarrier(&[transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
@@ -4839,6 +4846,18 @@ impl HostList {
         };
         if let Some(buf) = buf {
             crate::indirect::done_on(&self.list, &buf);
+        }
+        if self.deferred().budget_zeroed
+            && let Some(Some(budget)) = self.budget.get()
+        {
+            // SAFETY: an open command list and our live budget buffer.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    budget,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
         }
     }
 

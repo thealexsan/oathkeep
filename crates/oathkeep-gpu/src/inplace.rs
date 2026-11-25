@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -60,7 +60,7 @@ pub(crate) struct Placed {
 }
 
 fn section_info(section: usize) -> Option<(u64, bool)> {
-    views()
+    views_read()
         .sections
         .iter()
         .find(|s| s.0 == section)
@@ -347,14 +347,18 @@ struct Views {
     sections: Vec<(usize, u64, bool)>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views {
+static VIEWS: RwLock<Views> = RwLock::new(Views {
     views: BTreeMap::new(),
     pages: BTreeMap::new(),
     sections: Vec::new(),
 });
 
-fn views() -> std::sync::MutexGuard<'static, Views> {
-    VIEWS.lock().unwrap_or_else(|e| e.into_inner())
+fn views() -> std::sync::RwLockWriteGuard<'static, Views> {
+    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
+    VIEWS.read().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
@@ -428,43 +432,121 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     }
 }
 
-pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
-    if start >= end {
+fn coalesce_blocks(mut blocks: Vec<usize>) -> Vec<(usize, usize)> {
+    if blocks.is_empty() {
         return Vec::new();
     }
-    let v = views();
-    let mut out = Vec::new();
-    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
-        && base + bytes > start
-    {
-        out.push((base, bytes));
-    }
-    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
-        out.push((base, bytes));
+    blocks.sort_unstable();
+    blocks.dedup();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for block in blocks {
+        match out.last_mut() {
+            Some(last) if block == last.1 => last.1 = block + 1,
+            _ => out.push((block, block + 1)),
+        }
     }
     out
 }
 
-pub(crate) fn pages_of(page: usize) -> Vec<usize> {
-    let v = views();
-    let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {
-        return Vec::new();
-    };
-    let within = page.wrapping_sub(base);
-    if within >= bytes || !within.is_multiple_of(K64) {
-        return Vec::new();
+pub(crate) fn alias_blocks_between(
+    start: usize,
+    end: usize,
+    max_views: usize,
+) -> (Vec<usize>, Vec<(usize, usize)>, u64) {
+    if start >= end {
+        return (Vec::new(), Vec::new(), 0);
     }
-    v.pages
-        .get(&(section, offset + within as u64))
-        .cloned()
-        .unwrap_or_default()
+    let v = views_read();
+    if v.views.is_empty() {
+        return (Vec::new(), Vec::new(), 0);
+    }
+    let mut overlapping: Vec<(usize, usize, usize, u64)> = Vec::new();
+    if let Some((&base, &(bytes, section, offset))) = v.views.range(..=start).next_back()
+        && base + bytes > start
+    {
+        overlapping.push((base, bytes, section, offset));
+    }
+    for (&base, &(bytes, section, offset)) in v.views.range(start.saturating_add(1)..end) {
+        overlapping.push((base, bytes, section, offset));
+    }
+    if overlapping.is_empty() {
+        return (Vec::new(), Vec::new(), 0);
+    }
+    let from = start / K64;
+    let to = end.div_ceil(K64);
+    let mut all = Vec::new();
+    let mut others = Vec::new();
+    let mut count = 0u64;
+    for (base, bytes, section, offset) in overlapping {
+        let first = (base / K64).max(from);
+        let last = (base.saturating_add(bytes).div_ceil(K64)).min(to);
+        for block in first..last {
+            let page = block * K64;
+            let within = page.wrapping_sub(base);
+            if within >= bytes || !within.is_multiple_of(K64) {
+                continue;
+            }
+            let Some(shown) = v.pages.get(&(section, offset + within as u64)) else {
+                continue;
+            };
+            if shown.len() < 2 || shown.len() > max_views {
+                continue;
+            }
+            count += 1;
+            for &alias in shown {
+                let alias_block = alias / K64;
+                all.push(alias_block);
+                if alias_block != block {
+                    others.push(alias_block);
+                }
+            }
+        }
+    }
+    all.sort_unstable();
+    all.dedup();
+    (all, coalesce_blocks(others), count)
+}
+
+pub(crate) fn alias_spans_of_blocks(blocks: &[usize]) -> (Vec<usize>, Vec<(usize, usize)>) {
+    if blocks.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let v = views_read();
+    if v.views.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut all = Vec::new();
+    let mut others = Vec::new();
+    for &block in blocks {
+        let page = block * K64;
+        let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {
+            continue;
+        };
+        let within = page.wrapping_sub(base);
+        if within >= bytes || !within.is_multiple_of(K64) {
+            continue;
+        }
+        let Some(shown) = v.pages.get(&(section, offset + within as u64)) else {
+            continue;
+        };
+        for &alias in shown {
+            let alias_block = alias / K64;
+            all.push(alias_block);
+            if alias_block != block {
+                others.push(alias_block);
+            }
+        }
+    }
+    all.sort_unstable();
+    all.dedup();
+    (all, coalesce_blocks(others))
 }
 
 pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
     if len == 0 {
         return Vec::new();
     }
-    let v = views();
+    let v = views_read();
     let end = offset.saturating_add(len as u64);
     let mut pages: Vec<usize> = Vec::new();
     let mut at = offset - offset % K64 as u64;
@@ -525,7 +607,7 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 }
 
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
-    cover_in(&views().views, at, len)
+    cover_in(&views_read().views, at, len)
 }
 
 pub(crate) fn private_whole(at: usize, len: usize) -> bool {
@@ -1227,7 +1309,7 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
             }
         }
     }
-    let v = views();
+    let v = views_read();
     let (count, bytes) = (
         v.views.len(),
         v.views.values().map(|view| view.0 as u64).sum::<u64>(),
