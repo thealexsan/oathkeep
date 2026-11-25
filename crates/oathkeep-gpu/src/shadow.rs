@@ -2187,10 +2187,55 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
 }
 
+fn heap_workers() -> &'static Workers {
+    static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let workers = WORKERS.get_or_init(|| Workers {
+        jobs: Mutex::new(std::collections::VecDeque::new()),
+        more: std::sync::Condvar::new(),
+    });
+    STARTED.call_once(|| {
+        let count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .clamp(2, 4);
+        for i in 0..count {
+            let _ = std::thread::Builder::new()
+                .name(format!("oathkeep-heap-{i}"))
+                .spawn(move || {
+                    let workers = heap_workers();
+                    loop {
+                        let job = {
+                            let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if let Some(job) = jobs.pop_front() {
+                                    break job;
+                                }
+                                jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                            }
+                        };
+                        job();
+                    }
+                });
+        }
+    });
+    workers
+}
+
+/// Runs descriptor-heap mirroring jobs on a dedicated pool isolated from `workers()`,
+/// so `heap_buffers` never queues behind or steals heavy `batch_flush` / `relay` jobs.
+pub(crate) fn wide_heap_run(jobs: Vec<Job>) {
+    wide_leaf_on(heap_workers(), jobs);
+}
+
 /// Runs pure leaf jobs in parallel on the shared `workers()` pool without ever popping
 /// unrelated jobs on the calling thread, preventing re-entrant lock deadlocks when called
 /// from inside an outer `wide_run` or while holding per-shadow locks.
 fn wide_leaf(jobs: Vec<Job>) {
+    wide_leaf_on(workers(), jobs);
+}
+
+fn wide_leaf_on(workers: &'static Workers, jobs: Vec<Job>) {
     if jobs.len() < 2 {
         for job in jobs {
             job();
@@ -2206,7 +2251,6 @@ fn wide_leaf(jobs: Vec<Job>) {
         queue: Mutex::new(std::collections::VecDeque::from(jobs)),
         rem: (Mutex::new(count), std::sync::Condvar::new()),
     });
-    let workers = workers();
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for _ in 0..count - 1 {

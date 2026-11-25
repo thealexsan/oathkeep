@@ -4,7 +4,7 @@ use std::sync::RwLock;
 pub(crate) const PAGE: usize = 64 << 10;
 const KERNEL_PAGE: usize = 4096;
 pub(crate) const HOT_WRITE: u64 = u64::MAX;
-const DEFAULT_HOT_FRAMES: u64 = 48;
+const DEFAULT_HOT_FRAMES: u64 = 240;
 const HOT_WINDOW_FRAMES: u64 = 16;
 const MAX_COOL_BACKOFF: u8 = 6;
 
@@ -791,6 +791,7 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
     // `title_memory_committed`; only probe `g.absent` via `VirtualQuery` when no hook
     // is installed (e.g. unit tests calling `VirtualAlloc(MEM_COMMIT)` directly).
     let probe_absent = COMMIT_TITLE_MEMORY.get().is_none();
+    let mut pre_gaps: Vec<(usize, usize)> = Vec::new();
     if !ask {
         let g = guards_read();
         if g.clean.contains_range(first, last) {
@@ -829,6 +830,19 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
             }
         }
         let known = g.accounted.overlaps(first, last) || g.protected.overlaps(first, last);
+        if view_guard() {
+            pre_gaps = g.accounted.gaps_in(first, last);
+            if !g.hot.is_empty() {
+                for (&block, &until) in g.hot.range(first..last) {
+                    if until <= frame {
+                        match pre_gaps.last_mut() {
+                            Some(last_gap) if last_gap.1 == block => last_gap.1 = block + 1,
+                            _ => pre_gaps.push((block, block + 1)),
+                        }
+                    }
+                }
+            }
+        }
         drop(g);
         if !known && !is_view(start, end) {
             return None;
@@ -836,6 +850,29 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
     } else if !is_view(start, end) {
         return None;
     }
+    // Pre-query `inplace::VIEWS` OUTSIDE `GUARDS.write()` so view-map mutations on other
+    // threads never stall `GUARDS` readers behind `inplace::VIEWS.read()`.
+    let pre_aliases = if view_guard() && !pre_gaps.is_empty() {
+        let seq = crate::inplace::views_seq();
+        let mut all_blocks = Vec::new();
+        let mut other_runs = Vec::new();
+        let mut total_count = 0u64;
+        for &(from, to) in &pre_gaps {
+            let (all, others, count) = crate::inplace::alias_blocks_between(
+                from.saturating_mul(BLOCK),
+                to.saturating_mul(BLOCK),
+                MANY_VIEWS,
+            );
+            if count > 0 {
+                total_count += count;
+                all_blocks.extend(all);
+                other_runs.extend(others);
+            }
+        }
+        Some((seq, pre_gaps, all_blocks, other_runs, total_count))
+    } else {
+        None
+    };
     install();
     let mut g = guards();
     if g.clean.contains_range(first, last) {
@@ -920,7 +957,23 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
         }
     }
     if !protected_runs.is_empty() {
-        protect_aliases(&mut g, &protected_runs);
+        let reused = if let Some((seq, ref covered, all_blocks, other_runs, total_count)) =
+            pre_aliases
+            && crate::inplace::views_seq() == seq
+            && protected_runs
+                .iter()
+                .all(|&(a, b)| covered.iter().any(|&(ca, cb)| ca <= a && b <= cb))
+        {
+            if total_count > 0 {
+                apply_alias_protection(&mut g, all_blocks, other_runs, total_count);
+            }
+            true
+        } else {
+            false
+        };
+        if !reused {
+            protect_aliases(&mut g, &protected_runs);
+        }
     }
     Some(GuardHot::Guarded {
         guarded: written,
@@ -962,6 +1015,7 @@ fn protect_aliases(g: &mut Guards, runs: &[(usize, usize)]) {
     if !view_guard() || runs.is_empty() {
         return;
     }
+    let mut all_blocks: Vec<usize> = Vec::new();
     let mut all_other_runs: Vec<(usize, usize)> = Vec::new();
     let mut total_count = 0u64;
     for &(from, to) in runs {
@@ -974,13 +1028,23 @@ fn protect_aliases(g: &mut Guards, runs: &[(usize, usize)]) {
             continue;
         }
         total_count += count;
-        for alias in all {
-            g.aliased.insert(alias);
-        }
+        all_blocks.extend(all);
         all_other_runs.extend(other_runs);
     }
     if total_count == 0 {
         return;
+    }
+    apply_alias_protection(g, all_blocks, all_other_runs, total_count);
+}
+
+fn apply_alias_protection(
+    g: &mut Guards,
+    all_blocks: Vec<usize>,
+    mut all_other_runs: Vec<(usize, usize)>,
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))] total_count: u64,
+) {
+    for alias in all_blocks {
+        g.aliased.insert(alias);
     }
     #[cfg(feature = "diagnostics")]
     ALIASES[0].fetch_add(total_count, std::sync::atomic::Ordering::Relaxed);
@@ -1218,10 +1282,6 @@ fn uncommitted_end(block: usize) -> usize {
     }
 }
 
-fn open(g: &mut Guards, start: usize, end: usize) -> bool {
-    open_and_aliases(g, start, end).0
-}
-
 fn open_and_aliases_spans(g: &mut Guards, start: usize, end: usize) -> (Vec<(usize, usize)>, Vec<usize>) {
     let mut opened = open_here_spans(g, start, end);
     if start >= end || g.aliased.is_empty() {
@@ -1331,10 +1391,6 @@ fn open_fault(g: &mut Guards, at: usize) -> bool {
     true
 }
 
-fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
-    !open_here_spans(g, start, end).is_empty()
-}
-
 fn open_here_spans(g: &mut Guards, start: usize, end: usize) -> Vec<(usize, usize)> {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -1418,6 +1474,41 @@ pub fn title_memory_committed(at: usize, len: usize) {
     }
 }
 
+fn promote_opened_hot(g: &mut Guards, opened_spans: &[(usize, usize)], immediate: bool) {
+    if !hot_enabled() || opened_spans.is_empty() {
+        return;
+    }
+    let frame = crate::frame::current();
+    let base_hot = hot_frames();
+    for &(a, b) in opened_spans {
+        for block in a..b {
+            if g.absent.contains(block) || g.clean.contains(block) || g.partly.contains(block) {
+                continue;
+            }
+            let become_hot = if immediate {
+                true
+            } else {
+                g.recent_fault
+                    .insert(block, frame)
+                    .is_some_and(|prev| {
+                        frame >= prev && frame.saturating_sub(prev) <= HOT_WINDOW_FRAMES
+                    })
+            };
+            if become_hot {
+                let shift = g
+                    .cool_count
+                    .get(&block)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(MAX_COOL_BACKOFF);
+                let until = frame.saturating_add(base_hot.saturating_mul(1u64 << shift));
+                g.hot.insert(block, until);
+                g.accounted.insert(block);
+            }
+        }
+    }
+}
+
 pub fn writing(at: usize, len: usize) {
     if len > 0 {
         record_written_range(at, at.saturating_add(len));
@@ -1433,7 +1524,9 @@ pub fn writing(at: usize, len: usize) {
             g.protected.overlaps(first, last) || g.aliased.range(first..last).next().is_some()
         };
         if needs_open {
-            open(&mut guards(), at, end);
+            let mut g = guards();
+            let (opened_spans, _) = open_and_aliases_spans(&mut g, at, end);
+            promote_opened_hot(&mut g, &opened_spans, false);
         }
     }
     crate::descriptor::host::remapped(at, len);
@@ -1454,13 +1547,17 @@ pub(crate) fn writing_copy(at: usize, len: usize) {
         g.protected.overlaps(first, last) || g.aliased.range(first..last).next().is_some()
     };
     if needs_open {
-        open(&mut guards(), at, end);
+        let mut g = guards();
+        let (opened_spans, _) = open_and_aliases_spans(&mut g, at, end);
+        promote_opened_hot(&mut g, &opened_spans, false);
     }
 }
 
 /// Opens guarded blocks for GPU-to-title readback merges and promotes opened blocks
 /// directly into `g.hot` + `g.accounted` so the next `writes_guarded_since` check does
 /// not immediately `VirtualProtect(PAGE_READONLY)` + `protect_aliases` ping-pong them.
+/// Also extends expiring hot blocks in the range so actively GPU-written pages do not
+/// flap out of `g.hot` every `hot_frames()` frames.
 /// Does not call `descriptor::host::remapped` (card buffer writebacks are not texture remaps).
 pub(crate) fn writing_gpu_back(at: usize, len: usize) {
     if len == 0 {
@@ -1472,34 +1569,41 @@ pub(crate) fn writing_gpu_back(at: usize, len: usize) {
         commit(at, len);
     }
     let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
-    let needs_open = {
+    let frame = crate::frame::current();
+    let renew_before = frame.saturating_add(hot_frames() / 2);
+    let (needs_open, needs_renew) = {
         let g = guards_read();
-        g.protected.overlaps(first, last) || g.aliased.range(first..last).next().is_some()
+        let open = g.protected.overlaps(first, last)
+            || g.aliased.range(first..last).next().is_some();
+        let renew = !open
+            && hot_enabled()
+            && !g.hot.is_empty()
+            && g.hot
+                .range(first..last)
+                .any(|(_, &until)| until <= renew_before);
+        (open, renew)
     };
     if needs_open {
         let mut g = guards();
         let (opened_spans, _) = open_and_aliases_spans(&mut g, at, end);
-        if hot_enabled() && !opened_spans.is_empty() {
-            let frame = crate::frame::current();
-            for (a, b) in opened_spans {
-                for block in a..b {
-                    if !g.absent.contains(block)
-                        && !g.clean.contains(block)
-                        && !g.partly.contains(block)
-                    {
-                        let shift = g
-                            .cool_count
-                            .get(&block)
-                            .copied()
-                            .unwrap_or(0)
-                            .min(MAX_COOL_BACKOFF);
-                        let until =
-                            frame.saturating_add(hot_frames().saturating_mul(1u64 << shift));
-                        g.hot.insert(block, until);
-                        g.accounted.insert(block);
-                    }
-                }
-            }
+        promote_opened_hot(&mut g, &opened_spans, true);
+    } else if needs_renew {
+        let mut g = guards();
+        let base_hot = hot_frames();
+        let to_renew: Vec<usize> = g
+            .hot
+            .range(first..last)
+            .filter_map(|(&block, &until)| (until <= renew_before).then_some(block))
+            .collect();
+        for block in to_renew {
+            let shift = g
+                .cool_count
+                .get(&block)
+                .copied()
+                .unwrap_or(0)
+                .min(MAX_COOL_BACKOFF);
+            let until = frame.saturating_add(base_hot.saturating_mul(1u64 << shift));
+            g.hot.insert(block, until);
         }
     }
 }
@@ -1547,7 +1651,9 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
             WRITTEN[2].fetch_add(guarded, Relaxed);
         }
         if mode & 1 != 0 && guarded != 0 {
-            open(&mut guards(), at, end);
+            let mut g = guards();
+            let (opened_spans, _) = open_and_aliases_spans(&mut g, at, end);
+            promote_opened_hot(&mut g, &opened_spans, false);
         }
     }
     crate::descriptor::host::page_written(at, len);
@@ -1573,9 +1679,11 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     }
     let mut g = guards();
     for &(at, n) in &ranges {
-        if open_here(&mut g, at, at.saturating_add(n)) {
+        let opened_spans = open_here_spans(&mut g, at, at.saturating_add(n));
+        if !opened_spans.is_empty() {
             #[cfg(feature = "diagnostics")]
             ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            promote_opened_hot(&mut g, &opened_spans, false);
         }
     }
 }

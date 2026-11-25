@@ -156,11 +156,13 @@ struct Window {
     step: u32,
     base: u64,
     records: u32,
+    epoch: u64,
     scratch: ID3D12Resource,
 }
 
-const WINDOW_MOST: u64 = 256;
+const WINDOW_MOST: u64 = 1024;
 const WINDOW_STEP_MAX: u64 = 4096;
+const MAX_WINDOWS: usize = 8;
 
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -188,7 +190,7 @@ pub(crate) struct State {
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
     depth_bounds: Option<[f32; 2]>,
-    window: Option<Window>,
+    windows: Vec<Window>,
     host_pipeline: usize,
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
@@ -713,7 +715,7 @@ impl State {
         self.blend = None;
         self.stencil = None;
         self.depth_bounds = None;
-        self.window = None;
+        self.windows.clear();
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -1147,7 +1149,9 @@ impl State {
 
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
-        if compute || p.stages.iter().any(|s| s.translated().stores) {
+        if compute {
+            list.mark_indirect_uav_dirty();
+        } else if p.stages.iter().any(|s| s.translated().stores) {
             list.mark_uav_dirty();
         }
         self.early_textures(list, p, compute);
@@ -1630,7 +1634,7 @@ impl State {
             todo.dedup();
         }
         if todo.len() >= 64 {
-            let worker_count = (todo.len() / 32).clamp(2, 6);
+            let worker_count = (todo.len() / 32).clamp(2, 4);
             let chunk_size = todo.len().div_ceil(worker_count);
             let heap_ptr = std::ptr::from_ref(heap) as usize;
             let host_ptr = std::ptr::from_ref(host) as usize;
@@ -1650,15 +1654,16 @@ impl State {
                 results.push(out.clone());
                 jobs.push(Box::new(move || {
                     // SAFETY: `heap` and `host` live for the entire `heap_buffers` call,
-                    // `wide_run` joins all workers before returning, every slot index in
+                    // `wide_heap_run` joins all workers before returning, every slot index in
                     // `todo` is distinct, and D3D12 `Create*View` is free-threaded on
                     // distinct CPU descriptor handles.
                     let heap = unsafe { &*(heap_ptr as *const crate::descriptor::Heap) };
                     let host = unsafe { &*(host_ptr as *const crate::descriptor::host::HostHeap) };
                     let mut local = Vec::with_capacity(chunk_vec.len());
+                    let mut retired = Vec::new();
                     for index in chunk_vec {
                         let resolved = heap.handle(index).and_then(|handle| {
-                            let mirrored = host.mirror_buffer(index, handle)?;
+                            let mirrored = host.mirror_buffer_into(index, handle, &mut retired)?;
                             let (shadow, address, len) = mirrored.copy?;
                             #[cfg(feature = "diagnostics")]
                             if mirrored.shows == Some(false) {
@@ -1673,10 +1678,11 @@ impl State {
                         };
                         local.push((index, resolved, key));
                     }
+                    crate::host::retire_batch(retired);
                     *out.lock().unwrap_or_else(|e| e.into_inner()) = local;
                 }));
             }
-            crate::shadow::wide_run(jobs);
+            crate::shadow::wide_heap_run(jobs);
             if alive && let Some(why) = crate::descriptor::host::device_removed() {
                 GONE.store(true, Ordering::Relaxed);
                 tracing::error!(
@@ -1694,9 +1700,10 @@ impl State {
                 }
             }
         } else {
+            let mut retired = Vec::new();
             for (n, &index) in todo.iter().enumerate() {
                 let resolved = heap.handle(index).and_then(|handle| {
-                    let mirrored = host.mirror_buffer(index, handle)?;
+                    let mirrored = host.mirror_buffer_into(index, handle, &mut retired)?;
                     if alive
                         && n % 64 == 63
                         && let Some(why) = crate::descriptor::host::device_removed()
@@ -1729,6 +1736,7 @@ impl State {
                 cache.set(index, resolved, key_of);
                 cache.set_slot_key(index, if resolved_ok { host.made_key(index) } else { 0 });
             }
+            crate::host::retire_batch(retired);
         }
         let mirror_us = mirror_started.elapsed().as_micros() as u64;
         let views = cache.slot_count() as u32;
@@ -2450,7 +2458,7 @@ impl State {
     }
 
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        self.window = None;
+        self.windows.clear();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2779,7 +2787,6 @@ impl State {
     }
 
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3177,7 +3184,6 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3272,7 +3278,6 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let lost = self.topology == RECTANGLES && !self.completes_rects();
@@ -3377,32 +3382,39 @@ impl State {
         }
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
-            && kind != DISPATCH
-            && max == 1
-            && count.is_none()
-            && !p.stages.iter().any(|stage| stage.translated().stores);
-        if !windowed || list.first_use(WINDOW_USE) || list.is_uav_dirty() {
-            self.window = None;
+        let epoch = list.indirect_epoch();
+        let windowed = windows() && kind != DISPATCH && max == 1 && count.is_none();
+        if list.first_use(WINDOW_USE) {
+            self.windows.clear();
+        } else {
+            self.windows.retain(|w| w.epoch == epoch);
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
-        let hit = self
-            .window
-            .as_ref()
-            .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| {
-                (offset - w.base) % u64::from(w.step) == 0
-                    && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
+        let hit = windowed
+            .then(|| {
+                self.windows
+                    .iter()
+                    .rev()
+                    .find(|w| {
+                        same(w)
+                            && offset >= w.base
+                            && (offset - w.base) % u64::from(w.step) == 0
+                            && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
+                    })
+                    .map(|w| {
+                        let idx = (offset - w.base) / u64::from(w.step);
+                        (w.scratch.clone(), idx * u64::from(w.stride))
+                    })
             })
-            .map(|w| {
-                let idx = (offset - w.base) / u64::from(w.step);
-                (w.scratch.clone(), idx * u64::from(w.stride))
-            });
+            .flatten();
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
-                let (step, records) = match &self.window {
-                    Some(w) if windowed && same(w) => {
+                let prev_window = windowed
+                    .then(|| self.windows.iter().rev().find(|w| same(w)))
+                    .flatten();
+                let (step, records) = match prev_window {
+                    Some(w) => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
                         let step = if offset > last {
                             offset - last
@@ -3429,7 +3441,7 @@ impl State {
                             };
                             (
                                 step as u32,
-                                (if w.records == 1 { 32 } else { w.records * 2 })
+                                (if w.records == 1 { 64 } else { w.records * 2 })
                                     .min(fit)
                                     .max(1),
                             )
@@ -3437,7 +3449,7 @@ impl State {
                             (stride, max)
                         }
                     }
-                    _ => (stride, max),
+                    None => (stride, max),
                 };
                 let refresh_len = if records > 1 {
                     u64::from(step) * u64::from(records - 1) + u64::from(stride)
@@ -3463,22 +3475,30 @@ impl State {
                         (kind, stride, records),
                     )
                 };
-                let Some(bounded) = bounded else {
-                    self.window = None;
+                let Some((bounded, evicted)) = bounded else {
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
+                if let Some(raw) = evicted {
+                    self.windows.retain(|w| w.scratch.as_raw() as usize != raw);
+                }
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
-                self.window = windowed.then(|| Window {
-                    copy: args.id(),
-                    kind,
-                    stride,
-                    step,
-                    base: offset,
-                    records,
-                    scratch: bounded.clone(),
-                });
+                if windowed {
+                    if self.windows.len() >= MAX_WINDOWS {
+                        self.windows.remove(0);
+                    }
+                    self.windows.push(Window {
+                        copy: args.id(),
+                        kind,
+                        stride,
+                        step,
+                        base: offset,
+                        records,
+                        epoch,
+                        scratch: bounded.clone(),
+                    });
+                }
                 (bounded, 0)
             }
         };

@@ -245,12 +245,12 @@ pub(crate) fn bound(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
-) -> Option<ID3D12Resource> {
+) -> Option<(ID3D12Resource, Option<usize>)> {
     let (dst_bytes, _) =
         validate_strided_layout((kind, stride, stride, records), src.1, count.map(|(_, off)| off))?;
-    let (c, budget, (dst, was_indirect)) =
+    let (c, budget, (slot, dst, was_indirect, evicted)) =
         (clamp()?, list.budget()?, list.indirect_scratch(dst_bytes)?);
-    let need_uav = list.take_uav_dirty();
+    let need_uav = list.take_indirect_uav_dirty();
     if record_clamp_as(
         c,
         &list.list,
@@ -263,8 +263,8 @@ pub(crate) fn bound(
         need_uav,
         was_indirect,
     ) {
-        list.mark_indirect_state(true);
-        Some(dst)
+        list.mark_indirect_state(slot, true);
+        Some((dst, evicted))
     } else {
         None
     }
@@ -274,11 +274,11 @@ pub(crate) fn bound_ahead(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32, u32),
-) -> Option<ID3D12Resource> {
+) -> Option<(ID3D12Resource, Option<usize>)> {
     let (dst_bytes, _) = validate_strided_layout(spec, src.1, None)?;
-    let (c, budget, (dst, was_indirect)) =
+    let (c, budget, (slot, dst, was_indirect, evicted)) =
         (clamp()?, list.budget()?, list.indirect_scratch(dst_bytes)?);
-    let need_uav = list.take_uav_dirty();
+    let need_uav = list.take_indirect_uav_dirty();
     if record_clamp_as(
         c,
         &list.list,
@@ -291,8 +291,8 @@ pub(crate) fn bound_ahead(
         need_uav,
         was_indirect,
     ) {
-        list.mark_indirect_state(true);
-        Some(dst)
+        list.mark_indirect_state(slot, true);
+        Some((dst, evicted))
     } else {
         None
     }
@@ -437,7 +437,8 @@ fn record_clamp_as(
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
     done_on(&list.list, scratch);
-    list.mark_indirect_state(false);
+    #[cfg(test)]
+    list.mark_indirect_resource_done(scratch);
 }
 
 pub(crate) fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
@@ -1181,35 +1182,58 @@ void main() {
             (count_ptr as *mut u32).write_volatile(2);
         }
 
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
-        done(&list, &b1);
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
-        done(&list, &b2);
-        assert_eq!(
-            b1.as_raw(),
-            b2.as_raw(),
-            "scratch buffer within capacity must be reused"
-        );
-
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
-        done(&list, &b3);
+        let mut first_ring = Vec::new();
+        for i in 0..8u64 {
+            let (buf, evicted) =
+                bound(&list, (&src_buf, i * 64), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+            assert!(evicted.is_none(), "initial ring fill should not evict");
+            first_ring.push(buf);
+        }
         assert_ne!(
-            b3.as_raw(),
-            b1.as_raw(),
-            "larger request must grow scratch buffer"
+            first_ring[0].as_raw(),
+            first_ring[1].as_raw(),
+            "consecutive indirect calls must use distinct ring slots"
+        );
+        // 9th call wraps to slot 0 and reuses the existing buffer without reallocating.
+        let (b_wrap, evicted) =
+            bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
+        assert_eq!(
+            b_wrap.as_raw(),
+            first_ring[0].as_raw(),
+            "wrapped ring slot within capacity must be reused"
+        );
+        assert_eq!(evicted, Some(first_ring[0].as_raw() as usize));
+
+        // Slot 1 grows when asked for a larger buffer (5000 * 20 = 100 KiB > 64 KiB).
+        let (b_grown, _) =
+            bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
+        assert_ne!(
+            b_grown.as_raw(),
+            first_ring[1].as_raw(),
+            "larger request must grow ring slot buffer"
         );
 
         list.close();
         host.execute(&[&list]);
         list.reset();
 
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
-        done(&list, &b4);
+        // After reset, slot 0 is reused, then slot 1 retains its grown capacity.
+        let (b_after0, _) =
+            bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
         assert_eq!(
-            b4.as_raw(),
-            b3.as_raw(),
-            "grown scratch buffer must persist across reset"
+            b_after0.as_raw(),
+            first_ring[0].as_raw(),
+            "ring slot 0 must persist across reset"
         );
+        let (b_after1, _) =
+            bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
+        assert_eq!(
+            b_after1.as_raw(),
+            b_grown.as_raw(),
+            "grown ring slot buffer must persist across reset"
+        );
+        done(&list, &b_after0);
+        done(&list, &b_after1);
         list.close();
         host.execute(&[&list]);
         list.reset();

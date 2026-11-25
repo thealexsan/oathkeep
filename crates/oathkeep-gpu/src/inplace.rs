@@ -731,6 +731,13 @@ static VIEWS: RwLock<Views> = RwLock::new(Views {
     sections: BTreeMap::new(),
 });
 
+static VIEWS_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn views_seq() -> u64 {
+    VIEWS_SEQ.load(Ordering::Acquire)
+}
+
 fn views() -> std::sync::RwLockWriteGuard<'static, Views> {
     VIEWS.write().unwrap_or_else(|e| e.into_inner())
 }
@@ -782,6 +789,7 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
                 }
             }
         }
+        VIEWS_SEQ.fetch_add(1, Ordering::Release);
     }
     crate::watch::views_mapped(section, offset, len);
 }
@@ -806,6 +814,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
                 .map(|(base, _)| *base),
         )
         .collect();
+    let had_gone = !gone.is_empty();
     for base in gone {
         let Some((bytes, section, offset)) = v.views.remove(&base) else {
             continue;
@@ -818,6 +827,9 @@ pub(crate) fn views_gone(at: usize, len: usize) {
                 v.pages.remove(&key);
             }
         }
+    }
+    if had_gone {
+        VIEWS_SEQ.fetch_add(1, Ordering::Release);
     }
 }
 

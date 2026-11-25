@@ -268,6 +268,9 @@ struct Views {
     index: std::collections::BTreeMap<View, u32>,
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
+}
+
+struct ShapeStore {
     shapes: Vec<Shape>,
     shape_index: std::collections::BTreeMap<Shape, u32>,
 }
@@ -277,6 +280,9 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
+});
+
+static SHAPES_STORE: std::sync::RwLock<ShapeStore> = std::sync::RwLock::new(ShapeStore {
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
 });
@@ -350,7 +356,7 @@ fn placed_words(shape: u32, address: u64) -> [u32; 2] {
     kind_words(PLACED, u64::from(shape) << PLACED_ADDRESS_BITS | address)
 }
 
-impl Views {
+impl ShapeStore {
     fn shape(&mut self, shape: Shape) -> Option<u32> {
         if let Some(&at) = self.shape_index.get(&shape) {
             return Some(at);
@@ -375,7 +381,17 @@ impl Views {
         desc[12..].copy_from_slice(&rest[10..]);
         Some(View::Placed(unordered, resource, desc))
     }
+}
 
+fn shapes_read() -> std::sync::RwLockReadGuard<'static, ShapeStore> {
+    SHAPES_STORE.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn shapes_write() -> std::sync::RwLockWriteGuard<'static, ShapeStore> {
+    SHAPES_STORE.write().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Views {
     fn entry_of(&self, view: &View) -> Option<[u32; 2]> {
         let &i = self.index.get(view)?;
         Some([i, self.list[i as usize].1])
@@ -419,8 +435,8 @@ fn words_for(view: View) -> [u32; 2] {
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
-                    let known = views_read().shape_index.get(&shape).copied();
-                    let shape = known.or_else(|| views_write().shape(shape));
+                    let known = shapes_read().shape_index.get(&shape).copied();
+                    let shape = known.or_else(|| shapes_write().shape(shape));
                     if let Some(shape) = shape {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
@@ -448,6 +464,7 @@ fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
 pub(crate) fn views_kept() -> [u64; 8] {
     use std::sync::atomic::Ordering::Relaxed;
     let views = views_read();
+    let shapes = shapes_read();
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
     let (mut constants, mut placed) = (0, 0);
@@ -463,11 +480,11 @@ pub(crate) fn views_kept() -> [u64; 8] {
         views.free.len() as u64,
         views.list.capacity() as u64 * each
             + views.index.len() as u64 * each * 3 / 2
-            + views.shapes.capacity() as u64 * shape
-            + views.shape_index.len() as u64 * shape * 3 / 2,
+            + shapes.shapes.capacity() as u64 * shape
+            + shapes.shape_index.len() as u64 * shape * 3 / 2,
         constants,
         placed,
-        views.shapes.len() as u64,
+        shapes.shapes.len() as u64,
         NAMED_WHOLE[0].load(Relaxed),
         NAMED_WHOLE[1].load(Relaxed),
     ]
@@ -591,7 +608,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => views_read().placed_of(i, generation),
+        PLACED => shapes_read().placed_of(i, generation),
         _ => None,
     }
 }
@@ -971,7 +988,7 @@ mod tests {
                 .count()
         };
         let shapes = || {
-            VIEWS
+            SHAPES_STORE
                 .read()
                 .unwrap()
                 .shapes

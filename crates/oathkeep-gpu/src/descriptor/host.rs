@@ -2196,9 +2196,7 @@ impl HostHeap {
                 }
             }
         }
-        for old in retired {
-            crate::host::retire(old);
-        }
+        crate::host::retire_batch(retired);
     }
 
     pub(crate) fn make_at(&self, index: u32, view: &View) {
@@ -2219,9 +2217,29 @@ impl HostHeap {
     }
 
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        if let Some(old) = self.keep_take(index, resource) {
+            crate::host::retire(old);
+        }
+    }
+
+    fn keep_into(
+        &self,
+        index: u32,
+        resource: Option<ID3D12Resource>,
+        retired: Option<&mut Vec<ID3D12Resource>>,
+    ) {
+        if let Some(old) = self.keep_take(index, resource) {
+            match retired {
+                Some(sink) => sink.push(old),
+                None => crate::host::retire(old),
+            }
+        }
+    }
+
+    fn keep_take(&self, index: u32, resource: Option<ID3D12Resource>) -> Option<ID3D12Resource> {
         let present = resource.is_some();
         if !present && !bit_get(&self.has_kept, index) {
-            return;
+            return None;
         }
         let stripe = index as usize % MADE_LOCK_STRIPES;
         let pos = index as usize / MADE_LOCK_STRIPES;
@@ -2245,9 +2263,7 @@ impl HostHeap {
             }
         };
         drop(unchanged);
-        if let Some(old) = old {
-            crate::host::retire(old);
-        }
+        old
     }
 
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
@@ -2399,6 +2415,7 @@ impl HostHeap {
         handle: u64,
         for_draw: bool,
         notify_changed: bool,
+        retired: Option<&mut Vec<ID3D12Resource>>,
     ) -> Option<(
         View,
         Option<std::sync::Arc<crate::shadow::Shadow>>,
@@ -2509,7 +2526,7 @@ impl HostHeap {
                 kept_raw = kept_res
                     .as_ref()
                     .map(|r| windows::core::Interface::as_raw(r) as usize);
-                self.keep(index, kept_res);
+                self.keep_into(index, kept_res, retired);
                 if !later {
                     self.made_keys[index as usize].store(key, std::sync::atomic::Ordering::Release);
                 }
@@ -2523,7 +2540,7 @@ impl HostHeap {
     }
 
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
-        self.mirror_inner(index, handle, for_draw, true)
+        self.mirror_inner(index, handle, for_draw, true, None)
             .map(|(view, ..)| view)
     }
 
@@ -2550,12 +2567,17 @@ impl HostHeap {
         }
     }
 
-    pub(crate) fn mirror_buffer(&self, index: u32, handle: u64) -> Option<MirroredBuffer> {
+    pub(crate) fn mirror_buffer_into(
+        &self,
+        index: u32,
+        handle: u64,
+        retired: &mut Vec<ID3D12Resource>,
+    ) -> Option<MirroredBuffer> {
         // Called from `heap_buffers`, which immediately updates its own `BufferSpanCache`
         // for `index`, so pass `notify_changed = false` to avoid locking `self.changed`
         // and self-requeueing `index` for the next frame.
         let (view, made_shadow, _, kept_raw, freshly_made) =
-            self.mirror_inner(index, handle, true, false)?;
+            self.mirror_inner(index, handle, true, false, Some(retired))?;
         let copy = buffer_copy_with_hint(&view, made_shadow);
         #[cfg(feature = "diagnostics")]
         let shows = copy.as_ref().and_then(|(shadow, _, _)| {
@@ -2576,7 +2598,7 @@ impl HostHeap {
 
     pub(crate) fn mirror_texture(&self, index: u32, handle: u64) -> Option<(View, Option<View>)> {
         let (view, _, made_placed, _, freshly_made) =
-            self.mirror_inner(index, handle, true, true)?;
+            self.mirror_inner(index, handle, true, true, None)?;
         let placed = if freshly_made {
             made_placed
         } else {
