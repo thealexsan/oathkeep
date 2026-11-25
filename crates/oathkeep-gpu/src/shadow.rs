@@ -5707,9 +5707,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let size = len.next_multiple_of(1 << 16);
         static INPLACE_BIG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let inplace_big = *INPLACE_BIG
-            .get_or_init(|| std::env::var_os("OATHKEEP_INPLACE_BIG").is_none_or(|v| v != "0"));
-        let big = !inplace_big && cards() && size >= card_limits().0;
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+            .get_or_init(|| std::env::var_os("OATHKEEP_INPLACE_BIG").is_some_and(|v| v == "1"));
+        let prefer_card = !inplace_big && cards() && size >= card_limits().0;
+        if !prefer_card && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
@@ -5736,6 +5736,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 (on_card, std::ptr::null_mut(), Some(card))
             }
             None => {
+                if prefer_card && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+                    entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+                    return entry.shadow.clone();
+                }
                 let (buffer, data) = host()?.shared_buffer(size)?;
                 crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
                 (buffer, data, None)

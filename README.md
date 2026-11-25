@@ -9,7 +9,7 @@ It runs unmodified x86-64 console executables directly on a Windows host by prov
 > **Legal & Clean-Room Notice:** This repository contains **zero** copyrighted software, executables, keys, shaders, textures, audio, archives, or extracted data. You must supply your own legally obtained console software. Oathkeep is an independent open-source interoperability project and is not affiliated with, endorsed by, or connected to any console manufacturer, game developer, or publisher. See [docs/asset-policy.md](docs/asset-policy.md).
 
 <!-- oathkeep:progress:start -->
-## Compatibility & Performance Progress (91%)
+## Compatibility & Performance Progress (92%)
 
 Live dashboard: [thealexsan.github.io/oathkeep](https://thealexsan.github.io/oathkeep/) • Auto-generated from [docs/progress.toml](docs/progress.toml) via `cargo xtask progress`.
 

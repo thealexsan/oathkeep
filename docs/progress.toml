@@ -8,7 +8,7 @@ current_frame_ms = "172 ms (timing)"
 current_gpu_ms = "27.7 ms base + 135 ms ML"
 current_preparing_ms = "59.7 ms (ask_once 4.5 ms)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~1.5-2.5 hours (DP4A ML fix + batch_flush sync + cache warm & verify)"
+eta = "~1-1.5 hours (verify VRAM ML fix + crush 174 MB buffer re-copy + cache warm)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -48,8 +48,8 @@ note = "2561af95 verified 0.36 ms/frame (down from 297 ms TDR); zero TDR"
 
 [[subsystems]]
 name = "DP4A / ML Compute"
-cells = [4, 4, 4, 4, 3, 3, 2, 2, 0, 0]
-note = "All 9/9 ML shaders dumped; 5 fast, diffing 4 regressed shaders next"
+cells = [4, 4, 4, 4, 4, 4, 3, 3, 2, 0]
+note = "Root cause found: 20 MB ML UAV was in L0 RAM (OATHKEEP_INPLACE_BIG); VRAM micro-bench 0.13-0.20 ms (38x-175x faster)"
 
 [[subsystems]]
 name = "Pipeline Cache & Queue"
@@ -104,8 +104,8 @@ detail = "59.7 ms -> <15 ms"
 [[milestones]]
 label = "All 9 ML DP4A shaders fast"
 state = "active"
-level = 2
-detail = "9/9 dumped"
+level = 3
+detail = "VRAM fix landed; benching"
 
 [[milestones]]
 label = "1:1 console visuals verified"
