@@ -157,12 +157,13 @@ struct Window {
     base: u64,
     records: u32,
     epoch: u64,
+    dst_offset: u64,
     scratch: ID3D12Resource,
 }
 
 const WINDOW_MOST: u64 = 1024;
 const WINDOW_STEP_MAX: u64 = 4096;
-const MAX_WINDOWS: usize = 8;
+const MAX_WINDOWS: usize = 16;
 
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1149,9 +1150,7 @@ impl State {
 
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
-        if compute {
-            list.mark_indirect_uav_dirty();
-        } else if p.stages.iter().any(|s| s.translated().stores) {
+        if compute || p.stages.iter().any(|s| s.translated().stores) {
             list.mark_uav_dirty();
         }
         self.early_textures(list, p, compute);
@@ -3383,7 +3382,7 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let epoch = list.indirect_epoch();
-        let windowed = windows() && kind != DISPATCH && max == 1 && count.is_none();
+        let windowed = windows() && max == 1 && count.is_none();
         if list.first_use(WINDOW_USE) {
             self.windows.clear();
         } else {
@@ -3403,7 +3402,7 @@ impl State {
                     })
                     .map(|w| {
                         let idx = (offset - w.base) / u64::from(w.step);
-                        (w.scratch.clone(), idx * u64::from(w.stride))
+                        (w.scratch.clone(), w.dst_offset + idx * u64::from(w.stride))
                     })
             })
             .flatten();
@@ -3434,7 +3433,7 @@ impl State {
                         add(C::IndMissStep, 1);
                     }
                 }
-                let (step, records) = match prev_window {
+                let (base_off, step, records) = match prev_window {
                     Some(w) => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
                         let step = if offset > last {
@@ -3453,31 +3452,78 @@ impl State {
                             && step <= WINDOW_STEP_MAX
                             && step % 4 == 0
                             && (w.records == 1 || step == u64::from(w.step));
+                        let left = args.left(arguments);
                         if walks {
-                            let left = args.left(arguments);
-                            let fit = if left >= u64::from(stride) {
-                                (((left - u64::from(stride)) / step) + 1).min(WINDOW_MOST) as u32
+                            let target = (if w.records == 1 { 64 } else { w.records * 2 })
+                                .min(WINDOW_MOST as u32);
+                            if offset < w.base {
+                                // Walking backwards: anchor the window ending at `offset` so
+                                // subsequent decreasing offsets hit the cache.
+                                let back_avail = offset / step;
+                                let from_here_avail = if left >= u64::from(stride) {
+                                    (((left - u64::from(stride)) / step) + 1).min(WINDOW_MOST)
+                                } else {
+                                    1
+                                };
+                                let count = back_avail
+                                    .saturating_add(from_here_avail)
+                                    .min(u64::from(target))
+                                    .max(1);
+                                let back = back_avail.min(count - 1);
+                                (offset - back * step, step as u32, count as u32)
+                            } else {
+                                let fit = if left >= u64::from(stride) {
+                                    (((left - u64::from(stride)) / step) + 1).min(WINDOW_MOST)
+                                        as u32
+                                } else {
+                                    1
+                                };
+                                (offset, step as u32, target.min(fit).max(1))
+                            }
+                        } else {
+                            // Random or non-sequential jump within the same indirect buffer:
+                            // clamp a stride-packed block of up to 64 records around `offset`
+                            // aligned to `phase = offset % block_step` so scattered/backwards
+                            // accesses hit the window cache.
+                            const JUMP_BLOCK: u64 = 64;
+                            let block_step = if w.records > 1
+                                && u64::from(w.step) > u64::from(stride)
+                                && u64::from(w.step) <= WINDOW_STEP_MAX
+                                && offset.abs_diff(w.base).is_multiple_of(u64::from(w.step))
+                            {
+                                u64::from(w.step)
+                            } else {
+                                u64::from(stride)
+                            };
+                            let before_avail = offset / block_step;
+                            let from_here_avail = if left >= u64::from(stride) {
+                                (((left - u64::from(stride)) / block_step) + 1).min(WINDOW_MOST)
                             } else {
                                 1
                             };
-                            (
-                                step as u32,
-                                (if w.records == 1 { 64 } else { w.records * 2 })
-                                    .min(fit)
-                                    .max(1),
-                            )
-                        } else {
-                            (stride, max)
+                            let count = before_avail
+                                .saturating_add(from_here_avail)
+                                .min(JUMP_BLOCK)
+                                .max(1);
+                            let want_before = (count / 2).min(before_avail);
+                            let after_needed = count.saturating_sub(want_before);
+                            let before = if after_needed > from_here_avail {
+                                (count - from_here_avail).min(before_avail)
+                            } else {
+                                want_before
+                            };
+                            (offset - before * block_step, block_step as u32, count as u32)
                         }
                     }
-                    None => (stride, max),
+                    None => (offset, stride, max),
                 };
                 let refresh_len = if records > 1 {
                     u64::from(step) * u64::from(records - 1) + u64::from(stride)
                 } else {
                     len
                 };
-                args.refresh(list, arguments, len.max(refresh_len));
+                let base_addr = arguments - (offset - base_off);
+                args.refresh(list, base_addr, len.max(refresh_len));
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
                 }
@@ -3485,23 +3531,23 @@ impl State {
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(
                         list,
-                        (&args.buffer, offset),
+                        (&args.buffer, base_off),
                         (kind, stride, step, records),
                     )
                 } else {
                     crate::indirect::bound(
                         list,
-                        (&args.buffer, offset),
+                        (&args.buffer, base_off),
                         count_arg,
                         (kind, stride, records),
                     )
                 };
-                let Some((bounded, evicted)) = bounded else {
+                let Some((bounded, dst_offset, evicted)) = bounded else {
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
-                if let Some(raw) = evicted {
-                    self.windows.retain(|w| w.scratch.as_raw() as usize != raw);
+                if evicted {
+                    self.windows.clear();
                 }
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
@@ -3514,13 +3560,15 @@ impl State {
                         kind,
                         stride,
                         step,
-                        base: offset,
+                        base: base_off,
                         records,
                         epoch,
+                        dst_offset,
                         scratch: bounded.clone(),
                     });
                 }
-                (bounded, 0)
+                let idx = (offset - base_off) / u64::from(step);
+                (bounded, dst_offset + idx * u64::from(stride))
             }
         };
         let ran = match kind {

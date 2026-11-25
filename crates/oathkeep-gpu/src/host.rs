@@ -818,12 +818,12 @@ mod tests {
     }
 }
 
-const INDIRECT_RING_SLOTS: usize = 2;
-
 #[derive(Default)]
 struct IndirectPool {
-    slots: Vec<(ID3D12Resource, u64, bool)>,
-    next: usize,
+    buffer: Option<ID3D12Resource>,
+    cap: u64,
+    used: u64,
+    in_indirect: bool,
 }
 
 pub(crate) struct HostList {
@@ -6324,12 +6324,6 @@ impl HostList {
         self.uav_dirty.store(true, Ordering::Relaxed);
     }
 
-    pub(crate) fn mark_indirect_uav_dirty(&self) {
-        self.uav_dirty.store(true, Ordering::Relaxed);
-        self.indirect_uav_dirty.store(true, Ordering::Relaxed);
-        self.indirect_epoch.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub(crate) fn indirect_epoch(&self) -> u64 {
         self.indirect_epoch.load(Ordering::Relaxed)
     }
@@ -6359,10 +6353,8 @@ impl HostList {
         self.indirect_epoch.fetch_add(1, Ordering::Relaxed);
         {
             let mut pool = self.indirect_pool.lock().unwrap_or_else(|e| e.into_inner());
-            for (_, _, in_indirect) in &mut pool.slots {
-                *in_indirect = false;
-            }
-            pool.next = 0;
+            pool.used = 0;
+            pool.in_indirect = false;
         }
         let old_deferred = std::mem::take(&mut *self.deferred());
         let old_states =
@@ -6913,72 +6905,77 @@ impl HostList {
     pub(crate) fn indirect_scratch(
         &self,
         size: u64,
-    ) -> Option<(usize, ID3D12Resource, bool, Option<usize>)> {
-        let needed = size.max(64 << 10);
+    ) -> Option<(ID3D12Resource, u64, bool, bool)> {
+        const ALIGN: u64 = 256;
+        let alloc_bytes = size.max(4).next_multiple_of(ALIGN);
         let mut pool = self.indirect_pool.lock().unwrap_or_else(|e| e.into_inner());
-        if pool.slots.len() < INDIRECT_RING_SLOTS {
-            let alloc = needed.next_multiple_of(64 << 10);
-            let buffer = host()?.uav_buffer(alloc)?;
-            name(&buffer, || format!("indirect arguments {alloc:#x}"));
-            let idx = pool.slots.len();
-            pool.slots.push((buffer.clone(), alloc, false));
-            pool.next = (idx + 1) % INDIRECT_RING_SLOTS;
-            return Some((idx, buffer, false, None));
+        if let Some(buf) = pool.buffer.clone() {
+            if pool.used.saturating_add(alloc_bytes) <= pool.cap {
+                let offset = pool.used;
+                pool.used += alloc_bytes;
+                return Some((buf, offset, pool.in_indirect, false));
+            }
+            if alloc_bytes <= pool.cap {
+                pool.used = alloc_bytes;
+                return Some((buf, 0, pool.in_indirect, true));
+            }
+            drop(buf);
+            let new_cap = pool
+                .cap
+                .saturating_mul(2)
+                .max(alloc_bytes)
+                .next_multiple_of(64 << 10);
+            let buffer = host()?.uav_buffer(new_cap)?;
+            name(&buffer, || format!("indirect arguments {new_cap:#x}"));
+            let old_buf = pool.buffer.replace(buffer.clone());
+            let old_in_indirect = pool.in_indirect;
+            pool.cap = new_cap;
+            pool.used = alloc_bytes;
+            pool.in_indirect = false;
+            drop(pool);
+            if let Some(old_buf) = old_buf {
+                if old_in_indirect {
+                    crate::indirect::done_on(&self.list, &old_buf);
+                }
+                self.keep(&old_buf);
+            }
+            return Some((buffer, 0, false, true));
         }
-        let idx = pool.next % pool.slots.len();
-        pool.next = (idx + 1) % pool.slots.len();
-        let (buf, cap, in_indirect) = &pool.slots[idx];
-        let evicted = Some(buf.as_raw() as usize);
-        if *cap >= needed {
-            return Some((idx, buf.clone(), *in_indirect, evicted));
-        }
-        let alloc = cap
-            .saturating_mul(2)
-            .max(needed)
-            .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
-        name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let (old_buf, _, old_in_indirect) =
-            std::mem::replace(&mut pool.slots[idx], (buffer.clone(), alloc, false));
-        drop(pool);
-        if old_in_indirect {
-            crate::indirect::done_on(&self.list, &old_buf);
-        }
-        self.keep(&old_buf);
-        Some((idx, buffer, false, evicted))
+        let cap = alloc_bytes.max(64 << 10).next_multiple_of(64 << 10);
+        let buffer = host()?.uav_buffer(cap)?;
+        name(&buffer, || format!("indirect arguments {cap:#x}"));
+        pool.buffer = Some(buffer.clone());
+        pool.cap = cap;
+        pool.used = alloc_bytes;
+        pool.in_indirect = false;
+        Some((buffer, 0, false, false))
     }
 
-    pub(crate) fn mark_indirect_state(&self, slot: usize, in_indirect: bool) {
+    pub(crate) fn mark_indirect_state(&self, in_indirect: bool) {
         let mut pool = self.indirect_pool.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, _, state)) = pool.slots.get_mut(slot) {
-            *state = in_indirect;
-        }
+        pool.in_indirect = in_indirect;
     }
 
     #[cfg(test)]
     pub(crate) fn mark_indirect_resource_done(&self, resource: &ID3D12Resource) {
         let raw = resource.as_raw();
         let mut pool = self.indirect_pool.lock().unwrap_or_else(|e| e.into_inner());
-        for (buf, _, state) in &mut pool.slots {
-            if buf.as_raw() == raw {
-                *state = false;
-            }
+        if pool.buffer.as_ref().is_some_and(|b| b.as_raw() == raw) {
+            pool.in_indirect = false;
         }
     }
 
     fn finish_indirect(&self) {
-        let bufs: Vec<ID3D12Resource> = {
+        let buf = {
             let mut pool = self.indirect_pool.lock().unwrap_or_else(|e| e.into_inner());
-            let mut out = Vec::new();
-            for (buf, _, in_indirect) in &mut pool.slots {
-                if *in_indirect {
-                    *in_indirect = false;
-                    out.push(buf.clone());
-                }
+            if pool.in_indirect {
+                pool.in_indirect = false;
+                pool.buffer.clone()
+            } else {
+                None
             }
-            out
         };
-        for buf in bufs {
+        if let Some(buf) = buf {
             crate::indirect::done_on(&self.list, &buf);
         }
         if self.deferred().budget_zeroed

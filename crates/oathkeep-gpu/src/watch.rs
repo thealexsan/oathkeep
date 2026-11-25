@@ -4,9 +4,9 @@ use std::sync::RwLock;
 pub(crate) const PAGE: usize = 64 << 10;
 const KERNEL_PAGE: usize = 4096;
 pub(crate) const HOT_WRITE: u64 = u64::MAX;
-const DEFAULT_HOT_FRAMES: u64 = 240;
+const DEFAULT_HOT_FRAMES: u64 = 12;
 const HOT_WINDOW_FRAMES: u64 = 16;
-const MAX_COOL_BACKOFF: u8 = 6;
+const MAX_COOL_BACKOFF: u8 = 2;
 
 static GLOBAL_WRITE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RANGED_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -735,24 +735,56 @@ struct Guards {
     cool_count: BTreeMap<usize, u8>,
 }
 
-static GUARDS: RwLock<Guards> = RwLock::new(Guards {
-    protected: IntervalSet::new(),
-    clean: IntervalSet::new(),
-    absent: IntervalSet::new(),
-    partly: IntervalSet::new(),
-    accounted: IntervalSet::new(),
-    aliased: BTreeSet::new(),
-    recent_fault: BTreeMap::new(),
-    hot: BTreeMap::new(),
-    cool_count: BTreeMap::new(),
-});
-
-fn guards_read() -> std::sync::RwLockReadGuard<'static, Guards> {
-    GUARDS.read().unwrap_or_else(|e| e.into_inner())
+impl Guards {
+    const fn new() -> Self {
+        Self {
+            protected: IntervalSet::new(),
+            clean: IntervalSet::new(),
+            absent: IntervalSet::new(),
+            partly: IntervalSet::new(),
+            accounted: IntervalSet::new(),
+            aliased: BTreeSet::new(),
+            recent_fault: BTreeMap::new(),
+            hot: BTreeMap::new(),
+            cool_count: BTreeMap::new(),
+        }
+    }
 }
 
-fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
-    GUARDS.write().unwrap_or_else(|e| e.into_inner())
+const GUARD_SHARDS: usize = 64;
+/// 1024 blocks (64 MiB) per contiguous address stripe.
+const SHARD_SHIFT: usize = 10;
+
+static GUARDS: [RwLock<Guards>; GUARD_SHARDS] =
+    [const { RwLock::new(Guards::new()) }; GUARD_SHARDS];
+
+#[inline]
+fn shard_of(block: usize) -> usize {
+    (block >> SHARD_SHIFT) & (GUARD_SHARDS - 1)
+}
+
+#[inline]
+fn guards_read_shard(shard: usize) -> std::sync::RwLockReadGuard<'static, Guards> {
+    GUARDS[shard].read().unwrap_or_else(|e| e.into_inner())
+}
+
+#[inline]
+fn guards_write_shard(shard: usize) -> std::sync::RwLockWriteGuard<'static, Guards> {
+    GUARDS[shard].write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn for_each_shard_span(first: usize, last: usize, mut f: impl FnMut(usize, usize, usize)) {
+    let mut at = first;
+    while at < last {
+        let shard = shard_of(at);
+        let next_boundary = (at >> SHARD_SHIFT)
+            .checked_add(1)
+            .and_then(|s| s.checked_shl(SHARD_SHIFT as u32))
+            .unwrap_or(last);
+        let end = next_boundary.min(last);
+        f(shard, at, end);
+        at = end;
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -786,105 +818,131 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ask = *ASK.get_or_init(|| std::env::var_os("OATHKEEP_GUARD_ASK").is_some_and(|v| v == "1"));
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    if first >= last {
+        return Some(GuardHot::HotOnly(Vec::new()));
+    }
     let frame = crate::frame::current();
     // When HLE demand-commit hooks are installed, all `MEM_MAPPED` commits notify
     // `title_memory_committed`; only probe `g.absent` via `VirtualQuery` when no hook
     // is installed (e.g. unit tests calling `VirtualAlloc(MEM_COMMIT)` directly).
     let probe_absent = COMMIT_TITLE_MEMORY.get().is_none();
     let mut pre_gaps: Vec<(usize, usize)> = Vec::new();
+    let mut slow_spans: Vec<(usize, usize, usize)> = Vec::new();
+    let mut fast_hot_pairs: Vec<(usize, u64)> = Vec::new();
+    let mut span_count = 0usize;
     if !ask {
         #[cfg(feature = "diagnostics")]
         let t_read = std::time::Instant::now();
-        let g = guards_read();
-        if g.clean.contains_range(first, last) {
+        #[cfg(feature = "diagnostics")]
+        let mut fast_hot_n = 0u64;
+        let mut known = false;
+        for_each_shard_span(first, last, |shard, a, b| {
+            span_count += 1;
+            let g = guards_read_shard(shard);
+            if g.clean.contains_range(a, b) {
+                known = true;
+                return;
+            }
+            if g.accounted.contains_range(a, b) && (!probe_absent || !g.absent.overlaps(a, b)) {
+                known = true;
+                let has_partly = g.partly.overlaps(a, b);
+                if g.hot.is_empty() && !has_partly {
+                    return;
+                }
+                let start_len = fast_hot_pairs.len();
+                let mut all_active = true;
+                if !g.hot.is_empty() {
+                    for (&block, &until) in g.hot.range(a..b) {
+                        if until > frame {
+                            fast_hot_pairs.push((block, HOT_WRITE));
+                        } else {
+                            all_active = false;
+                            break;
+                        }
+                    }
+                }
+                if all_active {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        fast_hot_n += (fast_hot_pairs.len() - start_len) as u64;
+                    }
+                    if has_partly {
+                        let had_hot = fast_hot_pairs.len() > start_len;
+                        g.partly.for_each_overlap(a, b, |pa, pb| {
+                            fast_hot_pairs.extend((pa..pb).map(|block| (block, HOT_WRITE)));
+                        });
+                        if had_hot {
+                            fast_hot_pairs[start_len..].sort_unstable_by_key(|&(block, _)| block);
+                        }
+                    }
+                    return;
+                }
+                fast_hot_pairs.truncate(start_len);
+            }
+            if g.accounted.overlaps(a, b) || g.protected.overlaps(a, b) {
+                known = true;
+            }
+            if view_guard() {
+                pre_gaps.extend(g.accounted.gaps_in(a, b));
+                if !g.hot.is_empty() {
+                    for (&block, &until) in g.hot.range(a..b) {
+                        if until <= frame {
+                            match pre_gaps.last_mut() {
+                                Some(last_gap) if last_gap.1 == block => last_gap.1 = block + 1,
+                                _ => pre_gaps.push((block, block + 1)),
+                            }
+                        }
+                    }
+                }
+            }
+            slow_spans.push((shard, a, b));
+        });
+        if slow_spans.is_empty() {
             #[cfg(feature = "diagnostics")]
             {
+                let total_n = fast_hot_pairs.len() as u64;
                 crate::copystat::add(crate::copystat::C::GuardReadFastN, 1);
                 crate::copystat::add(
                     crate::copystat::C::GuardReadFastUs,
                     t_read.elapsed().as_micros() as u64,
                 );
-            }
-            return Some(GuardHot::HotOnly(Vec::new()));
-        }
-        if g.accounted.contains_range(first, last)
-            && (!probe_absent || !g.absent.overlaps(first, last))
-        {
-            let has_partly = g.partly.overlaps(first, last);
-            if g.hot.is_empty() && !has_partly {
-                #[cfg(feature = "diagnostics")]
-                {
-                    crate::copystat::add(crate::copystat::C::GuardReadFastN, 1);
-                    crate::copystat::add(
-                        crate::copystat::C::GuardReadFastUs,
-                        t_read.elapsed().as_micros() as u64,
-                    );
-                }
-                return Some(GuardHot::HotOnly(Vec::new()));
-            }
-            let mut hot_pages = Vec::new();
-            let mut all_active = true;
-            if !g.hot.is_empty() {
-                for (&block, &until) in g.hot.range(first..last) {
-                    if until > frame {
-                        hot_pages.push((block, HOT_WRITE));
-                    } else {
-                        all_active = false;
-                        break;
-                    }
-                }
-            }
-            if all_active {
-                #[cfg(feature = "diagnostics")]
-                let hot_n = hot_pages.len() as u64;
-                if has_partly {
-                    let had_hot = !hot_pages.is_empty();
-                    g.partly.for_each_overlap(first, last, |a, b| {
-                        hot_pages.extend((a..b).map(|block| (block, HOT_WRITE)));
-                    });
-                    if had_hot {
-                        hot_pages.sort_unstable_by_key(|&(block, _)| block);
-                    }
-                }
-                #[cfg(feature = "diagnostics")]
-                {
-                    let total_n = hot_pages.len() as u64;
-                    crate::copystat::add(crate::copystat::C::GuardReadFastN, 1);
-                    crate::copystat::add(
-                        crate::copystat::C::GuardReadFastUs,
-                        t_read.elapsed().as_micros() as u64,
-                    );
-                    crate::copystat::add(crate::copystat::C::GuardRetHotPages, hot_n);
+                if total_n > 0 {
+                    crate::copystat::add(crate::copystat::C::GuardRetHotPages, fast_hot_n);
                     crate::copystat::add(
                         crate::copystat::C::GuardRetPartlyPages,
-                        total_n.saturating_sub(hot_n),
+                        total_n.saturating_sub(fast_hot_n),
                     );
                 }
-                return Some(GuardHot::HotOnly(hot_pages));
             }
+            return Some(GuardHot::HotOnly(fast_hot_pairs));
         }
-        let known = g.accounted.overlaps(first, last) || g.protected.overlaps(first, last);
-        if view_guard() {
-            pre_gaps = g.accounted.gaps_in(first, last);
-            if !g.hot.is_empty() {
-                for (&block, &until) in g.hot.range(first..last) {
-                    if until <= frame {
-                        match pre_gaps.last_mut() {
-                            Some(last_gap) if last_gap.1 == block => last_gap.1 = block + 1,
-                            _ => pre_gaps.push((block, block + 1)),
+        if !known && !is_view(start, end) {
+            return None;
+        }
+    } else {
+        if !is_view(start, end) {
+            return None;
+        }
+        for_each_shard_span(first, last, |shard, a, b| {
+            span_count += 1;
+            if view_guard() {
+                let g = guards_read_shard(shard);
+                pre_gaps.extend(g.accounted.gaps_in(a, b));
+                if !g.hot.is_empty() {
+                    for (&block, &until) in g.hot.range(a..b) {
+                        if until <= frame {
+                            match pre_gaps.last_mut() {
+                                Some(last_gap) if last_gap.1 == block => last_gap.1 = block + 1,
+                                _ => pre_gaps.push((block, block + 1)),
+                            }
                         }
                     }
                 }
             }
-        }
-        drop(g);
-        if !known && !is_view(start, end) {
-            return None;
-        }
-    } else if !is_view(start, end) {
-        return None;
+            slow_spans.push((shard, a, b));
+        });
     }
-    // Pre-query `inplace::VIEWS` OUTSIDE `GUARDS.write()` so view-map mutations on other
+    // Pre-query `inplace::VIEWS` OUTSIDE shard write locks so view-map mutations on other
     // threads never stall `GUARDS` readers behind `inplace::VIEWS.read()`.
     #[cfg(feature = "diagnostics")]
     let t_pre = std::time::Instant::now();
@@ -915,104 +973,113 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
         t_pre.elapsed().as_micros() as u64,
     );
     install();
-    #[cfg(feature = "diagnostics")]
-    let t_wlock = std::time::Instant::now();
-    let mut g = guards();
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(
-        crate::copystat::C::GuardWriteWaitUs,
-        t_wlock.elapsed().as_micros() as u64,
-    );
-    if g.clean.contains_range(first, last) {
-        return Some(GuardHot::HotOnly(Vec::new()));
-    }
-    let mut hot_pages = Vec::new();
-    let mut expired_hot = Vec::new();
-    if !g.hot.is_empty() {
-        for (&block, &until) in g.hot.range(first..last) {
-            if until > frame {
-                hot_pages.push(block);
-            } else {
-                expired_hot.push(block);
-            }
-        }
-    }
-    for block in expired_hot {
-        g.hot.remove(&block);
-        g.accounted.remove(block);
-        g.cool_count
-            .entry(block)
-            .and_modify(|c| *c = c.saturating_add(1).min(MAX_COOL_BACKOFF))
-            .or_insert(1);
-    }
-    if probe_absent && g.absent.overlaps(first, last) {
-        let mut newly_committed: Vec<(usize, usize)> = Vec::new();
-        let mut uncommitted_until = first;
-        g.absent.for_each_overlap(first, last, |a, b| {
-            let mut block = a;
-            while block < b {
-                if block >= uncommitted_until {
-                    uncommitted_until = uncommitted_end(block);
-                }
-                if block < uncommitted_until {
-                    block = uncommitted_until.min(b);
-                } else {
-                    match newly_committed.last_mut() {
-                        Some(last_run) if last_run.1 == block => last_run.1 = block + 1,
-                        _ => newly_committed.push((block, block + 1)),
-                    }
-                    block += 1;
-                }
-            }
-        });
-        for (a, b) in newly_committed {
-            g.absent.remove_range(a, b);
-            g.accounted.remove_range(a, b);
-        }
-    }
-    if g.partly.overlaps(first, last) {
-        let had_hot = !hot_pages.is_empty();
-        g.partly.for_each_overlap(first, last, |a, b| {
-            hot_pages.extend(a..b);
-        });
-        if had_hot {
-            hot_pages.sort_unstable();
-        }
-    }
-    if g.accounted.contains_range(first, last) {
-        return Some(GuardHot::HotOnly(
-            hot_pages.into_iter().map(|p| (p, HOT_WRITE)).collect(),
-        ));
-    }
-    #[cfg(feature = "diagnostics")]
-    let t_prot = std::time::Instant::now();
+    let mut hot_pages: Vec<usize> = fast_hot_pairs.into_iter().map(|(p, _)| p).collect();
     let mut written = Vec::new();
     let mut protected_runs = Vec::new();
-    for (gap_first, gap_last) in g.accounted.gaps_in(first, last) {
-        written.extend(gap_first * BLOCK / PAGE..gap_last * BLOCK / PAGE);
-        if !g.protected.overlaps(gap_first, gap_last) {
-            protect_here(&mut g, gap_first, gap_last, &mut protected_runs);
-        } else {
-            let mut already = Vec::new();
-            g.protected.for_each_overlap(gap_first, gap_last, |a, b| {
-                already.push((a, b));
-            });
-            for (a, b) in g.protected.gaps_in(gap_first, gap_last) {
-                protect_here(&mut g, a, b, &mut protected_runs);
-            }
-            for (a, b) in already {
-                g.clean.insert_range(a, b);
-                g.accounted.insert_range(a, b);
+    for &(shard, a, b) in &slow_spans {
+        #[cfg(feature = "diagnostics")]
+        let t_wlock = std::time::Instant::now();
+        let mut g = guards_write_shard(shard);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::GuardWriteWaitUs,
+            t_wlock.elapsed().as_micros() as u64,
+        );
+        if g.clean.contains_range(a, b) {
+            continue;
+        }
+        let span_hot_start = hot_pages.len();
+        let mut expired_hot = Vec::new();
+        if !g.hot.is_empty() {
+            for (&block, &until) in g.hot.range(a..b) {
+                if until > frame {
+                    hot_pages.push(block);
+                } else {
+                    expired_hot.push(block);
+                }
             }
         }
+        for block in expired_hot {
+            g.hot.remove(&block);
+            g.accounted.remove(block);
+            g.cool_count
+                .entry(block)
+                .and_modify(|c| *c = c.saturating_add(1).min(MAX_COOL_BACKOFF))
+                .or_insert(1);
+        }
+        if probe_absent && g.absent.overlaps(a, b) {
+            let mut newly_committed: Vec<(usize, usize)> = Vec::new();
+            let mut uncommitted_until = a;
+            g.absent.for_each_overlap(a, b, |oa, ob| {
+                let mut block = oa;
+                while block < ob {
+                    if block >= uncommitted_until {
+                        uncommitted_until = uncommitted_end(block);
+                    }
+                    if block < uncommitted_until {
+                        block = uncommitted_until.min(ob);
+                    } else {
+                        match newly_committed.last_mut() {
+                            Some(last_run) if last_run.1 == block => last_run.1 = block + 1,
+                            _ => newly_committed.push((block, block + 1)),
+                        }
+                        block += 1;
+                    }
+                }
+            });
+            for (na, nb) in newly_committed {
+                g.absent.remove_range(na, nb);
+                g.accounted.remove_range(na, nb);
+            }
+        }
+        if g.partly.overlaps(a, b) {
+            let had_hot = hot_pages.len() > span_hot_start;
+            g.partly.for_each_overlap(a, b, |pa, pb| {
+                hot_pages.extend(pa..pb);
+            });
+            if had_hot {
+                hot_pages[span_hot_start..].sort_unstable();
+            }
+        }
+        if g.accounted.contains_range(a, b) {
+            continue;
+        }
+        #[cfg(feature = "diagnostics")]
+        let t_prot = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let written_before = written.len();
+        for (gap_first, gap_last) in g.accounted.gaps_in(a, b) {
+            written.extend(gap_first * BLOCK / PAGE..gap_last * BLOCK / PAGE);
+            if !g.protected.overlaps(gap_first, gap_last) {
+                protect_here(&mut g, gap_first, gap_last, &mut protected_runs);
+            } else {
+                let mut already = Vec::new();
+                g.protected.for_each_overlap(gap_first, gap_last, |pa, pb| {
+                    already.push((pa, pb));
+                });
+                for (pa, pb) in g.protected.gaps_in(gap_first, gap_last) {
+                    protect_here(&mut g, pa, pb, &mut protected_runs);
+                }
+                for (pa, pb) in already {
+                    g.clean.insert_range(pa, pb);
+                    g.accounted.insert_range(pa, pb);
+                }
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(
+                crate::copystat::C::GuardProtectUs,
+                t_prot.elapsed().as_micros() as u64,
+            );
+            crate::copystat::add(
+                crate::copystat::C::GuardRetGuardedPages,
+                (written.len() - written_before) as u64,
+            );
+        }
     }
-    #[cfg(feature = "diagnostics")]
-    {
-        crate::copystat::add(
-            crate::copystat::C::GuardProtectUs,
-            t_prot.elapsed().as_micros() as u64,
-        );
-        crate::copystat::add(crate::copystat::C::GuardRetGuardedPages, written.len() as u64);
+    if span_count > 1 && hot_pages.len() > 1 {
+        hot_pages.sort_unstable();
     }
     if !protected_runs.is_empty() {
         #[cfg(feature = "diagnostics")]
@@ -1025,14 +1092,14 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
                 .all(|&(a, b)| covered.iter().any(|&(ca, cb)| ca <= a && b <= cb))
         {
             if total_count > 0 {
-                apply_alias_protection(&mut g, all_blocks, other_runs, total_count);
+                apply_alias_protection_sharded(all_blocks, other_runs, total_count);
             }
             true
         } else {
             false
         };
         if !reused {
-            protect_aliases(&mut g, &protected_runs);
+            protect_aliases_sharded(&protected_runs);
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
@@ -1040,10 +1107,16 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
             t_alias.elapsed().as_micros() as u64,
         );
     }
-    Some(GuardHot::Guarded {
-        guarded: written,
-        hot: hot_pages,
-    })
+    if written.is_empty() {
+        Some(GuardHot::HotOnly(
+            hot_pages.into_iter().map(|p| (p, HOT_WRITE)).collect(),
+        ))
+    } else {
+        Some(GuardHot::Guarded {
+            guarded: written,
+            hot: hot_pages,
+        })
+    }
 }
 
 fn is_view(start: usize, end: usize) -> bool {
@@ -1076,7 +1149,7 @@ fn is_view(start: usize, end: usize) -> bool {
     }
 }
 
-fn protect_aliases(g: &mut Guards, runs: &[(usize, usize)]) {
+fn protect_aliases_sharded(runs: &[(usize, usize)]) {
     if !view_guard() || runs.is_empty() {
         return;
     }
@@ -1099,17 +1172,32 @@ fn protect_aliases(g: &mut Guards, runs: &[(usize, usize)]) {
     if total_count == 0 {
         return;
     }
-    apply_alias_protection(g, all_blocks, all_other_runs, total_count);
+    apply_alias_protection_sharded(all_blocks, all_other_runs, total_count);
 }
 
-fn apply_alias_protection(
-    g: &mut Guards,
-    all_blocks: Vec<usize>,
+fn apply_alias_protection_sharded(
+    mut all_blocks: Vec<usize>,
     mut all_other_runs: Vec<(usize, usize)>,
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))] total_count: u64,
 ) {
-    for alias in all_blocks {
-        g.aliased.insert(alias);
+    if !all_blocks.is_empty() {
+        if all_blocks.len() > 1 {
+            all_blocks.sort_unstable();
+            all_blocks.dedup();
+        }
+        let mut i = 0;
+        while i < all_blocks.len() {
+            let shard = shard_of(all_blocks[i]);
+            let mut k = i + 1;
+            while k < all_blocks.len() && shard_of(all_blocks[k]) == shard {
+                k += 1;
+            }
+            let mut g = guards_write_shard(shard);
+            for &alias in &all_blocks[i..k] {
+                g.aliased.insert(alias);
+            }
+            i = k;
+        }
     }
     #[cfg(feature = "diagnostics")]
     ALIASES[0].fetch_add(total_count, std::sync::atomic::Ordering::Relaxed);
@@ -1125,7 +1213,10 @@ fn apply_alias_protection(
         all_other_runs = merged;
     }
     for (a, b) in all_other_runs {
-        protect_alias_range(g, a, b);
+        for_each_shard_span(a, b, |shard, sa, sb| {
+            let mut g = guards_write_shard(shard);
+            protect_alias_range(&mut g, sa, sb);
+        });
     }
 }
 
@@ -1287,49 +1378,56 @@ pub(crate) fn cool_hot(blocks: &[usize]) -> usize {
     if blocks.is_empty() {
         return 0;
     }
-    {
-        let g = guards_read();
-        if g.hot.is_empty() || !blocks.iter().any(|b| g.hot.contains_key(b)) {
-            return 0;
-        }
+    let mut sorted = blocks.to_vec();
+    if sorted.len() > 1 {
+        sorted.sort_unstable();
+        sorted.dedup();
     }
-    let mut g = guards();
-    let mut cooled: Vec<usize> = blocks
-        .iter()
-        .copied()
-        .filter(|b| g.hot.contains_key(b))
-        .collect();
-    if cooled.is_empty() {
-        return 0;
-    }
-    cooled.sort_unstable();
-    cooled.dedup();
-    for &block in &cooled {
-        g.hot.remove(&block);
-        g.accounted.remove(block);
-        g.recent_fault.remove(&block);
-        g.cool_count
-            .entry(block)
-            .and_modify(|c| *c = c.saturating_add(1).min(MAX_COOL_BACKOFF))
-            .or_insert(1);
-    }
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    for &block in &cooled {
-        match runs.last_mut() {
-            Some(last) if last.1 == block => last.1 = block + 1,
-            _ => runs.push((block, block + 1)),
-        }
-    }
+    let mut total_cooled = 0usize;
     let mut protected_runs: Vec<(usize, usize)> = Vec::new();
-    for (from, to) in runs {
-        for (a, b) in g.protected.gaps_in(from, to) {
-            protect_range(&mut g, a, b, false, &mut protected_runs);
+    let mut i = 0;
+    while i < sorted.len() {
+        let shard = shard_of(sorted[i]);
+        let mut k = i + 1;
+        while k < sorted.len() && shard_of(sorted[k]) == shard {
+            k += 1;
+        }
+        let slice = &sorted[i..k];
+        i = k;
+        {
+            let g = guards_read_shard(shard);
+            if g.hot.is_empty() || !slice.iter().any(|b| g.hot.contains_key(b)) {
+                continue;
+            }
+        }
+        let mut g = guards_write_shard(shard);
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for &block in slice {
+            if g.hot.remove(&block).is_none() {
+                continue;
+            }
+            total_cooled += 1;
+            g.accounted.remove(block);
+            g.recent_fault.remove(&block);
+            g.cool_count
+                .entry(block)
+                .and_modify(|c| *c = c.saturating_add(1).min(MAX_COOL_BACKOFF))
+                .or_insert(1);
+            match runs.last_mut() {
+                Some(last) if last.1 == block => last.1 = block + 1,
+                _ => runs.push((block, block + 1)),
+            }
+        }
+        for (from, to) in runs {
+            for (a, b) in g.protected.gaps_in(from, to) {
+                protect_range(&mut g, a, b, false, &mut protected_runs);
+            }
         }
     }
     if !protected_runs.is_empty() {
-        protect_aliases(&mut g, &protected_runs);
+        protect_aliases_sharded(&protected_runs);
     }
-    cooled.len()
+    total_cooled
 }
 
 fn uncommitted_end(block: usize) -> usize {
@@ -1347,51 +1445,74 @@ fn uncommitted_end(block: usize) -> usize {
     }
 }
 
-fn open_and_aliases_spans(g: &mut Guards, start: usize, end: usize) -> (Vec<(usize, usize)>, Vec<usize>) {
-    let mut opened = open_here_spans(g, start, end);
-    if start >= end || g.aliased.is_empty() {
-        return (opened, Vec::new());
+fn open_and_aliases_block_spans_sharded(
+    first: usize,
+    last: usize,
+) -> (Vec<(usize, usize)>, Vec<usize>) {
+    if first >= last {
+        return (Vec::new(), Vec::new());
     }
-    let aliased: Vec<usize> = g
-        .aliased
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let mut opened = Vec::new();
+    let mut aliased = Vec::new();
+    for_each_shard_span(first, last, |shard, a, b| {
+        let mut g = guards_write_shard(shard);
+        opened.extend(open_here_block_spans(&mut g, a, b));
+        if !g.aliased.is_empty() {
+            let found: Vec<usize> = g.aliased.range(a..b).copied().collect();
+            for &block in &found {
+                g.aliased.remove(&block);
+            }
+            aliased.extend(found);
+        }
+    });
     if aliased.is_empty() {
         return (opened, Vec::new());
     }
-    for &block in &aliased {
-        g.aliased.remove(&block);
-    }
     let (all, other_runs) = crate::inplace::alias_spans_of_blocks(&aliased);
-    for &alias in &all {
-        g.aliased.remove(&alias);
+    if !all.is_empty() {
+        let mut sorted = all.clone();
+        if sorted.len() > 1 {
+            sorted.sort_unstable();
+            sorted.dedup();
+        }
+        let mut i = 0;
+        while i < sorted.len() {
+            let shard = shard_of(sorted[i]);
+            let mut k = i + 1;
+            while k < sorted.len() && shard_of(sorted[k]) == shard {
+                k += 1;
+            }
+            let mut g = guards_write_shard(shard);
+            for &alias in &sorted[i..k] {
+                g.aliased.remove(&alias);
+            }
+            i = k;
+        }
     }
     for (a, b) in other_runs {
-        let alias_opened = open_here_spans(g, a.saturating_mul(BLOCK), b.saturating_mul(BLOCK));
-        #[cfg(feature = "diagnostics")]
-        {
-            let count: u64 = alias_opened.iter().map(|&(lo, hi)| (hi - lo) as u64).sum();
-            if count > 0 {
-                ALIASES[1].fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        for_each_shard_span(a, b, |shard, sa, sb| {
+            let mut g = guards_write_shard(shard);
+            let alias_opened = open_here_block_spans(&mut g, sa, sb);
+            #[cfg(feature = "diagnostics")]
+            {
+                let count: u64 = alias_opened.iter().map(|&(lo, hi)| (hi - lo) as u64).sum();
+                if count > 0 {
+                    ALIASES[1].fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                }
             }
-        }
-        opened.extend(alias_opened);
+            opened.extend(alias_opened);
+        });
     }
     (opened, all)
 }
 
-fn open_and_aliases(g: &mut Guards, start: usize, end: usize) -> (bool, Vec<usize>) {
-    let (opened, all) = open_and_aliases_spans(g, start, end);
-    (!opened.is_empty(), all)
-}
-
-fn open_fault(g: &mut Guards, at: usize) -> bool {
-    let (opened, aliases) = open_and_aliases(g, at, at + 1);
-    if !opened {
+fn open_fault_sharded(at: usize) -> bool {
+    let fault_block = at / BLOCK;
+    let (opened_spans, aliases) =
+        open_and_aliases_block_spans_sharded(fault_block, fault_block + 1);
+    if opened_spans.is_empty() {
         return false;
     }
-    let fault_block = at / BLOCK;
     record_written_range(
         fault_block.saturating_mul(BLOCK),
         fault_block.saturating_add(1).saturating_mul(BLOCK),
@@ -1405,50 +1526,63 @@ fn open_fault(g: &mut Guards, at: usize) -> bool {
         }
     }
     if hot_enabled() {
-        let block = at / BLOCK;
         let frame = crate::frame::current();
-        let mut become_hot = g
-            .recent_fault
-            .insert(block, frame)
-            .is_some_and(|prev| frame >= prev && frame.saturating_sub(prev) <= HOT_WINDOW_FRAMES);
+        let (mut become_hot, block_shift) = {
+            let mut g = guards_write_shard(shard_of(fault_block));
+            let hit = g
+                .recent_fault
+                .insert(fault_block, frame)
+                .is_some_and(|prev| {
+                    frame >= prev && frame.saturating_sub(prev) <= HOT_WINDOW_FRAMES
+                });
+            let shift = g
+                .cool_count
+                .get(&fault_block)
+                .copied()
+                .unwrap_or(0)
+                .min(MAX_COOL_BACKOFF);
+            (hit, shift)
+        };
         for &alias in &aliases {
-            if alias != block
-                && g.recent_fault
+            if alias != fault_block {
+                let mut g = guards_write_shard(shard_of(alias));
+                if g.recent_fault
                     .insert(alias, frame)
                     .is_some_and(|prev| {
                         frame >= prev && frame.saturating_sub(prev) <= HOT_WINDOW_FRAMES
                     })
-            {
-                become_hot = true;
+                {
+                    become_hot = true;
+                }
             }
         }
         if become_hot {
-            let block_shift = g
-                .cool_count
-                .get(&block)
-                .copied()
-                .unwrap_or(0)
-                .min(MAX_COOL_BACKOFF);
-            let until = frame.saturating_add(hot_frames().saturating_mul(1u64 << block_shift));
-            g.hot.insert(block, until);
-            g.accounted.insert(block);
+            let base_hot = hot_frames();
+            {
+                let mut g = guards_write_shard(shard_of(fault_block));
+                let until = frame.saturating_add(base_hot.saturating_mul(1u64 << block_shift));
+                g.hot.insert(fault_block, until);
+                g.accounted.insert(fault_block);
+            }
             for alias in aliases {
-                if alias != block
-                    && !g.absent.contains(alias)
-                    && !g.clean.contains(alias)
-                    && !g.partly.contains(alias)
-                {
-                    let alias_shift = g
-                        .cool_count
-                        .get(&alias)
-                        .copied()
-                        .unwrap_or(0)
-                        .max(block_shift)
-                        .min(MAX_COOL_BACKOFF);
-                    let alias_until =
-                        frame.saturating_add(hot_frames().saturating_mul(1u64 << alias_shift));
-                    g.hot.insert(alias, alias_until);
-                    g.accounted.insert(alias);
+                if alias != fault_block {
+                    let mut g = guards_write_shard(shard_of(alias));
+                    if !g.absent.contains(alias)
+                        && !g.clean.contains(alias)
+                        && !g.partly.contains(alias)
+                    {
+                        let alias_shift = g
+                            .cool_count
+                            .get(&alias)
+                            .copied()
+                            .unwrap_or(0)
+                            .max(block_shift)
+                            .min(MAX_COOL_BACKOFF);
+                        let alias_until =
+                            frame.saturating_add(base_hot.saturating_mul(1u64 << alias_shift));
+                        g.hot.insert(alias, alias_until);
+                        g.accounted.insert(alias);
+                    }
                 }
             }
         }
@@ -1456,9 +1590,8 @@ fn open_fault(g: &mut Guards, at: usize) -> bool {
     true
 }
 
-fn open_here_spans(g: &mut Guards, start: usize, end: usize) -> Vec<(usize, usize)> {
+fn open_here_block_spans(g: &mut Guards, first: usize, last: usize) -> Vec<(usize, usize)> {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let spans = g.protected.remove_range(first, last);
     if spans.is_empty() {
         return spans;
@@ -1522,56 +1655,75 @@ pub fn title_memory_committed(at: usize, len: usize) {
     }
     record_written_range(at, at.saturating_add(len));
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    {
-        let g = guards_read();
-        if !g.absent.overlaps(first, last) && !g.partly.overlaps(first, last) {
-            return;
+    for_each_shard_span(first, last, |shard, a, b| {
+        {
+            let g = guards_read_shard(shard);
+            if !g.absent.overlaps(a, b) && !g.partly.overlaps(a, b) {
+                return;
+            }
         }
-    }
-    let mut g = guards();
-    let removed_absent = g.absent.remove_range(first, last);
-    for (a, b) in removed_absent {
-        g.accounted.remove_range(a, b);
-    }
-    let removed_partly = g.partly.remove_range(first, last);
-    for (a, b) in removed_partly {
-        g.accounted.remove_range(a, b);
-    }
+        let mut g = guards_write_shard(shard);
+        let removed_absent = g.absent.remove_range(a, b);
+        for (ra, rb) in removed_absent {
+            g.accounted.remove_range(ra, rb);
+        }
+        let removed_partly = g.partly.remove_range(a, b);
+        for (ra, rb) in removed_partly {
+            g.accounted.remove_range(ra, rb);
+        }
+    });
 }
 
-fn promote_opened_hot(g: &mut Guards, opened_spans: &[(usize, usize)], immediate: bool) {
+fn promote_opened_hot_sharded(opened_spans: &[(usize, usize)]) {
     if !hot_enabled() || opened_spans.is_empty() {
         return;
     }
     let frame = crate::frame::current();
     let base_hot = hot_frames();
-    for &(a, b) in opened_spans {
-        for block in a..b {
-            if g.absent.contains(block) || g.clean.contains(block) || g.partly.contains(block) {
-                continue;
-            }
-            let become_hot = if immediate {
-                true
-            } else {
-                g.recent_fault
+    for &(span_a, span_b) in opened_spans {
+        for_each_shard_span(span_a, span_b, |shard, a, b| {
+            let mut g = guards_write_shard(shard);
+            for block in a..b {
+                if g.absent.contains(block)
+                    || g.clean.contains(block)
+                    || g.partly.contains(block)
+                {
+                    continue;
+                }
+                let become_hot = g
+                    .recent_fault
                     .insert(block, frame)
                     .is_some_and(|prev| {
                         frame >= prev && frame.saturating_sub(prev) <= HOT_WINDOW_FRAMES
-                    })
-            };
-            if become_hot {
-                let shift = g
-                    .cool_count
-                    .get(&block)
-                    .copied()
-                    .unwrap_or(0)
-                    .min(MAX_COOL_BACKOFF);
-                let until = frame.saturating_add(base_hot.saturating_mul(1u64 << shift));
-                g.hot.insert(block, until);
-                g.accounted.insert(block);
+                    });
+                if become_hot {
+                    let shift = g
+                        .cool_count
+                        .get(&block)
+                        .copied()
+                        .unwrap_or(0)
+                        .min(MAX_COOL_BACKOFF);
+                    let until = frame.saturating_add(base_hot.saturating_mul(1u64 << shift));
+                    g.hot.insert(block, until);
+                    g.accounted.insert(block);
+                }
             }
-        }
+        });
     }
+}
+
+fn range_needs_open(first: usize, last: usize) -> bool {
+    let mut needs = false;
+    for_each_shard_span(first, last, |shard, a, b| {
+        if needs {
+            return;
+        }
+        let g = guards_read_shard(shard);
+        if g.protected.overlaps(a, b) || g.aliased.range(a..b).next().is_some() {
+            needs = true;
+        }
+    });
+    needs
 }
 
 pub fn writing(at: usize, len: usize) {
@@ -1584,14 +1736,8 @@ pub fn writing(at: usize, len: usize) {
     let end = at.saturating_add(len);
     if at < end {
         let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
-        let needs_open = {
-            let g = guards_read();
-            g.protected.overlaps(first, last) || g.aliased.range(first..last).next().is_some()
-        };
-        if needs_open {
-            let mut g = guards();
-            let (opened_spans, _) = open_and_aliases_spans(&mut g, at, end);
-            promote_opened_hot(&mut g, &opened_spans, false);
+        if range_needs_open(first, last) {
+            let _ = open_and_aliases_block_spans_sharded(first, last);
         }
     }
     crate::descriptor::host::remapped(at, len);
@@ -1607,22 +1753,14 @@ pub(crate) fn writing_copy(at: usize, len: usize) {
     let end = at.saturating_add(len);
     record_written_range(at, end);
     let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
-    let needs_open = {
-        let g = guards_read();
-        g.protected.overlaps(first, last) || g.aliased.range(first..last).next().is_some()
-    };
-    if needs_open {
-        let mut g = guards();
-        let (opened_spans, _) = open_and_aliases_spans(&mut g, at, end);
-        promote_opened_hot(&mut g, &opened_spans, false);
+    if range_needs_open(first, last) {
+        let _ = open_and_aliases_block_spans_sharded(first, last);
     }
 }
 
-/// Opens guarded blocks for GPU-to-title readback merges and promotes opened blocks
-/// directly into `g.hot` + `g.accounted` so the next `writes_guarded_since` check does
-/// not immediately `VirtualProtect(PAGE_READONLY)` + `protect_aliases` ping-pong them.
-/// Also extends expiring hot blocks in the range so actively GPU-written pages do not
-/// flap out of `g.hot` every `hot_frames()` frames.
+/// Opens guarded blocks for GPU-to-title readback merges and promotes repeatedly
+/// written blocks (within `HOT_WINDOW_FRAMES`) into `g.hot` + `g.accounted` so
+/// active GPU writebacks avoid `VirtualProtect` ping-pong without flooding `g.hot`.
 /// Does not call `descriptor::host::remapped` (card buffer writebacks are not texture remaps).
 pub(crate) fn writing_gpu_back(at: usize, len: usize) {
     if len == 0 {
@@ -1634,42 +1772,9 @@ pub(crate) fn writing_gpu_back(at: usize, len: usize) {
         commit(at, len);
     }
     let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
-    let frame = crate::frame::current();
-    let renew_before = frame.saturating_add(hot_frames() / 2);
-    let (needs_open, needs_renew) = {
-        let g = guards_read();
-        let open = g.protected.overlaps(first, last)
-            || g.aliased.range(first..last).next().is_some();
-        let renew = !open
-            && hot_enabled()
-            && !g.hot.is_empty()
-            && g.hot
-                .range(first..last)
-                .any(|(_, &until)| until <= renew_before);
-        (open, renew)
-    };
-    if needs_open {
-        let mut g = guards();
-        let (opened_spans, _) = open_and_aliases_spans(&mut g, at, end);
-        promote_opened_hot(&mut g, &opened_spans, true);
-    } else if needs_renew {
-        let mut g = guards();
-        let base_hot = hot_frames();
-        let to_renew: Vec<usize> = g
-            .hot
-            .range(first..last)
-            .filter_map(|(&block, &until)| (until <= renew_before).then_some(block))
-            .collect();
-        for block in to_renew {
-            let shift = g
-                .cool_count
-                .get(&block)
-                .copied()
-                .unwrap_or(0)
-                .min(MAX_COOL_BACKOFF);
-            let until = frame.saturating_add(base_hot.saturating_mul(1u64 << shift));
-            g.hot.insert(block, until);
-        }
+    if range_needs_open(first, last) {
+        let (opened_spans, _) = open_and_aliases_block_spans_sharded(first, last);
+        promote_opened_hot_sharded(&opened_spans);
     }
 }
 
@@ -1711,14 +1816,15 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     {
         let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
-        let guarded = guards_read().protected.count_in(first, last);
+        let mut guarded = 0u64;
+        for_each_shard_span(first, last, |shard, a, b| {
+            guarded += guards_read_shard(shard).protected.count_in(a, b);
+        });
         if pages {
             WRITTEN[2].fetch_add(guarded, Relaxed);
         }
         if mode & 1 != 0 && guarded != 0 {
-            let mut g = guards();
-            let (opened_spans, _) = open_and_aliases_spans(&mut g, at, end);
-            promote_opened_hot(&mut g, &opened_spans, false);
+            let _ = open_and_aliases_block_spans_sharded(first, last);
         }
     }
     crate::descriptor::host::page_written(at, len);
@@ -1732,24 +1838,24 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if ranges.is_empty() {
         return;
     }
-    let needs_open = {
-        let g = guards_read();
-        ranges.iter().any(|&(at, n)| {
-            let end = at.saturating_add(n);
-            at < end && g.protected.overlaps(at / BLOCK, end.div_ceil(BLOCK))
-        })
-    };
-    if !needs_open {
-        return;
-    }
-    let mut g = guards();
     for &(at, n) in &ranges {
-        let opened_spans = open_here_spans(&mut g, at, at.saturating_add(n));
-        if !opened_spans.is_empty() {
-            #[cfg(feature = "diagnostics")]
-            ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            promote_opened_hot(&mut g, &opened_spans, false);
+        let end = at.saturating_add(n);
+        if at >= end {
+            continue;
         }
+        let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+        for_each_shard_span(first, last, |shard, a, b| {
+            let needs_open = guards_read_shard(shard).protected.overlaps(a, b);
+            if !needs_open {
+                return;
+            }
+            let mut g = guards_write_shard(shard);
+            let opened_spans = open_here_block_spans(&mut g, a, b);
+            if !opened_spans.is_empty() {
+                #[cfg(feature = "diagnostics")]
+                ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
     }
 }
 
@@ -1831,39 +1937,49 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     if first >= last {
         return;
     }
-    let has_any = {
-        let g = guards_read();
-        g.accounted.overlaps(first, last)
-            || g.protected.overlaps(first, last)
-            || g.aliased.range(first..last).next().is_some()
-            || g.recent_fault.range(first..last).next().is_some()
-            || g.cool_count.range(first..last).next().is_some()
-    };
-    if !has_any {
-        return;
+    let has_journal = journal_read().written.range(first..last).next().is_some();
+    if has_journal {
+        let mut j = journal_write();
+        let keys: Vec<usize> = j.written.range(first..last).map(|(&k, _)| k).collect();
+        for page in keys {
+            j.written.remove(&page);
+        }
     }
-    let mut g = guards();
-    g.absent.remove_range(first, last);
-    g.partly.remove_range(first, last);
-    g.protected.remove_range(first, last);
-    g.clean.remove_range(first, last);
-    g.accounted.remove_range(first, last);
-    let aliased: Vec<usize> = g.aliased.range(first..last).copied().collect();
-    for block in aliased {
-        g.aliased.remove(&block);
-    }
-    let hot_keys: Vec<usize> = g.hot.range(first..last).map(|(&k, _)| k).collect();
-    for block in hot_keys {
-        g.hot.remove(&block);
-    }
-    let recent_keys: Vec<usize> = g.recent_fault.range(first..last).map(|(&k, _)| k).collect();
-    for block in recent_keys {
-        g.recent_fault.remove(&block);
-    }
-    let cool_keys: Vec<usize> = g.cool_count.range(first..last).map(|(&k, _)| k).collect();
-    for block in cool_keys {
-        g.cool_count.remove(&block);
-    }
+    for_each_shard_span(first, last, |shard, a, b| {
+        let has_any = {
+            let g = guards_read_shard(shard);
+            g.accounted.overlaps(a, b)
+                || g.protected.overlaps(a, b)
+                || g.aliased.range(a..b).next().is_some()
+                || g.recent_fault.range(a..b).next().is_some()
+                || g.cool_count.range(a..b).next().is_some()
+        };
+        if !has_any {
+            return;
+        }
+        let mut g = guards_write_shard(shard);
+        g.absent.remove_range(a, b);
+        g.partly.remove_range(a, b);
+        g.protected.remove_range(a, b);
+        g.clean.remove_range(a, b);
+        g.accounted.remove_range(a, b);
+        let aliased: Vec<usize> = g.aliased.range(a..b).copied().collect();
+        for block in aliased {
+            g.aliased.remove(&block);
+        }
+        let hot_keys: Vec<usize> = g.hot.range(a..b).map(|(&k, _)| k).collect();
+        for block in hot_keys {
+            g.hot.remove(&block);
+        }
+        let recent_keys: Vec<usize> = g.recent_fault.range(a..b).map(|(&k, _)| k).collect();
+        for block in recent_keys {
+            g.recent_fault.remove(&block);
+        }
+        let cool_keys: Vec<usize> = g.cool_count.range(a..b).map(|(&k, _)| k).collect();
+        for block in cool_keys {
+            g.cool_count.remove(&block);
+        }
+    });
 }
 
 fn install() {
@@ -1885,16 +2001,13 @@ fn install() {
         let at = r.ExceptionInformation[1];
         let block = at / BLOCK;
         let tracked = {
-            let g = guards_read();
+            let g = guards_read_shard(shard_of(block));
             g.protected.contains(block) || g.aliased.contains(&block)
         };
-        if tracked {
-            let mut g = guards();
-            if open_fault(&mut g, at) {
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
+        if tracked && open_fault_sharded(at) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
             EXCEPTION_CONTINUE_EXECUTION
@@ -1912,16 +2025,13 @@ fn install() {
 pub fn try_open_write(at: usize) -> bool {
     let block = at / BLOCK;
     let tracked = {
-        let g = guards_read();
+        let g = guards_read_shard(shard_of(block));
         g.protected.contains(block) || g.aliased.contains(&block)
     };
-    if tracked {
-        let mut g = guards();
-        if open_fault(&mut g, at) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            return true;
-        }
+    if tracked && open_fault_sharded(at) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+        return true;
     }
     writable(at)
 }
@@ -2025,6 +2135,7 @@ mod tests {
             guard(view, view + 2 * BLOCK),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
+        title_memory_remapped(view, 2 * BLOCK);
         // SAFETY: our view.
         unsafe {
             UnmapViewOfFile(
@@ -2033,7 +2144,6 @@ mod tests {
                 },
             )
         };
-        title_memory_remapped(view, 2 * BLOCK);
     }
 
     #[test]
@@ -2171,6 +2281,7 @@ mod tests {
         let mut local = [0u8; 16];
         let at = local.as_mut_ptr() as usize;
         assert!(!is_view(at, at + local.len()));
+        title_memory_remapped(p, 3 * BLOCK);
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
@@ -2180,7 +2291,6 @@ mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-        title_memory_remapped(p, 3 * BLOCK);
     }
 
     #[test]
@@ -2253,6 +2363,7 @@ mod tests {
         title_memory_remapped(p + BLOCK, BLOCK);
         assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
         assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        title_memory_remapped(p, 3 * BLOCK);
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
@@ -2262,7 +2373,6 @@ mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-        title_memory_remapped(p, 3 * BLOCK);
     }
 
     fn two_views(bytes: usize) -> (usize, usize, usize) {
@@ -2505,10 +2615,10 @@ mod tests {
         // Initial guard with since=u64::MAX protects blocks and skips journal scan.
         let (ts0, w0) = writes_guarded_since(start, end, u64::MAX).unwrap();
         assert!(w0.is_empty());
-        {
-            let g = guards_read();
-            assert!(g.clean.contains_range(b0, b2 + 1));
-            assert!(g.accounted.contains_range(b0, b2 + 1));
+        for b in b0..=b2 {
+            let g = guards_read_shard(shard_of(b));
+            assert!(g.clean.contains(b));
+            assert!(g.accounted.contains(b));
         }
 
         // Subsequent check with since=ts0 returns empty immediately.
@@ -2529,11 +2639,15 @@ mod tests {
         let (ts3, w3) = writes_guarded_since(start, end, ts2).unwrap();
         assert_eq!(w3, vec![(b0, HOT_WRITE)]);
         {
-            let g = guards_read();
+            let g = guards_read_shard(shard_of(b0));
             assert!(!g.clean.contains(b0));
             assert!(g.hot.contains_key(&b0));
-            assert!(g.clean.contains_range(b1, b2 + 1));
-            assert!(g.accounted.contains_range(b0, b2 + 1));
+            assert!(g.accounted.contains(b0));
+        }
+        for b in b1..=b2 {
+            let g = guards_read_shard(shard_of(b));
+            assert!(g.clean.contains(b));
+            assert!(g.accounted.contains(b));
         }
 
         // Fast path with since=ts3 still preserves HOT_WRITE for b0.
@@ -2544,23 +2658,27 @@ mod tests {
         // `writing()` on hot block b0 stays open without disturbing b1..=b2;
         // `writing()` on protected block b2 opens b2 and removes it from clean & accounted.
         writing(start, 16);
-        assert!(guards_read().clean.contains_range(b1, b2 + 1));
+        for b in b1..=b2 {
+            assert!(guards_read_shard(shard_of(b)).clean.contains(b));
+        }
         writing(start + 2 * BLOCK, 16);
         {
-            let g = guards_read();
+            let g = guards_read_shard(shard_of(b2));
             assert!(!g.clean.contains(b2));
             assert!(!g.accounted.contains(b2));
-            assert!(g.accounted.contains_range(b0, b2));
+        }
+        for b in b0..b2 {
+            assert!(guards_read_shard(shard_of(b)).accounted.contains(b));
         }
 
         // Remap cleans all guard sets including accounted.
         title_memory_remapped(start, 3 * BLOCK);
-        {
-            let g = guards_read();
-            assert!(!g.accounted.overlaps(b0, b2 + 1));
-            assert!(!g.clean.overlaps(b0, b2 + 1));
-            assert!(!g.protected.overlaps(b0, b2 + 1));
-            assert!(g.hot.range(b0..=b2).next().is_none());
+        for b in b0..=b2 {
+            let g = guards_read_shard(shard_of(b));
+            assert!(!g.accounted.contains(b));
+            assert!(!g.clean.contains(b));
+            assert!(!g.protected.contains(b));
+            assert!(!g.hot.contains_key(&b));
         }
         // SAFETY: unmap our test view.
         unsafe { UnmapViewOfFile(view) };
@@ -2638,7 +2756,9 @@ mod mapping_tests {
 
     #[test]
     fn repeated_faults_enter_hot_cooldown_and_skip_reprotect() {
-        use super::{BLOCK, guard_with_hot, guards_read, title_memory_remapped, writable};
+        use super::{
+            BLOCK, guard_with_hot, guards_read_shard, shard_of, title_memory_remapped, writable,
+        };
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
@@ -2683,14 +2803,17 @@ mod mapping_tests {
         assert!(writable(start));
         // Remap clears hot state cleanly.
         title_memory_remapped(start, 2 * BLOCK);
-        assert!(!guards_read().hot.contains_key(&block0));
+        assert!(!guards_read_shard(shard_of(block0)).hot.contains_key(&block0));
         // SAFETY: unmap our test view.
         unsafe { UnmapViewOfFile(view) };
     }
 
     #[test]
     fn cool_hot_rearms_guard_and_clears_hot_state() {
-        use super::{BLOCK, cool_hot, guard_with_hot, guards_read, title_memory_remapped, writable};
+        use super::{
+            BLOCK, cool_hot, guard_with_hot, guards_read_shard, shard_of, title_memory_remapped,
+            writable,
+        };
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
@@ -2738,14 +2861,17 @@ mod mapping_tests {
         assert_eq!(cool_hot(&[b0, b2]), 1);
         assert_eq!(cool_hot(&[b0]), 0);
         {
-            let g = guards_read();
-            assert!(!g.hot.contains_key(&b0));
-            assert!(g.protected.contains(b0));
-            assert!(!g.clean.contains(b0));
-            assert!(!g.accounted.contains(b0));
-            assert!(g.hot.contains_key(&b1));
-            assert!(g.clean.contains(b2));
-            assert!(g.accounted.contains(b2));
+            let g0 = guards_read_shard(shard_of(b0));
+            assert!(!g0.hot.contains_key(&b0));
+            assert!(g0.protected.contains(b0));
+            assert!(!g0.clean.contains(b0));
+            assert!(!g0.accounted.contains(b0));
+        }
+        assert!(guards_read_shard(shard_of(b1)).hot.contains_key(&b1));
+        {
+            let g2 = guards_read_shard(shard_of(b2));
+            assert!(g2.clean.contains(b2));
+            assert!(g2.accounted.contains(b2));
         }
         assert!(!writable(start));
         assert!(writable(start + BLOCK));
@@ -2753,9 +2879,9 @@ mod mapping_tests {
         // Next guard reports b0 once (catching any raced write) and promotes b0 to clean.
         assert_eq!(guard_with_hot(start, end), Some((vec![b0], vec![b1])));
         {
-            let g = guards_read();
-            assert!(g.clean.contains(b0));
-            assert!(g.accounted.contains(b0));
+            let g0 = guards_read_shard(shard_of(b0));
+            assert!(g0.clean.contains(b0));
+            assert!(g0.accounted.contains(b0));
         }
         // Subsequent guard skips b0 completely while b1 remains hot.
         assert_eq!(guard_with_hot(start, end), Some((vec![], vec![b1])));
@@ -2764,7 +2890,7 @@ mod mapping_tests {
         // SAFETY: committed mapped view memory.
         unsafe { (start as *mut u8).write_volatile(3) };
         assert_eq!(guard_with_hot(start, end), Some((vec![b0], vec![b1])));
-        assert!(!guards_read().hot.contains_key(&b0));
+        assert!(!guards_read_shard(shard_of(b0)).hot.contains_key(&b0));
         assert_eq!(guard_with_hot(start, end), Some((vec![], vec![b1])));
 
         title_memory_remapped(start, 3 * BLOCK);
@@ -2774,7 +2900,10 @@ mod mapping_tests {
 
     #[test]
     fn cool_hot_coalesces_contiguous_runs_and_catches_raced_write() {
-        use super::{BLOCK, cool_hot, guard_with_hot, guards_read, title_memory_remapped, writable};
+        use super::{
+            BLOCK, cool_hot, guard_with_hot, guards_read_shard, shard_of, title_memory_remapped,
+            writable,
+        };
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
@@ -2815,8 +2944,8 @@ mod mapping_tests {
         assert_eq!(cool_hot(&[blocks[3], blocks[1], blocks[0], blocks[2], blocks[1]]), 4);
         for i in 0..4 {
             assert!(!writable(start + i * BLOCK));
+            assert!(!guards_read_shard(shard_of(blocks[i])).hot.contains_key(&blocks[i]));
         }
-        assert!(guards_read().hot.range(blocks[0]..=blocks[3]).next().is_none());
 
         // Single transition verification reports all 4 blocks once, so the raced write is seen,
         // and the next check is completely clean.
@@ -2831,8 +2960,8 @@ mod mapping_tests {
     #[test]
     fn cooling_backoff_doubles_hot_duration_and_resets_on_remap() {
         use super::{
-            BLOCK, MAX_COOL_BACKOFF, cool_hot, guard_with_hot, guards_read, hot_frames,
-            title_memory_remapped,
+            BLOCK, MAX_COOL_BACKOFF, cool_hot, guard_with_hot, guards_read_shard, hot_frames,
+            shard_of, title_memory_remapped,
         };
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
@@ -2857,6 +2986,7 @@ mod mapping_tests {
         let start = view.Value as usize;
         let end = start + BLOCK;
         let b0 = start / BLOCK;
+        let s0 = shard_of(b0);
         let base_hot = hot_frames();
 
         let promote_to_hot = |val: u8| {
@@ -2874,28 +3004,31 @@ mod mapping_tests {
         // First promotion: cool_count = 0 -> duration = 1x hot_frames.
         promote_to_hot(1);
         let frame = crate::frame::current();
-        assert_eq!(guards_read().hot.get(&b0).copied(), Some(frame + base_hot));
-        assert_eq!(guards_read().cool_count.get(&b0).copied(), None);
+        assert_eq!(
+            guards_read_shard(s0).hot.get(&b0).copied(),
+            Some(frame + base_hot)
+        );
+        assert_eq!(guards_read_shard(s0).cool_count.get(&b0).copied(), None);
 
         // Cool once -> cool_count = 1 -> next promotion lasts 2x hot_frames.
         assert_eq!(cool_hot(&[b0]), 1);
-        assert_eq!(guards_read().cool_count.get(&b0).copied(), Some(1));
+        assert_eq!(guards_read_shard(s0).cool_count.get(&b0).copied(), Some(1));
         let _ = guard_with_hot(start, end).unwrap();
         promote_to_hot(10);
         let frame = crate::frame::current();
         assert_eq!(
-            guards_read().hot.get(&b0).copied(),
+            guards_read_shard(s0).hot.get(&b0).copied(),
             Some(frame + base_hot * 2)
         );
 
         // Cool a second time -> cool_count = 2 -> next promotion lasts 4x hot_frames.
         assert_eq!(cool_hot(&[b0]), 1);
-        assert_eq!(guards_read().cool_count.get(&b0).copied(), Some(2));
+        assert_eq!(guards_read_shard(s0).cool_count.get(&b0).copied(), Some(2));
         let _ = guard_with_hot(start, end).unwrap();
         promote_to_hot(20);
         let frame = crate::frame::current();
         assert_eq!(
-            guards_read().hot.get(&b0).copied(),
+            guards_read_shard(s0).hot.get(&b0).copied(),
             Some(frame + base_hot * 4)
         );
 
@@ -2906,18 +3039,18 @@ mod mapping_tests {
             promote_to_hot(30 + step * 2);
         }
         assert_eq!(
-            guards_read().cool_count.get(&b0).copied(),
+            guards_read_shard(s0).cool_count.get(&b0).copied(),
             Some(MAX_COOL_BACKOFF)
         );
         let frame = crate::frame::current();
         assert_eq!(
-            guards_read().hot.get(&b0).copied(),
+            guards_read_shard(s0).hot.get(&b0).copied(),
             Some(frame + base_hot * (1u64 << MAX_COOL_BACKOFF))
         );
 
         // Remap resets cool_count cleanly.
         title_memory_remapped(start, BLOCK);
-        assert_eq!(guards_read().cool_count.get(&b0).copied(), None);
+        assert_eq!(guards_read_shard(s0).cool_count.get(&b0).copied(), None);
         // SAFETY: unmap our test view.
         unsafe { UnmapViewOfFile(view) };
     }
@@ -2925,7 +3058,7 @@ mod mapping_tests {
     #[test]
     fn writing_gpu_back_promotes_opened_blocks_to_hot_and_guarded_asked_fast_paths() {
         use super::{
-            BLOCK, HOT_WRITE, guards_read, journal_write, title_memory_remapped,
+            BLOCK, HOT_WRITE, guards_read_shard, journal_write, shard_of, title_memory_remapped,
             writes_guarded_since, writing_gpu_back,
         };
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -2954,20 +3087,32 @@ mod mapping_tests {
         let b1 = b0 + 1;
 
         // Guard both blocks clean.
-        let (since, _) = writes_guarded_since(start, end, 0).unwrap();
-        assert!(guards_read().protected.contains(b0));
-        assert!(guards_read().protected.contains(b1));
+        let (since0, _) = writes_guarded_since(start, end, 0).unwrap();
+        assert!(guards_read_shard(shard_of(b0)).protected.contains(b0));
+        assert!(guards_read_shard(shard_of(b1)).protected.contains(b1));
 
-        // GPU writeback to block 0 opens it and promotes it directly into `g.hot` + `g.accounted`
+        // First GPU writeback opens b0 without flooding `g.hot`; next guard re-arms it.
+        writing_gpu_back(start, BLOCK);
+        {
+            let g0 = guards_read_shard(shard_of(b0));
+            assert!(!g0.protected.contains(b0));
+            assert!(!g0.hot.contains_key(&b0));
+        }
+        assert!(guards_read_shard(shard_of(b1)).protected.contains(b1));
+        let (since, pages1) = writes_guarded_since(start, end, since0).unwrap();
+        assert_eq!(pages1, vec![(b0, since)]);
+        assert!(guards_read_shard(shard_of(b0)).protected.contains(b0));
+
+        // Second GPU writeback within HOT_WINDOW_FRAMES promotes b0 into `g.hot` + `g.accounted`
         // so the next `writes_guarded_since` does not re-protect it.
         writing_gpu_back(start, BLOCK);
         {
-            let g = guards_read();
-            assert!(!g.protected.contains(b0));
-            assert!(g.hot.contains_key(&b0));
-            assert!(g.accounted.contains(b0));
-            assert!(g.protected.contains(b1));
+            let g0 = guards_read_shard(shard_of(b0));
+            assert!(!g0.protected.contains(b0));
+            assert!(g0.hot.contains_key(&b0));
+            assert!(g0.accounted.contains(b0));
         }
+        assert!(guards_read_shard(shard_of(b1)).protected.contains(b1));
 
         // Simulate `GetWriteWatch` on a private buffer bumping `j.asked` without bumping
         // `j.guarded_asked`: `writes_guarded_since` must still fast-path and return only hot `b0`.
@@ -2980,8 +3125,11 @@ mod mapping_tests {
         assert!(now > bumped_since);
         assert_eq!(pages, vec![(b0, HOT_WRITE)]);
         // Block 0 must still be hot (not re-protected).
-        assert!(!guards_read().protected.contains(b0));
-        assert!(guards_read().hot.contains_key(&b0));
+        {
+            let g0 = guards_read_shard(shard_of(b0));
+            assert!(!g0.protected.contains(b0));
+            assert!(g0.hot.contains_key(&b0));
+        }
 
         title_memory_remapped(start, BLOCK * 2);
         {

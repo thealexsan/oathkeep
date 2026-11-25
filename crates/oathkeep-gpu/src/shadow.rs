@@ -174,6 +174,8 @@ struct CopiedState {
     chunk_min_nz: Vec<u64>,
     /// Lazy floor applied to non-zero pages in a fully-copied chunk (`chunk_min[c] > 0`).
     chunk_floor: Vec<u64>,
+    /// Lazily allocated per-64 KiB page quiet tracking for non-card `copy_hot` cooling.
+    hot_quiet: Vec<HotPageQuiet>,
 }
 
 impl CopiedState {
@@ -184,6 +186,7 @@ impl CopiedState {
             chunk_min: vec![0; chunks],
             chunk_min_nz: vec![u64::MAX; chunks],
             chunk_floor: vec![0; chunks],
+            hot_quiet: Vec::new(),
         }
     }
 
@@ -192,6 +195,34 @@ impl CopiedState {
         self.chunk_min.clear();
         self.chunk_min_nz.clear();
         self.chunk_floor.clear();
+        self.hot_quiet.clear();
+    }
+
+    fn record_hot_quiet(
+        &mut self,
+        idx: usize,
+        frame: u64,
+        changed: bool,
+        full_page: bool,
+        cool_after: u32,
+    ) -> bool {
+        if cool_after == 0 {
+            return false;
+        }
+        if self.hot_quiet.is_empty() {
+            self.hot_quiet.resize(self.pages.len(), HotPageQuiet::default());
+        }
+        let Some(slot) = self.hot_quiet.get_mut(idx) else {
+            return false;
+        };
+        slot.record(frame, changed, true, full_page, cool_after)
+    }
+
+    #[inline]
+    fn mark_hot_changed(&mut self, idx: usize, frame: u64) {
+        if let Some(slot) = self.hot_quiet.get_mut(idx) {
+            slot.mark_changed(frame);
+        }
     }
 
     fn len(&self) -> usize {
@@ -454,8 +485,8 @@ fn full_page_range(
     (lo, hi)
 }
 
-const DEFAULT_HOT_COOL_FRAMES: u32 = 32;
-const MAX_QUIET_COOL_BACKOFF: u8 = 4;
+const DEFAULT_HOT_COOL_FRAMES: u32 = 4;
+const MAX_QUIET_COOL_BACKOFF: u8 = 2;
 const PARALLEL_CARD_PAGES: usize = 16;
 const PARALLEL_UNWATCHED_BYTES: usize = 1 << 20;
 const MAX_CARD_SCAN_CHUNKS: usize = 6;
@@ -4151,6 +4182,9 @@ impl Shadow {
             let mut bytes = 0;
             let mut run: Option<(usize, usize)> = None;
             let mut dirty_chunk: Option<usize> = None;
+            let mut cool_blocks: Vec<usize> = Vec::new();
+            let frame = crate::frame::current();
+            let cool_after = hot_cool_frames();
             for &(page, write) in written {
                 if page < base || page - base >= pages_len {
                     continue;
@@ -4177,8 +4211,17 @@ impl Shadow {
                         bytes += self
                             .copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
                     }
-                    bytes += self.copy_hot((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                    let p_from = (page * PAGE).max(from);
+                    let p_to = ((page + 1) * PAGE).min(to);
+                    let full_page =
+                        p_from == (page * PAGE).max(start) && p_to == ((page + 1) * PAGE).min(end);
+                    let changed = self.copy_hot(p_from, p_to);
+                    bytes += changed;
+                    if copied.record_hot_quiet(idx, frame, changed > 0, full_page, cool_after) {
+                        cool_blocks.push(page);
+                    }
                 } else {
+                    copied.mark_hot_changed(idx, frame);
                     match run {
                         Some((first, prev)) if page == prev + 1 => run = Some((first, page)),
                         Some((first, prev)) => {
@@ -4202,7 +4245,13 @@ impl Shadow {
                     self.synced_at.fetch_max(now, Ordering::Release);
                 } else {
                     copied.advance_synced(full_lo, full_hi, now);
+                    drop(copied);
                 }
+            } else {
+                drop(copied);
+            }
+            if !cool_blocks.is_empty() {
+                crate::watch::cool_hot(&cool_blocks);
             }
             return bytes;
         }
@@ -4289,6 +4338,9 @@ impl Shadow {
         let (mut bytes, mut run): (usize, Option<usize>) = (0, None);
         let mut newly_copied = 0u64;
         let mut dirty_chunk: Option<usize> = None;
+        let mut cool_blocks: Vec<usize> = Vec::new();
+        let frame = crate::frame::current();
+        let cool_after = hot_cool_frames();
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -4314,8 +4366,17 @@ impl Shadow {
                 if let Some(first) = run.take() {
                     bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
                 }
-                bytes += self.copy_hot((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                let p_from = (page * PAGE).max(from);
+                let p_to = ((page + 1) * PAGE).min(to);
+                let full_page =
+                    p_from == (page * PAGE).max(start) && p_to == ((page + 1) * PAGE).min(end);
+                let changed = self.copy_hot(p_from, p_to);
+                bytes += changed;
+                if copied.record_hot_quiet(idx, frame, changed > 0, full_page, cool_after) {
+                    cool_blocks.push(page);
+                }
             } else if at == 0 || write > at {
+                copied.mark_hot_changed(idx, frame);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     if copied.set_raw(idx, now) {
                         newly_copied += 1;
@@ -4348,7 +4409,13 @@ impl Shadow {
                 self.synced_at.fetch_max(now, Ordering::Release);
             } else {
                 copied.advance_synced(full_lo, full_hi, now);
+                drop(copied);
             }
+        } else {
+            drop(copied);
+        }
+        if !cool_blocks.is_empty() {
+            crate::watch::cool_hot(&cool_blocks);
         }
         bytes
     }
@@ -6833,7 +6900,7 @@ mod window_tests {
     #[test]
     fn hot_page_quiet_doubles_threshold_after_each_cool_and_survives_reset() {
         use super::{DEFAULT_HOT_COOL_FRAMES, HotPageQuiet};
-        assert_eq!(DEFAULT_HOT_COOL_FRAMES, 32);
+        assert_eq!(DEFAULT_HOT_COOL_FRAMES, 4);
 
         let mut q = HotPageQuiet::default();
         // First cooling requires 4 quiet frames (frames 11..=14 after change on frame 10).
@@ -6856,13 +6923,13 @@ mod window_tests {
         assert!(q.record(28, false, true, true, 4));
         assert_eq!(q.cool_count, 2);
 
-        // Third cooling requires 16 quiet frames (4 << 2 = 16).
+        // Third cooling requires 16 quiet frames (4 << 2 = 16) and saturates at MAX_QUIET_COOL_BACKOFF (2).
         assert!(!q.record(40, true, true, true, 4));
         for f in 41..=55 {
             assert!(!q.record(f, false, true, true, 4), "frame {f}");
         }
         assert!(q.record(56, false, true, true, 4));
-        assert_eq!(q.cool_count, 3);
+        assert_eq!(q.cool_count, 2);
     }
 
     #[test]

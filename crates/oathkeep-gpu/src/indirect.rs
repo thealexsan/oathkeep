@@ -53,7 +53,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        uint3 raw = src_args.Load3(src_at);
+        if (ahead && (raw.x > 65535u || raw.y > 65535u || raw.z > 65535u)) {
+            raw = uint3(0, 0, 0);
+        }
+        uint3 g = min(raw, uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -245,16 +249,16 @@ pub(crate) fn bound(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
-) -> Option<(ID3D12Resource, Option<usize>)> {
+) -> Option<(ID3D12Resource, u64, bool)> {
     let (dst_bytes, _) =
         validate_strided_layout((kind, stride, stride, records), src.1, count.map(|(_, off)| off))?;
-    let (c, budget, (slot, dst, was_indirect, evicted)) =
+    let (c, budget, (dst, dst_offset, was_indirect, evicted)) =
         (clamp()?, list.budget()?, list.indirect_scratch(dst_bytes)?);
     let need_uav = list.take_indirect_uav_dirty();
     if record_clamp_as(
         c,
         &list.list,
-        &dst,
+        (&dst, dst_offset),
         budget,
         src,
         count,
@@ -263,8 +267,8 @@ pub(crate) fn bound(
         need_uav,
         was_indirect,
     ) {
-        list.mark_indirect_state(slot, true);
-        Some((dst, evicted))
+        list.mark_indirect_state(true);
+        Some((dst, dst_offset, evicted))
     } else {
         None
     }
@@ -274,15 +278,15 @@ pub(crate) fn bound_ahead(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32, u32),
-) -> Option<(ID3D12Resource, Option<usize>)> {
+) -> Option<(ID3D12Resource, u64, bool)> {
     let (dst_bytes, _) = validate_strided_layout(spec, src.1, None)?;
-    let (c, budget, (slot, dst, was_indirect, evicted)) =
+    let (c, budget, (dst, dst_offset, was_indirect, evicted)) =
         (clamp()?, list.budget()?, list.indirect_scratch(dst_bytes)?);
     let need_uav = list.take_indirect_uav_dirty();
     if record_clamp_as(
         c,
         &list.list,
-        &dst,
+        (&dst, dst_offset),
         budget,
         src,
         None,
@@ -291,8 +295,8 @@ pub(crate) fn bound_ahead(
         need_uav,
         was_indirect,
     ) {
-        list.mark_indirect_state(slot, true);
-        Some((dst, evicted))
+        list.mark_indirect_state(true);
+        Some((dst, dst_offset, evicted))
     } else {
         None
     }
@@ -311,7 +315,7 @@ fn record_clamp(
     record_clamp_as(
         c,
         l,
-        dst,
+        (dst, 0),
         budget,
         src,
         count,
@@ -326,7 +330,7 @@ fn record_clamp(
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
-    dst: &ID3D12Resource,
+    (dst, dst_offset): (&ID3D12Resource, u64),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
@@ -343,7 +347,10 @@ fn record_clamp_as(
         return false;
     };
     // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    let (src_base, dst_base) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    let Some(dst_gpu) = dst_base.checked_add(dst_offset) else {
+        return false;
+    };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return false;
     }
@@ -988,7 +995,7 @@ void main() {
             assert!(record_clamp_as(
                 &warp.clamp,
                 &warp.list,
-                &dst_buf,
+                (&dst_buf, 0),
                 budget_gpu,
                 (&src_buf, 0),
                 None,
@@ -1186,58 +1193,55 @@ void main() {
             (count_ptr as *mut u32).write_volatile(2);
         }
 
-        let mut first_ring = Vec::new();
-        for i in 0..2u64 {
-            let (buf, evicted) =
-                bound(&list, (&src_buf, i * 64), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
-            assert!(evicted.is_none(), "initial ring fill should not evict");
-            first_ring.push(buf);
-        }
-        assert_ne!(
-            first_ring[0].as_raw(),
-            first_ring[1].as_raw(),
-            "consecutive indirect calls must use distinct ring slots"
-        );
-        // 3rd call wraps to slot 0 and reuses the existing buffer without reallocating.
-        let (b_wrap, evicted) =
+        // Consecutive allocations sub-allocate 256-byte-aligned slices from the same 64 KiB buffer.
+        let (buf0, off0, ev0) =
+            bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        assert_eq!(off0, 0);
+        assert!(!ev0);
+        let (buf1, off1, ev1) =
             bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
-        assert_eq!(
-            b_wrap.as_raw(),
-            first_ring[0].as_raw(),
-            "wrapped ring slot within capacity must be reused"
-        );
-        assert_eq!(evicted, Some(first_ring[0].as_raw() as usize));
+        assert_eq!(buf1.as_raw(), buf0.as_raw());
+        assert_eq!(off1, 1024);
+        assert!(!ev1);
 
-        // Slot 1 grows when asked for a larger buffer (5000 * 20 = 100 KiB > 64 KiB).
-        let (b_grown, _) =
+        // Request that exceeds remaining space (but fits in 64 KiB) wraps to offset 0 and signals eviction.
+        let (buf_wrap, off_wrap, ev_wrap) =
+            bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 3200)).unwrap();
+        assert_eq!(buf_wrap.as_raw(), buf0.as_raw());
+        assert_eq!(off_wrap, 0);
+        assert!(ev_wrap);
+
+        // Request larger than current 64 KiB capacity (5000 * 20 = 100 KiB) grows buffer and signals eviction.
+        let (b_grown, off_grown, ev_grown) =
             bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
         assert_ne!(
             b_grown.as_raw(),
-            first_ring[1].as_raw(),
-            "larger request must grow ring slot buffer"
+            buf0.as_raw(),
+            "larger request must grow single scratch buffer"
         );
+        assert_eq!(off_grown, 0);
+        assert!(ev_grown);
 
         list.close();
         host.execute(&[&list]);
         list.reset();
 
-        // After reset, slot 0 is reused, then slot 1 retains its grown capacity.
-        let (b_after0, _) =
+        // After reset, the grown buffer persists and bump offset resets to 0.
+        let (b_after0, off_after0, ev_after0) =
             bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
         assert_eq!(
             b_after0.as_raw(),
-            first_ring[0].as_raw(),
-            "ring slot 0 must persist across reset"
-        );
-        let (b_after1, _) =
-            bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
-        assert_eq!(
-            b_after1.as_raw(),
             b_grown.as_raw(),
-            "grown ring slot buffer must persist across reset"
+            "grown scratch buffer must persist across reset"
         );
+        assert_eq!(off_after0, 0);
+        assert!(!ev_after0);
+        let (b_after1, off_after1, ev_after1) =
+            bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
+        assert_eq!(b_after1.as_raw(), b_grown.as_raw());
+        assert_eq!(off_after1, 1024);
+        assert!(!ev_after1);
         done(&list, &b_after0);
-        done(&list, &b_after1);
         list.close();
         host.execute(&[&list]);
         list.reset();
@@ -1258,7 +1262,7 @@ void main() {
         let (src_buf, src_ptr, _) = warp.shared_buffer(SRC_BYTES as u64);
         let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
         let (readback_buf, readback_ptr, _) = warp.shared_buffer(DST_BYTES as u64);
-        let dst_buf = warp.default_uav(DST_BYTES as u64);
+        let dst_buf = warp.default_uav(512);
 
         let mut src = vec![0xFFu8; SRC_BYTES];
         for (i, groups) in [12u32, 34, 56, 0xFFFF_FFFF].into_iter().enumerate() {
@@ -1274,11 +1278,11 @@ void main() {
             std::ptr::write_bytes(readback_ptr, 0, DST_BYTES);
         }
 
-        // First clamp from COMMON, second clamp directly from INDIRECT_ARGUMENT (no done() between).
+        // First clamp from COMMON at offset 0, second clamp from INDIRECT_ARGUMENT at offset 256.
         assert!(record_clamp_as(
             &warp.clamp,
             &warp.list,
-            &dst_buf,
+            (&dst_buf, 0),
             budget_gpu,
             (&src_buf, 0),
             None,
@@ -1290,7 +1294,7 @@ void main() {
         assert!(record_clamp_as(
             &warp.clamp,
             &warp.list,
-            &dst_buf,
+            (&dst_buf, 256),
             budget_gpu,
             (&src_buf, 0),
             None,
@@ -1300,7 +1304,7 @@ void main() {
             true,
         ));
         done_on(&warp.list, &dst_buf);
-        // SAFETY: an open list; copy packed dst to readback.
+        // SAFETY: an open list; copy packed dst at offset 256 to readback.
         unsafe {
             warp.list.ResourceBarrier(&[transition(
                 &dst_buf,
@@ -1308,7 +1312,7 @@ void main() {
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
             warp.list
-                .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, DST_BYTES as u64);
+                .CopyBufferRegion(&readback_buf, 0, &dst_buf, 256, DST_BYTES as u64);
             warp.list.ResourceBarrier(&[transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -1322,6 +1326,65 @@ void main() {
                 .to_vec()
         };
         assert_eq!(out, [12, 1, 1, 34, 1, 1, 56, 1, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn warp_dispatch_ahead_zeroes_uninitialized_slots() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        const RECORDS: u32 = 3;
+        const BYTES: usize = (STRIDE * RECORDS) as usize;
+
+        let (src_buf, src_ptr, _) = warp.shared_buffer(BYTES as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(BYTES as u64);
+        let dst_buf = warp.default_uav(256);
+
+        let words: [u32; 9] = [4, 2, 1, u32::MAX, u32::MAX, u32::MAX, 8, 1, 65536];
+        // SAFETY: mapped buffers of exact sizes above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), src_ptr, BYTES);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0, BYTES);
+        }
+
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, 0),
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (KIND_DISPATCH, STRIDE, STRIDE, RECORDS),
+            true,
+            true,
+            false,
+        ));
+        done_on(&warp.list, &dst_buf);
+        // SAFETY: copy clamped output for verification.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list
+                .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, BYTES as u64);
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        warp.submit_and_wait();
+        // SAFETY: completed readback buffer.
+        let out = unsafe {
+            std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), BYTES / 4).to_vec()
+        };
+        assert_eq!(out, [4, 2, 1, 0, 0, 0, 0, 0, 0]);
     }
 }
 
