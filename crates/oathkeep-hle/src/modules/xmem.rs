@@ -210,10 +210,13 @@ pub extern "system" fn XMemVirtualQuery(
             return 0;
         }
         let info = &mut *out;
-        if demand_commit() && process == GetCurrentProcess() && info.host.State == MEM_RESERVE {
-            let logical_end = if info.host.Type == MEM_MAPPED {
+        if (demand_commit() || demand_commit_private())
+            && process == GetCurrentProcess()
+            && info.host.State == MEM_RESERVE
+        {
+            let logical_end = if info.host.Type == MEM_MAPPED && demand_commit() {
                 demand_view_end(address as usize)
-            } else if info.host.Type == MEM_PRIVATE {
+            } else if info.host.Type == MEM_PRIVATE && demand_commit_private() {
                 demand_private_end(address as usize)
             } else {
                 None
@@ -422,21 +425,41 @@ fn demand_commit() -> bool {
 fn demand_commit_private() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        demand_commit() && std::env::var_os("OATHKEEP_DEMAND_PRIVATE").is_none_or(|v| v != "0")
+        !on_wine()
+            && std::env::var_os("OATHKEEP_DEMAND_COMMIT").is_none_or(|v| v != "0")
+            && std::env::var_os("OATHKEEP_DEMAND_PRIVATE").is_none_or(|v| v != "0")
     })
+}
+
+fn parse_inplace_sections(sections_raw: Option<&str>, inplace_raw: Option<&str>) -> bool {
+    if let Some(v) = sections_raw {
+        return v.trim() == "1";
+    }
+    inplace_raw
+        .and_then(|v| v.trim().parse::<u8>().ok())
+        .is_some_and(|level| level >= 3)
 }
 
 fn inplace_sections() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if let Some(v) = std::env::var_os("OATHKEEP_INPLACE_SECTIONS") {
-            return v == "1";
-        }
-        std::env::var("OATHKEEP_INPLACE")
-            .ok()
-            .and_then(|v| v.trim().parse::<u8>().ok())
-            .is_some_and(|level| level >= 3)
+        parse_inplace_sections(
+            std::env::var("OATHKEEP_INPLACE_SECTIONS").ok().as_deref(),
+            std::env::var("OATHKEEP_INPLACE").ok().as_deref(),
+        )
     })
+}
+
+fn parse_inplace_section_chunk_pages(section_kb: Option<&str>, section_mb: Option<&str>) -> usize {
+    if let Some(kb) = section_kb.and_then(|v| v.trim().parse::<usize>().ok()) {
+        let bytes = kb.clamp(64, 1024 << 10) << 10;
+        return bytes.div_ceil(PAGE).max(1);
+    }
+    let mb = section_mb
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(256)
+        .clamp(1, 1024);
+    (mb << 20) / PAGE
 }
 
 #[derive(Clone)]
@@ -785,7 +808,9 @@ fn note_demand_private_committed(bytes: u64) {
 }
 
 fn ensure_committed(at: usize, len: usize) {
-    if len == 0 || !demand_commit() {
+    let lazy_views = demand_commit();
+    let lazy_private = demand_commit_private();
+    if len == 0 || (!lazy_views && !lazy_private) {
         return;
     }
     let end = at.saturating_add(len);
@@ -794,40 +819,42 @@ fn ensure_committed(at: usize, len: usize) {
     let mut newly_private = 0u64;
     {
         let demand = DEMAND.read().unwrap_or_else(|e| e.into_inner());
-        let first = demand
-            .views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, view)| **base + view.len > at)
-            .map(|(&base, _)| base);
-        let start_key = first.unwrap_or(at);
-        for (&base, view) in demand.views.range(start_key..end) {
-            let view_end = base + view.len;
-            if view_end <= at || base >= end {
-                continue;
-            }
-            let lo = (at.max(base) - base) / PAGE;
-            let hi = (end.min(view_end) - base).div_ceil(PAGE);
-            let span_base = base + lo * PAGE;
-            let span_len = (hi - lo) * PAGE;
-            if commit_if_reserved(span_base, span_len) {
-                committed_spans.push((span_base, span_len));
-            }
-            for k in lo..hi {
-                if view.slice.section.mark_committed(view.slice.index + k) {
-                    newly_committed += 1;
+        if lazy_views {
+            let first = demand
+                .views
+                .range(..=at)
+                .next_back()
+                .filter(|(base, view)| **base + view.len > at)
+                .map(|(&base, _)| base);
+            let start_key = first.unwrap_or(at);
+            for (&base, view) in demand.views.range(start_key..end) {
+                let view_end = base + view.len;
+                if view_end <= at || base >= end {
+                    continue;
                 }
-                if let Some(addrs) = demand.shown.get(&view.slice.key(k)) {
-                    let here = base + k * PAGE;
-                    for &alias in addrs.as_slice() {
-                        if alias != here && commit_if_reserved(alias, PAGE) {
-                            committed_spans.push((alias, PAGE));
+                let lo = (at.max(base) - base) / PAGE;
+                let hi = (end.min(view_end) - base).div_ceil(PAGE);
+                let span_base = base + lo * PAGE;
+                let span_len = (hi - lo) * PAGE;
+                if commit_if_reserved(span_base, span_len) {
+                    committed_spans.push((span_base, span_len));
+                }
+                for k in lo..hi {
+                    if view.slice.section.mark_committed(view.slice.index + k) {
+                        newly_committed += 1;
+                    }
+                    if let Some(addrs) = demand.shown.get(&view.slice.key(k)) {
+                        let here = base + k * PAGE;
+                        for &alias in addrs.as_slice() {
+                            if alias != here && commit_if_reserved(alias, PAGE) {
+                                committed_spans.push((alias, PAGE));
+                            }
                         }
                     }
                 }
             }
         }
-        if !demand.private_pools.is_empty() {
+        if lazy_private && !demand.private_pools.is_empty() {
             let first_priv = demand
                 .private_pools
                 .range(..=at)
@@ -1067,25 +1094,17 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let commit = on_wine() || inplace_sections();
     // D3D12's OpenExistingHeapFromFileMapping rejects sections >= 4 GiB with
     // E_INVALIDARG, and each opened section counts against WDDM's shared GPU
-    // memory budget. Chunk committed sections (default 1 MiB) so only small
-    // chunks backing GPU buffers are opened as host heaps without wasting
-    // WDDM shared memory budget.
+    // memory budget. Keep committed sections large (default 256 MiB) so huge
+    // contiguous buffers stay within one section instead of shattering into
+    // hundreds of 1 MiB handles, while `inplace.rs` gates section heap opens
+    // to large buffers (`OATHKEEP_INPLACE_SECTION_MIN_MB`, default 16 MiB).
     static CHUNK_PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let chunk_pages = if inplace_sections() {
         *CHUNK_PAGES.get_or_init(|| {
-            if let Some(kb) = std::env::var("OATHKEEP_INPLACE_SECTION_KB")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-            {
-                let bytes = kb.clamp(64, 512 << 10) << 10;
-                return bytes.div_ceil(PAGE).max(1);
-            }
-            let mb = std::env::var("OATHKEEP_INPLACE_SECTION_MB")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(1)
-                .clamp(1, 512);
-            (mb << 20) / PAGE
+            parse_inplace_section_chunk_pages(
+                std::env::var("OATHKEEP_INPLACE_SECTION_KB").ok().as_deref(),
+                std::env::var("OATHKEEP_INPLACE_SECTION_MB").ok().as_deref(),
+            )
         })
     } else {
         n
@@ -2277,5 +2296,35 @@ mod tests {
         assert!(demand_private_end(p as usize).is_none());
         // SAFETY: our own reservation.
         assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn inplace_section_config_defaults_and_overrides() {
+        assert!(!parse_inplace_sections(None, None));
+        assert!(!parse_inplace_sections(None, Some("2")));
+        assert!(parse_inplace_sections(None, Some("3")));
+        assert!(parse_inplace_sections(Some("1"), Some("0")));
+        assert!(!parse_inplace_sections(Some("0"), Some("3")));
+
+        assert_eq!(
+            parse_inplace_section_chunk_pages(None, None),
+            (256 * MIB) / PAGE
+        );
+        assert_eq!(
+            parse_inplace_section_chunk_pages(None, Some("64")),
+            (64 * MIB) / PAGE
+        );
+        assert_eq!(
+            parse_inplace_section_chunk_pages(None, Some("0")),
+            MIB / PAGE
+        );
+        assert_eq!(
+            parse_inplace_section_chunk_pages(None, Some("4096")),
+            (1024 * MIB) / PAGE
+        );
+        assert_eq!(
+            parse_inplace_section_chunk_pages(Some("512"), Some("64")),
+            (512 << 10) / PAGE
+        );
     }
 }

@@ -25,14 +25,13 @@ pub(crate) fn probe_level() -> u8 {
     })
 }
 
+fn parse_level(raw: Option<&str>) -> u8 {
+    raw.and_then(|v| v.trim().parse().ok()).unwrap_or(2)
+}
+
 pub(crate) fn level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| {
-        std::env::var("OATHKEEP_INPLACE")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
-    })
+    *LEVEL.get_or_init(|| parse_level(std::env::var("OATHKEEP_INPLACE").ok().as_deref()))
 }
 
 fn most() -> u64 {
@@ -57,20 +56,69 @@ fn sections_most() -> u64 {
     })
 }
 
+fn parse_min_bytes(level: u8, min_kb: Option<&str>, min_mb: Option<&str>) -> u64 {
+    if let Some(kb) = min_kb.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return kb << 10;
+    }
+    if let Some(mb) = min_mb.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return mb << 20;
+    }
+    if level >= 2 { 1 << 20 } else { 0 }
+}
+
 fn min_bytes() -> u64 {
     static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MIN.get_or_init(|| {
-        if let Some(kb) = std::env::var("OATHKEEP_INPLACE_MIN_KB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-        {
-            return kb << 10;
-        }
-        std::env::var("OATHKEEP_INPLACE_MIN_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(0)
-            << 20
+        parse_min_bytes(
+            level(),
+            std::env::var("OATHKEEP_INPLACE_MIN_KB").ok().as_deref(),
+            std::env::var("OATHKEEP_INPLACE_MIN_MB").ok().as_deref(),
+        )
+    })
+}
+
+fn parse_section_min_bytes(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(16)
+        << 20
+}
+
+fn section_min_bytes() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        parse_section_min_bytes(
+            std::env::var("OATHKEEP_INPLACE_SECTION_MIN_MB")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn section_allows_len(len: u64, min_bytes: u64) -> bool {
+    min_bytes == 0 || len >= min_bytes
+}
+
+fn parse_commit_private_max_bytes(flag: Option<&str>, max_mb: Option<&str>) -> u64 {
+    if let Some(mb) = max_mb.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return mb << 20;
+    }
+    if flag.is_some_and(|v| v.trim() == "1") {
+        return 64 << 20;
+    }
+    0
+}
+
+fn commit_private_max_bytes() -> u64 {
+    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        parse_commit_private_max_bytes(
+            std::env::var("OATHKEEP_INPLACE_COMMIT_PRIVATE")
+                .ok()
+                .as_deref(),
+            std::env::var("OATHKEEP_INPLACE_COMMIT_PRIVATE_MB")
+                .ok()
+                .as_deref(),
+        )
     })
 }
 
@@ -435,6 +483,18 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
                 STATS[6].fetch_add(1, Ordering::Relaxed);
                 return None;
             }
+            if !window {
+                let commit_cap = commit_private_max_bytes();
+                if commit_cap > 0
+                    && !private_whole(at as usize, bytes as usize)
+                    && let Some(need) = private_commit_need(at as usize, bytes as usize)
+                    && need > 0
+                    && need <= commit_cap
+                    && commit_allows(need)
+                {
+                    crate::watch::writing(at as usize, bytes as usize);
+                }
+            }
             match place_part(&host.device, start, len) {
                 Ok(mut placed) => {
                     if let PlaceHeap::Part(part) = &mut placed.heap {
@@ -448,12 +508,17 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
                 }
             }
         }
-        Cover::Run(section, section_off) if lvl >= 3 => match sec_info {
-            Some((sec_size, true)) => {
-                place_section(host, section, sec_size, section_off, start, at, bytes)
+        Cover::Run(section, section_off) if lvl >= 3 => {
+            if !section_allows_len(len, section_min_bytes()) {
+                return None;
             }
-            _ => Err(None),
-        },
+            match sec_info {
+                Some((sec_size, true)) => {
+                    place_section(host, section, sec_size, section_off, start, at, bytes)
+                }
+                _ => Err(None),
+            }
+        }
         _ => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
             return None;
@@ -932,6 +997,51 @@ pub(crate) fn private_whole(at: usize, len: usize) -> bool {
         && info.Type == mem::MEM_PRIVATE
         && info.Protect == mem::PAGE_READWRITE
         && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(len)
+}
+
+fn private_commit_need(at: usize, len: usize) -> Option<u64> {
+    if len == 0 {
+        return Some(0);
+    }
+    let end = at.checked_add(len)?;
+    let mut cur = at;
+    let mut needed = 0u64;
+    while cur < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { mem::VirtualQuery(cur as *const c_void, &mut info, size_of_val(&info)) };
+        if n == 0 || info.RegionSize == 0 || info.Type != mem::MEM_PRIVATE {
+            return None;
+        }
+        let next = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .min(end);
+        if next <= cur {
+            return None;
+        }
+        if info.State == mem::MEM_COMMIT {
+            if info.Protect != mem::PAGE_READWRITE {
+                return None;
+            }
+        } else if info.State == mem::MEM_RESERVE {
+            let mut probe = cur;
+            while probe < next {
+                if !crate::watch::is_demand_reserved(probe) {
+                    return None;
+                }
+                probe = probe.saturating_add(K64);
+            }
+            if !crate::watch::is_demand_reserved(next - 1) {
+                return None;
+            }
+            needed = needed.saturating_add((next - cur) as u64);
+        } else {
+            return None;
+        }
+        cur = next;
+    }
+    Some(needed)
 }
 
 fn hr<T>(result: &windows::core::Result<T>) -> String {
@@ -2042,5 +2152,86 @@ mod tests {
         assert_eq!(views_of_section(sec_b, 0, K64), [(at, K64)]);
         views_gone(at, K64);
         assert!(views_of_section(sec_b, 0, K64).is_empty());
+    }
+
+    #[test]
+    fn default_level_and_min_bytes_honor_overrides() {
+        assert_eq!(parse_level(None), 2);
+        assert_eq!(parse_level(Some("0")), 0);
+        assert_eq!(parse_level(Some("1")), 1);
+        assert_eq!(parse_level(Some("2")), 2);
+        assert_eq!(parse_level(Some("3")), 3);
+        assert_eq!(parse_level(Some("invalid")), 2);
+
+        assert_eq!(parse_min_bytes(2, None, None), 1 << 20);
+        assert_eq!(parse_min_bytes(3, None, None), 1 << 20);
+        assert_eq!(parse_min_bytes(1, None, None), 0);
+        assert_eq!(parse_min_bytes(0, None, None), 0);
+        assert_eq!(parse_min_bytes(2, None, Some("0")), 0);
+        assert_eq!(parse_min_bytes(2, Some("0"), None), 0);
+        assert_eq!(parse_min_bytes(2, Some("256"), Some("4")), 256 << 10);
+        assert_eq!(parse_min_bytes(2, None, Some("8")), 8 << 20);
+    }
+
+    #[test]
+    fn section_min_bytes_gates_small_ranges_and_honors_overrides() {
+        assert_eq!(parse_section_min_bytes(None), 16 << 20);
+        assert_eq!(parse_section_min_bytes(Some("8")), 8 << 20);
+        assert_eq!(parse_section_min_bytes(Some("0")), 0);
+
+        let default_floor = parse_section_min_bytes(None);
+        assert!(!section_allows_len(64 << 10, default_floor));
+        assert!(!section_allows_len(1 << 20, default_floor));
+        assert!(!section_allows_len(4 << 20, default_floor));
+        assert!(!section_allows_len(15 << 20, default_floor));
+        assert!(section_allows_len(16 << 20, default_floor));
+        assert!(section_allows_len(174 << 20, default_floor));
+        assert!(section_allows_len(64 << 10, 0));
+    }
+
+    #[test]
+    fn commit_private_max_bytes_defaults_off_and_honors_overrides() {
+        assert_eq!(parse_commit_private_max_bytes(None, None), 0);
+        assert_eq!(parse_commit_private_max_bytes(Some("0"), None), 0);
+        assert_eq!(parse_commit_private_max_bytes(Some("1"), None), 64 << 20);
+        assert_eq!(parse_commit_private_max_bytes(Some("1"), Some("0")), 0);
+        assert_eq!(parse_commit_private_max_bytes(None, Some("48")), 48 << 20);
+    }
+
+    #[test]
+    fn private_whole_accepts_committed_subrange_of_write_watch_pool_and_rejects_partial() {
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            let base = mem::VirtualAlloc(
+                std::ptr::null(),
+                8 * K64,
+                mem::MEM_RESERVE | MEM_WRITE_WATCH,
+                mem::PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!base.is_null());
+            assert!(!private_whole(base as usize, K64), "reserved pool");
+
+            let sub = base.add(K64);
+            assert!(
+                !mem::VirtualAlloc(sub.cast(), 4 * K64, mem::MEM_COMMIT, mem::PAGE_READWRITE)
+                    .is_null()
+            );
+            assert!(
+                private_whole(sub as usize, 4 * K64),
+                "committed sub-range of a MEM_RESERVE | MEM_WRITE_WATCH pool is accepted"
+            );
+            assert!(
+                !private_whole(sub as usize, 5 * K64),
+                "partially committed sub-range spanning into MEM_RESERVE is rejected"
+            );
+            assert_eq!(private_commit_need(sub as usize, 4 * K64), Some(0));
+            assert_eq!(
+                private_commit_need(sub as usize, 5 * K64),
+                None,
+                "unregistered MEM_RESERVE tail is not eligible for demand pre-commit"
+            );
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
     }
 }
