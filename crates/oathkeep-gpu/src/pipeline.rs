@@ -40,7 +40,8 @@ pub(crate) struct ComputeHead {
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     pub(crate) hash: String,
-    container: Vec<u8>,
+    container_len: usize,
+    container: Mutex<Vec<u8>>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -83,7 +84,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
+                container_len: bytes.len(),
+                container: Mutex::new(bytes.to_vec()),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -103,12 +105,29 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let container = {
+                    #[cfg_attr(test, allow(unused_mut))]
+                    let mut guard = self.container.lock().unwrap_or_else(|e| e.into_inner());
+                    #[cfg(test)]
+                    {
+                        guard.clone()
+                    }
+                    #[cfg(not(test))]
+                    {
+                        let taken = std::mem::take(&mut *guard);
+                        KEPT[1].fetch_sub(
+                            taken.len() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        taken
+                    }
+                };
+                let done = translate(&container);
                 if let Some(dir) = std::env::var_os("OATHKEEP_SHADER_SAVE") {
                     let dir = std::path::PathBuf::from(dir);
                     let _ = std::fs::create_dir_all(&dir);
                     let stem = format!("{}.{}", self.hash, self.stage);
-                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
+                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &container);
                     if let Ok(t) = &done {
                         let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
                     }
@@ -186,7 +205,8 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
     if shader.stage != "compute" {
         return false;
     }
-    let Ok(c) = Container::parse(&shader.container) else {
+    let container = shader.container.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(c) = Container::parse(&container) else {
         return false;
     };
     c.part(FourCC::DXIL)
@@ -302,7 +322,7 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container_len, hash = %shader.hash, "first bind");
     }
 }
 
@@ -631,7 +651,12 @@ mod tests {
         pipeline(p)
             .shaders
             .iter()
-            .map(|s| (s.stage, s.container.clone()))
+            .map(|s| {
+                (
+                    s.stage,
+                    s.container.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                )
+            })
             .collect()
     }
 
@@ -716,7 +741,12 @@ mod tests {
         assert_eq!(shaders(p), [("mesh", ms.to_vec()), ("pixel", ps.to_vec())]);
         #[cfg(windows)]
         {
-            let g = pipeline(p).host.graphics.as_deref().unwrap();
+            let guard = pipeline(p)
+                .host
+                .graphics
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let g = guard.as_deref().unwrap();
             assert_eq!(g.topology.0, 3);
             assert_eq!(
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),

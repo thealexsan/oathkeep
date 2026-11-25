@@ -316,12 +316,48 @@ impl Slice {
     }
 }
 
+enum ShownAddrs {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl ShownAddrs {
+    fn push(&mut self, addr: usize) {
+        match self {
+            ShownAddrs::One(first) => *self = ShownAddrs::Many(vec![*first, addr]),
+            ShownAddrs::Many(list) => list.push(addr),
+        }
+    }
+
+    fn remove(&mut self, addr: usize) -> bool {
+        match self {
+            ShownAddrs::One(first) => *first == addr,
+            ShownAddrs::Many(list) => {
+                list.retain(|&a| a != addr);
+                if list.len() == 1 {
+                    *self = ShownAddrs::One(list[0]);
+                    false
+                } else {
+                    list.is_empty()
+                }
+            }
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            ShownAddrs::One(first) => std::slice::from_ref(first),
+            ShownAddrs::Many(list) => list.as_slice(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Physical {
     next_page: usize,
     pages: HashMap<usize, Slice>,
     views: BTreeMap<usize, (usize, Slice)>,
-    shown: HashMap<(usize, usize), Vec<usize>>,
+    shown: HashMap<(usize, usize), ShownAddrs>,
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -569,7 +605,7 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
             };
             let lo = if i == 0 { offset % PAGE } else { 0 };
             let hi = (end - (first + i) * PAGE).min(PAGE);
-            pieces.extend(addresses.iter().map(|&at| (at + lo, hi - lo)));
+            pieces.extend(addresses.as_slice().iter().map(|&at| (at + lo, hi - lo)));
         }
     }
     pieces.sort_unstable();
@@ -726,11 +762,14 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         (slice.index * PAGE) as u64,
     );
     for k in 0..len.div_ceil(PAGE) {
-        physical
-            .shown
-            .entry(slice.key(k))
-            .or_default()
-            .push(base + k * PAGE);
+        let key = slice.key(k);
+        let addr = base + k * PAGE;
+        match physical.shown.get_mut(&key) {
+            Some(addresses) => addresses.push(addr),
+            None => {
+                physical.shown.insert(key, ShownAddrs::One(addr));
+            }
+        }
     }
     physical.views.insert(base, (len, slice));
     true
@@ -804,11 +843,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         };
         for k in 0..size.div_ceil(PAGE) {
             let key = slice.key(k);
-            if let Some(addresses) = physical.shown.get_mut(&key) {
-                addresses.retain(|&a| a != at + k * PAGE);
-                if addresses.is_empty() {
-                    physical.shown.remove(&key);
-                }
+            if let Some(addresses) = physical.shown.get_mut(&key)
+                && addresses.remove(at + k * PAGE)
+            {
+                physical.shown.remove(&key);
             }
         }
         oathkeep_gpu::title_memory_remapped(at, size);

@@ -1339,6 +1339,16 @@ impl HostHeap {
                 .store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
             slots.fill(false);
         }
+        drop(guard);
+        let base = self.count as usize;
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slots) = kept.get_mut(base + at as usize..base + end) {
+            for slot in slots {
+                if let Some(old) = slot.take() {
+                    crate::host::retire(old);
+                }
+            }
+        }
     }
 
     pub(crate) fn make_at(&self, index: u32, view: &View) {

@@ -475,9 +475,52 @@ pub(crate) fn place(
     placed.ok_or_else(windows::core::Error::empty)
 }
 
+enum ShownPages {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl ShownPages {
+    fn push(&mut self, addr: usize) {
+        match self {
+            ShownPages::One(first) => *self = ShownPages::Many(vec![*first, addr]),
+            ShownPages::Many(list) => list.push(addr),
+        }
+    }
+
+    fn remove(&mut self, addr: usize) -> bool {
+        match self {
+            ShownPages::One(first) => *first == addr,
+            ShownPages::Many(list) => {
+                list.retain(|&shown| shown != addr);
+                if list.len() == 1 {
+                    *self = ShownPages::One(list[0]);
+                    false
+                } else {
+                    list.is_empty()
+                }
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            ShownPages::One(_) => 1,
+            ShownPages::Many(list) => list.len(),
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            ShownPages::One(first) => std::slice::from_ref(first),
+            ShownPages::Many(list) => list.as_slice(),
+        }
+    }
+}
+
 struct Views {
     views: BTreeMap<usize, (usize, usize, u64)>,
-    pages: BTreeMap<(usize, u64), Vec<usize>>,
+    pages: BTreeMap<(usize, u64), ShownPages>,
     sections: Vec<(usize, u64, bool)>,
 }
 
@@ -515,10 +558,14 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
         let mut v = views();
         v.views.insert(at, (len, section, offset));
         for k in 0..len.div_ceil(K64) {
-            v.pages
-                .entry((section, offset + (k * K64) as u64))
-                .or_default()
-                .push(at + k * K64);
+            let key = (section, offset + (k * K64) as u64);
+            let addr = at + k * K64;
+            match v.pages.get_mut(&key) {
+                Some(shown) => shown.push(addr),
+                None => {
+                    v.pages.insert(key, ShownPages::One(addr));
+                }
+            }
         }
     }
     crate::watch::views_mapped(section, offset, len);
@@ -550,12 +597,10 @@ pub(crate) fn views_gone(at: usize, len: usize) {
         };
         for k in 0..bytes.div_ceil(K64) {
             let key = (section, offset + (k * K64) as u64);
-            if let Some(pages) = v.pages.get_mut(&key) {
-                let page = base + k * K64;
-                pages.retain(|&shown| shown != page);
-                if pages.is_empty() {
-                    v.pages.remove(&key);
-                }
+            if let Some(pages) = v.pages.get_mut(&key)
+                && pages.remove(base + k * K64)
+            {
+                v.pages.remove(&key);
             }
         }
     }
@@ -622,7 +667,7 @@ pub(crate) fn alias_blocks_between(
                 continue;
             }
             count += 1;
-            for &alias in shown {
+            for &alias in shown.as_slice() {
                 let alias_block = alias / K64;
                 all.push(alias_block);
                 if alias_block != block {
@@ -658,7 +703,7 @@ pub(crate) fn alias_spans_of_blocks(blocks: &[usize]) -> (Vec<usize>, Vec<(usize
         let Some(shown) = v.pages.get(&(section, offset + within as u64)) else {
             continue;
         };
-        for &alias in shown {
+        for &alias in shown.as_slice() {
             let alias_block = alias / K64;
             all.push(alias_block);
             if alias_block != block {
@@ -683,7 +728,7 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
         if let Some(shown) = v.pages.get(&(section, at))
             && shown.len() <= crate::watch::MANY_VIEWS
         {
-            pages.extend(shown.iter().copied());
+            pages.extend(shown.as_slice().iter().copied());
         }
         match at.checked_add(K64 as u64) {
             Some(next) => at = next,

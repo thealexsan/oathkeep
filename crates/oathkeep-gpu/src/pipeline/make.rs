@@ -8,7 +8,7 @@ use super::host::{GraphicsState, HostPipeline};
 
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
-    pub(crate) graphics: Option<Box<GraphicsState>>,
+    pub(crate) graphics: Mutex<Option<Box<GraphicsState>>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
     key: String,
@@ -37,7 +37,7 @@ impl Pending {
         );
         Pending {
             shaders,
-            graphics,
+            graphics: Mutex::new(graphics),
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
@@ -46,8 +46,14 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            let graphics = self
+                .graphics
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            HostPipeline::new(&self.shaders, graphics.as_deref())
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
