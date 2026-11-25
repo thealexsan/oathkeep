@@ -79,6 +79,154 @@ struct Allocator {
     kind: u32,
 }
 
+#[cfg(windows)]
+const RECORDED_INLINE: usize = 4;
+
+#[cfg(windows)]
+const BOUND_PIPELINES_SLOTS: usize = 16;
+
+#[cfg(windows)]
+struct RecordedState {
+    last_pipeline: This,
+    bound_pipelines: [usize; BOUND_PIPELINES_SLOTS],
+    topology: Option<u32>,
+    stencil_ref: Option<u32>,
+    blend_factor: Option<Option<[u32; 4]>>,
+    depth_bounds: Option<[u32; 2]>,
+    viewports: Option<(u8, [[u32; 6]; RECORDED_INLINE])>,
+    scissors: Option<(u8, [[i32; 4]; RECORDED_INLINE])>,
+}
+
+#[cfg(windows)]
+impl RecordedState {
+    fn new(pipeline: This) -> Self {
+        Self {
+            last_pipeline: pipeline,
+            bound_pipelines: [0; BOUND_PIPELINES_SLOTS],
+            topology: None,
+            stencil_ref: None,
+            blend_factor: None,
+            depth_bounds: None,
+            viewports: None,
+            scissors: None,
+        }
+    }
+
+    #[inline]
+    fn reset(&mut self, pipeline: This) {
+        self.last_pipeline = pipeline;
+        self.bound_pipelines = [0; BOUND_PIPELINES_SLOTS];
+        self.clear_gpu();
+    }
+
+    #[inline]
+    fn clear_gpu(&mut self) {
+        self.topology = None;
+        self.stencil_ref = None;
+        self.blend_factor = None;
+        self.depth_bounds = None;
+        self.viewports = None;
+        self.scissors = None;
+    }
+
+    /// Returns `true` if `pipeline` has not yet been reported via `pipeline::bound`
+    /// on this command list (avoids cross-core atomic `xchg` on repeated binds).
+    #[inline]
+    fn mark_pipeline_bound(&mut self, pipeline: This) -> bool {
+        let key = pipeline as usize;
+        let slot = ((key >> 4) ^ (key >> 12)) & (BOUND_PIPELINES_SLOTS - 1);
+        if self.bound_pipelines[slot] == key {
+            return false;
+        }
+        self.bound_pipelines[slot] = key;
+        true
+    }
+
+    #[inline]
+    fn topology_changed(&mut self, topology: u32) -> bool {
+        if self.topology == Some(topology) {
+            return false;
+        }
+        self.topology = Some(topology);
+        true
+    }
+
+    #[inline]
+    fn stencil_ref_changed(&mut self, reference: u32) -> bool {
+        if self.stencil_ref == Some(reference) {
+            return false;
+        }
+        self.stencil_ref = Some(reference);
+        true
+    }
+
+    #[inline]
+    fn blend_factor_changed(&mut self, factor: Option<&[f32; 4]>) -> bool {
+        let bits = factor.map(|f| [f[0].to_bits(), f[1].to_bits(), f[2].to_bits(), f[3].to_bits()]);
+        if self.blend_factor == Some(bits) {
+            return false;
+        }
+        self.blend_factor = Some(bits);
+        true
+    }
+
+    #[inline]
+    fn depth_bounds_changed(&mut self, min: f32, max: f32) -> bool {
+        let bits = [min.to_bits(), max.to_bits()];
+        if self.depth_bounds == Some(bits) {
+            return false;
+        }
+        self.depth_bounds = Some(bits);
+        true
+    }
+
+    #[inline]
+    fn viewports_changed(
+        &mut self,
+        viewports: &[windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT],
+    ) -> bool {
+        if viewports.len() > RECORDED_INLINE {
+            self.viewports = None;
+            return true;
+        }
+        let mut packed = [[0u32; 6]; RECORDED_INLINE];
+        for (dst, v) in packed.iter_mut().zip(viewports) {
+            *dst = [
+                v.TopLeftX.to_bits(),
+                v.TopLeftY.to_bits(),
+                v.Width.to_bits(),
+                v.Height.to_bits(),
+                v.MinDepth.to_bits(),
+                v.MaxDepth.to_bits(),
+            ];
+        }
+        let key = (viewports.len() as u8, packed);
+        if self.viewports == Some(key) {
+            return false;
+        }
+        self.viewports = Some(key);
+        true
+    }
+
+    #[inline]
+    fn scissors_changed(&mut self, rects: &[windows::Win32::Foundation::RECT]) -> bool {
+        if rects.len() > RECORDED_INLINE {
+            self.scissors = None;
+            return true;
+        }
+        let mut packed = [[0i32; 4]; RECORDED_INLINE];
+        for (dst, r) in packed.iter_mut().zip(rects) {
+            *dst = [r.left, r.top, r.right, r.bottom];
+        }
+        let key = (rects.len() as u8, packed);
+        if self.scissors == Some(key) {
+            return false;
+        }
+        self.scissors = Some(key);
+        true
+    }
+}
+
 #[repr(C)]
 struct List {
     object: Object,
@@ -89,8 +237,8 @@ struct List {
     compute_root_headers: [u32; 128],
     pipeline_shadow: [u32; 8],
     newer: [u32; 256],
-    uploads: std::sync::Mutex<Vec<Vec<u8>>>,
-    has_uploads: bool,
+    uploads: Vec<Vec<u8>>,
+    upload_used: usize,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
@@ -101,6 +249,8 @@ struct List {
     gate: Vec<ValueWait>,
     #[cfg(windows)]
     uav_barrier_needed: bool,
+    #[cfg(windows)]
+    recorded: RecordedState,
 }
 
 #[cfg(windows)]
@@ -319,6 +469,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
+    let mut ready: Vec<Idle> = Vec::new();
     for (
         i,
         Detached {
@@ -330,19 +481,26 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     {
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE_LEN.load(std::sync::atomic::Ordering::Relaxed) >= IDLE_MOST.0
+        if !ran.contains(&i)
+            || IDLE_LEN.load(std::sync::atomic::Ordering::Relaxed) + ready.len() >= IDLE_MOST.0
         {
             continue;
         }
         host.reset();
         let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
-            idle.1 += bytes;
-            IDLE_LEN.store(idle.0.len(), std::sync::atomic::Ordering::Relaxed);
+        ready.push(Idle(host, bytes));
+    }
+    if ready.is_empty() {
+        return;
+    }
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    for entry in ready {
+        if idle.0.len() < IDLE_MOST.0 && idle.1 + entry.1 <= IDLE_MOST.1 {
+            idle.1 += entry.1;
+            idle.0.push(entry);
         }
     }
+    IDLE_LEN.store(idle.0.len(), std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(windows)]
@@ -384,6 +542,7 @@ fn cut(this: This, wait: ValueWait) {
         list.earlier.push(Part { waits, host: done });
     }
     list.uav_barrier_needed = true;
+    list.recorded.clear_gpu();
     if let Some(host) = list.host.as_ref() {
         list.state.replay(host);
     }
@@ -406,7 +565,7 @@ pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 #[cfg(windows)]
 pub(crate) fn detach_parts(lists: &[This]) -> Parts {
     let mut parts: Parts = vec![(Vec::new(), Vec::new(), Vec::new())];
-    let mut seen: Vec<(This, Option<(usize, usize)>)> = Vec::new();
+    let mut seen: Vec<(This, Option<(usize, usize)>)> = Vec::with_capacity(lists.len());
     for &this in lists {
         if this.is_null() {
             continue;
@@ -441,28 +600,23 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         };
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
-        let uploads = if list.has_uploads {
-            list.has_uploads = false;
-            std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()))
-        } else {
-            Vec::new()
-        };
+        list.upload_used = 0;
+        let uploads = std::mem::take(&mut list.uploads);
         let state = std::mem::take(&mut list.state);
         list.uav_barrier_needed = true;
+        list.recorded.reset(std::ptr::null());
         let single = earlier.is_empty() && gate.is_empty();
-        let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
-            .into_iter()
-            .map(|part| {
-                (
-                    part.waits,
-                    Detached {
-                        host: part.host,
-                        _uploads: Vec::new(),
-                        _state: Default::default(),
-                    },
-                )
-            })
-            .collect();
+        let mut pieces: Vec<(Vec<ValueWait>, Detached)> = Vec::with_capacity(earlier.len() + 1);
+        for part in earlier {
+            pieces.push((
+                part.waits,
+                Detached {
+                    host: part.host,
+                    _uploads: Vec::new(),
+                    _state: Default::default(),
+                },
+            ));
+        }
         pieces.push((
             gate,
             Detached {
@@ -491,13 +645,20 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
-    let mut taken: Vec<(This, Detached)> = Vec::new();
-    let mut order = Vec::new();
+    let mut taken: Vec<Detached> = Vec::with_capacity(lists.len());
+    let mut order = Vec::with_capacity(lists.len());
+    let mut seen_inline = [std::ptr::null(); 16];
+    let mut seen_spill: Vec<This> = Vec::new();
     for &this in lists {
         if this.is_null() {
             continue;
         }
-        if let Some(i) = taken.iter().position(|(t, _)| *t == this) {
+        let seen_slice = if seen_spill.is_empty() {
+            &seen_inline[..taken.len()]
+        } else {
+            &seen_spill
+        };
+        if let Some(i) = seen_slice.iter().position(|&t| t == this) {
             order.push(i);
             continue;
         }
@@ -509,27 +670,31 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             let Some(host) = list.host.take() else {
                 continue;
             };
-            let uploads = if list.has_uploads {
-                list.has_uploads = false;
-                std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()))
-            } else {
-                Vec::new()
-            };
+            list.upload_used = 0;
+            let uploads = std::mem::take(&mut list.uploads);
             let state = std::mem::take(&mut list.state);
             list.uav_barrier_needed = true;
+            list.recorded.reset(std::ptr::null());
             (host, uploads, state)
         };
-        order.push(taken.len());
-        taken.push((
-            this,
-            Detached {
-                host,
-                _uploads: uploads,
-                _state: state,
-            },
-        ));
+        let idx = taken.len();
+        if seen_spill.is_empty() && idx < seen_inline.len() {
+            seen_inline[idx] = this;
+        } else {
+            if seen_spill.is_empty() {
+                seen_spill.reserve(lists.len());
+                seen_spill.extend_from_slice(&seen_inline[..idx]);
+            }
+            seen_spill.push(this);
+        }
+        order.push(idx);
+        taken.push(Detached {
+            host,
+            _uploads: uploads,
+            _state: state,
+        });
     }
-    (taken.into_iter().map(|(_, d)| d).collect(), order)
+    (taken, order)
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -606,8 +771,8 @@ fn new_list(
         compute_root_headers: [0; 128],
         pipeline_shadow: [0; 8],
         newer: [0; 256],
-        uploads: Default::default(),
-        has_uploads: false,
+        uploads: Vec::new(),
+        upload_used: 0,
         #[cfg(windows)]
         host: None,
         #[cfg(windows)]
@@ -622,6 +787,8 @@ fn new_list(
         gate: Vec::new(),
         #[cfg(windows)]
         uav_barrier_needed: true,
+        #[cfg(windows)]
+        recorded: RecordedState::new(pipeline),
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -668,18 +835,16 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     // SAFETY: the title passes one of our lists, and neither records
     // into it nor submits it during its reset.
     let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-    if list.has_uploads {
-        list.has_uploads = false;
-        list.uploads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+    if !list.uploads.is_empty() {
+        list.uploads.clear();
+        list.upload_used = 0;
     }
     #[cfg(windows)]
     {
         list.earlier.clear();
         list.gate.clear();
         list.uav_barrier_needed = true;
+        list.recorded.reset(pipeline);
         if let Some(host) = list.host.as_ref() {
             host.reset();
         }
@@ -761,16 +926,18 @@ const BARRIER_INLINE: usize = 16;
 
 #[cfg(any(windows, test))]
 struct BarrierBuf {
-    inline: [Barrier; BARRIER_INLINE],
+    inline: [std::mem::MaybeUninit<Barrier>; BARRIER_INLINE],
     len: usize,
     spill: Vec<Barrier>,
 }
 
 #[cfg(any(windows, test))]
 impl BarrierBuf {
+    #[inline]
     fn new() -> Self {
         Self {
-            inline: [UAV_BARRIER; BARRIER_INLINE],
+            // SAFETY: an array of `MaybeUninit<Barrier>` requires no initialization.
+            inline: [const { std::mem::MaybeUninit::uninit() }; BARRIER_INLINE],
             len: 0,
             spill: Vec::new(),
         }
@@ -781,11 +948,15 @@ impl BarrierBuf {
         if !self.spill.is_empty() {
             self.spill.push(b);
         } else if self.len < BARRIER_INLINE {
-            self.inline[self.len] = b;
+            self.inline[self.len].write(b);
             self.len += 1;
         } else {
             self.spill.reserve(BARRIER_INLINE * 2);
-            self.spill.extend_from_slice(&self.inline);
+            // SAFETY: `self.inline[..BARRIER_INLINE]` are all initialized.
+            let initialized = unsafe {
+                std::slice::from_raw_parts(self.inline.as_ptr().cast::<Barrier>(), BARRIER_INLINE)
+            };
+            self.spill.extend_from_slice(initialized);
             self.spill.push(b);
         }
     }
@@ -795,7 +966,8 @@ impl BarrierBuf {
         if !self.spill.is_empty() {
             &self.spill
         } else {
-            &self.inline[..self.len]
+            // SAFETY: `self.inline[..self.len]` have all been written via `push`.
+            unsafe { std::slice::from_raw_parts(self.inline.as_ptr().cast::<Barrier>(), self.len) }
         }
     }
 }
@@ -803,9 +975,69 @@ impl BarrierBuf {
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
     if count > 0 && !barriers.is_null() && !this.is_null() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         const BEGIN_ONLY: u32 = 1;
+        if barriers.len() == 1 {
+            let b = &barriers[0];
+            if b.kind == 0 && b.flags & BEGIN_ONLY != 0 {
+                return 0;
+            }
+            // SAFETY: the title passes one of our lists, recorded by one thread at
+            // a time and not submitted while it records.
+            let list_obj = unsafe { &mut *this.cast_mut().cast::<List>() };
+            if b.kind == 2 && b.first.is_null() {
+                if !list_obj.uav_barrier_needed {
+                    return 0;
+                }
+                let Some(list) = ensure_host(&mut list_obj.host) else {
+                    return 0;
+                };
+                // SAFETY: identical layout; borrowed resource pointer.
+                let hb = unsafe {
+                    std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER)
+                };
+                // SAFETY: an open list.
+                unsafe { list.list.ResourceBarrier(&[hb]) };
+                list.mark_uav_clean();
+                list_obj.uav_barrier_needed = false;
+                return 0;
+            }
+            if b.kind != 1
+                && !b.first.is_null()
+                && crate::resource::buffer_bytes(b.first).is_some()
+            {
+                if !list_obj.uav_barrier_needed {
+                    return 0;
+                }
+                let Some(list) = ensure_host(&mut list_obj.host) else {
+                    return 0;
+                };
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+                // SAFETY: identical layout.
+                let hb = unsafe {
+                    std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER)
+                };
+                // SAFETY: an open list.
+                unsafe { list.list.ResourceBarrier(&[hb]) };
+                list.mark_uav_clean();
+                list_obj.uav_barrier_needed = false;
+                return 0;
+            }
+            let Some(list) = ensure_host(&mut list_obj.host) else {
+                return 0;
+            };
+            if let Some(hb) = host_barrier(list, b) {
+                // SAFETY: identical layout; borrowed resource pointer.
+                let hb = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(hb) };
+                // SAFETY: an open list and live resource.
+                unsafe { list.list.ResourceBarrier(&[hb]) };
+            }
+            return 0;
+        }
         if barriers
             .iter()
             .all(|b| b.kind == 0 && b.flags & BEGIN_ONLY != 0)
@@ -851,8 +1083,6 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }
         let slice = host.as_slice();
         if !slice.is_empty() {
-            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-            const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
             // SAFETY: the same layout; borrowed resource pointers, never
             // released through this slice.
             let host_barriers = unsafe {
@@ -909,13 +1139,14 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
+    if len == 0 {
+        return;
+    }
+    #[cfg(windows)]
     if let Some(list) = record_work_host(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        if len == 0 {
-            return;
-        }
         static DIRECT_BUF_COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let direct = *DIRECT_BUF_COPY
             .get_or_init(|| std::env::var_os("OATHKEEP_DIRECT_BUF_COPY").is_some_and(|v| v == "1"));
@@ -942,14 +1173,17 @@ extern "system" fn copy_buffer_region(
                 && dst_shadow.left(to_u64) >= len
             {
                 let (src_off, dst_off) = (src_shadow.offset(from_u64), dst_shadow.offset(to_u64));
-                let same_overlap = std::sync::Arc::ptr_eq(&src_shadow, &dst_shadow)
+                let same_shadow = std::sync::Arc::ptr_eq(&src_shadow, &dst_shadow);
+                let same_overlap = same_shadow
                     && src_off < dst_off.saturating_add(len)
                     && dst_off < src_off.saturating_add(len);
                 if !same_overlap {
                     src_shadow.refresh(list, from_u64, len);
                     dst_shadow.refresh(list, to_u64, len);
                     list.keep(&src_shadow.buffer);
-                    list.keep(&dst_shadow.buffer);
+                    if !same_shadow {
+                        list.keep(&dst_shadow.buffer);
+                    }
                     // SAFETY: an open list with live shadow buffers; UAV barriers
                     // bracket CopyBufferRegion so prior shader writes are visible
                     // and destination bytes are visible to subsequent shaders.
@@ -1163,7 +1397,7 @@ extern "system" fn copy_texture_region(
                 {
                     read = Some((shadow.gpu(data as u64), bytes));
                 }
-                _upload = shadow.buffer.clone();
+                _upload = None;
             } else {
                 let Some((buffer, staging)) = list.upload(host, bytes) else {
                     return;
@@ -1176,7 +1410,7 @@ extern "system" fn copy_texture_region(
                     // SAFETY: a live buffer.
                     read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
                 }
-                _upload = buffer;
+                _upload = Some(buffer);
             }
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
@@ -1539,6 +1773,9 @@ extern "system" fn resolve_queries(
     buffer: This,
     offset: u64,
 ) {
+    if count == 0 {
+        return;
+    }
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
@@ -1586,11 +1823,33 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 };
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
-    crate::pipeline::bound(pipeline);
     #[cfg(windows)]
-    with_state_only(this, |state| state.set_pipeline(pipeline));
+    {
+        if this.is_null() {
+            crate::pipeline::bound(pipeline);
+            return;
+        }
+        // SAFETY: the title passes one of our lists, recorded by one thread at
+        // a time and not submitted while it records.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        if !pipeline.is_null() && list.recorded.mark_pipeline_bound(pipeline) {
+            crate::pipeline::bound(pipeline);
+        }
+        if list.recorded.last_pipeline == pipeline {
+            return;
+        }
+        list.recorded.last_pipeline = pipeline;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        list.state.set_pipeline(pipeline);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::recorded(started);
+    }
     #[cfg(not(windows))]
-    let _ = this;
+    {
+        crate::pipeline::bound(pipeline);
+        let _ = this;
+    }
 }
 
 extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
@@ -1599,29 +1858,59 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
     reset(this, allocator, pipeline)
 }
 
+const UPLOAD_CHUNK: usize = 64 << 10;
+const UPLOAD_ARENA_MAX: usize = 32 << 10;
+
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size)
-        .ok()
-        .and_then(|s| s.checked_add(align))
-    else {
+    let Some(size_usize) = usize::try_from(size).ok() else {
+        return std::ptr::null_mut();
+    };
+    let Some(len) = size_usize.checked_add(align) else {
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
+    // SAFETY: the title passes one of our lists, recorded by one thread at a
+    // time and not submitted while it records.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    if size_usize <= UPLOAD_ARENA_MAX && align <= 4096 {
+        if let Some(chunk) = list.uploads.last_mut() {
+            // SAFETY: `upload_used <= chunk.len()`.
+            let cursor = unsafe { chunk.as_mut_ptr().add(list.upload_used) };
+            let pad = cursor.align_offset(align);
+            if let Some(end) = list
+                .upload_used
+                .checked_add(pad)
+                .and_then(|o| o.checked_add(size_usize))
+                && end <= chunk.len()
+            {
+                list.upload_used = end;
+                // SAFETY: `pad + size_usize` fits inside the chunk from `cursor`.
+                return unsafe { cursor.add(pad) };
+            }
+        }
+        let mut chunk = vec![0u8; UPLOAD_CHUNK.max(len)];
+        let start = chunk.as_mut_ptr();
+        let pad = start.align_offset(align);
+        let at = unsafe { start.add(pad) };
+        list.upload_used = pad + size_usize;
+        list.uploads.push(chunk);
+        return at;
+    }
     let mut block = vec![0u8; len];
     let start = block.as_mut_ptr();
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
-    // SAFETY: the title passes one of our lists, recorded by one thread at a
-    // time and not submitted while it records.
-    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-    list.uploads
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(block);
-    list.has_uploads = true;
+    // Keep any active bump-arena chunk at the tail of `uploads`.
+    if list.uploads.is_empty() {
+        list.upload_used = block.len();
+        list.uploads.push(block);
+    } else {
+        let last = list.uploads.len() - 1;
+        list.uploads.insert(last, block);
+    }
     at
 }
 
@@ -1629,7 +1918,7 @@ extern "system" fn ignored_state(_: This) {}
 
 #[cfg(windows)]
 mod state {
-    use super::{This, with_state, with_state_only, with_work_state};
+    use super::{List, This, with_state, with_state_only, with_work_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1644,31 +1933,78 @@ mod state {
     }
 
     pub(super) extern "system" fn topology(this: This, topology: u32) {
-        with_state(this, |list, s| s.set_topology(list, topology));
+        if this.is_null() {
+            return;
+        }
+        // SAFETY: one of our lists, recorded by one thread at a time.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        if !list.recorded.topology_changed(topology) {
+            return;
+        }
+        with_state(this, |host, s| s.set_topology(host, topology));
     }
     pub(super) extern "system" fn viewports(
         this: This,
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
-        with_state(this, |list, s| {
-            s.set_viewports(list, items(viewports, count))
-        });
+        if this.is_null() {
+            return;
+        }
+        let slice = items(viewports, count);
+        // SAFETY: one of our lists, recorded by one thread at a time.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        if !list.recorded.viewports_changed(slice) {
+            return;
+        }
+        with_state(this, |host, s| s.set_viewports(host, slice));
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
+        if this.is_null() {
+            return;
+        }
+        let slice = items(rects, count);
+        // SAFETY: one of our lists, recorded by one thread at a time.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        if !list.recorded.scissors_changed(slice) {
+            return;
+        }
+        with_state(this, |host, s| s.set_scissors(host, slice));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        with_state(this, |list, s| {
-            // SAFETY: the title passes four floats or null.
-            s.set_blend_factor(list, unsafe { factor.as_ref() })
-        });
+        if this.is_null() {
+            return;
+        }
+        // SAFETY: the title passes four floats or null.
+        let factor = unsafe { factor.as_ref() };
+        // SAFETY: one of our lists, recorded by one thread at a time.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        if !list.recorded.blend_factor_changed(factor) {
+            return;
+        }
+        with_state(this, |host, s| s.set_blend_factor(host, factor));
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        with_state(this, |list, s| s.set_stencil_ref(list, reference));
+        if this.is_null() {
+            return;
+        }
+        // SAFETY: one of our lists, recorded by one thread at a time.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        if !list.recorded.stencil_ref_changed(reference) {
+            return;
+        }
+        with_state(this, |host, s| s.set_stencil_ref(host, reference));
     }
     pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
-        with_state(this, |list, s| s.set_depth_bounds(list, min, max));
+        if this.is_null() {
+            return;
+        }
+        // SAFETY: one of our lists, recorded by one thread at a time.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        if !list.recorded.depth_bounds_changed(min, max) {
+            return;
+        }
+        with_state(this, |host, s| s.set_depth_bounds(host, min, max));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state_only(this, |s| s.set_heaps(items(heaps, count)));
@@ -2183,6 +2519,7 @@ fn value_written(this: This, address: u64, value: u64) {
             list.earlier.push(Part { waits, host: done });
         }
         list.uav_barrier_needed = true;
+        list.recorded.clear_gpu();
         if let Some(host) = list.host.as_ref() {
             list.state.replay(host);
         }
@@ -2344,15 +2681,115 @@ mod tests {
         );
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
-        assert!(
-            unsafe { &(*list.cast::<List>()).uploads }
-                .lock()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(unsafe { &(*list.cast::<List>()).uploads }.is_empty());
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn upload_arena_packs_small_allocations_and_keeps_alignment() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let mut ptrs = Vec::new();
+        for i in 0..32u8 {
+            let p = allocate_upload(list, 128, 256);
+            assert!(!p.is_null() && (p as usize).is_multiple_of(256));
+            // SAFETY: 128 bytes handed out.
+            unsafe { p.write_bytes(i.wrapping_add(1), 128) };
+            ptrs.push(p);
+        }
+        // All 32 small allocations (32 * 256 = 8 KiB) fit in a single 64 KiB chunk.
+        // SAFETY: the list is ours.
+        assert_eq!(unsafe { (*list.cast::<List>()).uploads.len() }, 1);
+        // Oversized allocation gets its own block without disturbing the bump chunk.
+        let big = allocate_upload(list, 64 << 10, 256);
+        assert!(!big.is_null() && (big as usize).is_multiple_of(256));
+        assert_eq!(unsafe { (*list.cast::<List>()).uploads.len() }, 2);
+        // Next small allocation still fits in the existing bump chunk.
+        let after = allocate_upload(list, 64, 64);
+        assert!(!after.is_null() && (after as usize).is_multiple_of(64));
+        assert_eq!(unsafe { (*list.cast::<List>()).uploads.len() }, 2);
+        // Earlier allocations remain intact and non-overlapping.
+        for (i, &p) in ptrs.iter().enumerate() {
+            let expected = (i as u8).wrapping_add(1);
+            // SAFETY: 128 bytes remain valid until reset.
+            let slice = unsafe { std::slice::from_raw_parts(p, 128) };
+            assert!(slice.iter().all(|&b| b == expected));
+        }
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(unsafe { (*list.cast::<List>()).uploads.is_empty() });
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recorded_state_dedups_redundant_setters_and_clears_on_reset() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
+
+        let mut rec = RecordedState::new(std::ptr::null());
+        assert!(rec.topology_changed(4));
+        assert!(!rec.topology_changed(4));
+        assert!(rec.topology_changed(5));
+
+        assert!(rec.stencil_ref_changed(7));
+        assert!(!rec.stencil_ref_changed(7));
+        assert!(rec.stencil_ref_changed(8));
+
+        let bf = [0.5f32, 0.25, 0.75, 1.0];
+        assert!(rec.blend_factor_changed(Some(&bf)));
+        assert!(!rec.blend_factor_changed(Some(&bf)));
+        assert!(rec.blend_factor_changed(None));
+        assert!(!rec.blend_factor_changed(None));
+
+        assert!(rec.depth_bounds_changed(0.0, 1.0));
+        assert!(!rec.depth_bounds_changed(0.0, 1.0));
+        assert!(rec.depth_bounds_changed(0.1, 0.9));
+
+        let vp = [D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: 1920.0,
+            Height: 1080.0,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }];
+        assert!(rec.viewports_changed(&vp));
+        assert!(!rec.viewports_changed(&vp));
+
+        let sc = [RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        }];
+        assert!(rec.scissors_changed(&sc));
+        assert!(!rec.scissors_changed(&sc));
+
+        let fake_p = 0x1000usize as This;
+        assert!(rec.mark_pipeline_bound(fake_p));
+        assert!(!rec.mark_pipeline_bound(fake_p));
+
+        rec.clear_gpu();
+        assert!(rec.topology_changed(5));
+        assert!(rec.stencil_ref_changed(8));
+        assert!(rec.viewports_changed(&vp));
+        assert!(rec.scissors_changed(&sc));
+
+        rec.reset(std::ptr::null());
+        assert!(rec.mark_pipeline_bound(fake_p));
     }
 
     #[test]

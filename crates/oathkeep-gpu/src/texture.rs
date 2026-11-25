@@ -1,10 +1,203 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
+
+#[derive(Default)]
+struct UsizeHasher(u64);
+
+impl Hasher for UsizeHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.wrapping_mul(0x517c_c1b7_2722_0a95) ^ u64::from(b);
+        }
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        let x = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.0 = x ^ (x >> 32);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct UsizeBuildHasher;
+
+impl BuildHasher for UsizeBuildHasher {
+    type Hasher = UsizeHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> Self::Hasher {
+        UsizeHasher(0)
+    }
+}
+
+type UsizeMap<V> = HashMap<usize, V, UsizeBuildHasher>;
+type UsizeSet = HashSet<usize, UsizeBuildHasher>;
+
+/// Fast 4-lane unrolled 128-bit streaming hash for same-texture change detection
+/// and slot fingerprinting. Covers 100% of every input byte with identical output
+/// across direct-read and copy-fallback paths.
+struct FastHasher {
+    v0: u64,
+    v1: u64,
+    v2: u64,
+    v3: u64,
+    total: u64,
+}
+
+impl FastHasher {
+    const K0: u64 = 0x9e37_79b9_7f4a_7c15;
+    const K1: u64 = 0xbf58_476d_1ce4_e5b9;
+    const K2: u64 = 0x94d0_49bb_1331_11eb;
+    const K3: u64 = 0xd6e8_feb8_6659_fd93;
+
+    #[inline]
+    fn new() -> Self {
+        Self {
+            v0: Self::K0,
+            v1: Self::K1,
+            v2: Self::K2,
+            v3: Self::K3,
+            total: 0,
+        }
+    }
+
+    #[inline]
+    fn mix64(mut x: u64) -> u64 {
+        x ^= x >> 30;
+        x = x.wrapping_mul(Self::K1);
+        x ^= x >> 27;
+        x = x.wrapping_mul(Self::K2);
+        x ^ (x >> 31)
+    }
+
+    #[inline]
+    fn update(&mut self, bytes: &[u8]) {
+        self.total = self.total.wrapping_add(bytes.len() as u64);
+        let (mut v0, mut v1, mut v2, mut v3) = (self.v0, self.v1, self.v2, self.v3);
+        let chunks = bytes.chunks_exact(32);
+        let rem = chunks.remainder();
+        for chunk in chunks {
+            let a = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+            let b = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+            let c = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
+            let d = u64::from_le_bytes(chunk[24..32].try_into().unwrap());
+            v0 = (v0 ^ a.wrapping_mul(Self::K1))
+                .rotate_left(27)
+                .wrapping_mul(Self::K0);
+            v1 = (v1 ^ b.wrapping_mul(Self::K2))
+                .rotate_left(31)
+                .wrapping_mul(Self::K1);
+            v2 = (v2 ^ c.wrapping_mul(Self::K3))
+                .rotate_left(29)
+                .wrapping_mul(Self::K2);
+            v3 = (v3 ^ d.wrapping_mul(Self::K0))
+                .rotate_left(33)
+                .wrapping_mul(Self::K3);
+        }
+        let words = rem.chunks_exact(8);
+        let tail = words.remainder();
+        for (i, w) in words.enumerate() {
+            let x = u64::from_le_bytes(w.try_into().unwrap());
+            match i {
+                0 => {
+                    v0 = (v0 ^ x.wrapping_mul(Self::K1))
+                        .rotate_left(27)
+                        .wrapping_mul(Self::K0)
+                }
+                1 => {
+                    v1 = (v1 ^ x.wrapping_mul(Self::K2))
+                        .rotate_left(31)
+                        .wrapping_mul(Self::K1)
+                }
+                _ => {
+                    v2 = (v2 ^ x.wrapping_mul(Self::K3))
+                        .rotate_left(29)
+                        .wrapping_mul(Self::K2)
+                }
+            }
+        }
+        if !tail.is_empty() {
+            let mut last = [0u8; 8];
+            last[..tail.len()].copy_from_slice(tail);
+            let x = u64::from_le_bytes(last);
+            v3 = (v3 ^ x.wrapping_mul(Self::K0))
+                .rotate_left(33)
+                .wrapping_mul(Self::K3);
+        }
+        // Domain-separate each chunk by its byte length.
+        v1 = (v1 ^ (bytes.len() as u64).wrapping_mul(Self::K3))
+            .rotate_left(19)
+            .wrapping_mul(Self::K0);
+        (self.v0, self.v1, self.v2, self.v3) = (v0, v1, v2, v3);
+    }
+
+    #[inline]
+    fn finalize128(self) -> [u64; 2] {
+        let t = self.total.wrapping_mul(Self::K0);
+        let h0 = Self::mix64(
+            self.v0
+                ^ self.v2.rotate_left(23)
+                ^ t
+                ^ self.v1.wrapping_mul(Self::K3),
+        );
+        let h1 = Self::mix64(
+            self.v1
+                ^ self.v3.rotate_left(41)
+                ^ t.rotate_left(17)
+                ^ self.v0.wrapping_mul(Self::K2),
+        );
+        [h0, h1]
+    }
+
+    #[inline]
+    fn finalize64(self) -> u64 {
+        let [h0, h1] = self.finalize128();
+        (h0 ^ h1.rotate_left(17)) | 1
+    }
+
+    #[inline]
+    fn hash128(bytes: &[u8]) -> [u64; 2] {
+        let mut h = Self::new();
+        h.update(bytes);
+        h.finalize128()
+    }
+}
+
+#[inline]
+fn is_all_zero(bytes: &[u8]) -> bool {
+    let chunks = bytes.chunks_exact(32);
+    let rem = chunks.remainder();
+    for chunk in chunks {
+        let a = u64::from_ne_bytes(chunk[0..8].try_into().unwrap());
+        let b = u64::from_ne_bytes(chunk[8..16].try_into().unwrap());
+        let c = u64::from_ne_bytes(chunk[16..24].try_into().unwrap());
+        let d = u64::from_ne_bytes(chunk[24..32].try_into().unwrap());
+        if (a | b | c | d) != 0 {
+            return false;
+        }
+    }
+    let words = rem.chunks_exact(8);
+    let tail = words.remainder();
+    for w in words {
+        if u64::from_ne_bytes(w.try_into().unwrap()) != 0 {
+            return false;
+        }
+    }
+    tail.iter().all(|&b| b == 0)
+}
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -39,7 +232,7 @@ pub(crate) struct Staging {
 
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<[u64; 2]>,
     asked: u64,
     partial: Option<u64>,
 }
@@ -50,7 +243,8 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+static STAGING: RwLock<Option<UsizeMap<Arc<Staging>>>> = RwLock::new(None);
+static STAGING_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 struct Through {
     buffer: ID3D12Resource,
@@ -67,7 +261,8 @@ unsafe impl Send for Through {}
 // SAFETY: as above.
 unsafe impl Sync for Through {}
 
-static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
+static THROUGH: RwLock<Option<UsizeMap<Arc<Through>>>> = RwLock::new(None);
+static THROUGH_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
@@ -80,89 +275,111 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         return false;
     };
     let Some(host) = host() else { return false };
-    let through = {
-        let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
-        let map = map.get_or_insert_with(HashMap::new);
-        match map.get(&(placed as usize)) {
-            Some(through) => through.clone(),
-            None => {
-                // SAFETY: live textures.
-                let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
-                let count = |d: &D3D12_RESOURCE_DESC| {
-                    let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
-                        1
-                    } else {
-                        u32::from(d.DepthOrArraySize)
-                    };
-                    u32::from(d.MipLevels) * layers
+    let placed_key = placed as usize;
+    let existing = if THROUGH_COUNT.load(Ordering::Relaxed) != 0 {
+        THROUGH
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|map| map.get(&placed_key).cloned())
+    } else {
+        None
+    };
+    let through = match existing {
+        Some(through) => through,
+        None => {
+            // Build outside the global lock so D3D12 queries and buffer creation
+            // never stall other recording threads.
+            // SAFETY: live textures.
+            let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
+            let count = |d: &D3D12_RESOURCE_DESC| {
+                let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                    1
+                } else {
+                    u32::from(d.DepthOrArraySize)
                 };
-                let parts = count(&of_from);
-                if parts == 0 || parts > ALIAS_PARTS || parts != count(&of_to) {
-                    return false;
-                }
-                let mut rows = [(); 2]
-                    .map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
-                let mut bytes = [0u64; 2];
-                // SAFETY: plain queries; the out pointers are ours and
-                // hold `parts` layouts each.
-                unsafe {
-                    host.device.GetCopyableFootprints(
-                        &of_from,
-                        0,
-                        parts,
-                        0,
-                        Some(rows[0].as_mut_ptr()),
-                        None,
-                        None,
-                        Some(&mut bytes[0]),
-                    );
-                    host.device.GetCopyableFootprints(
-                        &of_to,
-                        0,
-                        parts,
-                        0,
-                        Some(rows[1].as_mut_ptr()),
-                        None,
-                        None,
-                        Some(&mut bytes[1]),
-                    );
-                }
-                let alike = rows[0].iter().zip(&rows[1]).all(|(a, b)| {
-                    let (fa, fb) = (a.Footprint, b.Footprint);
-                    a.Offset == b.Offset
-                        && (fa.Width, fa.Height, fa.Depth, fa.RowPitch)
-                            == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
-                });
-                if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
-                    return false;
-                }
-                let Some(buffer) = host.uav_buffer(bytes[0]) else {
-                    return false;
-                };
-                crate::host::name(&buffer, || {
-                    format!(
-                        "alias copy {}x{} f{} to f{}",
-                        of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
-                    )
-                });
-                tracing::info!(
-                    view = ?placed,
-                    texture = ?source,
-                    width = of_from.Width,
-                    height = of_from.Height,
-                    parts,
-                    written_as = of_from.Format.0,
-                    read_as = of_to.Format.0,
-                    "a view placed in the memory of a texture the host writes, in another format: read from that texture by a copy on the host"
-                );
-                let [of_written, of_read] = rows;
-                let through = Arc::new(Through {
-                    buffer,
-                    parts: of_written.into_iter().zip(of_read).collect(),
-                });
-                map.insert(placed as usize, through.clone());
-                through
+                u32::from(d.MipLevels) * layers
+            };
+            let parts = count(&of_from);
+            if parts == 0 || parts > ALIAS_PARTS || parts != count(&of_to) {
+                return false;
             }
+            let mut rows = [(); 2]
+                .map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
+            let mut bytes = [0u64; 2];
+            // SAFETY: plain queries; the out pointers are ours and
+            // hold `parts` layouts each.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &of_from,
+                    0,
+                    parts,
+                    0,
+                    Some(rows[0].as_mut_ptr()),
+                    None,
+                    None,
+                    Some(&mut bytes[0]),
+                );
+                host.device.GetCopyableFootprints(
+                    &of_to,
+                    0,
+                    parts,
+                    0,
+                    Some(rows[1].as_mut_ptr()),
+                    None,
+                    None,
+                    Some(&mut bytes[1]),
+                );
+            }
+            let alike = rows[0].iter().zip(&rows[1]).all(|(a, b)| {
+                let (fa, fb) = (a.Footprint, b.Footprint);
+                a.Offset == b.Offset
+                    && (fa.Width, fa.Height, fa.Depth, fa.RowPitch)
+                        == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
+            });
+            if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
+                return false;
+            }
+            let Some(buffer) = host.uav_buffer(bytes[0]) else {
+                return false;
+            };
+            crate::host::name(&buffer, || {
+                format!(
+                    "alias copy {}x{} f{} to f{}",
+                    of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
+                )
+            });
+            tracing::info!(
+                view = ?placed,
+                texture = ?source,
+                width = of_from.Width,
+                height = of_from.Height,
+                parts,
+                written_as = of_from.Format.0,
+                read_as = of_to.Format.0,
+                "a view placed in the memory of a texture the host writes, in another format: read from that texture by a copy on the host"
+            );
+            let [of_written, of_read] = rows;
+            let built = Arc::new(Through {
+                buffer,
+                parts: of_written.into_iter().zip(of_read).collect(),
+            });
+            let (chosen, surplus) = {
+                let mut map = THROUGH.write().unwrap_or_else(|e| e.into_inner());
+                let map = map.get_or_insert_with(UsizeMap::default);
+                match map.entry(placed_key) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        (e.get().clone(), Some(built))
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(built.clone());
+                        THROUGH_COUNT.store(map.len(), Ordering::Relaxed);
+                        (built, None)
+                    }
+                }
+            };
+            drop(surplus);
+            chosen
         }
     };
     let first = list.first_use(placed as usize);
@@ -265,7 +482,12 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
         if read.len() < size {
             read.resize(size, 0);
         }
-        f(&mut read[..size])
+        let out = f(&mut read[..size]);
+        if read.capacity() > (16 << 20) {
+            read.clear();
+            read.shrink_to(4 << 20);
+        }
+        out
     })
 }
 
@@ -373,11 +595,7 @@ impl Drop for Staging {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 3] {
     use std::sync::atomic::Ordering::Relaxed;
-    let kept = STAGING
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .map_or(0, |map| map.len() as u64);
+    let kept = STAGING_COUNT.load(Relaxed) as u64;
     [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
 }
 
@@ -427,18 +645,7 @@ fn let_go_idle_with(urgent: bool) {
             }
         }
     }
-    let mut map = if urgent {
-        let Ok(guard) = STAGING.try_lock() else {
-            return;
-        };
-        guard
-    } else {
-        STAGING.lock().unwrap_or_else(|e| e.into_inner())
-    };
-    let Some(map) = map.as_mut() else {
-        return;
-    };
-    if map.is_empty() {
+    if STAGING_COUNT.load(Relaxed) == 0 {
         return;
     }
     let (idle_ms, idle_frames) = if urgent {
@@ -449,23 +656,45 @@ fn let_go_idle_with(urgent: bool) {
             crate::host::commit_idle_frames(avail_commit).min(IDLE_FRAMES),
         )
     };
+    let mut evicted: Vec<Arc<Staging>> = Vec::new();
     let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
-        let in_flight = s
-            .buffer
-            .as_ref()
-            .is_some_and(|b| crate::host::references(b) > 1);
-        let keep = Arc::strong_count(s) > 1
-            || in_flight
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, idle_frames);
-        if !keep {
-            LET_GO[0].fetch_add(1, Relaxed);
-            LET_GO[1].fetch_add(s.bytes, Relaxed);
-            went += 1;
-            bytes += s.bytes;
+    {
+        let mut map = if urgent {
+            let Ok(guard) = STAGING.try_write() else {
+                return;
+            };
+            guard
+        } else {
+            STAGING.write().unwrap_or_else(|e| e.into_inner())
+        };
+        let Some(map) = map.as_mut() else {
+            return;
+        };
+        if map.is_empty() {
+            return;
         }
-        keep
-    });
+        map.retain(|_, s| {
+            let in_flight = s
+                .buffer
+                .as_ref()
+                .is_some_and(|b| crate::host::references(b) > 1);
+            let keep = Arc::strong_count(s) > 1
+                || in_flight
+                || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, idle_frames);
+            if !keep {
+                LET_GO[0].fetch_add(1, Relaxed);
+                LET_GO[1].fetch_add(s.bytes, Relaxed);
+                went += 1;
+                bytes += s.bytes;
+                evicted.push(s.clone());
+            }
+            keep
+        });
+        STAGING_COUNT.store(map.len(), Relaxed);
+    }
+    // Drop evicted staging entries after releasing `STAGING` so `Staging::drop`
+    // does not nest `STAGING_POOL` under `STAGING`.
+    drop(evicted);
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -476,13 +705,28 @@ fn let_go_idle_with(urgent: bool) {
     }
 }
 
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static HOST_WRITTEN: RwLock<Option<UsizeSet>> = RwLock::new(None);
+static HOST_WRITTEN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn host_written(resource: This) {
+    let key = resource as usize;
+    if HOST_WRITTEN_COUNT.load(Ordering::Relaxed) != 0
+        && HOST_WRITTEN
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|set| set.contains(&key))
+    {
+        return;
+    }
     let new = {
-        let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-        set.get_or_insert_with(Default::default)
-            .insert(resource as usize)
+        let mut set = HOST_WRITTEN.write().unwrap_or_else(|e| e.into_inner());
+        let set = set.get_or_insert_with(UsizeSet::default);
+        let inserted = set.insert(key);
+        if inserted {
+            HOST_WRITTEN_COUNT.store(set.len(), Ordering::Relaxed);
+        }
+        inserted
     };
     if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
         // SAFETY: 56 bytes in the description's layout.
@@ -493,30 +737,26 @@ pub(crate) fn host_written(resource: This) {
         };
         let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
         if !at.is_null() && bytes > 0 {
-            HOST_WRITTEN_AT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    at as u64,
-                    (
-                        bytes,
-                        words[4],
-                        words[6],
-                        words[7],
-                        words[8],
-                        resource as usize,
-                    ),
-                );
+            let mut map = HOST_WRITTEN_AT.write().unwrap_or_else(|e| e.into_inner());
+            map.insert(
+                at as u64,
+                (bytes, words[4], words[6], words[7], words[8], key),
+            );
+            HOST_WRITTEN_AT_COUNT.store(map.len(), Ordering::Relaxed);
         }
     }
 }
 
-static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u32, u32, usize)>> =
-    Mutex::new(std::collections::BTreeMap::new());
+static HOST_WRITTEN_AT: RwLock<std::collections::BTreeMap<u64, (u64, u32, u32, u32, u32, usize)>> =
+    RwLock::new(std::collections::BTreeMap::new());
+static HOST_WRITTEN_AT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
+    if HOST_WRITTEN_AT_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let hit = {
-        let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let map = HOST_WRITTEN_AT.read().unwrap_or_else(|e| e.into_inner());
         map.range(..=address)
             .next_back()
             .filter(|(at, d)| address < **at + d.0)
@@ -545,29 +785,72 @@ pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
 }
 
 pub(crate) fn host_wrote(resource: usize) -> bool {
+    if HOST_WRITTEN_COUNT.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
     HOST_WRITTEN
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .is_some_and(|set| set.contains(&resource))
 }
 
 pub(crate) fn forget(resource: usize) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
+    if STAGING_COUNT.load(Ordering::Relaxed) != 0 {
+        let present = STAGING
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|map| map.contains_key(&resource));
+        if present {
+            let removed = {
+                let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
+                map.as_mut().and_then(|map| {
+                    let v = map.remove(&resource);
+                    STAGING_COUNT.store(map.len(), Ordering::Relaxed);
+                    v
+                })
+            };
+            drop(removed);
+        }
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
+    let mut was_host_written = false;
+    if HOST_WRITTEN_COUNT.load(Ordering::Relaxed) != 0 {
+        let present = HOST_WRITTEN
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|set| set.contains(&resource));
+        if present {
+            let mut set = HOST_WRITTEN.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(set) = set.as_mut() {
+                was_host_written = set.remove(&resource);
+                HOST_WRITTEN_COUNT.store(set.len(), Ordering::Relaxed);
+            }
+        }
     }
-    HOST_WRITTEN_AT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|_, d| d.5 != resource);
-    let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(through) = through.as_mut() {
-        through.remove(&resource);
+    if was_host_written && HOST_WRITTEN_AT_COUNT.load(Ordering::Relaxed) != 0 {
+        let mut map = HOST_WRITTEN_AT.write().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, d| d.5 != resource);
+        HOST_WRITTEN_AT_COUNT.store(map.len(), Ordering::Relaxed);
+    }
+    if THROUGH_COUNT.load(Ordering::Relaxed) != 0 {
+        let present = THROUGH
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|through| through.contains_key(&resource));
+        if present {
+            let removed = {
+                let mut through = THROUGH.write().unwrap_or_else(|e| e.into_inner());
+                through.as_mut().and_then(|through| {
+                    let v = through.remove(&resource);
+                    THROUGH_COUNT.store(through.len(), Ordering::Relaxed);
+                    v
+                })
+            };
+            drop(removed);
+        }
     }
 }
 
@@ -578,12 +861,7 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 }
 
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
-    if host_written || !list.first_use(resource as usize) {
+    if host_wrote(resource as usize) || !list.first_use(resource as usize) {
         return;
     }
     let Some(staging) = staging(resource, texture) else {
@@ -620,17 +898,20 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Some(staging_buffer) = staging.buffer.as_ref() else {
         return;
     };
+    #[cfg(feature = "diagnostics")]
+    // SAFETY: live staging buffer.
+    let staging_gpu = unsafe { staging_buffer.GetGPUVirtualAddress() };
     for (i, footprint) in staging.footprints.iter().enumerate() {
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
-            // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging_buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
+                    // SAFETY: live texture.
+                    let d = unsafe { texture.GetDesc() };
                     format!(
-                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {staging_gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
                         d.Width,
                         d.Height,
                         d.DepthOrArraySize,
@@ -645,7 +926,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
                         f.RowPitch
                     )
                 },
-                (gpu + footprint.Offset, len),
+                (staging_gpu + footprint.Offset, len),
             );
         }
         let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -667,37 +948,39 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    {
-        let staging = staging.clone();
-        list.defer_after_textures(move || {
-            staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
-        });
-    }
     let on_demand = if staging.on_demand {
         crate::resource::host_tiled(resource)
     } else {
         None
     };
-    let Some(on_demand) = on_demand else {
-        list.defer_texture(staging);
-        return;
-    };
-    list.defer_texture(staging.clone());
-    list.defer_after_textures(move || {
-        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
-        staging.waiting.store(
-            if waiting {
-                crate::host::moment().max(1)
-            } else {
-                0
-            },
-            Relaxed,
-        );
-        if waiting {
-            crate::descriptor::host::levels_waiting(staging.memory as u64);
+    let after = staging.clone();
+    list.defer_texture(staging);
+    match on_demand {
+        None => {
+            list.defer_after_textures(move || {
+                after.uploaded.store(true, Relaxed);
+                after.dirty.store(false, Relaxed);
+            });
         }
-    });
+        Some(on_demand) => {
+            list.defer_after_textures(move || {
+                after.uploaded.store(true, Relaxed);
+                after.dirty.store(false, Relaxed);
+                let waiting = on_demand.uploaded(after.detiled.load(Relaxed), after.memory as u64);
+                after.waiting.store(
+                    if waiting {
+                        crate::host::moment().max(1)
+                    } else {
+                        0
+                    },
+                    Relaxed,
+                );
+                if waiting {
+                    crate::descriptor::host::levels_waiting(after.memory as u64);
+                }
+            });
+        }
+    }
 }
 
 struct Claimed {
@@ -830,13 +1113,36 @@ impl Staging {
             return u32::MAX;
         }
         let tail = (self.layout.first_tail_mip as usize).min(mips.len());
-        let there = |from: u64, to: u64| {
-            to > from
-                && to <= limit
-                && committed(
-                    self.memory.wrapping_add(from as usize),
-                    (to - from) as usize,
-                )
+        let use_query = by_query();
+        let mut last_span: Option<(usize, usize, bool)> = None;
+        let mut there = |from: u64, to: u64| {
+            if to <= from || to > limit {
+                return false;
+            }
+            let addr = (self.memory as usize).wrapping_add(from as usize);
+            let len = (to - from) as usize;
+            if !use_query {
+                return committed(addr as *const u8, len);
+            }
+            let end = addr.saturating_add(len);
+            if let Some((base, span_end, is_commit)) = last_span
+                && addr >= base
+                && end <= span_end
+            {
+                return is_commit;
+            }
+            let mut p = addr;
+            while p < end {
+                let Some((base, span_end, is_commit)) = query_region_live(p) else {
+                    return false;
+                };
+                last_span = Some((base, span_end, is_commit));
+                if !is_commit {
+                    return false;
+                }
+                p = span_end;
+            }
+            true
         };
         let mut held = 0u32;
         for (level, m) in mips.iter().enumerate().take(tail) {
@@ -974,12 +1280,12 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                let hash = FastHasher::hash128(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
                 last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
+                if is_all_zero(read) {
                     return false;
                 }
                 self.detile(read);
@@ -994,7 +1300,7 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = FastHasher::hash128(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -1010,7 +1316,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = FastHasher::hash128(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -1029,7 +1335,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
+            let hash = FastHasher::hash128(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
@@ -1060,7 +1366,7 @@ impl Staging {
             u32::MAX
         };
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
+        if tracing::enabled!(tracing::Level::DEBUG) && is_all_zero(tiled) {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,
@@ -1117,73 +1423,309 @@ impl Staging {
 }
 
 pub(crate) fn unstage(resource: This) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
+    if STAGING_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
     }
+    let key = resource as usize;
+    let present = STAGING
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|map| map.contains_key(&key));
+    if !present {
+        return;
+    }
+    let removed = {
+        let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
+        map.as_mut().and_then(|map| {
+            let v = map.remove(&key);
+            STAGING_COUNT.store(map.len(), Ordering::Relaxed);
+            v
+        })
+    };
+    drop(removed);
 }
 
 pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if STAGING_COUNT.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
     Some((at as u64, len as u64))
 }
 
-pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
-    const WINDOW: usize = 16 << 10;
+const FINGERPRINT_WINDOW: usize = 16 << 10;
+
+fn fingerprint_windows(len: usize) -> ([(usize, usize); 3], usize) {
+    if len <= 3 * FINGERPRINT_WINDOW {
+        ([(0, len), (0, 0), (0, 0)], 1)
+    } else {
+        (
+            [
+                (0, FINGERPRINT_WINDOW),
+                ((len / 2) & !0xfff, FINGERPRINT_WINDOW),
+                (len - FINGERPRINT_WINDOW, FINGERPRINT_WINDOW),
+            ],
+            3,
+        )
+    }
+}
+
+fn readable_committed_live(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    if len == 0 {
+        return true;
+    }
+    let mut p = at;
+    let end = p.saturating_add(len);
+    while p < end {
+        let mut info = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::uninit();
+        // SAFETY: valid out pointer of exact size.
+        let n = unsafe { VirtualQuery(p as *const _, info.as_mut_ptr(), size_of_val(&info)) };
+        if n == 0 {
+            return false;
+        }
+        // SAFETY: VirtualQuery succeeded and initialized `info`.
+        let info = unsafe { info.assume_init() };
+        if info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 {
+            return false;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= p {
+            return false;
+        }
+        p = next;
+    }
+    true
+}
+
+fn fingerprint_via_copy(at: usize, windows: &[(usize, usize)]) -> u64 {
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    let len = len as usize;
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = FastHasher::new();
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        read.resize(3 * WINDOW, 0);
-        let mut take = |from: usize, bytes: usize| {
-            read[..bytes].fill(0);
+        if read.len() < 3 * FINGERPRINT_WINDOW {
+            read.resize(3 * FINGERPRINT_WINDOW, 0);
+        }
+        for &(from, bytes) in windows {
+            // `copy_mapped` overwrites every byte (zeroing any unmapped pages),
+            // so no pre-zero fill is needed.
             crate::host::copy_mapped(
                 read.as_mut_ptr(),
-                (at as usize + from) as *const u8,
+                at.wrapping_add(from) as *const u8,
                 bytes,
                 false,
             );
             hasher.update(&read[..bytes]);
-        };
-        if len <= 3 * WINDOW {
-            take(0, len);
-        } else {
-            take(0, WINDOW);
-            take((len / 2) & !0xfff, WINDOW);
-            take(len - WINDOW, WINDOW);
         }
     });
-    let hash = hasher.finalize();
-    let mut first = [0u8; 8];
-    first.copy_from_slice(&hash.as_bytes()[..8]);
-    u64::from_le_bytes(first) | 1
+    hasher.finalize64()
+}
+
+pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+    let at = at as usize;
+    let len = len as usize;
+    let (windows, count) = fingerprint_windows(len);
+    let windows = &windows[..count];
+    if !through_copy()
+        && no_wait()
+        && let Some(_mapped) = crate::watch::title_memory_reading_now()
+    {
+        let mut all_readable = true;
+        let mut last_span: Option<(usize, usize)> = None;
+        for &(from, bytes) in windows {
+            let start = at.wrapping_add(from);
+            let end = start.saturating_add(bytes);
+            if let Some((b, e)) = last_span
+                && start >= b
+                && end <= e
+            {
+                continue;
+            }
+            if !readable_committed_live(start, bytes) {
+                all_readable = false;
+                break;
+            }
+            last_span = Some((start, end));
+        }
+        if all_readable {
+            let mut hasher = FastHasher::new();
+            for &(from, bytes) in windows {
+                // SAFETY: verified committed and readable above while `_mapped`
+                // prevents title memory unmapping.
+                let slice =
+                    unsafe { std::slice::from_raw_parts(at.wrapping_add(from) as *const u8, bytes) };
+                hasher.update(slice);
+            }
+            return hasher.finalize64();
+        }
+    }
+    fingerprint_via_copy(at, windows)
 }
 
 #[cfg(feature = "diagnostics")]
 pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
     use std::sync::atomic::Ordering::Relaxed;
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if STAGING_COUNT.load(Relaxed) == 0 {
+        return None;
+    }
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     let staging = map.as_ref()?.get(&(resource as usize))?;
     Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
 }
 
 pub(crate) fn is_staged(resource: This) -> bool {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if STAGING_COUNT.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     map.as_ref()
         .is_some_and(|map| map.contains_key(&(resource as usize)))
 }
 
 pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
-    let s = {
-        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-        map.as_ref()?.get(&(resource as usize))?.clone()
+    if STAGING_COUNT.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let (memory, size) = {
+        let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
+        let s = map.as_ref()?.get(&(resource as usize))?;
+        (s.memory as usize, s.layout.size as usize)
     };
-    let size = s.layout.size as usize;
-    Some((size as u64, committed(s.memory, size)))
+    Some((size as u64, committed_advisory(memory as *const u8, size)))
+}
+
+#[inline]
+fn query_region_live(p: usize) -> Option<(usize, usize, bool)> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut info = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::uninit();
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(p as *const _, info.as_mut_ptr(), size_of_val(&info)) };
+    if n == 0 {
+        return None;
+    }
+    // SAFETY: VirtualQuery succeeded and initialized `info`.
+    let info = unsafe { info.assume_init() };
+    let base = info.BaseAddress as usize;
+    let end = base.saturating_add(info.RegionSize);
+    if end <= p {
+        return None;
+    }
+    Some((base, end, info.State == MEM_COMMIT))
+}
+
+const QUERY_CACHE_SLOTS: usize = 16;
+
+struct QueryCache {
+    seq: u64,
+    frame: u64,
+    ms: u64,
+    hits: u32,
+    next: usize,
+    len: usize,
+    entries: [(usize, usize, bool); QUERY_CACHE_SLOTS],
+}
+
+impl QueryCache {
+    const fn new() -> Self {
+        Self {
+            seq: u64::MAX,
+            frame: u64::MAX,
+            ms: 0,
+            hits: 0,
+            next: 0,
+            len: 0,
+            entries: [(0, 0, false); QUERY_CACHE_SLOTS],
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self, seq: u64, frame: u64, ms: u64) {
+        self.seq = seq;
+        self.frame = frame;
+        self.ms = ms;
+        self.hits = 0;
+        self.next = 0;
+        self.len = 0;
+    }
+
+    #[inline]
+    fn lookup_or_query(&mut self, p: usize) -> Option<(usize, usize, bool)> {
+        let seq = crate::watch::title_memory_remapping_seq();
+        let frame = crate::frame::current();
+        if self.seq != seq || self.frame != frame {
+            self.clear(seq, frame, crate::host::now_ms());
+        } else if self.hits >= 64 {
+            let now = crate::host::now_ms();
+            self.hits = 0;
+            if now != self.ms {
+                self.clear(seq, frame, now);
+            }
+        }
+        for &(base, end, is_commit) in &self.entries[..self.len] {
+            if p >= base && p < end {
+                self.hits += 1;
+                return Some((base, end, is_commit));
+            }
+        }
+        let region = query_region_live(p)?;
+        self.entries[self.next] = region;
+        self.next = (self.next + 1) % QUERY_CACHE_SLOTS;
+        if self.len < QUERY_CACHE_SLOTS {
+            self.len += 1;
+        }
+        Some(region)
+    }
+}
+
+thread_local! {
+    static QUERY_CACHE: std::cell::RefCell<QueryCache> = const { std::cell::RefCell::new(QueryCache::new()) };
+}
+
+fn query_cache_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_QUERY_CACHE").is_none_or(|v| v != "0"))
+}
+
+#[inline]
+fn query_region_cached(p: usize) -> Option<(usize, usize, bool)> {
+    if !query_cache_on() {
+        return query_region_live(p);
+    }
+    QUERY_CACHE.with(|c| c.borrow_mut().lookup_or_query(p))
+}
+
+#[cfg(test)]
+fn clear_query_cache() {
+    QUERY_CACHE.with(|c| c.borrow_mut().clear(u64::MAX, u64::MAX, 0));
+}
+
+/// Advisory commitment check used by `staged()` (never gates unsafe derefs).
+fn committed_advisory(at: *const u8, len: usize) -> bool {
+    if !by_query() {
+        if len == 0 {
+            return true;
+        }
+        let (there, of) = readable(at as usize, len, true);
+        return there == of;
+    }
+    let mut p = at as usize;
+    let end = p.saturating_add(len);
+    while p < end {
+        let Some((_, next, is_commit)) = query_region_cached(p) else {
+            return false;
+        };
+        if !is_commit {
+            return false;
+        }
+        p = next;
+    }
+    true
 }
 
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
@@ -1243,33 +1785,30 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;
-    let end = p + len;
+    let end = p.saturating_add(len);
     while p < end {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        let Some((_, next, is_commit)) = query_region_live(p) else {
+            return false;
+        };
+        if !is_commit {
             return false;
         }
-        p = info.BaseAddress as usize + info.RegionSize;
+        p = next;
     }
     true
 }
 
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
     let start = at as usize;
     let end = start.saturating_add(len);
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
-        return 0;
-    }
     if !by_query() {
+        if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+            return 0;
+        }
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE
             .get_or_init(|| std::env::var_os("OATHKEEP_MAPPED_BY_PAGE").is_some_and(|v| v == "1"))
@@ -1289,19 +1828,55 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         }
         return there;
     }
-    let (mut p, mut there) = (start, 0u64);
-    while p < end {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        let next = (info.BaseAddress as usize)
-            .saturating_add(info.RegionSize)
-            .min(end);
-        if n == 0 || next <= p {
+    let Some((_, next0, commit0)) = query_region_cached(start) else {
+        return 0;
+    };
+    let next0 = next0.min(end);
+    if commit0 {
+        if next0 >= end {
+            return len as u64;
+        }
+        let mut there = (next0 - start) as u64;
+        let mut p = next0;
+        while p < end {
+            let Some((_, next, is_commit)) = query_region_cached(p) else {
+                break;
+            };
+            let next = next.min(end);
+            if next <= p {
+                break;
+            }
+            if is_commit {
+                there += (next - p) as u64;
+            }
+            p = next;
+        }
+        return there;
+    }
+    // `start` is uncommitted. If that single uncommitted region already covers
+    // `[start, end)`, return 0 without a second query.
+    if next0 >= end {
+        return 0;
+    }
+    // Preserve fast-out when both endpoints are uncommitted.
+    let Some((tail_base, _, commit_end)) = query_region_cached(end - 1) else {
+        return 0;
+    };
+    if !commit_end {
+        return 0;
+    }
+    let tail_start = tail_base.max(next0);
+    let mut there = (end - tail_start) as u64;
+    let mut p = next0;
+    while p < tail_start {
+        let Some((_, next, is_commit)) = query_region_cached(p) else {
+            break;
+        };
+        let next = next.min(tail_start);
+        if next <= p {
             break;
         }
-        if info.State == MEM_COMMIT {
+        if is_commit {
             there += (next - p) as u64;
         }
         p = next;
@@ -1310,12 +1885,19 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 }
 
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
-    let on_demand = crate::resource::host_tiled(resource).is_some();
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
-        return Some(s.clone());
+    let key = resource as usize;
+    if STAGING_COUNT.load(Ordering::Relaxed) != 0
+        && let Some(s) = STAGING
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|map| map.get(&key).cloned())
+    {
+        return Some(s);
     }
+    // Build the staging object outside the global `STAGING` lock so D3D12
+    // layout queries and upload-buffer creation never block other threads.
+    let on_demand = crate::resource::host_tiled(resource).is_some();
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -1365,7 +1947,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
-    let s = Arc::new(Staging {
+    let built = Arc::new(Staging {
         buffer: Some(buffer),
         capacity,
         #[cfg(feature = "diagnostics")]
@@ -1388,8 +1970,20 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
     });
-    map.insert(resource as usize, s.clone());
-    Some(s)
+    let (chosen, surplus) = {
+        let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(UsizeMap::default);
+        match map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => (e.get().clone(), Some(built)),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(built.clone());
+                STAGING_COUNT.store(map.len(), Ordering::Relaxed);
+                (built, None)
+            }
+        }
+    };
+    drop(surplus);
+    Some(chosen)
 }
 
 #[cfg(test)]
@@ -1507,6 +2101,112 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+
+    #[test]
+    fn fast_hasher_covers_every_byte_and_matches_across_paths() {
+        use super::{FINGERPRINT_WINDOW, FastHasher, fingerprint, fingerprint_via_copy, fingerprint_windows, is_all_zero};
+        assert!(is_all_zero(&[]));
+        assert!(is_all_zero(&[0u8; 7]));
+        assert!(is_all_zero(&[0u8; 65]));
+        let mut nonzero = vec![0u8; 65];
+        nonzero[64] = 1;
+        assert!(!is_all_zero(&nonzero));
+        nonzero[64] = 0;
+        nonzero[31] = 0x80;
+        assert!(!is_all_zero(&nonzero));
+
+        // Single-bit sensitivity at arbitrary offsets including unaligned tail.
+        let mut buf = vec![0x3cu8; 103];
+        let base = FastHasher::hash128(&buf);
+        for idx in [0, 7, 31, 32, 63, 64, 95, 96, 102] {
+            buf[idx] ^= 1;
+            assert_ne!(FastHasher::hash128(&buf), base, "bit flip at {idx}");
+            buf[idx] ^= 1;
+        }
+
+        // Fingerprint direct-read fast path and copy-mapped fallback produce identical output,
+        // and detect edits in head, middle, and tail windows.
+        let len = 5 * FINGERPRINT_WINDOW + 123;
+        let mut big = vec![0u8; len];
+        for (i, b) in big.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(31) ^ (i >> 7)) as u8;
+        }
+        let (wins, count) = fingerprint_windows(len);
+        let direct = fingerprint(big.as_ptr() as u64, len as u64);
+        let copied = fingerprint_via_copy(big.as_ptr() as usize, &wins[..count]);
+        assert_eq!(direct, copied, "direct and copy paths must match bit-for-bit");
+        assert_ne!(direct & 1, 0, "fingerprint is always odd / non-zero");
+
+        for &pos in &[0usize, FINGERPRINT_WINDOW - 1, (len / 2) & !0xfff, len - 1] {
+            big[pos] ^= 0x01;
+            let changed = fingerprint(big.as_ptr() as u64, len as u64);
+            assert_ne!(changed, direct, "fingerprint must detect edit at {pos}");
+            big[pos] ^= 0x01;
+        }
+    }
+
+    #[test]
+    fn mapped_bytes_and_query_cache_handle_committed_partial_and_uncommitted() {
+        use super::{clear_query_cache, committed, committed_advisory, mapped_bytes};
+        use windows_sys::Win32::System::Memory::*;
+        const SIZE: usize = 0x10_0000;
+        const HEAD: usize = 0x4_0000;
+        const HOLE: usize = 0x2_0000;
+        // SAFETY: private reservation owned by this test.
+        unsafe {
+            let base =
+                VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+
+            // Whole uncommitted reservation.
+            clear_query_cache();
+            assert!(!committed(base, SIZE));
+            assert_eq!(mapped_bytes(base, SIZE), 0);
+            assert!(!committed_advisory(base, SIZE));
+
+            // Commit head only (partial mapping).
+            assert_eq!(
+                VirtualAlloc(base.cast(), HEAD, MEM_COMMIT, PAGE_READWRITE),
+                base.cast()
+            );
+            clear_query_cache();
+            assert!(committed(base, HEAD));
+            assert!(!committed(base, SIZE));
+            assert_eq!(mapped_bytes(base, HEAD), HEAD as u64);
+            assert_eq!(mapped_bytes(base, SIZE), HEAD as u64);
+            assert!(committed_advisory(base, HEAD));
+            assert!(!committed_advisory(base, SIZE));
+
+            // Commit the entire reservation, then punch a hole in the middle.
+            assert_eq!(
+                VirtualAlloc(base.cast(), SIZE, MEM_COMMIT, PAGE_READWRITE),
+                base.cast()
+            );
+            clear_query_cache();
+            assert_eq!(mapped_bytes(base, SIZE), SIZE as u64);
+            assert!(committed_advisory(base, SIZE));
+
+            assert_ne!(
+                VirtualFree(base.add(HEAD).cast(), HOLE, MEM_DECOMMIT),
+                0
+            );
+            // Live `committed` sees the decommit immediately without clearing cache.
+            assert!(!committed(base, SIZE));
+            // Remapping guard bumps `title_memory_remapping_seq()`, invalidating the cache.
+            {
+                let _remap = crate::watch::title_memory_remapping();
+            }
+            assert_eq!(mapped_bytes(base, SIZE), (SIZE - HOLE) as u64);
+            assert!(!committed_advisory(base, SIZE));
+
+            // Head uncommitted, tail committed: `mapped_bytes` still counts tail.
+            assert_ne!(VirtualFree(base.cast(), HEAD, MEM_DECOMMIT), 0);
+            clear_query_cache();
+            assert_eq!(mapped_bytes(base, SIZE), (SIZE - HEAD - HOLE) as u64);
+
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
 }
