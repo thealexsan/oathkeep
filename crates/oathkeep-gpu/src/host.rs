@@ -2463,7 +2463,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         }
     }
     if late_exact() {
-        let mut runs_left = 512;
+        let mut runs_left = 8192;
         return spans.iter().any(|(shadow, from, to)| {
             shadow.merge_under_writes(*from, *to - *from, &mut runs_left)
         });
@@ -2650,6 +2650,7 @@ const COPY_WAIT_SLOTS: usize = 8;
 
 struct PendingCopyFetch {
     copy_sent: u64,
+    isolated_wait: bool,
     dst_data: usize,
     items: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)>,
     after_by_shadow: std::collections::HashMap<usize, u64>,
@@ -2688,10 +2689,22 @@ impl RelayFetch {
         !self.pending_order.is_empty()
     }
 
-    fn oldest_pending_copy_sent(&self) -> Option<u64> {
-        self.pending_order
-            .front()
-            .and_then(|&idx| self.copy_wait_slots[idx].pending.as_ref().map(|p| p.copy_sent))
+    fn oldest_pending_copy_sent(&self) -> Option<(u64, bool)> {
+        self.pending_order.front().and_then(|&idx| {
+            self.copy_wait_slots[idx]
+                .pending
+                .as_ref()
+                .map(|p| (p.copy_sent, p.isolated_wait))
+        })
+    }
+
+    fn has_pending_isolated_for_shadow(&self, ptr: usize) -> bool {
+        self.pending_order.iter().any(|&idx| {
+            self.copy_wait_slots[idx]
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.isolated_wait && p.shadow_ptrs.contains(&ptr))
+        })
     }
 
     fn pending_written_ranges(&self) -> Vec<(usize, usize)> {
@@ -2753,8 +2766,8 @@ enum RelayAction {
     Land(Vec<Late>, std::collections::HashSet<usize>, bool),
     DrainAllPending,
     Wait3d(u64),
-    Wait3dAndCopy(u64, u64),
-    WaitCopyOnly(u64),
+    Wait3dAndCopy(u64, u64, bool),
+    WaitCopyOnly(u64, bool),
 }
 
 fn relay_worker() {
@@ -2782,11 +2795,11 @@ fn relay_worker() {
             let mut line = line();
             loop {
                 if line.line.is_empty() {
-                    if let Some(oldest_copy) = oldest_pending {
+                    if let Some((oldest_copy, isolated)) = oldest_pending {
                         if line.waiters > 0 {
                             break RelayAction::DrainAllPending;
                         }
-                        break RelayAction::WaitCopyOnly(oldest_copy);
+                        break RelayAction::WaitCopyOnly(oldest_copy, isolated);
                     }
                     defer_count = 0;
                     defer_since = None;
@@ -2802,11 +2815,15 @@ fn relay_worker() {
                 let completed = unsafe { host.fence.GetCompletedValue() };
                 let n = landable(&fences, completed);
                 if n == 0 {
-                    if let Some(oldest_copy) = oldest_pending {
+                    if let Some((oldest_copy, isolated)) = oldest_pending {
                         if line.waiters > 0 {
                             break RelayAction::DrainAllPending;
                         }
-                        break RelayAction::Wait3dAndCopy(fences[0].unwrap_or(0), oldest_copy);
+                        break RelayAction::Wait3dAndCopy(
+                            fences[0].unwrap_or(0),
+                            oldest_copy,
+                            isolated,
+                        );
                     }
                     break RelayAction::Wait3d(fences[0].unwrap_or(0));
                 }
@@ -2864,8 +2881,8 @@ fn relay_worker() {
                         defer_since = Some(std::time::Instant::now());
                     }
                     defer_count += 1;
-                    if let Some(oldest_copy) = oldest_pending {
-                        break RelayAction::Wait3dAndCopy(max_busy_fence, oldest_copy);
+                    if let Some((oldest_copy, isolated)) = oldest_pending {
+                        break RelayAction::Wait3dAndCopy(max_busy_fence, oldest_copy, isolated);
                     }
                     break RelayAction::Wait3d(max_busy_fence);
                 }
@@ -2905,19 +2922,22 @@ fn relay_worker() {
                 }
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
-            RelayAction::Wait3dAndCopy(target, oldest_copy) => {
+            RelayAction::Wait3dAndCopy(target, oldest_copy, isolated) => {
                 let waiting = std::time::Instant::now();
                 let copy_wake = fetch.as_ref().map(|f| f.copy_wake_event);
+                let copy_fence = if isolated {
+                    host.copy_wait_fence.as_ref().or(host.copy_fence.as_ref())
+                } else {
+                    host.copy_fence.as_ref()
+                };
                 // SAFETY: the host's 3D/copy fences and this thread's events.
                 unsafe {
                     let _ = ResetEvent(event);
                     let ok_3d = host.fence.SetEventOnCompletion(target, event).is_ok();
-                    let ok_copy = copy_wake
-                        .zip(host.copy_wait_fence.as_ref().or(host.copy_fence.as_ref()))
-                        .is_some_and(|(ev, cf)| {
-                            let _ = ResetEvent(ev);
-                            cf.SetEventOnCompletion(oldest_copy, ev).is_ok()
-                        });
+                    let ok_copy = copy_wake.zip(copy_fence).is_some_and(|(ev, cf)| {
+                        let _ = ResetEvent(ev);
+                        cf.SetEventOnCompletion(oldest_copy, ev).is_ok()
+                    });
                     if ok_3d && ok_copy {
                         let handles = [event, copy_wake.unwrap()];
                         WaitForMultipleObjects(&handles, false, 2);
@@ -2929,14 +2949,17 @@ fn relay_worker() {
                 }
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
-            RelayAction::WaitCopyOnly(oldest_copy) => {
+            RelayAction::WaitCopyOnly(oldest_copy, isolated) => {
                 let waiting = std::time::Instant::now();
                 let copy_wake = fetch.as_ref().map(|f| f.copy_wake_event);
+                let copy_fence = if isolated {
+                    host.copy_wait_fence.as_ref().or(host.copy_fence.as_ref())
+                } else {
+                    host.copy_fence.as_ref()
+                };
                 // SAFETY: the host's copy fence and this thread's copy wake event.
                 unsafe {
-                    if let Some((ev, cf)) =
-                        copy_wake.zip(host.copy_wait_fence.as_ref().or(host.copy_fence.as_ref()))
-                    {
+                    if let Some((ev, cf)) = copy_wake.zip(copy_fence) {
                         let _ = ResetEvent(ev);
                         if cf.SetEventOnCompletion(oldest_copy, ev).is_ok() {
                             WaitForSingleObject(ev, 2);
@@ -4205,15 +4228,19 @@ impl Host {
     }
 
     fn finish_pending_slot(&self, f: &mut RelayFetch, slot_idx: usize, wait_blocking: bool) -> bool {
-        let Some(copy_fence) = self.copy_wait_fence.as_ref().or(self.copy_fence.as_ref()) else {
-            return false;
-        };
-        let Some(copy_sent) = f.copy_wait_slots[slot_idx]
+        let Some((copy_sent, isolated_wait)) = f.copy_wait_slots[slot_idx]
             .pending
             .as_ref()
-            .map(|p| p.copy_sent)
+            .map(|p| (p.copy_sent, p.isolated_wait))
         else {
             return true;
+        };
+        let Some(copy_fence) = (if isolated_wait {
+            self.copy_wait_fence.as_ref().or(self.copy_fence.as_ref())
+        } else {
+            self.copy_fence.as_ref()
+        }) else {
+            return false;
         };
         // SAFETY: plain fence query and optional event wait on this thread's slot event.
         let completed = unsafe { copy_fence.GetCompletedValue() };
@@ -4553,9 +4580,9 @@ impl Host {
             let s_start = shadow.span().0 as usize;
             for (lo, hi) in intervals {
                 let len = hi - lo;
-                if !shadow.card_has_old_piece(lo, len)
+                if (skip_uncommitted && !readable_cache.any_readable(s_start + lo, len))
+                    || !shadow.card_has_old_piece(lo, len)
                     || shadow.card_piece_is_superseded(lo, hi, landed_seq)
-                    || (skip_uncommitted && !readable_cache.any_readable(s_start + lo, len))
                 {
                     skipped_pieces += 1;
                     skipped_bytes += len as u64;
@@ -4574,6 +4601,7 @@ impl Host {
                 let guard = queue_sync();
                 for (ptr, shadow, lo, hi) in live_pieces {
                     let busy = busy_shadows.contains(&ptr)
+                        || f.has_pending_isolated_for_shadow(ptr)
                         || guard
                             .as_ref()
                             .is_some_and(|sync| sync.is_shadow_busy(ptr, completed_3d));
@@ -4619,10 +4647,15 @@ impl Host {
         let total = fast_now_total + fast_wait_total + slow_total;
         let piece_count = fast_now.len() + fast_wait.len() + slow.len();
 
-        // Keep per-shadow merge ordering strictly FIFO: if any in-flight deferred copy fetch
-        // touches a shadow we are about to merge immediately via `fast_now` (or `slow`),
-        // drain up through that deferred fetch first.
-        if !fast_now.is_empty() && f.has_pending() {
+        // Pipeline `fast_now` asynchronously into a `copy_wait_slots` entry on `copy_queue`
+        // whenever no thread is actively waiting (`!must_drain`) so the relay thread never
+        // blocks synchronously on PCIe copy-queue roundtrips between landings. Shadows that
+        // already have an in-flight `isolated_wait` fetch were routed to `fast_wait` above,
+        // so `fast_now` stays strictly FIFO on `copy_queue` + `pending_order`.
+        let async_fast_now = !fast_now.is_empty() && !must_drain && can_split_copy;
+
+        // Keep per-shadow merge ordering strictly FIFO when `fast_now` merges synchronously.
+        if !fast_now.is_empty() && !async_fast_now && f.has_pending() {
             let mut fast_now_ptrs: Vec<usize> = fast_now
                 .iter()
                 .map(|(s, ..)| Arc::as_ptr(s) as usize)
@@ -4633,26 +4666,6 @@ impl Host {
                 self.drain_pending_slots(f, pos + 1, true, false);
             }
         }
-
-        // Choose a free `copy_wait_slots` entry for `fast_wait`. If all slots are occupied,
-        // reap completed slots first, then blocking-drain only the oldest slot (keeping newer
-        // slots pipelined in flight).
-        let wait_slot_idx = if !fast_wait.is_empty() {
-            if let Some(idx) = f.free_slot() {
-                Some(idx)
-            } else {
-                let n = f.pending_order.len();
-                self.drain_pending_slots(f, n, false, false);
-                if let Some(idx) = f.free_slot() {
-                    Some(idx)
-                } else {
-                    self.drain_pending_slots(f, 1, true, false);
-                    f.free_slot()
-                }
-            }
-        } else {
-            None
-        };
 
         let ensure_readback =
             |slot: &mut Option<(ID3D12Resource, usize, u64)>, need: u64| -> Option<(ID3D12Resource, usize)> {
@@ -4672,10 +4685,11 @@ impl Host {
                 };
                 Some((buffer, data))
             };
-        let fast_now_buf = ensure_readback(&mut f.copy_buffer, fast_now_total);
-        let fast_wait_buf = wait_slot_idx.and_then(|idx| {
-            ensure_readback(&mut f.copy_wait_slots[idx].buffer, fast_wait_total)
-        });
+        let fast_now_sync_buf = if !async_fast_now {
+            ensure_readback(&mut f.copy_buffer, fast_now_total)
+        } else {
+            None
+        };
         let slow_buf = ensure_readback(&mut f.buffer, slow_total);
 
         let build_copy_regions =
@@ -4701,7 +4715,7 @@ impl Host {
                                  prelude: &Prelude,
                                  dst_buf: &ID3D12Resource,
                                  use_wait_queue: bool|
-         -> (u64, Vec<usize>, std::collections::HashMap<usize, u64>) {
+         -> (u64, bool, Vec<usize>, std::collections::HashMap<usize, u64>) {
             let isolated_wait =
                 use_wait_queue && self.copy_wait_queue.is_some() && self.copy_wait_fence.is_some();
             let copy_queue = if isolated_wait {
@@ -4721,7 +4735,7 @@ impl Host {
             // `QUEUE_SYNC` orders this read strictly after any pending 3D write to these
             // shadows and strictly before any subsequent 3D write to these shadows.
             let submitted = unsafe {
-                (|| -> windows::core::Result<(u64, Vec<usize>, std::collections::HashMap<usize, u64>)> {
+                (|| -> windows::core::Result<(u64, bool, Vec<usize>, std::collections::HashMap<usize, u64>)> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     for &(shadow_idx, lo, hi, at) in &copy_regions {
@@ -4758,7 +4772,7 @@ impl Host {
                         sync.record_copy_reads(&shadow_ptrs, sent, completed_copy);
                         sent
                     };
-                    Ok((copy_sent, shadow_ptrs, after_by_shadow))
+                    Ok((copy_sent, isolated_wait, shadow_ptrs, after_by_shadow))
                 })()
             };
             match submitted {
@@ -4772,58 +4786,87 @@ impl Host {
         let mut waits = 0u64;
         let mut wait_us_total = 0u64;
         let mut total_written = 0usize;
+        let mut deferred_ptrs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut last_deferred_slot: Option<usize> = None;
 
-        // Submit BOTH `fast_now` (immediate, on `copy_queue` with no 3D wait) and `fast_wait`
-        // (pipelined on isolated `copy_wait_queue` behind the specific busy 3D fence so it never
-        // head-of-line blocks `fast_now`) before waiting on `fast_now`!
-        let fast_now_submitted = if !fast_now.is_empty() {
-            let (dst_buf, dst_data) = fast_now_buf.as_ref().unwrap();
-            let (copy_sent, _, after_by_shadow) =
+        let mut enqueue_copy_slot =
+            |f: &mut RelayFetch,
+             batch: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u64)>,
+             need: u64,
+             use_wait_queue: bool| {
+                let slot_idx = if let Some(idx) = f.free_slot() {
+                    Some(idx)
+                } else {
+                    let n = f.pending_order.len();
+                    self.drain_pending_slots(f, n, false, false);
+                    if let Some(idx) = f.free_slot() {
+                        Some(idx)
+                    } else {
+                        self.drain_pending_slots(f, 1, true, false);
+                        f.free_slot()
+                    }
+                };
+                let Some(slot_idx) = slot_idx else {
+                    return;
+                };
+                let (dst_buf, dst_data) =
+                    ensure_readback(&mut f.copy_wait_slots[slot_idx].buffer, need).unwrap();
+                let (copy_sent, isolated_wait, shadow_ptrs, after_by_shadow) = submit_copy_batch(
+                    &batch,
+                    &f.copy_wait_slots[slot_idx].prelude,
+                    &dst_buf,
+                    use_wait_queue,
+                );
+                let min_after = after_by_shadow
+                    .values()
+                    .copied()
+                    .min()
+                    .unwrap_or(landed_seq);
+                let mut written_ranges = Vec::new();
+                join_ranges(
+                    &mut written_ranges,
+                    batch.iter().map(|(s, lo, hi, _)| {
+                        let start = s.span().0 as usize;
+                        (start + *lo, start + *hi)
+                    }),
+                );
+                deferred_ptrs.extend(shadow_ptrs.iter().copied());
+                f.copy_wait_slots[slot_idx].pending = Some(PendingCopyFetch {
+                    copy_sent,
+                    isolated_wait,
+                    dst_data,
+                    items: batch,
+                    after_by_shadow,
+                    shadow_ptrs,
+                    landed_seq,
+                    min_after,
+                    written_ranges,
+                    deferred_done: Vec::new(),
+                    deferred_sync: Vec::new(),
+                });
+                f.pending_order.push_back(slot_idx);
+                RELAY_STATS[11].fetch_add(1, Ordering::Relaxed);
+                last_deferred_slot = Some(slot_idx);
+            };
+
+        // Submit `fast_now` (on `copy_queue` with no 3D wait, pipelined into a slot when
+        // `!must_drain`) and `fast_wait` (pipelined on isolated `copy_wait_queue` behind the
+        // busy 3D fence so it never head-of-line blocks `fast_now`).
+        let fast_now_submitted = if async_fast_now {
+            enqueue_copy_slot(f, std::mem::take(&mut fast_now), fast_now_total, false);
+            None
+        } else if !fast_now.is_empty() {
+            let (dst_buf, dst_data) = fast_now_sync_buf.as_ref().unwrap();
+            let (copy_sent, _, _, after_by_shadow) =
                 submit_copy_batch(&fast_now, f.copy_list.as_ref().unwrap(), dst_buf, false);
             Some((copy_sent, *dst_data, after_by_shadow))
         } else {
             None
         };
-        let mut deferred_result: Option<(usize, std::collections::HashSet<usize>)> = None;
-        if let Some(slot_idx) = wait_slot_idx {
-            let (dst_buf, dst_data) = fast_wait_buf.as_ref().unwrap();
-            let (copy_sent, shadow_ptrs, after_by_shadow) = submit_copy_batch(
-                &fast_wait,
-                &f.copy_wait_slots[slot_idx].prelude,
-                dst_buf,
-                true,
-            );
-            let min_after = after_by_shadow
-                .values()
-                .copied()
-                .min()
-                .unwrap_or(landed_seq);
-            let mut written_ranges = Vec::new();
-            join_ranges(
-                &mut written_ranges,
-                fast_wait.iter().map(|(s, lo, hi, _)| {
-                    let start = s.span().0 as usize;
-                    (start + *lo, start + *hi)
-                }),
-            );
-            let deferred_ptrs: std::collections::HashSet<usize> =
-                shadow_ptrs.iter().copied().collect();
-            f.copy_wait_slots[slot_idx].pending = Some(PendingCopyFetch {
-                copy_sent,
-                dst_data: *dst_data,
-                items: fast_wait,
-                after_by_shadow,
-                shadow_ptrs,
-                landed_seq,
-                min_after,
-                written_ranges,
-                deferred_done: Vec::new(),
-                deferred_sync: Vec::new(),
-            });
-            f.pending_order.push_back(slot_idx);
-            RELAY_STATS[11].fetch_add(1, Ordering::Relaxed);
-            deferred_result = Some((slot_idx, deferred_ptrs));
+        if !fast_wait.is_empty() {
+            enqueue_copy_slot(f, fast_wait, fast_wait_total, true);
         }
+        let mut deferred_result = last_deferred_slot.map(|slot_idx| (slot_idx, deferred_ptrs));
 
         let slow_submitted = if !slow.is_empty() {
             f.sent += 1;

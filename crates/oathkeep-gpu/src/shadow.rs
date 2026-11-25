@@ -3787,6 +3787,24 @@ impl Shadow {
             })
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn log_why_stale(reason: &'static str, shadow: &Self, detail: usize, a: usize, e: usize) {
+        static HITS: AtomicU64 = AtomicU64::new(0);
+        let hit = HITS.fetch_add(1, Ordering::Relaxed);
+        if hit < 16 {
+            tracing::info!(
+                hit,
+                reason,
+                shadow = format_args!("{:#x}+{:#x}", shadow.start, shadow.len),
+                range = format_args!("{a:#x}..{e:#x}"),
+                carded = shadow.card.is_some(),
+                window = shadow.window,
+                detail,
+                "WHY_STALE merge_under_writes fallback"
+            );
+        }
+    }
+
     pub(crate) fn merge_under_writes(
         &self,
         address: usize,
@@ -3811,6 +3829,8 @@ impl Shadow {
         }
         let mode = self.watched.load(Ordering::Relaxed);
         if mode == NOT_WATCHED {
+            #[cfg(feature = "diagnostics")]
+            Self::log_why_stale("not_watched", self, 0, from, to);
             return true;
         }
         let base = start / PAGE;
@@ -3879,6 +3899,8 @@ impl Shadow {
                 },
             };
             let Some((now, written)) = found else {
+                #[cfg(feature = "diagnostics")]
+                Self::log_why_stale("writes_none", self, 0, a, e);
                 return true;
             };
             if let Some(ep) = clean_epochs {
@@ -3927,11 +3949,15 @@ impl Shadow {
                     {
                         let mut old = card.old.lock().unwrap_or_else(|e| e.into_inner());
                         let Some(piece_buf) = old.get_mut(&p) else {
+                            #[cfg(feature = "diagnostics")]
+                            Self::log_why_stale("no_card_old", self, p, lo, hi);
                             return true;
                         };
                         let held = &mut piece_buf[at - p_lo..at - p_lo + n];
                         let runs = changed_runs(title, held);
                         if runs.len() > *runs_left {
+                            #[cfg(feature = "diagnostics")]
+                            Self::log_why_stale("runs_limit", self, runs.len(), lo, hi);
                             return true;
                         }
                         *runs_left -= runs.len();
@@ -3948,6 +3974,8 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        #[cfg(feature = "diagnostics")]
+                        Self::log_why_stale("no_before", self, 0, lo, hi);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
