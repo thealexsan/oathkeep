@@ -209,6 +209,7 @@ fn sweep() {
     if let Some(avail) = avail_commit
         && avail < (3u64 << 30)
     {
+        crate::pipeline::trim_shaders();
         if avail < (2560u64 << 20) {
             drain_spare(false);
         }
@@ -239,6 +240,7 @@ pub(crate) fn reclaim_for_oom() {
     let _guard = Guard;
     tracing::warn!("reclaim_for_oom: trimming idle caches and retired resources after E_OUTOFMEMORY");
     crate::pipeline::trim_library();
+    crate::pipeline::trim_shaders();
     crate::shadow::let_go_idle_urgent();
     crate::texture::let_go_idle_urgent();
     crate::resource::let_go_idle_urgent();

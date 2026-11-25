@@ -897,7 +897,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     };
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
-    let (gpu_optimal, standard) = oathkeep_gpu::console::current().title_memory();
+    let (gpu_optimal, standard) = oathkeep_gpu::console::current().reported_title_memory();
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
         title_used: counters.PagefileUsage,
@@ -929,7 +929,7 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     let Some(size) = size.checked_next_multiple_of(2 * MIB) else {
         return 0;
     };
-    let standard = oathkeep_gpu::console::current().title_memory().1;
+    let standard = oathkeep_gpu::console::current().reported_title_memory().1;
     let moved = kind == TITLE_TO_SYSTEM
         && TRANSFERRED
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
@@ -1043,7 +1043,7 @@ mod tests {
         assert!(before.title_used > 0);
         assert_eq!(XMemTransferMemory(0, 128 * MIB - 1), 1);
         assert_eq!(XMemTransferMemory(2, MIB), 0, "no tools memory");
-        let standard = oathkeep_gpu::console::current().title_memory().1;
+        let standard = oathkeep_gpu::console::current().reported_title_memory().1;
         assert_eq!(XMemTransferMemory(0, standard), 0, "over budget");
         let mut after = WorkingSet::default();
         XMemGetWorkingSetStatistics(0x2000_0001, &mut after);

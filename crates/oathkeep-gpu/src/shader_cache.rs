@@ -8,16 +8,22 @@ use oathkeep_shader::resource::RootIndexedView;
 use oathkeep_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
+static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
 pub fn use_shader_cache(dir: PathBuf) {
+    let _ = CACHE_DIR.set(dir.clone());
     match Cache::open(dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
         }
         Err(e) => tracing::warn!(error = %e, "no shader cache"),
     }
+}
+
+pub(crate) fn cache_dir() -> Option<&'static std::path::Path> {
+    CACHE_DIR.get().map(PathBuf::as_path)
 }
 
 pub(crate) fn counts() -> (u64, u64) {
@@ -69,12 +75,35 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
+#[allow(dead_code)]
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    host_shader_with_path(container).map(|(shader, _)| shader)
+}
+
+pub(crate) fn host_shader_with_path(
+    container: &[u8],
+) -> Result<(HostShader, Option<PathBuf>), String> {
     let translate = |c: &[u8]| oathkeep_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
-        None => translate(container),
+        None => translate(container).map(|s| (s, None)),
     }
+}
+
+pub(crate) fn load_dxil(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 12];
+    file.read_exact(&mut header).ok()?;
+    if &header[..4] != MAGIC {
+        return None;
+    }
+    let stage_idx = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
+    STAGES.get(stage_idx)?;
+    let dxil_len = u32::from_le_bytes(header[8..12].try_into().ok()?) as usize;
+    let mut dxil = vec![0u8; dxil_len];
+    file.read_exact(&mut dxil).ok()?;
+    Some(dxil)
 }
 
 struct Translate<F> {
@@ -101,7 +130,7 @@ fn cached(
     build: &[u8; 32],
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
-) -> Result<HostShader, String> {
+) -> Result<(HostShader, Option<PathBuf>), String> {
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
@@ -119,13 +148,13 @@ fn cached(
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
+            return Ok((shader, Some(path)));
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    (converter.translate)(container).map(|s| (s, None))
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
@@ -344,19 +373,34 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        let (first, path) = cached(&cache, &build, container, translate).unwrap();
+        assert_eq!(first, shader());
+        let path = path.expect("cache path");
+        assert_eq!(load_dxil(&path), Some(shader().dxil));
+        assert_eq!(
+            cached(&cache, &build, container, translate).map(|(s, _)| s),
+            Ok(shader())
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
-        assert_eq!(cached(&cache, &[8; 32], container, translate), Ok(shader()));
+        assert_eq!(
+            cached(&cache, &[8; 32], container, translate).map(|(s, _)| s),
+            Ok(shader())
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(
+            cached(&cache, &build, container, translate).map(|(s, _)| s),
+            Ok(shader())
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(
+            cached(&cache, &build, container, translate).map(|(s, _)| s),
+            Ok(shader())
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());

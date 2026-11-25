@@ -37,11 +37,86 @@ pub(crate) struct ComputeHead {
     stage: Bytecode,
 }
 
+#[cfg_attr(test, allow(dead_code))]
+enum ContainerStore {
+    Empty,
+    Inline(Vec<u8>),
+    #[cfg(windows)]
+    Spilled {
+        offset: u64,
+        len: usize,
+    },
+}
+
+#[cfg(windows)]
+struct ContainerSpill {
+    file: std::fs::File,
+    len: u64,
+}
+
+#[cfg(windows)]
+impl ContainerSpill {
+    fn open_at(path: &std::path::Path) -> Option<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+            .open(path)
+            .ok()?;
+        Some(Self { file, len: 0 })
+    }
+
+    fn open_default() -> Option<Self> {
+        let dir = crate::shader_cache::cache_dir()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("oathkeep-containers-{}.tmp", std::process::id()));
+        Self::open_at(&path)
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Option<u64> {
+        use std::io::{Seek, SeekFrom, Write};
+        let offset = self.len;
+        self.file.seek(SeekFrom::Start(offset)).ok()?;
+        self.file.write_all(bytes).ok()?;
+        self.len = offset.checked_add(bytes.len() as u64)?;
+        Some(offset)
+    }
+
+    fn read(&mut self, offset: u64, len: usize) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        self.file.seek(SeekFrom::Start(offset)).ok()?;
+        let mut buf = vec![0u8; len];
+        self.file.read_exact(&mut buf).ok()?;
+        Some(buf)
+    }
+}
+
+#[cfg(windows)]
+fn container_spill() -> Option<&'static Mutex<ContainerSpill>> {
+    static SPILL: OnceLock<Option<Mutex<ContainerSpill>>> = OnceLock::new();
+    SPILL
+        .get_or_init(|| {
+            if std::env::var_os("OATHKEEP_SPILL_SHADERS").is_some_and(|v| v == "0") {
+                return None;
+            }
+            ContainerSpill::open_default().map(Mutex::new)
+        })
+        .as_ref()
+}
+
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     pub(crate) hash: String,
     container_len: usize,
-    container: Mutex<Vec<u8>>,
+    container: Mutex<ContainerStore>,
+    #[cfg(windows)]
+    is_spilled: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -72,6 +147,20 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+#[cfg(windows)]
+fn compute_is_spilled(stage: &'static str, bytes: &[u8]) -> bool {
+    use oathkeep_shader::{Container, FourCC};
+    if stage != "compute" {
+        return false;
+    }
+    let Ok(c) = Container::parse(bytes) else {
+        return false;
+    };
+    c.part(FourCC::DXIL)
+        .and_then(|part| oathkeep_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(oathkeep_shader::spill::is_spilled))
+}
+
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -80,12 +169,39 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .entry(*full.as_bytes())
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(windows)]
+            let is_spilled = compute_is_spilled(stage, bytes);
+            let store = {
+                #[cfg(all(windows, not(test)))]
+                {
+                    if let Some(spill) = container_spill()
+                        && let Some(offset) = spill
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .write(bytes)
+                    {
+                        ContainerStore::Spilled {
+                            offset,
+                            len: bytes.len(),
+                        }
+                    } else {
+                        KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        ContainerStore::Inline(bytes.to_vec())
+                    }
+                }
+                #[cfg(any(not(windows), test))]
+                {
+                    KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    ContainerStore::Inline(bytes.to_vec())
+                }
+            };
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container_len: bytes.len(),
-                container: Mutex::new(bytes.to_vec()),
+                container: Mutex::new(store),
+                #[cfg(windows)]
+                is_spilled,
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -96,12 +212,51 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: oathkeep_shader::emit::HostShader,
+    dxil: Mutex<Vec<u8>>,
+    cache_path: Option<std::path::PathBuf>,
     pub(crate) used: Vec<oathkeep_shader::UsedResource>,
     pub(crate) stores: bool,
 }
 
 #[cfg(windows)]
+impl Translated {
+    pub(crate) fn dxil(&self) -> Option<Vec<u8>> {
+        {
+            let guard = self.dxil.lock().unwrap_or_else(|e| e.into_inner());
+            if !guard.is_empty() {
+                return Some(guard.clone());
+            }
+        }
+        let path = self.cache_path.as_deref()?;
+        crate::shader_cache::load_dxil(path)
+    }
+
+    pub(crate) fn evict_dxil(&self) -> usize {
+        if self.cache_path.is_none() {
+            return 0;
+        }
+        let Ok(mut guard) = self.dxil.try_lock() else {
+            return 0;
+        };
+        if guard.is_empty() {
+            return 0;
+        }
+        let taken = std::mem::take(&mut *guard);
+        let freed = taken.len();
+        KEPT[3].fetch_sub(freed as u64, std::sync::atomic::Ordering::Relaxed);
+        freed
+    }
+}
+
+#[cfg(windows)]
 impl Shader {
+    pub(crate) fn evict_dxil(&self) -> usize {
+        self.translated
+            .get()
+            .and_then(Option::as_ref)
+            .map_or(0, Translated::evict_dxil)
+    }
+
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
@@ -110,16 +265,33 @@ impl Shader {
                     let mut guard = self.container.lock().unwrap_or_else(|e| e.into_inner());
                     #[cfg(test)]
                     {
-                        guard.clone()
+                        match &*guard {
+                            ContainerStore::Inline(v) => v.clone(),
+                            ContainerStore::Spilled { offset, len } => container_spill()
+                                .and_then(|s| s.lock().unwrap_or_else(|e| e.into_inner()).read(*offset, *len))
+                                .unwrap_or_default(),
+                            ContainerStore::Empty => Vec::new(),
+                        }
                     }
                     #[cfg(not(test))]
                     {
-                        let taken = std::mem::take(&mut *guard);
-                        KEPT[1].fetch_sub(
-                            taken.len() as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        taken
+                        match std::mem::replace(&mut *guard, ContainerStore::Empty) {
+                            ContainerStore::Inline(taken) => {
+                                KEPT[1].fetch_sub(
+                                    taken.len() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                taken
+                            }
+                            ContainerStore::Spilled { offset, len } => container_spill()
+                                .and_then(|s| {
+                                    s.lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .read(offset, len)
+                                })
+                                .unwrap_or_default(),
+                            ContainerStore::Empty => Vec::new(),
+                        }
                     }
                 };
                 let done = translate(&container);
@@ -128,16 +300,16 @@ impl Shader {
                     let _ = std::fs::create_dir_all(&dir);
                     let stem = format!("{}.{}", self.hash, self.stage);
                     let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &container);
-                    if let Ok(t) = &done {
-                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+                    if let Ok(t) = &done
+                        && let Some(dxil) = t.dxil()
+                    {
+                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &dxil);
                     }
                 }
                 if let Ok(t) = &done {
+                    let dxil_len = t.dxil.lock().unwrap_or_else(|e| e.into_inner()).len() as u64;
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    KEPT[3].fetch_add(
-                        t.host.dxil.len() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    KEPT[3].fetch_add(dxil_len, std::sync::atomic::Ordering::Relaxed);
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -169,7 +341,8 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => oathkeep_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let (mut host, cache_path) = crate::shader_cache::host_shader_with_path(container)?;
+    let dxil = std::mem::take(&mut host.dxil);
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()
@@ -181,7 +354,28 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated {
+        host,
+        dxil: Mutex::new(dxil),
+        cache_path,
+        used,
+        stores,
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn trim_shaders() -> usize {
+    let Ok(guard) = SHADERS.try_lock() else {
+        return 0;
+    };
+    let Some(map) = guard.as_ref() else {
+        return 0;
+    };
+    let mut freed = 0usize;
+    for shader in map.values() {
+        freed += shader.evict_dxil();
+    }
+    freed
 }
 
 #[cfg(windows)]
@@ -200,18 +394,8 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
-    use oathkeep_shader::{Container, FourCC};
     let [shader] = shaders else { return false };
-    if shader.stage != "compute" {
-        return false;
-    }
-    let container = shader.container.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(c) = Container::parse(&container) else {
-        return false;
-    };
-    c.part(FourCC::DXIL)
-        .and_then(|part| oathkeep_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(oathkeep_shader::spill::is_spilled))
+    shader.stage == "compute" && shader.is_spilled
 }
 
 #[cfg(windows)]
@@ -652,12 +836,29 @@ mod tests {
             .shaders
             .iter()
             .map(|s| {
-                (
-                    s.stage,
-                    s.container.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-                )
+                let bytes = match &*s.container.lock().unwrap_or_else(|e| e.into_inner()) {
+                    ContainerStore::Inline(v) => v.clone(),
+                    _ => Vec::new(),
+                };
+                (s.stage, bytes)
             })
             .collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn container_spill_round_trips_and_deletes_on_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("containers-test.tmp");
+        let mut spill = ContainerSpill::open_at(&path).expect("open spill file");
+        let a = b"shader container alpha";
+        let b = b"shader container beta with more bytes";
+        let off_a = spill.write(a).expect("write a");
+        let off_b = spill.write(b).expect("write b");
+        assert_eq!(spill.read(off_a, a.len()).as_deref(), Some(&a[..]));
+        assert_eq!(spill.read(off_b, b.len()).as_deref(), Some(&b[..]));
+        drop(spill);
+        assert!(!path.exists(), "delete-on-close removes spill file on drop");
     }
 
     #[test]

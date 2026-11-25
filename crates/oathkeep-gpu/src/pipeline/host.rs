@@ -463,12 +463,29 @@ impl HostPipeline {
                     return None;
                 }
             };
+        struct EvictDxil<'a>(&'a [(&'a Arc<Shader>, D3D12_SHADER_VISIBILITY)]);
+        impl Drop for EvictDxil<'_> {
+            fn drop(&mut self) {
+                for (s, _) in self.0 {
+                    s.evict_dxil();
+                }
+            }
+        }
+        let _evict_dxil = EvictDxil(&stages);
+        let mut stage_dxil = Vec::with_capacity(stages.len());
+        for (s, _) in &stages {
+            let Some(bytes) = s.translated().and_then(Translated::dxil) else {
+                tracing::warn!(?shaders, "translated shader DXIL unavailable for host pipeline");
+                return None;
+            };
+            stage_dxil.push(bytes);
+        }
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
+            stage_dxil.get(i).map_or(
                 D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
+                |dxil| D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: dxil.as_ptr().cast(),
+                    BytecodeLength: dxil.len(),
                 },
             )
         };
@@ -570,9 +587,9 @@ impl HostPipeline {
 
         let mut rect_gs = None;
         if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
-            let vs = &stages[0].0.translated()?.host.dxil;
-            match oathkeep_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
+            let vs = &stage_dxil[0];
+            let ps = stage_dxil.get(1).map(|b| b.as_slice());
+            match oathkeep_shader::emit::rect_list_gs(vs, ps) {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
