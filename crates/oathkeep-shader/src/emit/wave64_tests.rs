@@ -489,3 +489,137 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         "ran on the hardware device: the inner test's SCC for every lane once some lane is inside"
     );
 }
+
+#[test]
+fn wave64_early_out_with_lds_readlane_and_guarded_sampler_lowers_to_wave32() {
+    // Wave64 group=256 compute shader with:
+    // - outer early-out (s_and_saveexec_b64 + s_cbranch_execz endpgm)
+    // - inner skip initializing a constant sampler used after the join under the same exec guard
+    // - v_readlane_b32 lane 32
+    // - guarded ds_write_b32, s_barrier, ds_read_b32, buffer_store_dword
+    let words: [u32; 32] = [
+        0xBE85_0380, // [0]  s_mov_b32 s5, 0
+        0xF40C_0202, // [1]  s_load_dwordx8 s[8:15], s[4:5], 0
+        0xFA00_0000, // [2]
+        0xF408_0402, // [3]  s_load_dwordx4 s[16:19], s[4:5], 0x20
+        0xFA00_0020, // [4]
+        0x7D88_0000, // [5]  v_cmp_gt_u32 vcc, s0, v0
+        0xBE94_246A, // [6]  s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0017, // [7]  s_cbranch_execz +23 -> [31] (s_endpgm)
+        0xBF88_0004, // [8]  s_cbranch_execz +4  -> [13] (join)
+        0xB000_3088, // [9]  s_movk_i32 s0, 0x3088
+        0xBE81_0380, // [10] s_mov_b32 s1, 0
+        0xBE82_0380, // [11] s_mov_b32 s2, 0
+        0xBE83_0380, // [12] s_mov_b32 s3, 0
+        0x7E02_02F0, // [13] v_mov_b32 v1, 0.5
+        0x7E04_02F0, // [14] v_mov_b32 v2, 0.5
+        0xF09C_0108, // [15] image_sample_lz v3, v[1:2], s[8:15], s[0:3] dmask:0x1 dim:SQ_RSRC_IMG_2D
+        0x0002_0301, // [16]
+        0xD760_0016, // [17] v_readlane_b32 s22, v3, 32
+        0x0001_4103, // [18]
+        0x3408_0082, // [19] v_lshlrev_b32 v4, 2, v0
+        0xBE98_246A, // [20] s_and_saveexec_b64 s[24:25], vcc
+        0xBF88_0002, // [21] s_cbranch_execz +2  -> [24]
+        0xD834_0000, // [22] ds_write_b32 v4, v3
+        0x0000_0304, // [23]
+        0xBEFE_0418, // [24] s_mov_b64 exec, s[24:25]
+        0xBF8A_0000, // [25] s_barrier
+        0xD8D8_0000, // [26] ds_read_b32 v5, v4
+        0x0500_0004, // [27]
+        0x060A_0A16, // [28] v_add_f32 v5, s22, v5
+        0xE070_1000, // [29] buffer_store_dword v5, v4, s[16:19], 0 offen
+        0x8004_0504, // [30]
+        S_ENDPGM,    // [31] s_endpgm
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: (5 << 1) | (2 << 15),
+            threads: [256, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let container_bytes = crate::dxbc::build(&[]);
+    let container = crate::dxbc::Container::parse(&container_bytes).expect("empty container");
+    let no_early = ir::without_early_outs(&p).expect("without_early_outs");
+    let st_no_early = structure::structure(&no_early).expect("structure without early-outs");
+    let io_no_early = io::raise(&no_early, &native).expect("io::raise without early-outs");
+    let res_no_early =
+        resource::track(&no_early, &native.layout, native.stage, Some(&st_no_early))
+            .expect("resource::track without early-outs");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered_no_early = lower::lower(&lower::Parts {
+        native: &native,
+        p: &no_early,
+        st: &st_no_early,
+        io: &io_no_early,
+        res: &res_no_early,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower without early-outs");
+    assert_eq!(lowered_no_early.wave_size, Some(32));
+    let emitted = super::emit(&container, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let mut shader =
+        emitted.expect("emit should lower wave64 shader to wave32 via without_early_outs");
+    assert_eq!(shader.dxil, lowered_no_early.dxil);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Ok(host) = Host::new(false) {
+        host.compute_pipeline(&shader)
+            .expect("host compute pipeline creation failed");
+    }
+}

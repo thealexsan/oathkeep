@@ -144,9 +144,9 @@ pub fn track(
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
-        t.at.set(Some(b));
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
+            t.at.set(Some(site));
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
@@ -154,7 +154,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 if !t.kept_per_lane(inst, op) {
                     first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 }
@@ -302,7 +302,7 @@ struct Tracer<'a> {
     read_first_lane: std::cell::Cell<bool>,
     meets: std::cell::RefCell<Meets>,
     rpo: Vec<usize>,
-    at: std::cell::Cell<Option<usize>>,
+    at: std::cell::Cell<Option<Site>>,
 }
 
 type Known = Vec<(Bool, bool)>;
@@ -941,7 +941,7 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    fn descriptor(&self, inst: &Inst, op: &Operand, site: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -949,7 +949,7 @@ impl<'a> Tracer<'a> {
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        let mut known = self.known_at(site);
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
@@ -1028,6 +1028,17 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    fn known_at(&self, (b, i): Site) -> Known {
+        let Some(lanes) = self.lanes else {
+            return Vec::new();
+        };
+        let mut known = vec![(lanes.reach[b], true)];
+        if let Some(guard) = lanes.guards.get(b).and_then(|g| g.get(i)).copied().flatten() {
+            known.push((guard, true));
+        }
+        known
+    }
+
     fn only_edge(&self, block: usize, known: &mut Known) -> Option<usize> {
         let lanes = self.lanes?;
         let preds = &self.p.blocks[block].preds;
@@ -1045,7 +1056,11 @@ impl<'a> Tracer<'a> {
             } = lanes.exits[q]
                 && taken != not_taken
             {
-                known.push((when, taken == block));
+                let edge_holds = !lanes.wide.contains(&q)
+                    || lanes.wave_any.get(q).copied().flatten() == Some(taken != block);
+                if edge_holds {
+                    known.push((when, taken == block));
+                }
             }
             let possible = self.meet(lanes, known);
             known.truncate(n);
@@ -1082,10 +1097,13 @@ impl<'a> Tracer<'a> {
     }
 
     fn live(&self, mut t: Term) -> Term {
-        let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
+        let Some(at) = self.at.get() else {
             return t;
         };
-        let mut known = vec![(lanes.reach[at], true)];
+        if self.lanes.is_none() {
+            return t;
+        }
+        let mut known = self.known_at(at);
         for _ in 0..MAX_JOINS {
             let Term::Value(v) = t else { break };
             let Some((block, i)) = self.phis[v.0 as usize] else {
@@ -3582,5 +3600,57 @@ pub(crate) mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn descriptor_initialized_under_matching_exec_guard_ignores_dead_skip_edge() {
+        // Wave64 compute shader without an outer early-out:
+        // s_mov_b32 s5, 0
+        // s_load_dwordx8 s[8:15], s[4:5], 0
+        // v_cmp_gt_u32 vcc, s0, v0
+        // s_and_saveexec_b64 s[20:21], vcc
+        // s_cbranch_execz +4       ; skips initializing s[0:3] when exec == 0
+        // s_movk_i32 s0, 0x3088
+        // s_mov_b32 s1, 0
+        // s_mov_b32 s2, 0
+        // s_mov_b32 s3, 0
+        // image_sample_lz v2, v[0:1], s[8:15], s[0:3] dmask:0x1 dim:SQ_RSRC_IMG_2D
+        // s_endpgm
+        let words = [
+            0xBE85_0380u32,
+            0xF40C_0202,
+            0xFA00_0000,
+            0x7D88_0000,
+            0xBE94_246A,
+            0xBF88_0004,
+            0xB000_3088,
+            0xBE81_0380,
+            0xBE82_0380,
+            0xBE83_0380,
+            0xF09C_0108,
+            0x0002_0200,
+            0xBF81_0000,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 8).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let join = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.iter().any(|i| i.name() == "image_sample_lz"))
+            .expect("join block");
+        assert_eq!(st.reach[join], Bool::TRUE);
+        assert!(st.guards[join][0].is_some());
+        let layout = vec![
+            param(Constants, 0, 1),
+            param(Table, 4, 1),
+        ];
+        let r = track(&p, &layout, HwStage::Cs, Some(&st)).unwrap();
+        let sampler = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Sampler)
+            .expect("sampler descriptor");
+        assert_eq!(sampler.source, Source::Constant(vec![0x3088, 0, 0, 0]));
     }
 }
