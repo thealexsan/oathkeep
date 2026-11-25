@@ -27,9 +27,9 @@ cargo xtask install-hooks
 ### 2. Build Oathkeep
 
 ```powershell
-cargo build -j 4 --release -p victory
+cargo build -j 4 --release -p oathkeep
 # Or with diagnostics enabled (captures, DRED, scripted keys, frame timing):
-cargo build -j 4 --profile diag -p victory --features diagnostics
+cargo build -j 4 --profile diag -p oathkeep --features diagnostics
 ```
 
 ### 3. Windows 10 only: install the Microsoft DirectX 12 Agility SDK
@@ -55,7 +55,7 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Exe "<path-to-your-ti
 powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Exe "<path-to-your-title-exe>" -Profile nvidia8gb
 ```
 
-Caches and saves are stored outside the repository under `%LOCALAPPDATA%\oathkeep\cache` and `%LOCALAPPDATA%\oathkeep\data` (overridable via `-Cache` / `-Data` or `victory.toml`).
+Caches and saves are stored outside the repository under `%LOCALAPPDATA%\oathkeep\cache` and `%LOCALAPPDATA%\oathkeep\data` (overridable via `-Cache` / `-Data` or `oathkeep.toml`).
 
 ## Input Mapping
 
@@ -70,30 +70,34 @@ XInput controllers work natively. Without a controller connected, the keyboard a
 | `F` / `H` | Stick clicks |
 | `Esc` / `Tab` | Menu / View |
 
-## Architecture & Crates
+## Repository Structure
 
-See [docs/architecture.md](docs/architecture.md) for full subsystem details:
+See [docs/architecture.md](docs/architecture.md) for subsystem details:
 
-- `apps/victory` — `oathkeep` CLI (`run`, `inspect`, `census`, `translate`, `shader-info`, `lib-exports`, `config`)
-- `crates/victory-core` — configuration, logging, repo-boundary enforcement (`ensure_outside_repo`)
-- `crates/victory-pe` / `victory-loader` — PE32+ image preparation, TLS redirection, console CPU instruction emulation
-- `crates/victory-hle` — console OS, filesystem, DirectStorage, input, audio (XMA/Opus), and runtime HLE
-- `crates/victory-gpu` — Direct3D 12.x device, command lists, bindless heaps, texture/memory sync, host D3D12 backend
-- `crates/victory-shader` — RDNA 2 decoder, IR, optimization passes, and DXIL emitter
-- `crates/victory-formats` / `victory-pipeline` / `victory-game` — archive/compression codecs and build identification hooks
+- `apps/oathkeep` — `oathkeep` CLI (`run`, `inspect`, `census`, `translate`, `shader-info`, `lib-exports`, `config`)
+- `crates/oathkeep-core` — configuration, logging, repo-boundary enforcement (`ensure_outside_repo`)
+- `crates/oathkeep-pe` — read-only PE32+ and import-library parser
+- `crates/oathkeep-loader` — PE32+ image preparation, TLS redirection, console CPU instruction emulation
+- `crates/oathkeep-hle` — console OS, filesystem, DirectStorage, input, audio (XMA/Opus), and runtime HLE
+- `crates/oathkeep-gpu` — Direct3D 12.x device, command lists, bindless heaps, texture/memory sync, host D3D12 backend
+- `crates/oathkeep-shader` — RDNA 2 decoder, IR, optimization passes, and DXIL emitter
+- `crates/oathkeep-formats` — texture layouts, BCPack, and audio codecs
+- `crates/oathkeep-pipeline` — converter trait and content-addressed cache
+- `crates/oathkeep-game` — build identification and format helpers
+- `scripts/` — launcher (`play.ps1`) and Windows 10 Agility SDK setup (`setup-agility-sdk.ps1`)
 - `xtask` — repository asset-policy enforcement (`cargo xtask policy`) and hook installer
 
 ## Diagnostics & Environment Switches
 
 Build with `--profile diag --features diagnostics` (or pass `-Diag` to `scripts/play.ps1`) to enable diagnostic switches:
 
-- `VICTORY_LOG=<target>=debug,info` — structured trace logging
-- `VICTORY_D3D12_DRED=1` — Device Removed Extended Data (slows frames; use only to diagnose GPU hangs)
-- `VICTORY_D3D12_WARP=1` — run on Microsoft's WARP software adapter
-- `VICTORY_SHADER_LOOP_LIMIT=<n>` — bound translated shader loops
-- `VICTORY_LATE_WAIT=3`, `VICTORY_WIDE_BACK=1`, `VICTORY_RELAY=2` — asynchronous GPU submission tuning
-- `VICTORY_LEVELS_ON_DEMAND=1` — upload only populated mip levels (reduces VRAM usage on 8 GB GPUs)
-- `VICTORY_PIPELINE_WAIT_MS=<ms>` — cap per-frame wait for background PSO compilation
+- `OATHKEEP_LOG=<target>=debug,info` — structured trace logging
+- `OATHKEEP_D3D12_DRED=1` — Device Removed Extended Data (slows frames; use only to diagnose GPU hangs)
+- `OATHKEEP_D3D12_WARP=1` — run on Microsoft's WARP software adapter
+- `OATHKEEP_SHADER_LOOP_LIMIT=<n>` — bound translated shader loops
+- `OATHKEEP_LATE_WAIT=3`, `OATHKEEP_WIDE_BACK=1`, `OATHKEEP_RELAY=2` — asynchronous GPU submission tuning
+- `OATHKEEP_LEVELS_ON_DEMAND=1` — upload only populated mip levels (reduces VRAM usage on 8 GB GPUs)
+- `OATHKEEP_PIPELINE_WAIT_MS=<ms>` — cap per-frame wait for background PSO compilation
 
 ## Contributing & Governance
 
@@ -102,8 +106,8 @@ Build with `--profile diag --features diagnostics` (or pass `-Diag` to `scripts/
 - **AI Agent Guidelines:** [AGENTS.md](AGENTS.md)
 - **Code of Conduct:** [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 - **Security & Legal Contact:** [SECURITY.md](SECURITY.md)
-- **Upstream Credits:** [THIRD_PARTY.md](THIRD_PARTY.md)
+- **Third-Party Credits:** [THIRD_PARTY.md](THIRD_PARTY.md)
 
 ## License
 
-Oathkeep is licensed under the **GNU General Public License v3.0 or later** ([LICENSE](LICENSE)). Built upon [VIctory](https://github.com/Marvisak/VIctory) (Marvisak) and [victory-fork](https://github.com/fxceless/victory-fork) (fxceless). See [THIRD_PARTY.md](THIRD_PARTY.md) for complete attribution.
+Oathkeep is licensed under the **GNU General Public License v3.0 or later** ([LICENSE](LICENSE)). See [THIRD_PARTY.md](THIRD_PARTY.md) for upstream and dependency attribution.

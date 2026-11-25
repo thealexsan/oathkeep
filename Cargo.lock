@@ -285,6 +285,123 @@ dependencies = [
 ]
 
 [[package]]
+name = "oathkeep"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "memchr",
+ "oathkeep-core",
+ "oathkeep-game",
+ "oathkeep-hle",
+ "oathkeep-loader",
+ "oathkeep-pe",
+ "oathkeep-shader",
+ "walkdir",
+]
+
+[[package]]
+name = "oathkeep-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "oathkeep-formats"
+version = "0.1.0"
+
+[[package]]
+name = "oathkeep-game"
+version = "0.1.0"
+dependencies = [
+ "memchr",
+ "zlib-rs",
+]
+
+[[package]]
+name = "oathkeep-gpu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "oathkeep-formats",
+ "oathkeep-pipeline",
+ "oathkeep-shader",
+ "tempfile",
+ "tracing",
+ "windows",
+ "windows-sys",
+ "zlib-rs",
+]
+
+[[package]]
+name = "oathkeep-hle"
+version = "0.1.0"
+dependencies = [
+ "oathkeep-formats",
+ "oathkeep-gpu",
+ "oathkeep-loader",
+ "oathkeep-pe",
+ "opus-pure",
+ "tempfile",
+ "tracing",
+ "windows",
+ "windows-core",
+ "windows-sys",
+ "zlib-rs",
+]
+
+[[package]]
+name = "oathkeep-loader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "oathkeep-core",
+ "oathkeep-pe",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "windows-sys",
+]
+
+[[package]]
+name = "oathkeep-pe"
+version = "0.1.0"
+dependencies = [
+ "object",
+ "thiserror",
+]
+
+[[package]]
+name = "oathkeep-pipeline"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "oathkeep-core",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "oathkeep-shader"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "windows",
+ "windows-sys",
+ "zlib-rs",
+]
+
+[[package]]
 name = "object"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -627,123 +744,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "victory"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "memchr",
- "victory-core",
- "victory-game",
- "victory-hle",
- "victory-loader",
- "victory-pe",
- "victory-shader",
- "walkdir",
-]
-
-[[package]]
-name = "victory-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "tempfile",
- "thiserror",
- "toml",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "victory-formats"
-version = "0.1.0"
-
-[[package]]
-name = "victory-game"
-version = "0.1.0"
-dependencies = [
- "memchr",
- "zlib-rs",
-]
-
-[[package]]
-name = "victory-gpu"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "tempfile",
- "tracing",
- "victory-formats",
- "victory-pipeline",
- "victory-shader",
- "windows",
- "windows-sys",
- "zlib-rs",
-]
-
-[[package]]
-name = "victory-hle"
-version = "0.1.0"
-dependencies = [
- "opus-pure",
- "tempfile",
- "tracing",
- "victory-formats",
- "victory-gpu",
- "victory-loader",
- "victory-pe",
- "windows",
- "windows-core",
- "windows-sys",
- "zlib-rs",
-]
-
-[[package]]
-name = "victory-loader"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "tempfile",
- "thiserror",
- "tracing",
- "victory-core",
- "victory-pe",
- "windows-sys",
-]
-
-[[package]]
-name = "victory-pe"
-version = "0.1.0"
-dependencies = [
- "object",
- "thiserror",
-]
-
-[[package]]
-name = "victory-pipeline"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "tempfile",
- "tracing",
- "victory-core",
-]
-
-[[package]]
-name = "victory-shader"
-version = "0.1.0"
-dependencies = [
- "thiserror",
- "windows",
- "windows-sys",
- "zlib-rs",
-]
 
 [[package]]
 name = "walkdir"

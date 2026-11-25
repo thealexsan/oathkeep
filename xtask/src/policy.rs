@@ -1,10 +1,3 @@
-//! Rule #1, statically: the repository only ever contains small text files
-//! that we wrote. See docs/asset-policy.md.
-//!
-//! This is an allowlist, not a blocklist: a file passes only if its name is
-//! on the list, it is not too big, it is text, and it does not smuggle data
-//! inside text (long hex/base64 runs).
-
 use std::path::Path;
 use std::process::Command;
 
@@ -20,20 +13,18 @@ const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
     ".gitattributes",
     ".editorconfig",
-    ".victory-root",
+    ".oathkeep-root",
     "pre-commit",
     "LICENSE",
     "LICENSE-MIT",
     "LICENSE-APACHE",
 ];
 
-/// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
 const EXCEPTIONS: &[(&str, &str)] = &[(
-    "crates/victory-formats/src/bcpack-tables.bin",
-    "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
+    "crates/oathkeep-formats/src/bcpack-tables.bin",
+    "BCPack constant tables required for decoding (docs/asset-policy.md)",
 )];
 
-/// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
     (b"MZ", "PE executable"),
     (b"DXBC", "shader container"),
@@ -61,7 +52,7 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
                 .current_dir(root)
                 .output()?;
             if !out.status.success() {
-                continue; // deleted in the index
+                continue;
             }
             out.stdout
         } else {
@@ -127,7 +118,6 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
         tracked.dedup();
         return Ok(tracked);
     }
-    // Not a git repository: walk everything except build output.
     Ok(walkdir::WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| !matches!(e.file_name().to_str(), Some("target" | ".git")))
@@ -142,7 +132,6 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
         .collect())
 }
 
-/// All problems with one file. Pure, for testing.
 pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
@@ -184,8 +173,6 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     problems
 }
 
-/// Prohibits naming specific commercial titles or publishers in the repository.
-/// Tokens are assembled from fragments so this check does not trigger on itself.
 fn forbidden_trademark(content: &[u8]) -> Option<&'static str> {
     let lower = String::from_utf8_lossy(content).to_ascii_lowercase();
     let rules: &[(&str, &str, &str)] = &[
@@ -206,7 +193,6 @@ fn forbidden_trademark(content: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Longest run of characters that could be hex or base64 payload.
 fn longest_encoded_run(content: &[u8]) -> Option<usize> {
     let is_payload = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
     content.split(|b| !is_payload(b)).map(<[u8]>::len).max()
@@ -216,7 +202,6 @@ fn longest_encoded_run(content: &[u8]) -> Option<usize> {
 mod tests {
     use super::check;
 
-    /// Enforces the policy wherever tests run, even in clones without the hook.
     #[test]
     fn repository_passes_policy() {
         super::run(&crate::workspace_root(), false).unwrap();

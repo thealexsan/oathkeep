@@ -20,9 +20,9 @@ In any form (files, commits, issues, pull requests, string literals, tests, fixt
 - Synthetic test inputs generated from scratch by our own test suite.
 - Runtime telemetry summaries (FPS, draw counts, anonymized shader hashes, HRESULT error codes).
 
-## Legacy Upstream Exception
+## Binary Exception
 
-`crates/victory-formats/src/bcpack-tables.bin` (~78 KiB) is inherited from upstream VIctory as the single documented exception in `xtask/src/policy.rs`: static entropy/dictionary tables required to decode the BCPack compression format. It is excluded from the repository's GPL license notice and no further binary exceptions will be accepted.
+`crates/oathkeep-formats/src/bcpack-tables.bin` (~78 KiB) is the single documented exception in `xtask/src/policy.rs`: static entropy/dictionary tables required to decode the BCPack compression format. No further binary exceptions will be accepted.
 
 ## Where User Data Lives
 
@@ -41,7 +41,7 @@ All user-supplied title files, caches, saves, and crash dumps must remain **stri
    - Rejects binary magic headers (`MZ`, `DXBC`, `DDS `, `RIFF`, `BC\xC0\xDE`, `PDB`, `zip`, `7z`, `cab`, `MSI`, etc.) and NUL bytes.
    - Rejects long hex/base64 runs (> 512 chars) to prevent data smuggling.
    - Rejects prohibited commercial title/publisher identifiers.
-3. **Runtime boundary guard:** `victory_core::ensure_outside_repo` refuses to write derived cache/data inside the repository tree.
+3. **Runtime boundary guard:** `oathkeep_core::ensure_outside_repo` refuses to write derived cache/data inside the repository tree.
 
 ## Remediation if Protected Material Slips Through
 

@@ -1,0 +1,18 @@
+# Copy to `oathkeep.toml` (git-ignored) and point it at your local files.
+# Every path must be OUTSIDE the repository.
+# Environment variables take precedence over this file.
+# OATHKEEP_CONFIG selects a different config file.
+
+[paths]
+# Local title directory (read-only).   env: OATHKEEP_GAME_DIR
+game_dir = 'D:\oathkeep-data\game'
+
+# Derived cache. Default: %LOCALAPPDATA%\oathkeep\cache.   env: OATHKEEP_CACHE_DIR
+# cache_dir = 'D:\oathkeep-data\cache'
+
+# Persistent local storage. Default: %LOCALAPPDATA%\oathkeep\data.   env: OATHKEEP_DATA_DIR
+# data_dir = 'D:\oathkeep-data\data'
+
+# Additional titles used to test platform-level code.
+# env: OATHKEEP_TEST_TITLES (separated by ';')
+test_titles = []
