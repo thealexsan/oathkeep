@@ -4970,13 +4970,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let done = read_partial(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::MoveUs,
         moved.elapsed().as_micros() as u64,
     );
-    if whole {
+    if done == len {
         return;
     }
     if title_dst && !ask_first && !crate::texture::committed(dst, len) {
@@ -4986,6 +4986,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     #[cfg(feature = "diagnostics")]
     let sparse = std::time::Instant::now();
+    let (src, dst, len) = (src.wrapping_add(done), dst.wrapping_add(done), len - done);
     if !title_dst && len >= 64 << 10 {
         read_sparse(src, dst, len);
     } else {
@@ -5065,12 +5066,13 @@ core::arch::global_asm!(
     "    cld",
     "oathkeep_safe_copy_loop:",
     "    rep movsb",
-    "    mov eax, 1",
+    "    mov rax, r8",
     "    pop rsi",
     "    pop rdi",
     "    ret",
     "oathkeep_safe_copy_fail:",
-    "    xor eax, eax",
+    "    mov rax, r8",
+    "    sub rax, rcx",
     "    pop rsi",
     "    pop rdi",
     "    ret",
@@ -5078,7 +5080,7 @@ core::arch::global_asm!(
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 unsafe extern "C" {
-    fn oathkeep_safe_copy(dst: *mut u8, src: *const u8, len: usize) -> u8;
+    fn oathkeep_safe_copy(dst: *mut u8, src: *const u8, len: usize) -> usize;
     static oathkeep_safe_copy_loop: u8;
     static oathkeep_safe_copy_fail: u8;
 }
@@ -5091,6 +5093,7 @@ fn install_safe_read() {
         EXCEPTION_POINTERS,
     };
     const IN_PAGE_ERROR: NTSTATUS = 0xC000_0006u32 as NTSTATUS;
+    const WRITE: usize = 1;
     unsafe extern "system" fn on_safe_read(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes valid exception and context pointers.
         let (r, ctx) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
@@ -5100,18 +5103,24 @@ fn install_safe_read() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let loop_ip = (&raw const oathkeep_safe_copy_loop) as usize as u64;
-        let fail_ip = (&raw const oathkeep_safe_copy_fail) as usize as u64;
-        if ctx.Rip == loop_ip {
-            ctx.Rip = fail_ip;
+        if ctx.Rip != loop_ip {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && r.ExceptionInformation[0] == WRITE
+            && crate::watch::try_open_write(r.ExceptionInformation[1])
+        {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        EXCEPTION_CONTINUE_SEARCH
+        ctx.Rip = (&raw const oathkeep_safe_copy_fail) as usize as u64;
+        EXCEPTION_CONTINUE_EXECUTION
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
-    // SAFETY: registered after write-watch (first=0), and only redirects faults
-    // whose RIP matches `oathkeep_safe_copy_loop`.
+    // SAFETY: registered first (first=1) so it intercepts safe-copy faults before
+    // the crash-reporting VEH (`first=0`); only matches RIP == `oathkeep_safe_copy_loop`.
     ONCE.call_once(|| unsafe {
-        AddVectoredExceptionHandler(0, Some(on_safe_read));
+        AddVectoredExceptionHandler(1, Some(on_safe_read));
     });
 }
 
@@ -5121,12 +5130,12 @@ fn safe_read_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("OATHKEEP_SAFE_READ").is_none_or(|v| v != "0"))
 }
 
-fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+fn read_partial(src: *const u8, dst: *mut u8, len: usize) -> usize {
     if len == 0 {
-        return true;
+        return 0;
     }
     if src.is_null() || dst.is_null() {
-        return false;
+        return 0;
     }
     #[cfg(all(windows, target_arch = "x86_64"))]
     if safe_read_on() {
@@ -5136,8 +5145,8 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
             install_safe_read();
             // SAFETY: `dst` is mapped writable memory of `len` bytes; any fault
             // on `src` or `dst` at `oathkeep_safe_copy_loop` is caught by
-            // `on_safe_read` and returns 0 cleanly.
-            return unsafe { oathkeep_safe_copy(dst, src, len) != 0 };
+            // `on_safe_read` and returns the number of bytes copied before faulting.
+            return unsafe { oathkeep_safe_copy(dst, src, len) };
         }
     }
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
@@ -5145,12 +5154,21 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    if unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    {
+        len
+    } else {
+        done
+    }
+}
+
+fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    read_partial(src, dst, len) == len
 }
 
 #[cfg(all(test, windows, target_arch = "x86_64"))]
 mod safe_read_tests {
-    use super::read;
+    use super::{read, read_partial};
 
     #[test]
     fn safe_read_copies_valid_and_recovers_on_unmapped() {
@@ -5181,7 +5199,10 @@ mod safe_read_tests {
             let mut buf = vec![0u8; 0x2_0000];
             assert!(read(base, buf.as_mut_ptr(), 0x1_0000));
             assert!(buf[..0x1_0000].iter().all(|&b| b == 0xAB));
-            assert!(!read(base, buf.as_mut_ptr(), 0x2_0000));
+            buf.fill(0);
+            let partial = read_partial(base, buf.as_mut_ptr(), 0x2_0000);
+            assert_eq!(partial, 0x1_0000);
+            assert!(buf[..0x1_0000].iter().all(|&b| b == 0xAB));
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }

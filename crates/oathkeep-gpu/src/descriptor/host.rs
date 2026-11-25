@@ -13,7 +13,8 @@ pub(crate) struct HostHeap {
     count: u32,
     dynamic: u32,
     sampler: bool,
-    made: Mutex<Vec<u64>>,
+    made_keys: Vec<std::sync::atomic::AtomicU64>,
+    made_lock: Mutex<()>,
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
     next: Mutex<(u32, Vec<bool>)>,
     free: std::sync::atomic::AtomicU32,
@@ -719,7 +720,10 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made_keys: (0..count)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            made_lock: Mutex::new(()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -1034,9 +1038,12 @@ impl HostHeap {
         if tag != VIEW_TAG {
             return false;
         }
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        made.get(index as usize)
-            .is_some_and(|&made| made != 0 && made == key)
+        self.made_keys
+            .get(index as usize)
+            .is_some_and(|slot| {
+                let made = slot.load(std::sync::atomic::Ordering::Acquire);
+                made != 0 && made == key
+            })
             && self
                 .kept
                 .lock()
@@ -1103,12 +1110,13 @@ impl HostHeap {
                 .flat_map(|&start| placed.slots_at(start))
                 .collect()
         };
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let _made_guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut remade = 0;
         for slot in slots {
-            let Some(&key) = made.get(slot as usize) else {
+            let Some(entry) = self.made_keys.get(slot as usize) else {
                 continue;
             };
+            let key = entry.load(std::sync::atomic::Ordering::Relaxed);
             if key == 0 {
                 continue;
             }
@@ -1124,19 +1132,24 @@ impl HostHeap {
     }
 
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        if made.get(index as usize).is_none_or(|&key| key == 0) {
+        let _made_guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self
+            .made_keys
+            .get(index as usize)
+            .is_none_or(|s| s.load(std::sync::atomic::Ordering::Relaxed) == 0)
+        {
             return false;
         }
-        self.unmake(&mut made, index);
+        self.unmake(index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
     }
 
-    fn unmake(&self, made: &mut [u64], index: u32) {
-        let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
+    fn unmake(&self, index: u32) {
+        let Some(slot) = self.made_keys.get(index as usize) else {
             return;
         };
+        let key = slot.swap(0, std::sync::atomic::Ordering::Release);
         if key == 0 {
             return;
         }
@@ -1475,11 +1488,18 @@ impl HostHeap {
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if tag == VIEW_TAG
+            && key != 0
+            && self.made_keys[index as usize].load(std::sync::atomic::Ordering::Acquire) == key
+        {
+            return view_at(i, generation);
+        }
+        let _made_guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        let cur = self.made_keys[index as usize].load(std::sync::atomic::Ordering::Relaxed);
         let Some(view) = view else {
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
+            if cur != 0 {
+                self.made_keys[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -1487,10 +1507,10 @@ impl HostHeap {
             }
             return None;
         };
-        if made[index as usize] != key {
+        if cur != key {
             for stale in self.note_buffer(index, Some(&view), for_draw) {
                 if stale != index {
-                    self.unmake(&mut made, stale);
+                    self.unmake(stale);
                 }
             }
             let waiting = if for_draw {
@@ -1504,16 +1524,15 @@ impl HostHeap {
             let later = !for_draw && (view.is_buffer() || waiting.is_some());
             if later
                 && keep_views()
-                && view_at(
-                    made[index as usize] as u32,
-                    (made[index as usize] >> 32) as u32,
-                )
-                .is_some_and(|old| same_placed_texture(&old, &view))
+                && view_at(cur as u32, (cur >> 32) as u32)
+                    .is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
-            made[index as usize] = if later { 0 } else { key };
+            if later {
+                self.made_keys[index as usize].store(0, std::sync::atomic::Ordering::Release);
+            }
             let kept = if later {
                 None
             } else {
@@ -1523,6 +1542,9 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
+            if !later {
+                self.made_keys[index as usize].store(key, std::sync::atomic::Ordering::Release);
+            }
         }
         Some(view)
     }
@@ -1556,11 +1578,10 @@ impl HostHeap {
 
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self
-            .made
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(index as usize)?;
+        let key = self
+            .made_keys
+            .get(index as usize)?
+            .load(std::sync::atomic::Ordering::Acquire);
         if key == 0 {
             return Some("null".into());
         }
