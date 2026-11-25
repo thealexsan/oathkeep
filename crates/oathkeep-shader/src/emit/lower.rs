@@ -2441,24 +2441,29 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
+        let (miss_blk, join_blk) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(c, Term::CondBr(missing, miss_blk, join_blk));
+        self.cur = miss_blk;
         let places = k(self, MEMORY_FAULTS - 1);
-        let place = self.s.m.bin(c, Bin::URem, page, places);
+        let place = self.s.m.bin(miss_blk, Bin::URem, page, places);
         let one = k(self, 1);
-        let place = self.s.m.bin(c, Bin::Add, place, one);
+        let place = self.s.m.bin(miss_blk, Bin::Add, place, one);
         let k2 = k(self, 2);
-        let place = self.s.m.bin(c, Bin::Shl, place, k2);
-        let place = self.s.m.select(c, missing, place, zero);
+        let place = self.s.m.bin(miss_blk, Bin::Shl, place, k2);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
         self.s.op(
-            c,
+            miss_blk,
             "rawBufferStore.i32",
             Attr::NoUnwind,
             void,
             140,
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
+        self.s.m.terminate(miss_blk, Term::Br(join_blk));
+        self.cur = join_blk;
+        let c = self.cur;
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
@@ -2494,7 +2499,6 @@ impl<'a> Lower<'a> {
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
         let guard = self.guard(b, i)?;
-        let c = self.cur;
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
         let iu = self.s.m.undef(i32t);
         let align = self.s.m.i32(4);
@@ -2512,6 +2516,7 @@ impl<'a> Lower<'a> {
                 return Err("a global load result");
             };
             let (h, byte) = self.memory(lo, hi, guard);
+            let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
@@ -2564,6 +2569,7 @@ impl<'a> Lower<'a> {
             None => self.s.m.i32(0),
         };
         let (h, byte) = self.memory(lo, hi, guard);
+        let c = self.cur;
         let simple = match op {
             "add" => Some((0, v)),
             "sub" => {
@@ -2689,6 +2695,7 @@ impl<'a> Lower<'a> {
             let n = (count - first).min(4);
             let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
             let (h, byte) = self.memory(lo, hi, None);
+            let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,

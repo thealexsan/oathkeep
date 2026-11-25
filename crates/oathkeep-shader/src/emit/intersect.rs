@@ -192,7 +192,6 @@ impl<'a> Lower<'a> {
     }
 
     fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
-        let c = self.cur;
         let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let mut second = None;
         let mut out = Vec::with_capacity(count as usize);
@@ -206,9 +205,10 @@ impl<'a> Lower<'a> {
                     let (low, high) = self.address_plus(low, high, 64);
                     let (handle, byte) = self.bvh_memory(low, high, None);
                     let k64 = self.s.m.i32(64);
-                    (handle, self.s.m.bin(c, Bin::Sub, byte, k64))
+                    (handle, self.s.m.bin(self.cur, Bin::Sub, byte, k64))
                 }),
             };
+            let c = self.cur;
             if let Some(b) = base {
                 byte = self.s.m.bin(c, Bin::Add, byte, b);
             }
@@ -249,8 +249,8 @@ impl<'a> Lower<'a> {
     }
 
     fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool) -> [V; 4] {
-        let head = self.cur;
         let children = self.bvh_node_words(at, None, 0, 4);
+        let head = self.cur;
         let k5 = self.s.m.i32(5);
         let wide = self.s.m.cmp(head, pred::EQ, kind, k5);
         let (wide_block, half_block) = (self.s.m.new_block(), self.s.m.new_block());
@@ -262,18 +262,20 @@ impl<'a> Lower<'a> {
         let k16 = self.s.m.i32(16);
         let words = self.bvh_node_words(at, None, 16, 24);
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
-        self.s.m.terminate(wide_block, Term::Br(join));
+        let wide_end = self.cur;
+        self.s.m.terminate(wide_end, Term::Br(join));
         self.cur = half_block;
         let words = self.bvh_node_words(at, None, 16, 12);
+        let half_end = self.cur;
         let f32t = self.s.t.f32;
         let mut halves = Vec::with_capacity(24);
         for n in 0..24 {
             let mut h = words[n / 2];
             if n % 2 == 1 {
-                h = self.s.m.bin(half_block, Bin::LShr, h, k16);
+                h = self.s.m.bin(half_end, Bin::LShr, h, k16);
             }
             halves.push(self.s.op(
-                half_block,
+                half_end,
                 "legacyF16ToF32",
                 Attr::ReadNone,
                 f32t,
@@ -281,14 +283,14 @@ impl<'a> Lower<'a> {
                 &[h],
             ));
         }
-        self.s.m.terminate(half_block, Term::Br(join));
+        self.s.m.terminate(half_end, Term::Br(join));
         self.cur = join;
         let mut coords = Vec::with_capacity(24);
         for n in 0..24 {
             let phi = self.s.m.phi(join, f32t);
             self.s
                 .m
-                .set_phi(phi, vec![(floats[n], wide_block), (halves[n], half_block)]);
+                .set_phi(phi, vec![(floats[n], wide_end), (halves[n], half_end)]);
             coords.push(phi);
         }
         let (most, least) = (
@@ -348,9 +350,9 @@ impl<'a> Lower<'a> {
     }
 
     fn bvh_triangle(&mut self, at: NodeAt, kind: V, ray: &Ray) -> [V; 4] {
-        let c = self.cur;
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let id = self.bvh_node_words(at, None, 60, 1)[0];
+        let c = self.cur;
         let (k2, k3, k12, k15) = (k(self, 2), k(self, 3), k(self, 12), k(self, 15));
         let shift = self.s.m.bin(c, Bin::Shl, kind, k3);
         let id = self.s.m.bin(c, Bin::LShr, id, shift);
@@ -372,11 +374,13 @@ impl<'a> Lower<'a> {
         let map = self.s.m.select(c, is0, maps[0], map);
         let mut p = Vec::with_capacity(3);
         for n in [first, i, j] {
+            let c = self.cur;
             let nibble = self.s.m.bin(c, Bin::Shl, n, k2);
             let vertex = self.s.m.bin(c, Bin::LShr, map, nibble);
             let vertex = self.s.m.bin(c, Bin::And, vertex, k15);
             let byte = self.s.m.bin(c, Bin::Mul, vertex, k12);
             let words = self.bvh_node_words(at, Some(byte), 0, 3);
+            let c = self.cur;
             let r: Vec<V> = (0..3)
                 .map(|a| {
                     let f = self.as_float(words[a]);
@@ -385,6 +389,7 @@ impl<'a> Lower<'a> {
                 .collect();
             p.push([r[0], r[1], r[2]]);
         }
+        let c = self.cur;
         let fzero = self.s.m.f32(0);
         let size = ray.direction.map(|d| self.unary(6, d));
         let xy = self.s.m.cmp(c, pred::OGE, size[0], size[1]);

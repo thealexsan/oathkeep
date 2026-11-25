@@ -825,6 +825,16 @@ impl Staging {
         (self.memory as usize, self.layout.size as usize)
     }
 
+    pub(crate) fn watch_range(&self) -> Option<(usize, usize)> {
+        let mode = self.watch_mode.load(std::sync::atomic::Ordering::Relaxed);
+        if mode <= 1 && self.layout.size > 0 {
+            let start = self.memory as usize;
+            Some((start, start.saturating_add(self.layout.size as usize)))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
@@ -879,9 +889,9 @@ impl Staging {
             && *GUARD
                 .get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_GUARD").is_none_or(|v| v != "0"))
         {
-            if let Some((now, written)) =
-                waited(1, || crate::watch::writes_guarded(start, start + size))
-            {
+            if let Some((now, written)) = waited(1, || {
+                crate::watch::writes_guarded_since(start, start + size, last.asked)
+            }) {
                 if mode == 0 {
                     self.watch_mode.store(2, Relaxed);
                 }

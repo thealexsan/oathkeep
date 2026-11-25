@@ -91,7 +91,8 @@ struct Window {
     scratch: ID3D12Resource,
 }
 
-const WINDOW_MOST: u64 = 64;
+const WINDOW_MOST: u64 = 256;
+const WINDOW_STEP_MAX: u64 = 4096;
 
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2591,7 +2592,7 @@ impl State {
             && max == 1
             && count.is_none()
             && !p.stages.iter().any(|stage| stage.translated().stores);
-        if !windowed || list.first_use(WINDOW_USE) {
+        if !windowed || list.first_use(WINDOW_USE) || list.is_uav_dirty() {
             self.window = None;
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
@@ -2603,23 +2604,42 @@ impl State {
                 (offset - w.base) % u64::from(w.step) == 0
                     && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
             })
-            .map(|w| (w.scratch.clone(), offset - w.base));
+            .map(|w| {
+                let idx = (offset - w.base) / u64::from(w.step);
+                (w.scratch.clone(), idx * u64::from(w.stride))
+            });
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
                 let (step, records) = match &self.window {
                     Some(w) if windowed && same(w) => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
-                        let step = offset.saturating_sub(last);
+                        let step = if offset > last {
+                            offset - last
+                        } else if w.records == 1 && offset < w.base {
+                            w.base - offset
+                        } else if w.records > 1
+                            && offset < w.base
+                            && (w.base - offset).is_multiple_of(u64::from(w.step))
+                        {
+                            u64::from(w.step)
+                        } else {
+                            0
+                        };
                         let walks = step >= u64::from(stride)
-                            && step <= 256
+                            && step <= WINDOW_STEP_MAX
                             && step % 4 == 0
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
+                            let left = args.left(arguments);
+                            let fit = if left >= u64::from(stride) {
+                                (((left - u64::from(stride)) / step) + 1).min(WINDOW_MOST) as u32
+                            } else {
+                                1
+                            };
                             (
                                 step as u32,
-                                (if w.records == 1 { 16 } else { w.records * 2 })
+                                (if w.records == 1 { 32 } else { w.records * 2 })
                                     .min(fit)
                                     .max(1),
                             )
@@ -2629,11 +2649,12 @@ impl State {
                     }
                     _ => (stride, max),
                 };
-                args.refresh(
-                    list,
-                    arguments,
-                    len.max(u64::from(step) * u64::from(records)),
-                );
+                let refresh_len = if records > 1 {
+                    u64::from(step) * u64::from(records - 1) + u64::from(stride)
+                } else {
+                    len
+                };
+                args.refresh(list, arguments, len.max(refresh_len));
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
                 }
@@ -2642,14 +2663,14 @@ impl State {
                     crate::indirect::bound_ahead(
                         list,
                         (&args.buffer, offset),
-                        (kind, step, records),
+                        (kind, stride, step, records),
                     )
                 } else {
                     crate::indirect::bound(
                         list,
                         (&args.buffer, offset),
                         count_arg,
-                        (kind, step, records),
+                        (kind, stride, records),
                     )
                 };
                 let Some(bounded) = bounded else {
@@ -2678,7 +2699,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
             why("prepare failed");
             return false;
         }
@@ -2707,7 +2727,6 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

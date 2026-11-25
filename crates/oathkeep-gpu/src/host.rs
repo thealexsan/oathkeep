@@ -671,7 +671,7 @@ pub(crate) struct HostList {
     prelude: OnceLock<Option<Prelude>>,
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    indirect_args: Mutex<Option<(ID3D12Resource, u64, bool)>>,
     uav_dirty: std::sync::atomic::AtomicBool,
     _alive: Counted,
     #[cfg(feature = "diagnostics")]
@@ -3711,14 +3711,24 @@ impl Host {
                 std::collections::HashMap::new();
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                        && !shadow.guarded()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    match step {
+                        Step::Refresh(shadow, address, len)
+                            if !shadow.unwatched() && !shadow.guarded() =>
+                        {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
+                        Step::Texture(staging) => {
+                            if let Some((from, to)) = staging.watch_range() {
+                                let span = spans
+                                    .entry(std::sync::Arc::as_ptr(staging) as usize)
+                                    .or_insert((from, to));
+                                *span = (span.0.min(from), span.1.max(to));
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -4201,6 +4211,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.finish_indirect();
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -4225,6 +4236,10 @@ impl HostList {
         self.uav_dirty.store(true, Ordering::Relaxed);
     }
 
+    pub(crate) fn is_uav_dirty(&self) -> bool {
+        self.uav_dirty.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn mark_uav_clean(&self) {
         self.uav_dirty.store(false, Ordering::Relaxed);
     }
@@ -4238,6 +4253,9 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         self.uav_dirty.store(true, Ordering::Relaxed);
+        if let Some((_, _, in_indirect)) = &mut *self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()) {
+            *in_indirect = false;
+        }
         let old_deferred = std::mem::take(&mut *self.deferred());
         let old_states =
             std::mem::take(&mut *self.states.lock().unwrap_or_else(|e| e.into_inner()));
@@ -4773,27 +4791,55 @@ impl HostList {
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
-    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<(ID3D12Resource, bool)> {
         let needed = size.max(64 << 10);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
+        if let Some((buffer, cap, in_indirect)) = &*slot
             && *cap >= needed
         {
-            return Some(buffer.clone());
+            return Some((buffer.clone(), *in_indirect));
         }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let prev = slot.as_ref().map_or(0, |(_, cap, _)| *cap);
         let alloc = prev
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
+        let old = slot.replace((buffer.clone(), alloc, false));
         drop(slot);
-        if let Some((old_buf, _)) = old {
+        if let Some((old_buf, _, old_in_indirect)) = old {
+            if old_in_indirect {
+                crate::indirect::done_on(&self.list, &old_buf);
+            }
             self.keep(&old_buf);
         }
-        Some(buffer)
+        Some((buffer, false))
+    }
+
+    pub(crate) fn mark_indirect_state(&self, in_indirect: bool) {
+        if let Some((_, _, state)) =
+            &mut *self.indirect_args.lock().unwrap_or_else(|e| e.into_inner())
+        {
+            *state = in_indirect;
+        }
+    }
+
+    fn finish_indirect(&self) {
+        let buf = {
+            let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((buf, _, in_indirect)) = &mut *slot
+                && *in_indirect
+            {
+                *in_indirect = false;
+                Some(buf.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(buf) = buf {
+            crate::indirect::done_on(&self.list, &buf);
+        }
     }
 
     pub(crate) fn keep(&self, object: &impl Interface) {
@@ -4960,15 +5006,20 @@ impl Batch {
 
     fn flush(&mut self) {
         self.index.clear();
-        let ahead = self.refreshes.len() > 1;
+        let mut ranges: Vec<(usize, usize)> = self
+            .refreshes
+            .iter()
+            .filter(|r| !r.0.unwatched() && !r.0.guarded())
+            .map(|r| (r.1, r.2))
+            .collect();
+        for staging in &self.pending_textures {
+            if let Some(range) = staging.watch_range() {
+                ranges.push(range);
+            }
+        }
+        let ahead = ranges.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = self
-                .refreshes
-                .iter()
-                .filter(|r| !r.0.unwatched() && !r.0.guarded())
-                .map(|r| (r.1, r.2))
-                .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
@@ -4993,9 +5044,6 @@ impl Batch {
                 Self::update(&shadow, from, to);
             }
         }
-        if ahead {
-            crate::watch::ask_ahead_done();
-        }
         if !self.pending_textures.is_empty() {
             if self.pending_textures.len() >= 4 {
                 let started = std::time::Instant::now();
@@ -5016,6 +5064,9 @@ impl Batch {
                     staging.refresh();
                 }
             }
+        }
+        if ahead {
+            crate::watch::ask_ahead_done();
         }
     }
 }
