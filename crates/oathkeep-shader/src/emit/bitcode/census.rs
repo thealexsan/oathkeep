@@ -74,7 +74,9 @@ fn kind(name: &str) -> usize {
     let k = |s: &str| KINDS.iter().position(|k| *k == s).expect("kind");
     match n {
         "unary" | "binary" | "tertiary" | "unaryBits" | "legacyF16ToF32" | "legacyF32ToF16"
-        | "isSpecialFloat" | "dot2" | "dot3" | "dot4" | "quaternary" => k("math_call"),
+        | "isSpecialFloat" | "dot2" | "dot3" | "dot4" | "dot4AddPacked" | "quaternary" => {
+            k("math_call")
+        }
         "bufferLoad" | "rawBufferLoad" => k("buffer_load"),
         "cbufferLoadLegacy" | "cbufferLoad" => k("cbuffer_load"),
         "bufferStore" | "rawBufferStore" | "textureStore" => k("buffer_store"),

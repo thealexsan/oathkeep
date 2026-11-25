@@ -4981,11 +4981,12 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
-            for k in 0..count {
+            for first in (0..count).step_by(4) {
+                let n = (count - first).min(4);
                 let b = self.cur;
-                let off = self.s.m.i32(4 * k);
+                let off = self.s.m.i32(4 * first);
                 let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
+                let mask = self.s.m.i8((1u8 << n) - 1);
                 let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
                 let r = self.s.op(
                     b,
@@ -4995,9 +4996,11 @@ impl<'a> Lower<'a> {
                     139,
                     &[h, a, u, mask, al],
                 );
-                let x = self.s.m.extract(b, r, 0);
-                let x = self.as_int(x);
-                raw.push((x, zero));
+                for k in 0..n {
+                    let x = self.s.m.extract(b, r, k);
+                    let x = self.as_int(x);
+                    raw.push((x, zero));
+                }
             }
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
@@ -5019,11 +5022,12 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
+            let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+            for first in (0..count).step_by(4) {
+                let n = (count - first).min(4);
+                let off = self.s.m.i32(4 * first);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                let mask = self.s.m.i8((1u8 << n) - 1);
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
@@ -5032,9 +5036,11 @@ impl<'a> Lower<'a> {
                     139,
                     &[h, a, u, mask, al],
                 );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
-                self.write(inst, Reg::S(code + k as u8), x, None);
+                for k in 0..n {
+                    let x = self.s.m.extract(c, r, k);
+                    let x = self.as_int(x);
+                    self.write(inst, Reg::S(code + (first + k) as u8), x, None);
+                }
             }
             return Ok(());
         }
@@ -6113,27 +6119,16 @@ impl<'a> Lower<'a> {
             } else {
                 s(self, 2)?
             };
-            let k24 = self.s.m.i32(24);
-            let mut sum = None;
-            for lane in 0..4u32 {
-                let shl = self.s.m.i32(24 - 8 * lane);
-                let byte = |l: &mut Self, x: V| {
-                    let t = if lane == 3 {
-                        x
-                    } else {
-                        l.s.m.bin(c, Bin::Shl, x, shl)
-                    };
-                    l.s.m.bin(c, Bin::AShr, t, k24)
-                };
-                let (xa, xb) = (byte(self, a), byte(self, b));
-                let prod = self.s.m.bin(c, Bin::Mul, xa, xb);
-                sum = Some(match sum {
-                    Some(prev) => self.s.m.bin(c, Bin::Add, prev, prod),
-                    None => prod,
-                });
-            }
-            let dot = sum.expect("4 lanes");
             let r = if v.clamp {
+                let zero = self.s.m.i32(0);
+                let dot = self.s.op(
+                    c,
+                    "dot4AddPacked.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    163,
+                    &[zero, a, b],
+                );
                 let i64t = self.s.m.int(64);
                 self.s.flags |= flags::INT64;
                 let d64 = self.s.m.cast(c, Cast::SExt, dot, i64t);
@@ -6147,7 +6142,14 @@ impl<'a> Lower<'a> {
                 let clamped = self.s.m.select(c, too_hi, hi, clamped);
                 self.s.m.cast(c, Cast::Trunc, clamped, self.s.t.i32)
             } else {
-                self.s.m.bin(c, Bin::Add, dot, acc)
+                self.s.op(
+                    c,
+                    "dot4AddPacked.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    163,
+                    &[acc, a, b],
+                )
             };
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());

@@ -628,7 +628,10 @@ struct Guards {
     protected: IntervalSet,
     clean: IntervalSet,
     absent: IntervalSet,
-    /// Exact union `clean ∪ hot ∪ absent` (pairwise disjoint) for O(log n) fast-path checks.
+    /// Partly-committed 64 KiB blocks that cannot be `VirtualProtect`'d whole;
+    /// kept writable and reported as `HOT_WRITE` until fully committed or remapped.
+    partly: IntervalSet,
+    /// Exact union `clean ∪ hot ∪ absent ∪ partly` (pairwise disjoint) for O(log n) fast-path checks.
     accounted: IntervalSet,
     aliased: BTreeSet<usize>,
     recent_fault: BTreeMap<usize, u64>,
@@ -642,6 +645,7 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     protected: IntervalSet::new(),
     clean: IntervalSet::new(),
     absent: IntervalSet::new(),
+    partly: IntervalSet::new(),
     accounted: IntervalSet::new(),
     aliased: BTreeSet::new(),
     recent_fault: BTreeMap::new(),
@@ -689,26 +693,44 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
     let ask = *ASK.get_or_init(|| std::env::var_os("OATHKEEP_GUARD_ASK").is_some_and(|v| v == "1"));
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let frame = crate::frame::current();
+    // When HLE demand-commit hooks are installed, all `MEM_MAPPED` commits notify
+    // `title_memory_committed`; only probe `g.absent` via `VirtualQuery` when no hook
+    // is installed (e.g. unit tests calling `VirtualAlloc(MEM_COMMIT)` directly).
+    let probe_absent = COMMIT_TITLE_MEMORY.get().is_none();
     if !ask {
         let g = guards_read();
         if g.clean.contains_range(first, last) {
             return Some(GuardHot::HotOnly(Vec::new()));
         }
-        if g.accounted.contains_range(first, last) {
-            if g.hot.is_empty() {
+        if g.accounted.contains_range(first, last)
+            && (!probe_absent || !g.absent.overlaps(first, last))
+        {
+            let has_partly = g.partly.overlaps(first, last);
+            if g.hot.is_empty() && !has_partly {
                 return Some(GuardHot::HotOnly(Vec::new()));
             }
             let mut hot_pages = Vec::new();
             let mut all_active = true;
-            for (&block, &until) in g.hot.range(first..last) {
-                if until > frame {
-                    hot_pages.push((block, HOT_WRITE));
-                } else {
-                    all_active = false;
-                    break;
+            if !g.hot.is_empty() {
+                for (&block, &until) in g.hot.range(first..last) {
+                    if until > frame {
+                        hot_pages.push((block, HOT_WRITE));
+                    } else {
+                        all_active = false;
+                        break;
+                    }
                 }
             }
             if all_active {
+                if has_partly {
+                    let had_hot = !hot_pages.is_empty();
+                    g.partly.for_each_overlap(first, last, |a, b| {
+                        hot_pages.extend((a..b).map(|block| (block, HOT_WRITE)));
+                    });
+                    if had_hot {
+                        hot_pages.sort_unstable_by_key(|&(block, _)| block);
+                    }
+                }
                 return Some(GuardHot::HotOnly(hot_pages));
             }
         }
@@ -744,12 +766,7 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
             .and_modify(|c| *c = c.saturating_add(1).min(MAX_COOL_BACKOFF))
             .or_insert(1);
     }
-    if g.accounted.contains_range(first, last) {
-        return Some(GuardHot::HotOnly(
-            hot_pages.into_iter().map(|p| (p, HOT_WRITE)).collect(),
-        ));
-    }
-    if g.absent.overlaps(first, last) {
+    if probe_absent && g.absent.overlaps(first, last) {
         let mut newly_committed: Vec<(usize, usize)> = Vec::new();
         let mut uncommitted_until = first;
         g.absent.for_each_overlap(first, last, |a, b| {
@@ -774,21 +791,33 @@ fn guard_with_hot_fast(start: usize, end: usize) -> Option<GuardHot> {
             g.accounted.remove_range(a, b);
         }
     }
+    if g.partly.overlaps(first, last) {
+        let had_hot = !hot_pages.is_empty();
+        g.partly.for_each_overlap(first, last, |a, b| {
+            hot_pages.extend(a..b);
+        });
+        if had_hot {
+            hot_pages.sort_unstable();
+        }
+    }
+    if g.accounted.contains_range(first, last) {
+        return Some(GuardHot::HotOnly(
+            hot_pages.into_iter().map(|p| (p, HOT_WRITE)).collect(),
+        ));
+    }
     let mut written = Vec::new();
     let mut protected_runs = Vec::new();
     for (gap_first, gap_last) in g.accounted.gaps_in(first, last) {
         written.extend(gap_first * BLOCK / PAGE..gap_last * BLOCK / PAGE);
         if !g.protected.overlaps(gap_first, gap_last) {
-            protect_here(&mut g, gap_first, gap_last);
-            protected_runs.push((gap_first, gap_last));
+            protect_here(&mut g, gap_first, gap_last, &mut protected_runs);
         } else {
             let mut already = Vec::new();
             g.protected.for_each_overlap(gap_first, gap_last, |a, b| {
                 already.push((a, b));
             });
             for (a, b) in g.protected.gaps_in(gap_first, gap_last) {
-                protect_here(&mut g, a, b);
-                protected_runs.push((a, b));
+                protect_here(&mut g, a, b, &mut protected_runs);
             }
             for (a, b) in already {
                 g.clean.insert_range(a, b);
@@ -939,11 +968,22 @@ fn protect_alias_span(g: &mut Guards, a: usize, b: usize) {
     }
 }
 
-fn protect_here(g: &mut Guards, from: usize, to: usize) {
-    protect_range(g, from, to, true);
+fn protect_here(
+    g: &mut Guards,
+    from: usize,
+    to: usize,
+    protected_runs: &mut Vec<(usize, usize)>,
+) {
+    protect_range(g, from, to, true, protected_runs);
 }
 
-fn protect_range(g: &mut Guards, from: usize, to: usize, mark_clean: bool) {
+fn protect_range(
+    g: &mut Guards,
+    from: usize,
+    to: usize,
+    mark_clean: bool,
+    protected_runs: &mut Vec<(usize, usize)>,
+) {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect,
         VirtualQuery,
@@ -960,12 +1000,13 @@ fn protect_range(g: &mut Guards, from: usize, to: usize, mark_clean: bool) {
             ) != 0
         }
     };
-    let note = |g: &mut Guards, from: usize, to: usize| {
+    let mut note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.insert_range(from, to);
         if mark_clean {
             g.clean.insert_range(from, to);
             g.accounted.insert_range(from, to);
         }
+        protected_runs.push((from, to));
     };
     if set(from, to) {
         note(g, from, to);
@@ -988,6 +1029,8 @@ fn protect_range(g: &mut Guards, from: usize, to: usize, mark_clean: bool) {
                 g.accounted.insert_range(block, raw_end);
                 block = raw_end;
             } else {
+                g.partly.insert(block);
+                g.accounted.insert(block);
                 block += 1;
             }
             continue;
@@ -1003,6 +1046,9 @@ fn protect_range(g: &mut Guards, from: usize, to: usize, mark_clean: bool) {
                 note(g, single, single + 1);
             } else if single < uncommitted_end(single) {
                 g.absent.insert(single);
+                g.accounted.insert(single);
+            } else {
+                g.partly.insert(single);
                 g.accounted.insert(single);
             }
         }
@@ -1054,8 +1100,7 @@ pub(crate) fn cool_hot(blocks: &[usize]) -> usize {
     let mut protected_runs: Vec<(usize, usize)> = Vec::new();
     for (from, to) in runs {
         for (a, b) in g.protected.gaps_in(from, to) {
-            protect_range(&mut g, a, b, false);
-            protected_runs.push((a, b));
+            protect_range(&mut g, a, b, false, &mut protected_runs);
         }
     }
     if !protected_runs.is_empty() {
@@ -1149,7 +1194,11 @@ fn open_fault(g: &mut Guards, at: usize) -> bool {
             g.hot.insert(block, until);
             g.accounted.insert(block);
             for alias in aliases {
-                if alias != block && !g.absent.contains(alias) && !g.clean.contains(alias) {
+                if alias != block
+                    && !g.absent.contains(alias)
+                    && !g.clean.contains(alias)
+                    && !g.partly.contains(alias)
+                {
                     let alias_shift = g
                         .cool_count
                         .get(&alias)
@@ -1232,12 +1281,19 @@ pub fn title_memory_committed(at: usize, len: usize) {
     }
     bump_write_epoch();
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    if !guards_read().absent.overlaps(first, last) {
-        return;
+    {
+        let g = guards_read();
+        if !g.absent.overlaps(first, last) && !g.partly.overlaps(first, last) {
+            return;
+        }
     }
     let mut g = guards();
-    let removed = g.absent.remove_range(first, last);
-    for (a, b) in removed {
+    let removed_absent = g.absent.remove_range(first, last);
+    for (a, b) in removed_absent {
+        g.accounted.remove_range(a, b);
+    }
+    let removed_partly = g.partly.remove_range(first, last);
+    for (a, b) in removed_partly {
         g.accounted.remove_range(a, b);
     }
 }
@@ -1430,6 +1486,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
     let mut g = guards();
     g.absent.remove_range(first, last);
+    g.partly.remove_range(first, last);
     g.protected.remove_range(first, last);
     g.clean.remove_range(first, last);
     g.accounted.remove_range(first, last);
