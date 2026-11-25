@@ -45,16 +45,21 @@ $repo = Split-Path -Parent $PSScriptRoot
 $manifest = Join-Path $repo 'Cargo.toml'
 $env:CARGO_BUILD_JOBS = '4'
 
-if ($Diag) {
-    Write-Host 'Building Oathkeep (diag, diagnostics, -j 4)...'
-    & cargo build -j 4 --profile diag -p victory --features diagnostics --manifest-path $manifest
-    $binDir = Join-Path $repo 'target\diag'
-} else {
-    Write-Host 'Building Oathkeep (release, -j 4)...'
-    & cargo build -j 4 --release -p victory --manifest-path $manifest
-    $binDir = Join-Path $repo 'target\release'
+Push-Location $repo
+try {
+    if ($Diag) {
+        Write-Host 'Building Oathkeep (diag, diagnostics, -j 4)...'
+        & cargo build -j 4 --profile diag -p victory --features diagnostics --manifest-path $manifest
+        $binDir = Join-Path $repo 'target\diag'
+    } else {
+        Write-Host 'Building Oathkeep (release, -j 4)...'
+        & cargo build -j 4 --release -p victory --manifest-path $manifest
+        $binDir = Join-Path $repo 'target\release'
+    }
+    if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit code $LASTEXITCODE)." }
+} finally {
+    Pop-Location
 }
-if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit code $LASTEXITCODE)." }
 
 $oathkeepExe = Join-Path $binDir 'oathkeep.exe'
 
