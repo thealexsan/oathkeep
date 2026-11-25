@@ -2434,13 +2434,148 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+#[cfg(any(windows, test))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BarrierGroup {
+    kind: u32,
+    count: u32,
+    ptr: *const u8,
+}
+
+#[cfg(any(windows, test))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BarrierHeader {
+    sync_before: u32,
+    sync_after: u32,
+    access_before: u32,
+    access_after: u32,
+}
+
+#[cfg(any(windows, test))]
+const BARRIER_TYPE_GLOBAL: u32 = 0;
+#[cfg(any(windows, test))]
+const BARRIER_TYPE_TEXTURE: u32 = 1;
+#[cfg(any(windows, test))]
+const BARRIER_TYPE_BUFFER: u32 = 2;
+#[cfg(any(windows, test))]
+const BARRIER_SYNC_NONE: u32 = 0;
+#[cfg(any(windows, test))]
+const BARRIER_SYNC_SPLIT: u32 = 0x8000_0000;
+#[cfg(any(windows, test))]
+const BARRIER_ACCESS_COMMON: u32 = 0;
+#[cfg(any(windows, test))]
+const BARRIER_ACCESS_UNORDERED_ACCESS: u32 = 0x10;
+#[cfg(any(windows, test))]
+const BARRIER_ACCESS_NO_ACCESS: u32 = 0x8000_0000;
+
+#[cfg(any(windows, test))]
+#[inline]
+fn barrier_header_needs_uav(h: BarrierHeader) -> bool {
+    if h.sync_before == BARRIER_SYNC_NONE
+        || h.sync_after == BARRIER_SYNC_NONE
+        || h.sync_before == BARRIER_SYNC_SPLIT
+        || h.access_before == BARRIER_ACCESS_NO_ACCESS
+        || h.access_after == BARRIER_ACCESS_NO_ACCESS
+    {
+        return false;
+    }
+    (h.access_before & BARRIER_ACCESS_UNORDERED_ACCESS) != 0
+        || (h.access_after & BARRIER_ACCESS_UNORDERED_ACCESS) != 0
+        || h.access_before == BARRIER_ACCESS_COMMON
+        || h.access_after == BARRIER_ACCESS_COMMON
+}
+
+#[cfg(any(windows, test))]
+#[inline]
+fn barrier_layout_sane(layout: u32) -> bool {
+    layout <= 0x40 || layout == u32::MAX || (layout & 0x8000_0000) != 0
+}
+
+#[cfg(any(windows, test))]
+fn barrier_groups_need_uav(count: u32, groups: *const u8) -> bool {
+    const _: () = assert!(size_of::<BarrierGroup>() == 16);
+    const _: () = assert!(size_of::<BarrierHeader>() == 16);
+    const MAX_USER_ADDR: usize = 0x0000_8000_0000_0000;
+    if groups.is_null() || count > 64 {
+        return true;
+    }
+    #[cfg(feature = "diagnostics")]
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // SAFETY: the title passes `count` valid `D3D12_BARRIER_GROUP` entries.
+    let slice = unsafe { std::slice::from_raw_parts(groups.cast::<BarrierGroup>(), count as usize) };
+    for g in slice {
+        if g.count == 0 {
+            continue;
+        }
+        if g.ptr.is_null() || g.count > 1024 {
+            return true;
+        }
+        let stride = match g.kind {
+            BARRIER_TYPE_GLOBAL => 16usize,
+            BARRIER_TYPE_TEXTURE => 64usize,
+            BARRIER_TYPE_BUFFER => 40usize,
+            _ => return true,
+        };
+        for j in 0..g.count as usize {
+            // SAFETY: within `g.count` elements of the barrier array.
+            let entry = unsafe { g.ptr.add(j * stride) };
+            // SAFETY: all 3 D3D12 enhanced barrier structs start with `BarrierHeader`.
+            let h = unsafe { std::ptr::read_unaligned(entry.cast::<BarrierHeader>()) };
+            if g.kind == BARRIER_TYPE_BUFFER {
+                // SAFETY: `pResource` is at byte offset 16 in `D3D12_BUFFER_BARRIER`.
+                let res = unsafe { std::ptr::read_unaligned(entry.add(16).cast::<usize>()) };
+                if res >= MAX_USER_ADDR {
+                    return true;
+                }
+            } else if g.kind == BARRIER_TYPE_TEXTURE {
+                // SAFETY: `LayoutBefore` (16), `LayoutAfter` (20), `pResource` (24) in `D3D12_TEXTURE_BARRIER`.
+                let layout_before =
+                    unsafe { std::ptr::read_unaligned(entry.add(16).cast::<u32>()) };
+                let layout_after = unsafe { std::ptr::read_unaligned(entry.add(20).cast::<u32>()) };
+                let res = unsafe { std::ptr::read_unaligned(entry.add(24).cast::<usize>()) };
+                if res >= MAX_USER_ADDR
+                    || !barrier_layout_sane(layout_before)
+                    || !barrier_layout_sane(layout_after)
+                {
+                    return true;
+                }
+            }
+            let need = barrier_header_needs_uav(h);
+            #[cfg(feature = "diagnostics")]
+            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                tracing::info!(
+                    kind = g.kind,
+                    barriers = g.count,
+                    sync_before = format_args!("{:#x}", h.sync_before),
+                    sync_after = format_args!("{:#x}", h.sync_after),
+                    access_before = format_args!("{:#x}", h.access_before),
+                    access_after = format_args!("{:#x}", h.access_after),
+                    need_uav = need,
+                    "sample enhanced barrier group entry"
+                );
+            }
+            if need {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     #[cfg(windows)]
     if count > 0 && !this.is_null() {
         // SAFETY: the title passes one of our lists, recorded by one thread at
         // a time and not submitted while it records.
         let list_obj = unsafe { &mut *this.cast_mut().cast::<List>() };
         if !list_obj.uav_barrier_needed {
+            return;
+        }
+        if !barrier_groups_need_uav(count, groups) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::WaitsForGroupsSkipped, 1);
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -2463,7 +2598,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         list_obj.uav_barrier_needed = false;
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
 }
 
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
@@ -2901,5 +3036,124 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn barrier_groups_need_uav_filters_non_uav_transitions() {
+        const SYNC_DRAW: u32 = 0x2;
+        const SYNC_COMPUTE: u32 = 0x80;
+        const SYNC_COPY: u32 = 0x200;
+        const ACCESS_RTV: u32 = 0x8;
+        const ACCESS_SRV: u32 = 0x80;
+        const ACCESS_COPY_DEST: u32 = 0x400;
+
+        // Null pointer falls back conservatively to true.
+        assert!(barrier_groups_need_uav(1, std::ptr::null()));
+
+        // Non-UAV texture transition (RTV -> SRV) needs no UAV barrier.
+        #[repr(C)]
+        struct TexBarrier {
+            h: BarrierHeader,
+            layout_before: u32,
+            layout_after: u32,
+            res: usize,
+            sub: [u32; 6],
+            flags: u32,
+            pad: u32,
+        }
+        assert_eq!(size_of::<TexBarrier>(), 64);
+        let tex_rtv_to_srv = TexBarrier {
+            h: BarrierHeader {
+                sync_before: SYNC_DRAW,
+                sync_after: SYNC_DRAW,
+                access_before: ACCESS_RTV,
+                access_after: ACCESS_SRV,
+            },
+            layout_before: 4,
+            layout_after: 5,
+            res: 0x1000_0000,
+            sub: [0; 6],
+            flags: 0,
+            pad: 0,
+        };
+        let group = BarrierGroup {
+            kind: BARRIER_TYPE_TEXTURE,
+            count: 1,
+            ptr: (&tex_rtv_to_srv as *const TexBarrier).cast(),
+        };
+        assert!(!barrier_groups_need_uav(1, (&group as *const BarrierGroup).cast()));
+
+        // UAV -> SRV global barrier requires a UAV barrier.
+        let global_uav = BarrierHeader {
+            sync_before: SYNC_COMPUTE,
+            sync_after: SYNC_DRAW,
+            access_before: BARRIER_ACCESS_UNORDERED_ACCESS,
+            access_after: ACCESS_SRV,
+        };
+        let group_uav = BarrierGroup {
+            kind: BARRIER_TYPE_GLOBAL,
+            count: 1,
+            ptr: (&global_uav as *const BarrierHeader).cast(),
+        };
+        assert!(barrier_groups_need_uav(1, (&group_uav as *const BarrierGroup).cast()));
+
+        // Split-begin or NO_ACCESS barriers need no UAV barrier.
+        let split_begin = BarrierHeader {
+            sync_before: BARRIER_SYNC_SPLIT,
+            sync_after: SYNC_COMPUTE,
+            access_before: BARRIER_ACCESS_UNORDERED_ACCESS,
+            access_after: ACCESS_SRV,
+        };
+        let group_split = BarrierGroup {
+            kind: BARRIER_TYPE_GLOBAL,
+            count: 1,
+            ptr: (&split_begin as *const BarrierHeader).cast(),
+        };
+        assert!(!barrier_groups_need_uav(1, (&group_split as *const BarrierGroup).cast()));
+
+        // Buffer barrier COPY_DEST -> SRV needs no UAV barrier; COMMON -> SRV conservatively needs one.
+        #[repr(C)]
+        struct BufBarrier {
+            h: BarrierHeader,
+            res: usize,
+            offset: u64,
+            size: u64,
+        }
+        assert_eq!(size_of::<BufBarrier>(), 40);
+        let buf_copy = BufBarrier {
+            h: BarrierHeader {
+                sync_before: SYNC_COPY,
+                sync_after: SYNC_DRAW,
+                access_before: ACCESS_COPY_DEST,
+                access_after: ACCESS_SRV,
+            },
+            res: 0x2000_0000,
+            offset: 0,
+            size: 1024,
+        };
+        let group_buf = BarrierGroup {
+            kind: BARRIER_TYPE_BUFFER,
+            count: 1,
+            ptr: (&buf_copy as *const BufBarrier).cast(),
+        };
+        assert!(!barrier_groups_need_uav(1, (&group_buf as *const BarrierGroup).cast()));
+
+        let buf_common = BufBarrier {
+            h: BarrierHeader {
+                sync_before: SYNC_COMPUTE,
+                sync_after: SYNC_DRAW,
+                access_before: BARRIER_ACCESS_COMMON,
+                access_after: ACCESS_SRV,
+            },
+            res: 0x2000_0000,
+            offset: 0,
+            size: 1024,
+        };
+        let group_common = BarrierGroup {
+            kind: BARRIER_TYPE_BUFFER,
+            count: 1,
+            ptr: (&buf_common as *const BufBarrier).cast(),
+        };
+        assert!(barrier_groups_need_uav(1, (&group_common as *const BarrierGroup).cast()));
     }
 }

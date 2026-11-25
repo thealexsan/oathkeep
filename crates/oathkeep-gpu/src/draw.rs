@@ -3436,8 +3436,14 @@ impl State {
                 let (base_off, step, records) = match prev_window {
                     Some(w) => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
+                        let strided_first = offset > w.base
+                            && offset <= last
+                            && w.step == stride
+                            && !(offset - w.base).is_multiple_of(u64::from(stride));
                         let step = if offset > last {
                             offset - last
+                        } else if strided_first {
+                            offset - w.base
                         } else if w.records == 1 && offset < w.base {
                             w.base - offset
                         } else if w.records > 1
@@ -3451,7 +3457,7 @@ impl State {
                         let walks = step >= u64::from(stride)
                             && step <= WINDOW_STEP_MAX
                             && step % 4 == 0
-                            && (w.records == 1 || step == u64::from(w.step));
+                            && (w.records == 1 || strided_first || step == u64::from(w.step));
                         let left = args.left(arguments);
                         if walks {
                             let target = (if w.records == 1 { 64 } else { w.records * 2 })
@@ -3514,6 +3520,17 @@ impl State {
                             };
                             (offset - before * block_step, block_step as u32, count as u32)
                         }
+                    }
+                    None if windowed => {
+                        const FIRST_BLOCK: u64 = 64;
+                        let left = args.left(arguments);
+                        let fit = if left >= u64::from(stride) {
+                            (((left - u64::from(stride)) / u64::from(stride)) + 1)
+                                .min(FIRST_BLOCK) as u32
+                        } else {
+                            1
+                        };
+                        (offset, stride, fit.max(1))
                     }
                     None => (offset, stride, max),
                 };
