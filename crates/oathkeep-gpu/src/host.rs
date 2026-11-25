@@ -6888,7 +6888,7 @@ impl HostList {
                     }
                     batch.title_written_range(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    crate::watch::wrote(dst, len);
+                    crate::watch::wrote_after_writing(dst, len);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -6925,7 +6925,7 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    batch.flush_one(shadow);
+                    batch.flush_one_range(shadow, *address, address.saturating_add(*len));
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
                     shadow.writing(*address, *len);
@@ -6974,6 +6974,33 @@ struct Batch {
     after_textures: Vec<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
+fn split_overlapping_spans(
+    spans: &mut Vec<(usize, usize)>,
+    lo: usize,
+    hi: usize,
+) -> Vec<(usize, usize)> {
+    if lo >= hi || !spans.iter().any(|&(a, b)| a < hi && b > lo) {
+        return Vec::new();
+    }
+    let mut remaining = Vec::with_capacity(spans.len() + 1);
+    let mut overlapping = Vec::new();
+    for &(a, b) in spans.iter() {
+        if b <= lo || a >= hi {
+            remaining.push((a, b));
+        } else {
+            if a < lo {
+                remaining.push((a, lo));
+            }
+            overlapping.push((a.max(lo), b.min(hi)));
+            if b > hi {
+                remaining.push((hi, b));
+            }
+        }
+    }
+    *spans = remaining;
+    overlapping
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
@@ -6996,20 +7023,40 @@ impl Batch {
         }
     }
 
-    fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
-        let Some(at) = self
-            .index
-            .remove(&(std::sync::Arc::as_ptr(shadow) as usize))
-        else {
+    fn flush_one_range(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        from: usize,
+        to: usize,
+    ) {
+        if from >= to {
+            return;
+        }
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let Some(&at) = self.index.get(&key) else {
             return;
         };
-        let (shadow, spans) = self.refreshes.swap_remove(at);
-        if let Some(moved) = self.refreshes.get(at) {
-            self.index
-                .insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
+        let overlapping = split_overlapping_spans(&mut self.refreshes[at].1, from, to);
+        if overlapping.is_empty() {
+            return;
         }
-        for (from, to) in spans {
-            Self::update(&shadow, from, to);
+        let shadow = if self.refreshes[at].1.is_empty() {
+            self.index.remove(&key);
+            let (shadow, _) = self.refreshes.swap_remove(at);
+            if let Some(moved) = self.refreshes.get(at) {
+                self.index
+                    .insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
+            }
+            if self.refreshes.is_empty() {
+                self.refresh_min = 0;
+                self.refresh_max = 0;
+            }
+            shadow
+        } else {
+            self.refreshes[at].0.clone()
+        };
+        for (ov_from, ov_to) in overlapping {
+            Self::update(&shadow, ov_from, ov_to);
         }
     }
 
@@ -7074,19 +7121,21 @@ impl Batch {
             let mut overlapping_shadows = Vec::new();
             let mut i = 0;
             while i < self.refreshes.len() {
-                if self.refreshes[i]
-                    .1
-                    .iter()
-                    .any(|&(a, b)| a < end && b > dst)
-                {
-                    let (shadow, spans) = self.refreshes.swap_remove(i);
-                    self.index
-                        .remove(&(std::sync::Arc::as_ptr(&shadow) as usize));
-                    if let Some(moved) = self.refreshes.get(i) {
+                let overlapping = split_overlapping_spans(&mut self.refreshes[i].1, dst, end);
+                if !overlapping.is_empty() {
+                    if self.refreshes[i].1.is_empty() {
+                        let (shadow, _) = self.refreshes.swap_remove(i);
                         self.index
-                            .insert(std::sync::Arc::as_ptr(&moved.0) as usize, i);
+                            .remove(&(std::sync::Arc::as_ptr(&shadow) as usize));
+                        if let Some(moved) = self.refreshes.get(i) {
+                            self.index
+                                .insert(std::sync::Arc::as_ptr(&moved.0) as usize, i);
+                        }
+                        overlapping_shadows.push((shadow, overlapping));
+                    } else {
+                        overlapping_shadows.push((self.refreshes[i].0.clone(), overlapping));
+                        i += 1;
                     }
-                    overlapping_shadows.push((shadow, spans));
                 } else {
                     i += 1;
                 }
@@ -7260,7 +7309,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     let sparse = std::time::Instant::now();
     let (src, dst, len) = (src.wrapping_add(done), dst.wrapping_add(done), len - done);
-    if !title_dst && len >= 64 << 10 {
+    if !title_dst && len >= 4 << 10 {
         read_sparse(src, dst, len);
     } else {
         read_pieces(src, dst, len);
@@ -7323,6 +7372,22 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
+}
+
+pub(crate) fn read_into_zero_unmapped(src: *const u8, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    let done = read_partial(src, dst.as_mut_ptr(), dst.len());
+    if done == dst.len() {
+        return true;
+    }
+    read_sparse(
+        src.wrapping_add(done),
+        dst.as_mut_ptr().wrapping_add(done),
+        dst.len() - done,
+    );
+    false
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -9144,6 +9209,58 @@ mod batch {
         batch.title_written_range(0x1200, 0x100);
         assert!(batch.texture_due_range(&a, 0x1000, 0x400));
         assert!(!batch.texture_due_range(&b, 0x4000, 0x400));
+    }
+
+    #[test]
+    fn split_overlapping_spans_extracts_only_the_overlapping_slice() {
+        let mut spans = vec![(0x1000, 0x5000), (0x8000, 0xa000)];
+        let ov = super::split_overlapping_spans(&mut spans, 0x2000, 0x3000);
+        assert_eq!(ov, vec![(0x2000, 0x3000)]);
+        assert_eq!(spans, vec![(0x1000, 0x2000), (0x3000, 0x5000), (0x8000, 0xa000)]);
+
+        let ov2 = super::split_overlapping_spans(&mut spans, 0x6000, 0x7000);
+        assert!(ov2.is_empty());
+        assert_eq!(spans, vec![(0x1000, 0x2000), (0x3000, 0x5000), (0x8000, 0xa000)]);
+
+        let ov3 = super::split_overlapping_spans(&mut spans, 0x4000, 0x9000);
+        assert_eq!(ov3, vec![(0x4000, 0x5000), (0x8000, 0x9000)]);
+        assert_eq!(spans, vec![(0x1000, 0x2000), (0x3000, 0x4000), (0x9000, 0xa000)]);
+    }
+
+    #[test]
+    fn read_into_zero_unmapped_reads_committed_prefix_and_zeroes_uncommitted_tail() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const PAGE_4K: usize = 4096;
+        // SAFETY: reserve 2 4 KiB pages, commit only the first page, write known pattern, then free.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE_4K,
+                MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!base.is_null());
+        let committed = unsafe { VirtualAlloc(base, PAGE_4K, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(committed, base);
+        unsafe {
+            std::ptr::write_bytes(base.cast::<u8>(), 0xab, PAGE_4K);
+        }
+        let mut out = vec![0x55u8; 2 * PAGE_4K];
+        let fully_mapped = super::read_into_zero_unmapped(base.cast::<u8>(), &mut out);
+        assert!(!fully_mapped);
+        assert!(out[..PAGE_4K].iter().all(|&b| b == 0xab));
+        assert!(out[PAGE_4K..].iter().all(|&b| b == 0));
+
+        let mut head = vec![0u8; PAGE_4K];
+        assert!(super::read_into_zero_unmapped(base.cast::<u8>(), &mut head));
+        assert!(head.iter().all(|&b| b == 0xab));
+        // SAFETY: freeing our own test reservation.
+        unsafe {
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
     }
 
     #[test]

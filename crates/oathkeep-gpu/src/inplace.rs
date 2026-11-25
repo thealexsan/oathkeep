@@ -260,28 +260,41 @@ pub(crate) fn section_run_around(
     if !committed {
         return None;
     }
+    let cap = max_len as usize;
+    let forward_limit = at.saturating_add(cap);
     let mut run_start = base;
     let mut run_off = offset;
     let mut run_end = base.saturating_add(bytes);
-    // Extend forward through contiguous mappings of the same section.
-    while let Some(&(next_bytes, next_sec, next_off)) = v.views.get(&run_end) {
+    // Extend forward through contiguous mappings of the same section, stopping
+    // once we have at least `max_len` bytes of forward headroom from `at`.
+    while run_end < forward_limit {
+        let Some(&(next_bytes, next_sec, next_off)) = v.views.get(&run_end) else {
+            break;
+        };
         if next_sec != section || next_off != run_off + (run_end - run_start) as u64 {
             break;
         }
         run_end = run_end.saturating_add(next_bytes);
     }
-    // Extend backward through contiguous mappings of the same section.
-    while let Some((&prev_base, &(prev_bytes, prev_sec, prev_off))) =
-        v.views.range(..run_start).next_back()
-    {
-        if prev_base.saturating_add(prev_bytes) != run_start
-            || prev_sec != section
-            || prev_off.saturating_add(prev_bytes as u64) != run_off
-        {
-            break;
+    // Only extend backward if forward headroom from `at` is shorter than `max_len`,
+    // and stop once `run_end - run_start >= max_len`.
+    if run_end.saturating_sub(at) < cap {
+        let backward_limit = run_end.saturating_sub(cap);
+        while run_start > backward_limit {
+            let Some((&prev_base, &(prev_bytes, prev_sec, prev_off))) =
+                v.views.range(..run_start).next_back()
+            else {
+                break;
+            };
+            if prev_base.saturating_add(prev_bytes) != run_start
+                || prev_sec != section
+                || prev_off.saturating_add(prev_bytes as u64) != run_off
+            {
+                break;
+            }
+            run_start = prev_base;
+            run_off = prev_off;
         }
-        run_start = prev_base;
-        run_off = prev_off;
     }
     if run_end < need_end {
         return None;
@@ -289,7 +302,6 @@ pub(crate) fn section_run_around(
     // Clamp the span to `max_len` around `[at, need_end)` while preserving as
     // much forward headroom from `at` as possible.
     if (run_end - run_start) as u64 > max_len {
-        let cap = max_len as usize;
         let new_start = if run_end - at <= cap {
             run_end - cap
         } else {

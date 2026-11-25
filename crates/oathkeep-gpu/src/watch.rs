@@ -316,6 +316,8 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     kept: false,
 });
 
+static JOURNAL_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn journal_read() -> std::sync::RwLockReadGuard<'static, Journal> {
     JOURNAL.read().unwrap_or_else(|e| e.into_inner())
 }
@@ -415,22 +417,43 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         }
     }
     j.kept = !j.ahead.is_empty();
+    JOURNAL_KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
 }
 
 pub(crate) fn ask_once_end() {
     bump_global_write_epoch();
+    if !JOURNAL_KEPT.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let mut j = journal_write();
     if j.kept {
         j.kept = false;
+        JOURNAL_KEPT.store(false, std::sync::atomic::Ordering::Release);
         j.ahead.clear();
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn wrote(at: usize, len: usize) {
     if len == 0 {
         return;
     }
     record_written_range(at, at.saturating_add(len));
+    wrote_journal_only(at, len);
+}
+
+pub(crate) fn wrote_after_writing(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // `watch::writing(at, len)` already recorded the range in `WRITE_RANGE_LOG`.
+    wrote_journal_only(at, len);
+}
+
+fn wrote_journal_only(at: usize, len: usize) {
+    if !JOURNAL_KEPT.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let mut j = journal_write();
     if !j.kept {
         return;

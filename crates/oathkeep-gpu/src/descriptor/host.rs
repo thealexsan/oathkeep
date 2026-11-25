@@ -2778,8 +2778,7 @@ fn buffer_srv(
         buffer.StructureByteStride,
     );
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-    // SAFETY: a live buffer.
-    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    let width = shadow.host_width();
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(
@@ -2813,9 +2812,7 @@ fn buffer_uav(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<(Kept, std::sync::Arc<crate::shadow::Shadow>)> {
     let shadow = crate::shadow::find(address, len)?;
-    // SAFETY: a live buffer.
-    let res_desc = unsafe { shadow.buffer.GetDesc() };
-    if res_desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+    if !shadow.allow_uav() {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
@@ -2865,7 +2862,7 @@ fn buffer_uav(
     if window.is_some() {
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
-    let width = res_desc.Width;
+    let width = shadow.host_width();
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(

@@ -9,6 +9,8 @@ use crate::watch::PAGE;
 
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
+    host_width: u64,
+    allow_uav: bool,
     data: *mut u8,
     gpu: u64,
     start: u64,
@@ -843,7 +845,7 @@ fn scan_card_pages_chunk(
             let len = p_to - p_from;
             let full_page = p_from == page_lo && p_to == page_hi;
             let mut page_changed = false;
-            if len > PAGE || !crate::host::read_into(p_from as *const u8, &mut buf[..len]) {
+            if len > PAGE {
                 let s_lo = (off_from / HOT_HASH_BLOCK).saturating_sub(slot_base);
                 let s_hi = (off_from + len)
                     .div_ceil(HOT_HASH_BLOCK)
@@ -855,6 +857,7 @@ fn scan_card_pages_chunk(
                 push_coalesced_span(&mut changed_spans, p_from, p_to);
                 page_changed = true;
             } else {
+                let _ = crate::host::read_into_zero_unmapped(p_from as *const u8, &mut buf[..len]);
                 let stored = diff_hot_card_blocks_at(
                     slots,
                     slot_base,
@@ -1063,29 +1066,18 @@ fn scan_unwatched_card_chunk(
             let next_aligned = ((cur / HOT_HASH_BLOCK) + (PAGE / HOT_HASH_BLOCK)) * HOT_HASH_BLOCK;
             let step_end = next_aligned.min(off_to);
             let len = step_end - cur;
-            if !crate::host::read_into((start + cur) as *const u8, &mut buf[..len]) {
-                let s_lo = (cur / HOT_HASH_BLOCK).saturating_sub(slot_base);
-                let s_hi = step_end
-                    .div_ceil(HOT_HASH_BLOCK)
-                    .saturating_sub(slot_base)
-                    .min(slots.len());
-                if s_lo < s_hi {
-                    slots[s_lo..s_hi].fill(0);
-                }
-                push_coalesced_span(&mut changed_spans, start + cur, start + step_end);
-            } else {
-                let stored = diff_hot_card_blocks_at(
-                    slots,
-                    slot_base,
-                    buf_len,
-                    cur,
-                    &buf[..len],
-                    |cov_lo, cov_hi| {
-                        push_coalesced_span(&mut changed_spans, start + cov_lo, start + cov_hi);
-                    },
-                );
-                stored_any |= stored;
-            }
+            let _ = crate::host::read_into_zero_unmapped((start + cur) as *const u8, &mut buf[..len]);
+            let stored = diff_hot_card_blocks_at(
+                slots,
+                slot_base,
+                buf_len,
+                cur,
+                &buf[..len],
+                |cov_lo, cov_hi| {
+                    push_coalesced_span(&mut changed_spans, start + cov_lo, start + cov_hi);
+                },
+            );
+            stored_any |= stored;
             cur = step_end;
         }
     });
@@ -1602,6 +1594,18 @@ impl Flights {
 }
 
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    if title == held {
+        if now == held {
+            return false;
+        }
+        held.copy_from_slice(now);
+        title.copy_from_slice(now);
+        return true;
+    }
+    if title == now {
+        held.copy_from_slice(now);
+        return false;
+    }
     let mut differs = 0u8;
     for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
@@ -3134,6 +3138,14 @@ impl Shadow {
         self.place.is_some()
     }
 
+    pub(crate) fn host_width(&self) -> u64 {
+        self.host_width
+    }
+
+    pub(crate) fn allow_uav(&self) -> bool {
+        self.allow_uav
+    }
+
     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
         crate::host::name(&placed.buffer, || {
             format!("title memory {start:#x}+{len:#x} in place")
@@ -3159,11 +3171,19 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+        // SAFETY: `buffer` is a live D3D12 resource whose width and flags never change.
+        let desc = unsafe { buffer.GetDesc() };
+        let host_width = desc.Width;
+        let allow_uav = desc.Flags.0
+            & windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0
+            != 0;
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
         Shadow {
             buffer,
+            host_width,
+            allow_uav,
             data,
             gpu,
             start,
@@ -4276,9 +4296,7 @@ impl Shadow {
                 buf.resize(PAGE, 0);
             }
             let slice = &mut buf[..len];
-            if !crate::host::read_into(from as *const u8, slice) {
-                return self.copy(from, to);
-            }
+            let _ = crate::host::read_into_zero_unmapped(from as *const u8, slice);
             let off = from - start;
             // SAFETY: inside the write-back shared buffer mapping (`from..to` is within `start..end`).
             let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), len) };
@@ -4315,7 +4333,7 @@ impl Shadow {
                         let (p_lo, p_hi) = self.piece(p);
                         let a = off_from.max(p_lo);
                         let b = off_to.min(p_hi);
-                        crate::host::read_into(
+                        let _ = crate::host::read_into_zero_unmapped(
                             (start + a) as *const u8,
                             &mut buf[a - p_lo..b - p_lo],
                         );
@@ -4394,7 +4412,7 @@ impl Shadow {
                         let (p_lo, p_hi) = self.piece(p);
                         let a = off_from.max(p_lo);
                         let b = off_to.min(p_hi);
-                        crate::host::read_into(
+                        let _ = crate::host::read_into_zero_unmapped(
                             (start + a) as *const u8,
                             &mut buf[a - p_lo..b - p_lo],
                         );
@@ -4884,16 +4902,47 @@ impl Shadow {
         let total_writes: usize = buckets.iter().map(|b| b.writes.len()).sum();
         let mut spans: Vec<(usize, usize)> = Vec::with_capacity(total_writes);
         let mut total_written = 0usize;
+        let mut has_hash_updates = false;
+        let mut has_hash_clears = false;
         for b in &buckets {
+            has_hash_updates |= !b.hash_updates.is_empty();
+            has_hash_clears |= !b.hash_clears.is_empty();
             for w in &b.writes {
                 spans.push((w.at, w.at + w.len));
                 total_written += w.len;
             }
         }
 
-        if card.has_hot_hashes.load(Ordering::Acquire) {
-            for (a, b) in coalesce_hash_spans(&spans) {
-                card.clear_hot_hashes(a, b);
+        if has_hash_updates || (has_hash_clears && card.has_hot_hashes.load(Ordering::Acquire)) {
+            let mut guard = card.hot_hashes.lock().unwrap_or_else(|e| e.into_inner());
+            if has_hash_updates {
+                let slots_needed = (self.len as usize).div_ceil(HOT_HASH_BLOCK);
+                if guard.slots.len() < slots_needed {
+                    guard.slots.resize(slots_needed, 0);
+                }
+            }
+            if has_hash_clears && !guard.slots.is_empty() {
+                let mut clear_spans: Vec<(usize, usize)> = Vec::new();
+                for b in &buckets {
+                    clear_spans.extend_from_slice(&b.hash_clears);
+                }
+                for (a, b) in coalesce_hash_spans(&clear_spans) {
+                    let lo = a / HOT_HASH_BLOCK;
+                    let hi = b.div_ceil(HOT_HASH_BLOCK).min(guard.slots.len());
+                    if lo < hi {
+                        guard.slots[lo..hi].fill(0);
+                    }
+                }
+            }
+            if has_hash_updates {
+                for b in &buckets {
+                    for &(slot, hash) in &b.hash_updates {
+                        if let Some(dst) = guard.slots.get_mut(slot) {
+                            *dst = hash;
+                        }
+                    }
+                }
+                card.has_hot_hashes.store(true, Ordering::Release);
             }
         }
         for (a, b) in coalesce_watch_spans(start, &spans) {
@@ -4907,7 +4956,10 @@ impl Shadow {
                 .map(|bucket| {
                     Box::new(move || {
                         for w in &bucket.writes {
-                            let bytes = &bucket.arena[w.arena_off..w.arena_off + w.len];
+                            // SAFETY: `Arena` offsets lie inside `bucket.arena`; `Gpu` pointers
+                            // borrow the readback slices passed into `card_merge_relay_batch`,
+                            // which joins all worker threads before returning.
+                            let bytes = unsafe { w.bytes(&bucket.arena) };
                             merge_race(
                                 w.as_read.as_deref(),
                                 copy_span,
@@ -4928,7 +4980,8 @@ impl Shadow {
         } else {
             for bucket in &buckets {
                 for w in &bucket.writes {
-                    let bytes = &bucket.arena[w.arena_off..w.arena_off + w.len];
+                    // SAFETY: as above.
+                    let bytes = unsafe { w.bytes(&bucket.arena) };
                     merge_race(
                         w.as_read.as_deref(),
                         copy_span,
@@ -5041,11 +5094,27 @@ struct RelayPieceWork {
     items: Vec<(usize, usize, usize, u64)>,
 }
 
+enum RelayWriteSrc {
+    Arena(usize),
+    Gpu(usize),
+}
+
 struct RelayPendingWrite {
     at: usize,
     len: usize,
-    arena_off: usize,
+    src: RelayWriteSrc,
     as_read: Option<Vec<u8>>,
+}
+
+impl RelayPendingWrite {
+    unsafe fn bytes<'a>(&self, arena: &'a [u8]) -> &'a [u8] {
+        match self.src {
+            RelayWriteSrc::Arena(off) => &arena[off..off + self.len],
+            RelayWriteSrc::Gpu(ptr) => unsafe {
+                std::slice::from_raw_parts(ptr as *const u8, self.len)
+            },
+        }
+    }
 }
 
 const RELAY_OUT_WRITTEN: usize = 0;
@@ -5178,6 +5247,8 @@ fn card_range_is_superseded(
 struct RelayMergeBucket {
     arena: Vec<u8>,
     writes: Vec<RelayPendingWrite>,
+    hash_updates: Vec<(usize, u128)>,
+    hash_clears: Vec<(usize, usize)>,
     stats: RelayMergeStats,
 }
 
@@ -5189,6 +5260,8 @@ fn merge_relay_chunk(
 ) -> RelayMergeBucket {
     let mut arena = Vec::new();
     let mut writes = Vec::new();
+    let mut hash_updates = Vec::new();
+    let mut hash_clears = Vec::new();
     let mut scratch = Vec::new();
     let mut active = Vec::new();
     let mut stats = RelayMergeStats::default();
@@ -5227,6 +5300,36 @@ fn merge_relay_chunk(
                 continue;
             }
             let as_read = record_race.then(|| scratch.clone());
+            let full_active = active.len() == 1 && active[0] == (diff_at, diff_at + n);
+            if full_active && scratch[..] == held[..] {
+                held.copy_from_slice(gpu);
+                stats.add(RELAY_OUT_WRITTEN, n as u64);
+                writes.push(RelayPendingWrite {
+                    at: diff_at,
+                    len: n,
+                    src: RelayWriteSrc::Gpu(gpu.as_ptr() as usize),
+                    as_read,
+                });
+                let diff_end = diff_at + n;
+                let first_full = diff_at.next_multiple_of(HOT_HASH_BLOCK);
+                let last_full = (diff_end / HOT_HASH_BLOCK) * HOT_HASH_BLOCK;
+                if diff_at < first_full {
+                    hash_clears.push((diff_at, first_full.min(diff_end)));
+                }
+                if first_full < last_full {
+                    let mut b_at = first_full;
+                    while b_at < last_full {
+                        let h = hot_page_hash(&gpu[b_at - diff_at..b_at - diff_at + HOT_HASH_BLOCK])
+                            | 1;
+                        hash_updates.push((b_at / HOT_HASH_BLOCK, h));
+                        b_at += HOT_HASH_BLOCK;
+                    }
+                }
+                if last_full < diff_end {
+                    hash_clears.push((last_full.max(diff_at), diff_end));
+                }
+                continue;
+            }
             let mut changed = false;
             for &(a, b) in &active {
                 let (a, b) = (a - diff_at, b - diff_at);
@@ -5242,14 +5345,17 @@ fn merge_relay_chunk(
             writes.push(RelayPendingWrite {
                 at: diff_at,
                 len: n,
-                arena_off,
+                src: RelayWriteSrc::Arena(arena_off),
                 as_read,
             });
+            hash_clears.push((diff_at, diff_at + n));
         }
     }
     RelayMergeBucket {
         arena,
         writes,
+        hash_updates,
+        hash_clears,
         stats,
     }
 }
@@ -5406,7 +5512,8 @@ mod relay_batch_tests {
         assert_eq!(bucket.writes.len(), 2);
         assert_eq!(bucket.stats.pieces[super::RELAY_OUT_WRITTEN], 2);
         for w in &bucket.writes {
-            let bytes = &bucket.arena[w.arena_off..w.arena_off + w.len];
+            // SAFETY: `gpu0`/`gpu1` are alive for the duration of this test.
+            let bytes = unsafe { w.bytes(&bucket.arena) };
             title_mem[w.at..w.at + w.len].copy_from_slice(bytes);
         }
         assert!(title_mem[16..24].iter().all(|&b| b == 0xaa));
@@ -5415,6 +5522,76 @@ mod relay_batch_tests {
         assert_eq!(old0[16..24], [0xaa; 8]);
         assert_ne!(old0[100], 0xbb);
         assert_eq!(old1[32..48], [0xcc; 16]);
+    }
+
+    #[test]
+    fn merge_piece_fast_paths_match_three_way_semantics() {
+        use super::merge_piece;
+
+        // Fast path 1: title == held, now != held -> copies now into both.
+        let mut held = vec![1, 2, 3, 4];
+        let mut title = held.clone();
+        assert!(merge_piece(&[1, 9, 3, 8], &mut held, &mut title));
+        assert_eq!(held, vec![1, 9, 3, 8]);
+        assert_eq!(title, vec![1, 9, 3, 8]);
+
+        // Fast path 2: title == held == now -> unchanged.
+        assert!(!merge_piece(&[1, 9, 3, 8], &mut held, &mut title));
+
+        // Fast path 3: title == now, held != now -> updates held, reports unchanged.
+        let mut held2 = vec![1, 2, 3, 4];
+        let mut title2 = vec![1, 9, 3, 8];
+        assert!(!merge_piece(&[1, 9, 3, 8], &mut held2, &mut title2));
+        assert_eq!(held2, vec![1, 9, 3, 8]);
+        assert_eq!(title2, vec![1, 9, 3, 8]);
+
+        // Slow path: concurrent CPU edit at index 0, GPU edit at index 2.
+        let mut held3 = vec![1, 2, 3, 4];
+        let mut title3 = vec![7, 2, 3, 4];
+        assert!(merge_piece(&[1, 2, 9, 4], &mut held3, &mut title3));
+        assert_eq!(title3, vec![7, 2, 9, 4]);
+        assert_eq!(held3, vec![1, 2, 9, 4]);
+    }
+
+    #[test]
+    fn relay_merge_fast_path_skips_arena_copy_and_emits_hot_hash_updates() {
+        use super::{RelayWriteSrc, hot_page_hash};
+
+        let title_mem: Vec<u8> = (0..PAGE).map(|i| (i * 7 + 1) as u8).collect();
+        let mut old0 = title_mem.clone();
+        let mut gpu0 = old0.clone();
+        // GPU overwrites the entire 64 KiB piece; CPU did not touch title_mem.
+        for (i, b) in gpu0.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(31) ^ 0x5a) as u8;
+        }
+        let card = Card {
+            before: Mutex::default(),
+            old: Mutex::default(),
+            has_old: AtomicBool::new(false),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            hot_hashes: Mutex::default(),
+            has_hot_hashes: AtomicBool::new(false),
+            size: PAGE as u64,
+        };
+        let skip = RelaySkipSnapshot::capture(&card, &[(0, &gpu0[..], 1)]);
+        let works = vec![RelayPieceWork {
+            p_lo: 0,
+            old_ptr: old0.as_mut_ptr() as usize,
+            old_len: old0.len(),
+            items: vec![(0, gpu0.as_ptr() as usize, gpu0.len(), 1)],
+        }];
+        let bucket = merge_relay_chunk(title_mem.as_ptr() as usize, works, &skip, false);
+        assert_eq!(bucket.writes.len(), 1);
+        assert!(bucket.arena.is_empty(), "clean GPU write should borrow gpu slice directly");
+        assert!(matches!(bucket.writes[0].src, RelayWriteSrc::Gpu(_)));
+        assert!(bucket.hash_clears.is_empty());
+        assert_eq!(bucket.hash_updates.len(), PAGE / HOT_HASH_BLOCK);
+        for &(slot, hash) in &bucket.hash_updates {
+            let off = slot * HOT_HASH_BLOCK;
+            assert_eq!(hash, hot_page_hash(&gpu0[off..off + HOT_HASH_BLOCK]) | 1);
+        }
+        assert_eq!(old0, gpu0);
     }
 
     #[test]
@@ -5867,10 +6044,55 @@ static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let search_from = address.saturating_sub(WINDOW);
+    let inplace_l3 = crate::inplace::level() >= 3;
+    let pick_existing = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| -> Option<(u64, u64)> {
+        if unsized_ask && inplace_l3 {
+            let there = map
+                .range((search_from, 0)..=(address, u64::MAX))
+                .filter(|((start, bytes), _)| {
+                    *start <= address
+                        && *start + *bytes >= end
+                        && (*start + *bytes).saturating_sub(address) >= (256 << 10)
+                })
+                .map(|(key, _)| *key);
+            holder(there, address, end)
+        } else if unsized_ask && tails() {
+            let there = map
+                .range((cell, 0)..=(address, u64::MAX))
+                .map(|(key, _)| *key);
+            Some(longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end)))
+        } else if (fine() || inplace_l3) && !unsized_ask {
+            let _ = any;
+            let there = map
+                .range((search_from, 0)..=(address, u64::MAX))
+                .map(|(key, _)| *key);
+            holder(there, address, end)
+        } else {
+            let grid_size = if unsized_ask { WINDOW } else { window() };
+            Some(window_of(address, end, grid_size))
+        }
+    };
+    let note = |shadow: &Shadow| {
+        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+        if unsized_ask {
+            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(key) = pick_existing(&map)
+            && let Some(shadow) = map.get(&key)
+        {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+    }
     let named = {
         let grid_size = if unsized_ask { WINDOW } else { window() };
         let grid = window_of(address, end, grid_size);
-        if crate::inplace::level() >= 3 && !crate::inplace::section_run_in_place(grid.0, grid.1) {
+        if inplace_l3 && !crate::inplace::section_run_in_place(grid.0, grid.1) {
             if let Some((rs, rl, next_mapped)) =
                 crate::inplace::section_run_around(address, end, grid_size)
                 && (!unsized_ask || (rs + rl).saturating_sub(address) >= (256 << 10) || !next_mapped)
@@ -5885,53 +6107,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             grid
         }
     };
-    let pick = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| {
-        if unsized_ask && crate::inplace::level() >= 3 {
-            let there = map
-                .range((search_from, 0)..=(address, u64::MAX))
-                .filter(|((start, bytes), _)| {
-                    *start <= address
-                        && *start + *bytes >= end
-                        && (*start + *bytes).saturating_sub(address) >= (256 << 10)
-                })
-                .map(|(key, _)| *key);
-            if let Some(found) = holder(there, address, end) {
-                return found;
-            }
-            named
-        } else if unsized_ask && tails() {
-            let there = map
-                .range((cell, 0)..=(address, u64::MAX))
-                .map(|(key, _)| *key);
-            longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-        } else if (fine() || crate::inplace::level() >= 3) && !unsized_ask {
-            let _ = any;
-            let there = map
-                .range((search_from, 0)..=(address, u64::MAX))
-                .map(|(key, _)| *key);
-            holder(there, address, end).unwrap_or(named)
-        } else {
-            named
-        }
-    };
-    let note = |shadow: &Shadow| {
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
-    };
-    {
-        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        let key = pick(&map);
-        if let Some(shadow) = map.get(&key) {
-            note(shadow);
-            return Some(shadow.clone());
-        }
-    }
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    let (start, len) = pick(&map);
+    let (start, len) = pick_existing(&map).unwrap_or(named);
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());

@@ -1615,46 +1615,120 @@ impl State {
         let mut alive =
             !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         let mirror_started = std::time::Instant::now();
-        for (n, &index) in slots.iter().enumerate() {
+        let mut todo: Vec<u32> = Vec::new();
+        for &index in &slots {
             if let Some(handle) = heap.handle(index)
                 && let Some(key) = host.unchanged_slot_key(index, handle)
                 && cache.slot_key(index) == Some(key)
             {
                 continue;
             }
-            let resolved = heap.handle(index).and_then(|handle| {
-                let mirrored = host.mirror_buffer(index, handle)?;
-                if alive
-                    && n % 64 == 63
-                    && let Some(why) = crate::descriptor::host::device_removed()
-                {
-                    alive = false;
-                    GONE.store(true, Ordering::Relaxed);
-                    let last: Vec<String> = slots[n - 63..=n]
-                        .iter()
-                        .filter_map(|&i| {
-                            crate::descriptor::view(heap.handle(i)?)
-                                .map(|v| format!("{i}: {v:?}"))
-                        })
-                        .map(|s| s.chars().take(200).collect())
-                        .collect();
-                    tracing::error!(
-                        why,
-                        slot = index,
-                        "the host device went while buffer views of the heap were made; one of: {last:#?}"
-                    );
-                    crate::host::log_removal_context();
+            todo.push(index);
+        }
+        if !evicted.is_empty() && todo.len() > 1 {
+            todo.sort_unstable();
+            todo.dedup();
+        }
+        if todo.len() >= 64 {
+            let worker_count = (todo.len() / 32).clamp(2, 6);
+            let chunk_size = todo.len().div_ceil(worker_count);
+            let heap_ptr = std::ptr::from_ref(heap) as usize;
+            let host_ptr = std::ptr::from_ref(host) as usize;
+            type SlotResult = (
+                u32,
+                Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+                u64,
+            );
+            let mut results: Vec<std::sync::Arc<std::sync::Mutex<Vec<SlotResult>>>> =
+                Vec::with_capacity(worker_count);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(worker_count);
+            for chunk in todo.chunks(chunk_size) {
+                let chunk_vec: Vec<u32> = chunk.to_vec();
+                let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(
+                    chunk_vec.len(),
+                )));
+                results.push(out.clone());
+                jobs.push(Box::new(move || {
+                    // SAFETY: `heap` and `host` live for the entire `heap_buffers` call,
+                    // `wide_run` joins all workers before returning, every slot index in
+                    // `todo` is distinct, and D3D12 `Create*View` is free-threaded on
+                    // distinct CPU descriptor handles.
+                    let heap = unsafe { &*(heap_ptr as *const crate::descriptor::Heap) };
+                    let host = unsafe { &*(host_ptr as *const crate::descriptor::host::HostHeap) };
+                    let mut local = Vec::with_capacity(chunk_vec.len());
+                    for index in chunk_vec {
+                        let resolved = heap.handle(index).and_then(|handle| {
+                            let mirrored = host.mirror_buffer(index, handle)?;
+                            let (shadow, address, len) = mirrored.copy?;
+                            #[cfg(feature = "diagnostics")]
+                            if mirrored.shows == Some(false) {
+                                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Some((shadow, address, address + len))
+                        });
+                        let key = if resolved.is_some() {
+                            host.made_key(index)
+                        } else {
+                            0
+                        };
+                        local.push((index, resolved, key));
+                    }
+                    *out.lock().unwrap_or_else(|e| e.into_inner()) = local;
+                }));
+            }
+            crate::shadow::wide_run(jobs);
+            if alive && let Some(why) = crate::descriptor::host::device_removed() {
+                GONE.store(true, Ordering::Relaxed);
+                tracing::error!(
+                    why,
+                    slots = todo.len(),
+                    "the host device went while buffer views of the heap were made"
+                );
+                crate::host::log_removal_context();
+            }
+            for bucket in results {
+                let items = std::mem::take(&mut *bucket.lock().unwrap_or_else(|e| e.into_inner()));
+                for (index, resolved, key) in items {
+                    cache.set(index, resolved, key_of);
+                    cache.set_slot_key(index, key);
                 }
-                let (shadow, address, len) = mirrored.copy?;
-                #[cfg(feature = "diagnostics")]
-                if mirrored.shows == Some(false) {
-                    HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
-                }
-                Some((shadow, address, address + len))
-            });
-            let resolved_ok = resolved.is_some();
-            cache.set(index, resolved, key_of);
-            cache.set_slot_key(index, if resolved_ok { host.made_key(index) } else { 0 });
+            }
+        } else {
+            for (n, &index) in todo.iter().enumerate() {
+                let resolved = heap.handle(index).and_then(|handle| {
+                    let mirrored = host.mirror_buffer(index, handle)?;
+                    if alive
+                        && n % 64 == 63
+                        && let Some(why) = crate::descriptor::host::device_removed()
+                    {
+                        alive = false;
+                        GONE.store(true, Ordering::Relaxed);
+                        let last: Vec<String> = todo[n - 63..=n]
+                            .iter()
+                            .filter_map(|&i| {
+                                crate::descriptor::view(heap.handle(i)?)
+                                    .map(|v| format!("{i}: {v:?}"))
+                            })
+                            .map(|s| s.chars().take(200).collect())
+                            .collect();
+                        tracing::error!(
+                            why,
+                            slot = index,
+                            "the host device went while buffer views of the heap were made; one of: {last:#?}"
+                        );
+                        crate::host::log_removal_context();
+                    }
+                    let (shadow, address, len) = mirrored.copy?;
+                    #[cfg(feature = "diagnostics")]
+                    if mirrored.shows == Some(false) {
+                        HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some((shadow, address, address + len))
+                });
+                let resolved_ok = resolved.is_some();
+                cache.set(index, resolved, key_of);
+                cache.set_slot_key(index, if resolved_ok { host.made_key(index) } else { 0 });
+            }
         }
         let mirror_us = mirror_started.elapsed().as_micros() as u64;
         let views = cache.slot_count() as u32;
