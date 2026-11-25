@@ -2526,7 +2526,16 @@ impl Shadow {
                     continue;
                 }
                 let at = &mut copied[page - base];
-                if write > *at {
+                if write == crate::watch::HOT_WRITE && *at != 0 {
+                    if let Some((first, prev)) = run.take() {
+                        bytes += self
+                            .copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
+                    }
+                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                        *at = now;
+                    }
+                    bytes += self.copy_hot((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                } else if write > *at {
                     if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                         *at = now;
                     }
@@ -2551,7 +2560,7 @@ impl Shadow {
         }
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        let (mut bytes, mut run): (usize, Option<usize>) = (0, None);
         let mut newly_copied = 0u64;
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
@@ -2563,7 +2572,15 @@ impl Shadow {
                 _ => 0,
             };
             let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
+            if write == crate::watch::HOT_WRITE && *at != 0 {
+                if let Some(first) = run.take() {
+                    bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                }
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    *at = now;
+                }
+                bytes += self.copy_hot((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+            } else if *at == 0 || write > *at {
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     if *at == 0 && now != 0 {
                         newly_copied += 1;
@@ -2585,6 +2602,43 @@ impl Shadow {
             self.synced_at.fetch_max(now, Ordering::Release);
         }
         bytes
+    }
+
+    fn copy_hot(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        let len = to - from;
+        if len > PAGE {
+            return self.copy(from, to);
+        }
+        thread_local! {
+            static HOT_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        HOT_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            if buf.len() < len {
+                buf.resize(PAGE, 0);
+            }
+            let slice = &mut buf[..len];
+            if !crate::host::read_into(from as *const u8, slice) {
+                return self.copy(from, to);
+            }
+            let off = from - start;
+            // SAFETY: inside the write-back shared buffer mapping (`from..to` is within `start..end`).
+            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), len) };
+            let Some(first) = first_difference(slice, held) else {
+                return 0;
+            };
+            let last = last_difference(slice, held).unwrap_or(first);
+            let n = last + 1 - first;
+            held[first..=last].copy_from_slice(&slice[first..=last]);
+            self.changed(off + first, off + first + n);
+            self.card_changed(off + first, off + first + n);
+            n
+        })
     }
 
     fn copy(&self, from: usize, to: usize) -> usize {
@@ -3126,7 +3180,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 .range((cell, 0)..=(address, u64::MAX))
                 .map(|(key, _)| *key);
             longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-        } else if any && (fine() || crate::inplace::level() >= 3) && !unsized_ask {
+        } else if (fine() || crate::inplace::level() >= 3) && !unsized_ask {
+            let _ = any;
             let there = map
                 .range((cell, 0)..=(address, u64::MAX))
                 .map(|(key, _)| *key);

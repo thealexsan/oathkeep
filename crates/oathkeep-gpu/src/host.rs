@@ -668,7 +668,6 @@ pub(crate) struct HostList {
     scratch: Mutex<Scratch>,
     states: Mutex<States>,
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
-    prelude: OnceLock<Option<Prelude>>,
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     budget: OnceLock<Option<ID3D12Resource>>,
     indirect_args: Mutex<Option<(ID3D12Resource, u64, bool)>>,
@@ -682,9 +681,32 @@ pub(crate) struct HostList {
 
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
-fn lazy_prelude() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OATHKEEP_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+struct PooledPrelude(Option<Prelude>);
+
+// SAFETY: D3D12 command allocators and command lists are free-threaded;
+// each pooled prelude is exclusively owned while in flight and returned to the
+// pool only once its submission's GPU fence has completed.
+unsafe impl Send for PooledPrelude {}
+
+static PRELUDE_POOL: Mutex<Vec<PooledPrelude>> = Mutex::new(Vec::new());
+
+impl Drop for PooledPrelude {
+    fn drop(&mut self) {
+        if let Some(prelude) = self.0.take() {
+            let mut pool = PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+            if pool.len() < 64 {
+                pool.push(PooledPrelude(Some(prelude)));
+            }
+        }
+    }
+}
+
+fn take_prelude(host: &Host) -> Option<PooledPrelude> {
+    let popped = PRELUDE_POOL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pop();
+    popped.or_else(|| host.make_prelude().map(|p| PooledPrelude(Some(p))))
 }
 
 #[cfg(feature = "diagnostics")]
@@ -1496,6 +1518,7 @@ struct Sent {
     card: Option<CardPlan>,
     back: Vec<Declared>,
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    preludes: Vec<PooledPrelude>,
 }
 
 struct Flight {
@@ -1505,6 +1528,7 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    _preludes: Vec<PooledPrelude>,
 }
 
 enum Late {
@@ -2436,10 +2460,6 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude = OnceLock::new();
-            if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
-            }
             Ok(HostList {
                 allocator,
                 list,
@@ -2447,7 +2467,6 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
-                prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
@@ -3456,6 +3475,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                _preludes: sent.preludes,
             }));
             items.extend(
                 sent.writes
@@ -3509,6 +3529,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                _preludes: sent.preludes,
             }));
             items.extend(
                 sent.writes
@@ -3745,11 +3766,13 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        let mut preludes: Vec<PooledPrelude> = Vec::new();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
+            if let Some((prelude_cmd, pooled)) = list.prelude(self) {
+                lists.push(Some(prelude_cmd));
+                preludes.push(pooled);
             }
             lists.push(list.list.cast().ok());
         }
@@ -3806,6 +3829,7 @@ impl Host {
                 card,
                 back,
                 writes,
+                preludes,
             };
             working(was_working);
             return Some((submitted, sent));
@@ -4476,7 +4500,7 @@ impl HostList {
         }
     }
 
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude(&self, host: &Host) -> Option<(ID3D12CommandList, PooledPrelude)> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -4535,15 +4559,12 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        let Some(pooled) = take_prelude(host) else {
             fail(format_args!("no host list for a state prelude"));
         };
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        let (allocator, list) = pooled.0.as_ref().expect("pooled prelude");
+        // SAFETY: the pooled prelude is not executing (returned to the pool
+        // only after its submission's GPU fence completed); the textures are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
@@ -4562,7 +4583,8 @@ impl HostList {
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
-        list.cast().ok()
+        let cmd: ID3D12CommandList = list.cast().ok()?;
+        Some((cmd, pooled))
     }
 
     #[cfg(feature = "diagnostics")]
@@ -5045,13 +5067,19 @@ impl Batch {
         if wide_refresh() && self.refreshes.len() >= 4 {
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, from, to)| {
-                    Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>
-                })
-                .collect();
+            let mut all: Vec<_> = self.refreshes.drain(..).collect();
+            let chunks = all.len().min(6);
+            let chunk_size = all.len().div_ceil(chunks);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(chunks);
+            while !all.is_empty() {
+                let take = chunk_size.min(all.len());
+                let part: Vec<_> = all.drain(..take).collect();
+                jobs.push(Box::new(move || {
+                    for (shadow, from, to) in part {
+                        Self::update(&shadow, from, to);
+                    }
+                }));
+            }
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(
