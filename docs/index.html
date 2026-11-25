@@ -128,15 +128,15 @@
       <div class="mono muted">
         <a href="https://github.com/thealexsan/oathkeep">GitHub</a> ·
         <a href="https://discord.gg/PM6pr4Azzk">Discord</a> ·
-        eb5ce1e (perf/commit-reduction) · 2026-11-26
+        bc99622 (perf/commit-reduction) · 2026-11-26
       </div>
     </header>
 
     <section class="stats">
       <div class="card"><div class="k">Overall Matrix</div><div class="v green mono">94%</div></div>
-      <div class="card"><div class="k">Latest World FPS</div><div class="v mono">6.1 fps (uninstrumented, 4772 draws, 5 PSOs left)</div></div>
-      <div class="card"><div class="k">Frame / GPU</div><div class="v mono">162.8 ms (uninstrumented, GPU 55% busy) / 47.9 ms on GPU (uninstrumented, 4772 draws)</div></div>
-      <div class="card"><div class="k">CPU Preparing</div><div class="v mono">106.7 ms (batch_flush 67.8 ms, guards 33.2 ms)</div></div>
+      <div class="card"><div class="k">Latest World FPS</div><div class="v mono">5.4-6.7 fps (uninstrumented, 3467-3832 draws, 0 PSOs left)</div></div>
+      <div class="card"><div class="k">Frame / GPU</div><div class="v mono">150-184 ms (uninstrumented, GPU 54-59% busy) / 39-49 ms on GPU (1519 indirect clamps / 3038 UAV barriers)</div></div>
+      <div class="card"><div class="k">CPU Preparing</div><div class="v mono">103-125 ms (batch_flush 71.7 ms, guards 55.9 ms, run_deferred 10.4 ms)</div></div>
     </section>
 
     <div class="svg-wrap">
@@ -169,7 +169,7 @@
 <tr><td class="name">Wave64 -&gt; Wave32</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span></td><td class="mono num">98%</td><td class="muted">2561af95 verified 0.36 ms/frame (down from 297 ms TDR); zero TDR</td></tr>
 <tr><td class="name">DP4A / ML Compute</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span></td><td class="mono num">98%</td><td class="muted">VERIFIED in diag-run61: all 9 ML shaders 0.15-0.63 ms in VRAM (155.3 -&gt; 17.0 ms dispatch, 4.8x total GPU speedup)</td></tr>
 <tr><td class="name">Pipeline Cache &amp; Queue</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span></td><td class="mono num">98%</td><td class="muted">host-pipelines.bin warmed to 258.8 MB (1082 added, only 5 being made at 4772 draws/frame)</td></tr>
-<tr><td class="name">Shadow &amp; Page Sync</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l2"></span></td><td class="mono num">93%</td><td class="muted">eb5ce1e verified in diag-run62: heap_buffers 39.3-&gt;18.1 ms, ML copy 0.99 ms; GPU-writeback guard churn &amp; copy-queue stall next</td></tr>
+<tr><td class="name">Shadow &amp; Page Sync</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l2"></span></td><td class="mono num">93%</td><td class="muted">bc99622 verified in diag-run63-warm: run_deferred 18.2-&gt;10.4 ms, copy queue 39-&gt;19.3 ms, copy-back 62.7-&gt;42.3 ms, fallbacks 230-&gt;35; GUARDS lock/0xae00000 + mirror 18.6 ms next</td></tr>
 <tr><td class="name">Texture Streaming</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span><span class="box l2"></span></td><td class="mono num">90%</td><td class="muted">Levels-on-demand budgeting for 8 GB VRAM, zero-wait upload</td></tr>
 <tr><td class="name">Display &amp; Input</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span></td><td class="mono num">95%</td><td class="muted">1080p presentation, XInput + keyboard fallback, Agility SDK 620</td></tr>
 </tbody>
@@ -180,7 +180,8 @@
     <div class="card" style="padding: 4px 12px; overflow-x: auto;">
       <table>
         <thead><tr><th>Run</th><th>Commit</th><th class="num">FPS</th><th class="num">Frame</th><th class="num">GPU</th><th class="num">Preparing</th><th>Status</th></tr></thead>
-        <tbody><tr><td class="mono">diag-run62</td><td class="mono">eb5ce1e</td><td class="mono num">6.1</td><td class="mono num">162.8 ms</td><td class="mono num">47.9 ms (4772 draws, 55% busy)</td><td class="mono num">106.7 ms (warm 5 PSOs left)</td><td>Uninstrumented 4772 draws/frame (12x more draws); host-pipelines.bin 258.8 MB; heap_buffers 18.1 ms; next: guard churn + copy-queue stall</td></tr>
+        <tbody><tr><td class="mono">diag-run63-warm</td><td class="mono">bc99622</td><td class="mono num">5.4</td><td class="mono num">183.9 ms</td><td class="mono num">49.3 ms (3467 draws, 54-59% busy)</td><td class="mono num">125.3 ms (0 PSOs left, run_deferred 10.4 ms)</td><td>run_deferred -43%, copy queue -51% (19.3 ms), copy-back -33% (42.3 ms), fallbacks -85% (35); remaining: GUARDS 55.9 ms (0xae00000 29.5 ms), mirror 18.6 ms, 1519 indirect clamps on GPU</td></tr>
+<tr><td class="mono">diag-run62</td><td class="mono">eb5ce1e</td><td class="mono num">6.1</td><td class="mono num">162.8 ms</td><td class="mono num">47.9 ms (4772 draws, 55% busy)</td><td class="mono num">106.7 ms (warm 5 PSOs left)</td><td>Uninstrumented 4772 draws/frame (12x more draws); host-pipelines.bin 258.8 MB; heap_buffers 18.1 ms; next: guard churn + copy-queue stall</td></tr>
 <tr><td class="mono">diag-run61</td><td class="mono">15e6154</td><td class="mono num">3.7</td><td class="mono num">270.7 ms</td><td class="mono num">35.2 ms timed (ML &lt;=0.63 ms)</td><td class="mono num">103.3 ms (cold)</td><td>ML VRAM fix verified (4.8x GPU speedup, GPU 33% busy); CPU-bound now</td></tr>
 <tr><td class="mono">diag-run60</td><td class="mono">4a14eaa</td><td class="mono num">2.7</td><td class="mono num">376.1 ms</td><td class="mono num">168.7 ms (135.6 ms ML)</td><td class="mono num">108.2 ms (cold)</td><td>Zero TDR; all 9/9 ML shaders dumped for DP4A diff</td></tr>
 <tr><td class="mono">diag-run59b</td><td class="mono">40200b5</td><td class="mono num">5.8</td><td class="mono num">172.1 ms</td><td class="mono num">27.7 ms (no ML)</td><td class="mono num">59.7 ms</td><td>Zero TDR; 2561af95 0.36 ms/frame; ask_once 4.5 ms</td></tr>

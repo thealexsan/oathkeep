@@ -1,14 +1,14 @@
 [meta]
 updated = "2026-11-26"
-commit = "eb5ce1e"
+commit = "bc99622"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "6.1 fps (uninstrumented, 4772 draws, 5 PSOs left)"
-current_frame_ms = "162.8 ms (uninstrumented, GPU 55% busy)"
-current_gpu_ms = "47.9 ms on GPU (uninstrumented, 4772 draws)"
-current_preparing_ms = "106.7 ms (batch_flush 67.8 ms, guards 33.2 ms)"
+current_fps = "5.4-6.7 fps (uninstrumented, 3467-3832 draws, 0 PSOs left)"
+current_frame_ms = "150-184 ms (uninstrumented, GPU 54-59% busy)"
+current_gpu_ms = "39-49 ms on GPU (1519 indirect clamps / 3038 UAV barriers)"
+current_preparing_ms = "103-125 ms (batch_flush 71.7 ms, guards 55.9 ms, run_deferred 10.4 ms)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~30-50 min (fix GPU-writeback guard churn, sharded kept lock, copy-queue stall, Step::Copy)"
+eta = "~30-60 min (fix GUARDS lock/ping-pong, heap_buffers mirror, and indirect-clamp GPU barriers)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -59,7 +59,7 @@ note = "host-pipelines.bin warmed to 258.8 MB (1082 added, only 5 being made at 
 [[subsystems]]
 name = "Shadow & Page Sync"
 cells = [4, 4, 4, 4, 4, 4, 4, 4, 3, 2]
-note = "eb5ce1e verified in diag-run62: heap_buffers 39.3->18.1 ms, ML copy 0.99 ms; GPU-writeback guard churn & copy-queue stall next"
+note = "bc99622 verified in diag-run63-warm: run_deferred 18.2->10.4 ms, copy queue 39->19.3 ms, copy-back 62.7->42.3 ms, fallbacks 230->35; GUARDS lock/0xae00000 + mirror 18.6 ms next"
 
 [[subsystems]]
 name = "Texture Streaming"
@@ -181,3 +181,12 @@ frame_ms = 162.8
 gpu_ms = "47.9 ms (4772 draws, 55% busy)"
 preparing_ms = "106.7 ms (warm 5 PSOs left)"
 status = "Uninstrumented 4772 draws/frame (12x more draws); host-pipelines.bin 258.8 MB; heap_buffers 18.1 ms; next: guard churn + copy-queue stall"
+
+[[runs]]
+label = "diag-run63-warm"
+commit = "bc99622"
+fps = 5.4
+frame_ms = 183.9
+gpu_ms = "49.3 ms (3467 draws, 54-59% busy)"
+preparing_ms = "125.3 ms (0 PSOs left, run_deferred 10.4 ms)"
+status = "run_deferred -43%, copy queue -51% (19.3 ms), copy-back -33% (42.3 ms), fallbacks -85% (35); remaining: GUARDS 55.9 ms (0xae00000 29.5 ms), mirror 18.6 ms, 1519 indirect clamps on GPU"
