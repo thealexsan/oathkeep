@@ -23,6 +23,12 @@ thread_local! {
 static EMULATED: AtomicU64 = AtomicU64::new(0);
 static ASKED: AtomicU64 = AtomicU64::new(0);
 static ZEROED: AtomicU64 = AtomicU64::new(0);
+static DEMAND_RESERVED_END: std::sync::OnceLock<fn(usize) -> Option<usize>> =
+    std::sync::OnceLock::new();
+
+pub fn set_demand_reserved_end(hook: fn(usize) -> Option<usize>) {
+    let _ = DEMAND_RESERVED_END.set(hook);
+}
 
 fn readable(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
@@ -55,8 +61,8 @@ fn writable(va: usize, bytes: usize) -> Option<bool> {
 
 fn writable_to(va: usize, end: usize) -> Option<Writable> {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_MAPPED, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE,
-        PAGE_READWRITE, VirtualQuery,
+        MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION,
+        PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery,
     };
     let remember = remembers();
     if remember {
@@ -83,11 +89,18 @@ fn writable_to(va: usize, end: usize) -> Option<Writable> {
         m.BaseAddress as usize,
         m.BaseAddress as usize + m.RegionSize,
     );
-    if m.State == MEM_RESERVE
-        && m.Type == MEM_MAPPED
-        && m.AllocationProtect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
-    {
-        return Some(Writable::ZeroReserved(to.min(end)));
+    if m.State == MEM_RESERVE {
+        if m.Type == MEM_MAPPED
+            && m.AllocationProtect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
+        {
+            return Some(Writable::ZeroReserved(to.min(end)));
+        }
+        if m.Type == MEM_PRIVATE
+            && let Some(hook) = DEMAND_RESERVED_END.get()
+            && let Some(pool_end) = hook(va)
+        {
+            return Some(Writable::ZeroReserved(to.min(pool_end).min(end)));
+        }
     }
     if m.State != MEM_COMMIT || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 {
         return None;

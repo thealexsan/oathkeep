@@ -1778,14 +1778,19 @@ impl ValueWait {
         let mut raw = [0u8; 8];
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
             use windows_sys::Win32::System::Memory::{
-                MEM_MAPPED, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+                MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
             };
             // SAFETY: plain data filled in by the query.
             let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
             // SAFETY: a valid out pointer of the right size.
             let n =
                 unsafe { VirtualQuery(self.address as *const _, &mut info, size_of_val(&info)) };
-            if n != 0 && info.State == MEM_RESERVE && info.Type == MEM_MAPPED {
+            if n != 0
+                && info.State == MEM_RESERVE
+                && (info.Type == MEM_MAPPED
+                    || (info.Type == MEM_PRIVATE
+                        && crate::watch::is_demand_reserved(self.address as usize)))
+            {
                 return self.holds_for(0);
             }
             return true;

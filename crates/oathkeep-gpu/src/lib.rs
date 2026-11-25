@@ -49,6 +49,8 @@ pub use inplace::{
 };
 #[cfg(windows)]
 pub use watch::{
-    set_commit_title_memory, title_memory_committed, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_written, writing as kernel_will_write,
+    set_commit_title_memory, set_demand_reserved_end, title_memory_committed, title_memory_reading,
+    title_memory_remapped, title_memory_remapping, title_memory_remapping_seq,
+    title_memory_written, try_open_write, wait_if_title_memory_remapping,
+    writing as kernel_will_write,
 };

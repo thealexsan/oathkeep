@@ -1013,9 +1013,21 @@ fn open_here_count(g: &mut Guards, start: usize, end: usize) -> u64 {
 }
 
 static COMMIT_TITLE_MEMORY: std::sync::OnceLock<fn(usize, usize)> = std::sync::OnceLock::new();
+static DEMAND_RESERVED_END: std::sync::OnceLock<fn(usize) -> Option<usize>> =
+    std::sync::OnceLock::new();
 
 pub fn set_commit_title_memory(hook: fn(usize, usize)) {
     let _ = COMMIT_TITLE_MEMORY.set(hook);
+}
+
+pub fn set_demand_reserved_end(hook: fn(usize) -> Option<usize>) {
+    let _ = DEMAND_RESERVED_END.set(hook);
+}
+
+pub(crate) fn is_demand_reserved(at: usize) -> bool {
+    DEMAND_RESERVED_END
+        .get()
+        .is_some_and(|hook| hook(at).is_some())
 }
 
 pub fn title_memory_committed(at: usize, len: usize) {
@@ -1105,25 +1117,72 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 }
 
 static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+static REMAPPING_ACTIVE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static REMAPPING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static READING_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static REMAPPING_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
 
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        REMAPPING_SEQ.fetch_add(1, Ordering::Release);
+        REMAPPING_ACTIVE.fetch_sub(1, Ordering::Release);
+        REMAPPING_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    use std::sync::atomic::Ordering;
+    let guard = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    REMAPPING_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+    REMAPPING_ACTIVE.fetch_add(1, Ordering::Release);
+    REMAPPING_SEQ.fetch_add(1, Ordering::Release);
+    Remapping(guard)
 }
 
 pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
 
+impl Drop for Reading {
+    fn drop(&mut self) {
+        READING_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    let guard = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+    READING_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+    Reading(guard)
 }
 
 pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+    let guard = match MAPPING.try_read() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    READING_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+    Some(Reading(guard))
+}
+
+pub fn title_memory_remapping_seq() -> u64 {
+    REMAPPING_SEQ.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub fn wait_if_title_memory_remapping() -> bool {
+    if REMAPPING_ACTIVE.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
     }
+    if READING_DEPTH.with(|d| d.get() > 0) || REMAPPING_DEPTH.with(|d| d.get() > 0) {
+        return false;
+    }
+    let _reading = title_memory_reading();
+    true
 }
 
 pub fn title_memory_remapped(at: usize, len: usize) {
@@ -1185,7 +1244,7 @@ fn install() {
     });
 }
 
-pub(crate) fn try_open_write(at: usize) -> bool {
+pub fn try_open_write(at: usize) -> bool {
     let mut g = guards();
     if open_fault(&mut g, at) {
         #[cfg(feature = "diagnostics")]
@@ -1197,13 +1256,16 @@ pub(crate) fn try_open_write(at: usize) -> bool {
 
 fn writable(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READWRITE, VirtualQuery,
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+    n != 0
+        && info.State == MEM_COMMIT
+        && (info.Protect & PAGE_GUARD) == 0
+        && (info.Protect & 0xff) == PAGE_READWRITE
 }
 
 #[cfg(test)]

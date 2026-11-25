@@ -14,6 +14,8 @@ mod tls;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(windows)]
+pub use console_insn::set_demand_reserved_end;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;
 #[cfg(windows)]

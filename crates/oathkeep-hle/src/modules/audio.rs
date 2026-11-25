@@ -25,6 +25,8 @@ struct Block {
     size: usize,
     apu: u32,
     layout: Layout,
+    #[cfg(windows)]
+    demand_backed: bool,
 }
 
 struct Heap {
@@ -81,14 +83,30 @@ fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
     let layout = Layout::from_size_align(size.max(1), align.max(16)).ok()?;
     let mut heap = lock(&HEAP);
     let apu = heap.take(u32::try_from(layout.size()).ok()?, align as u32)?;
+    #[cfg(windows)]
+    let (ptr, demand_backed) = if size >= 1 << 20 && align <= 65536 {
+        (super::xmem::alloc_demand_private(size), true)
+    } else {
+        // SAFETY: non-zero size.
+        (unsafe { std::alloc::alloc_zeroed(layout) }, false)
+    };
+    #[cfg(not(windows))]
     // SAFETY: non-zero size.
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     if ptr.is_null() {
         heap.give_back(apu, apu + layout.size() as u32);
         return None;
     }
-    heap.blocks
-        .insert(ptr as usize, Block { size, apu, layout });
+    heap.blocks.insert(
+        ptr as usize,
+        Block {
+            size,
+            apu,
+            layout,
+            #[cfg(windows)]
+            demand_backed,
+        },
+    );
     heap.by_apu.insert(apu, ptr as usize);
     if size >= 32 << 20 {
         tracing::info!(mb = size >> 20, at = ?ptr, "audio memory for the title from our allocator");
@@ -104,6 +122,11 @@ fn heap_free(ptr: *mut u8) {
     heap.by_apu.remove(&block.apu);
     heap.give_back(block.apu, block.apu + block.layout.size() as u32);
     drop(heap);
+    #[cfg(windows)]
+    if block.demand_backed {
+        super::xmem::free_demand_private(ptr);
+        return;
+    }
     // SAFETY: allocated by `heap_alloc` with this layout.
     unsafe { std::alloc::dealloc(ptr, block.layout) };
 }

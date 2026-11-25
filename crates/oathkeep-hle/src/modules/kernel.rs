@@ -291,6 +291,12 @@ fn refuse(file: &str) {
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
+pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> i32 {
+    #[cfg(windows)]
+    super::xmem::private_freed(address, size, free_type);
+    host::virtual_free(address, size, free_type)
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -298,6 +304,7 @@ pub(crate) fn module() -> HleModule {
             "kernel32.dll",
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
+            "api-ms-win-core-memory-*",
             "api-ms-win-core-processthreads-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
@@ -323,6 +330,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(VirtualFree),
         ],
     }
 }
@@ -423,6 +431,11 @@ mod host {
         unsafe { TerminateProcess(process, code) }
     }
 
+    pub(super) fn virtual_free(address: *mut c_void, size: usize, free_type: u32) -> i32 {
+        // SAFETY: forwarded directly from the title.
+        unsafe { windows_sys::Win32::System::Memory::VirtualFree(address, size, free_type) }
+    }
+
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
         // SAFETY: our filter takes the exception pointers as an opaque pointer.
         unsafe {
@@ -507,6 +520,10 @@ mod host {
 
     pub(super) fn exit(code: i32) -> ! {
         std::process::exit(code)
+    }
+
+    pub(super) fn virtual_free(_: *mut c_void, _: usize, _: u32) -> i32 {
+        0
     }
 
     pub(super) fn abort() -> ! {

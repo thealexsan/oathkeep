@@ -16,12 +16,13 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     EXCEPTION_POINTERS,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_MAPPED,
-    MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
-    MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery,
-    VirtualQueryEx,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_DECOMMIT, MEM_EXTENDED_PARAMETER,
+    MEM_MAPPED, MEM_PRESERVE_PLACEHOLDER, MEM_PRIVATE, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
+    MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
+    MapViewOfFile3, MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READ,
+    PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY,
+    PAGE_READWRITE, PAGE_WRITECOPY, SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc,
+    VirtualAlloc2, VirtualFree, VirtualQuery, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -101,6 +102,42 @@ pub extern "system" fn XMemVirtualAlloc(
     parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
     parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
     let constrained = base.is_null();
+    let defer_private = demand_commit_private()
+        && !placeholder
+        && kind & MEM_COMMIT != 0
+        && size >= DEMAND_PRIVATE_MIN
+        && protect == PAGE_READWRITE;
+    if !constrained && defer_private && kind & MEM_RESERVE == 0 {
+        let base_addr = base as usize;
+        let end_addr = base_addr.saturating_add(size);
+        // SAFETY: plain data filled in by the query.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(base, &mut mbi, size_of_val(&mbi)) } != 0
+            && mbi.State == MEM_RESERVE
+            && mbi.Type == MEM_PRIVATE
+            && (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize) >= end_addr
+        {
+            install_demand_commit();
+            let reg_end = base_addr.saturating_add(size.next_multiple_of(4096));
+            DEMAND
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert_private_pool(base_addr, reg_end);
+            if size >= 16 * MIB {
+                tracing::info!(
+                    mb = size >> 20,
+                    at = format_args!("{base:p}"),
+                    "xmem demand-commit private sub-range deferred"
+                );
+            }
+            return base;
+        }
+    }
+    let defer_fresh = constrained && defer_private;
+    if defer_fresh {
+        kind &= !MEM_COMMIT;
+    }
     if constrained {
         kind |= MEM_RESERVE;
         if kind & MEM_RESERVE_PLACEHOLDER == 0 {
@@ -124,6 +161,22 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if defer_fresh && !at.is_null() {
+        install_demand_commit();
+        let at_addr = at as usize;
+        let reg_end = at_addr.saturating_add(size.next_multiple_of(4096));
+        DEMAND
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert_private_pool(at_addr, reg_end);
+        if size >= 16 * MIB {
+            tracing::info!(
+                mb = size >> 20,
+                at = format_args!("{at:p}"),
+                "xmem demand-commit private pool reserved"
+            );
+        }
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -157,18 +210,22 @@ pub extern "system" fn XMemVirtualQuery(
             return 0;
         }
         let info = &mut *out;
-        if demand_commit()
-            && process == GetCurrentProcess()
-            && info.host.State == MEM_RESERVE
-            && info.host.Type == MEM_MAPPED
-            && let Some(view_end) = demand_view_end(address as usize)
-        {
-            info.host.State = MEM_COMMIT;
-            info.host.Protect = PAGE_READWRITE;
-            let region_base = info.host.BaseAddress as usize;
-            let max_size = view_end.saturating_sub(region_base);
-            if max_size > 0 && info.host.RegionSize > max_size {
-                info.host.RegionSize = max_size;
+        if demand_commit() && process == GetCurrentProcess() && info.host.State == MEM_RESERVE {
+            let logical_end = if info.host.Type == MEM_MAPPED {
+                demand_view_end(address as usize)
+            } else if info.host.Type == MEM_PRIVATE {
+                demand_private_end(address as usize)
+            } else {
+                None
+            };
+            if let Some(view_end) = logical_end {
+                info.host.State = MEM_COMMIT;
+                info.host.Protect = PAGE_READWRITE;
+                let region_base = info.host.BaseAddress as usize;
+                let max_size = view_end.saturating_sub(region_base);
+                if max_size > 0 && info.host.RegionSize > max_size {
+                    info.host.RegionSize = max_size;
+                }
             }
         }
         info.flags = if info.host.State == MEM_COMMIT {
@@ -278,6 +335,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            private_freed(address, 0, MEM_RELEASE);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -326,10 +384,14 @@ impl Section {
             .is_some_and(|w| w.fetch_or(bit, Ordering::Release) & bit == 0)
     }
 
-    fn mark_range_committed(&self, start: usize, count: usize) {
+    fn mark_range_committed(&self, start: usize, count: usize) -> u64 {
+        let mut newly = 0u64;
         for i in start..start + count {
-            self.mark_committed(i);
+            if self.mark_committed(i) {
+                newly += 1;
+            }
         }
+        newly
     }
 }
 
@@ -346,12 +408,21 @@ impl Drop for Section {
     }
 }
 
+const DEMAND_PRIVATE_MIN: usize = MIB;
+
 fn demand_commit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         !on_wine()
             && !inplace_sections()
             && std::env::var_os("OATHKEEP_DEMAND_COMMIT").is_none_or(|v| v != "0")
+    })
+}
+
+fn demand_commit_private() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        demand_commit() && std::env::var_os("OATHKEEP_DEMAND_PRIVATE").is_none_or(|v| v != "0")
     })
 }
 
@@ -432,6 +503,60 @@ struct DemandView {
 struct DemandState {
     views: BTreeMap<usize, DemandView>,
     shown: HashMap<(usize, usize), ShownAddrs>,
+    private_pools: BTreeMap<usize, usize>,
+}
+
+impl DemandState {
+    fn insert_private_pool(&mut self, mut start: usize, mut end: usize) {
+        if start >= end {
+            return;
+        }
+        if let Some((&prev_start, &prev_end)) = self.private_pools.range(..=start).next_back()
+            && prev_end >= start
+        {
+            start = prev_start;
+            end = end.max(prev_end);
+        }
+        let overlapping: Vec<(usize, usize)> = self
+            .private_pools
+            .range(start..=end)
+            .map(|(&s, &e)| (s, e))
+            .collect();
+        for (s, e) in overlapping {
+            self.private_pools.remove(&s);
+            end = end.max(e);
+        }
+        self.private_pools.insert(start, end);
+    }
+
+    fn remove_private_pool(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let mut to_remove = Vec::new();
+        let mut to_insert = Vec::new();
+        if let Some((&s, &e)) = self.private_pools.range(..start).next_back()
+            && e > start
+        {
+            to_remove.push(s);
+            to_insert.push((s, start));
+            if e > end {
+                to_insert.push((end, e));
+            }
+        }
+        for (&s, &e) in self.private_pools.range(start..end) {
+            to_remove.push(s);
+            if e > end {
+                to_insert.push((end, e));
+            }
+        }
+        for s in to_remove {
+            self.private_pools.remove(&s);
+        }
+        for (s, e) in to_insert {
+            self.private_pools.insert(s, e);
+        }
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -446,6 +571,11 @@ static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
 static DEMAND: LazyLock<RwLock<DemandState>> = LazyLock::new(|| RwLock::new(DemandState::default()));
 
 static DEMAND_COMMITTED_PAGES: AtomicU64 = AtomicU64::new(0);
+static DEMAND_BY_FAULT_READ: AtomicU64 = AtomicU64::new(0);
+static DEMAND_BY_FAULT_WRITE: AtomicU64 = AtomicU64::new(0);
+static DEMAND_BY_ENSURE: AtomicU64 = AtomicU64::new(0);
+static DEMAND_BY_VIEW_MAP: AtomicU64 = AtomicU64::new(0);
+static DEMAND_PRIVATE_COMMITTED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 fn demand_view_end(at: usize) -> Option<usize> {
     let demand = DEMAND.read().unwrap_or_else(|e| e.into_inner());
@@ -457,45 +587,199 @@ fn demand_view_end(at: usize) -> Option<usize> {
         .map(|(&base, view)| base + view.len)
 }
 
+fn demand_private_end(at: usize) -> Option<usize> {
+    let demand = DEMAND.read().unwrap_or_else(|e| e.into_inner());
+    demand
+        .private_pools
+        .range(..=at)
+        .next_back()
+        .filter(|&(_, &end)| at < end)
+        .map(|(_, &end)| end)
+}
+
+pub(crate) fn alloc_demand_private(size: usize) -> *mut u8 {
+    let len = size.max(1);
+    let lazy = demand_commit_private();
+    let kind = if lazy {
+        MEM_RESERVE
+    } else {
+        MEM_RESERVE | MEM_COMMIT
+    };
+    // SAFETY: plain private allocation owned by caller until `free_demand_private`.
+    let at = unsafe { VirtualAlloc(std::ptr::null(), len, kind, PAGE_READWRITE) };
+    if at.is_null() {
+        return std::ptr::null_mut();
+    }
+    if lazy {
+        install_demand_commit();
+        let addr = at as usize;
+        let reg_end = addr.saturating_add(len.next_multiple_of(4096));
+        DEMAND
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert_private_pool(addr, reg_end);
+    }
+    at.cast()
+}
+
+pub(crate) fn free_demand_private(ptr: *mut u8) {
+    if ptr.is_null() {
+        return;
+    }
+    private_freed(ptr.cast(), 0, MEM_RELEASE);
+    // SAFETY: allocated by `alloc_demand_private`.
+    unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) };
+}
+
+pub(crate) fn private_freed(address: *mut c_void, size: usize, free_type: u32) {
+    if address.is_null() {
+        return;
+    }
+    let addr = address as usize;
+    let has_any = !DEMAND
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .private_pools
+        .is_empty();
+    if !has_any {
+        return;
+    }
+    let (start, end) = if free_type & MEM_RELEASE != 0 {
+        // Query the full allocation extent starting at `address` before release.
+        // SAFETY: plain data filled in by VirtualQuery.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid out pointer.
+        if unsafe { VirtualQuery(address, &mut mbi, size_of_val(&mbi)) } == 0
+            || mbi.RegionSize == 0
+        {
+            return;
+        }
+        let alloc_base = mbi.AllocationBase as usize;
+        let mut cur = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        while cur > alloc_base {
+            let mut next_mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: valid out pointer.
+            if unsafe { VirtualQuery(cur as *const c_void, &mut next_mbi, size_of_val(&next_mbi)) }
+                == 0
+                || next_mbi.RegionSize == 0
+                || next_mbi.AllocationBase as usize != alloc_base
+            {
+                break;
+            }
+            let next_end = (next_mbi.BaseAddress as usize).saturating_add(next_mbi.RegionSize);
+            if next_end <= cur {
+                break;
+            }
+            cur = next_end;
+        }
+        (alloc_base, cur)
+    } else if free_type & MEM_DECOMMIT != 0 {
+        if size == 0 {
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe { VirtualQuery(address, &mut mbi, size_of_val(&mbi)) } == 0
+                || mbi.RegionSize == 0
+            {
+                return;
+            }
+            (
+                mbi.BaseAddress as usize,
+                (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize),
+            )
+        } else {
+            let aligned_start = addr & !4095;
+            let aligned_end = addr.saturating_add(size).next_multiple_of(4096);
+            (aligned_start, aligned_end)
+        }
+    } else {
+        return;
+    };
+    DEMAND
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove_private_pool(start, end);
+}
+
 fn commit_if_reserved(at: usize, len: usize) -> bool {
+    commit_type_if_reserved(at, len, MEM_MAPPED).is_some()
+}
+
+fn commit_type_if_reserved(at: usize, len: usize, expected_type: u32) -> Option<u64> {
     if len == 0 || on_wine() {
-        return true;
+        return Some(0);
     }
     let end = at.saturating_add(len);
     let mut cur = at;
+    let mut committed_bytes = 0u64;
     while cur < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(cur as *const c_void, &mut info, size_of_val(&info)) };
         if n == 0 || info.RegionSize == 0 {
-            return false;
+            return None;
         }
         let next = (info.BaseAddress as usize)
             .saturating_add(info.RegionSize)
             .min(end);
         if next <= cur {
-            return false;
+            return None;
         }
-        if info.State == MEM_RESERVE && info.Type == MEM_MAPPED && !commit(cur, next - cur) {
-            return false;
+        if info.State == MEM_RESERVE && info.Type == expected_type {
+            if !commit(cur, next - cur) {
+                return None;
+            }
+            committed_bytes += (next - cur) as u64;
         }
         cur = next;
     }
-    true
+    Some(committed_bytes)
 }
 
-fn note_demand_committed(pages: u64) {
+#[derive(Clone, Copy)]
+enum CommitSource {
+    FaultRead,
+    FaultWrite,
+    Ensure,
+    ViewMap,
+}
+
+fn note_demand_committed(pages: u64, source: CommitSource) {
     if pages == 0 {
         return;
     }
+    match source {
+        CommitSource::FaultRead => DEMAND_BY_FAULT_READ.fetch_add(pages, Ordering::Relaxed),
+        CommitSource::FaultWrite => DEMAND_BY_FAULT_WRITE.fetch_add(pages, Ordering::Relaxed),
+        CommitSource::Ensure => DEMAND_BY_ENSURE.fetch_add(pages, Ordering::Relaxed),
+        CommitSource::ViewMap => DEMAND_BY_VIEW_MAP.fetch_add(pages, Ordering::Relaxed),
+    };
     let prev = DEMAND_COMMITTED_PAGES.fetch_add(pages, Ordering::Relaxed);
     let total = prev + pages;
     if prev / 2048 != total / 2048 {
         tracing::info!(
             pages = total,
             mb = (total * PAGE as u64) >> 20,
+            read_mb = (DEMAND_BY_FAULT_READ.load(Ordering::Relaxed) * PAGE as u64) >> 20,
+            write_mb = (DEMAND_BY_FAULT_WRITE.load(Ordering::Relaxed) * PAGE as u64) >> 20,
+            ensure_mb = (DEMAND_BY_ENSURE.load(Ordering::Relaxed) * PAGE as u64) >> 20,
+            dstorage_mb = (DEMAND_BY_VIEW_MAP.load(Ordering::Relaxed) * PAGE as u64) >> 20,
+            private_mb = DEMAND_PRIVATE_COMMITTED_BYTES.load(Ordering::Relaxed) >> 20,
             "xmem demand-commit physical pages committed"
+        );
+    }
+}
+
+fn note_demand_private_committed(bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    let prev = DEMAND_PRIVATE_COMMITTED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    let total = prev + bytes;
+    if prev / (128 * MIB as u64) != total / (128 * MIB as u64) {
+        tracing::info!(
+            private_mb = total >> 20,
+            phys_mb = (DEMAND_COMMITTED_PAGES.load(Ordering::Relaxed) * PAGE as u64) >> 20,
+            "xmem demand-commit private pool pages committed"
         );
     }
 }
@@ -507,6 +791,7 @@ fn ensure_committed(at: usize, len: usize) {
     let end = at.saturating_add(len);
     let mut committed_spans: Vec<(usize, usize)> = Vec::new();
     let mut newly_committed = 0u64;
+    let mut newly_private = 0u64;
     {
         let demand = DEMAND.read().unwrap_or_else(|e| e.into_inner());
         let first = demand
@@ -542,8 +827,33 @@ fn ensure_committed(at: usize, len: usize) {
                 }
             }
         }
+        if !demand.private_pools.is_empty() {
+            let first_priv = demand
+                .private_pools
+                .range(..=at)
+                .next_back()
+                .filter(|&(_, &pool_end)| pool_end > at)
+                .map(|(&pool_base, _)| pool_base);
+            let priv_key = first_priv.unwrap_or(at);
+            for (&pool_base, &pool_end) in demand.private_pools.range(priv_key..end) {
+                if pool_end <= at || pool_base >= end {
+                    continue;
+                }
+                let span_base = (at.max(pool_base) & !4095).max(pool_base);
+                let span_end = end.min(pool_end).next_multiple_of(4096).min(pool_end);
+                if span_end > span_base
+                    && let Some(bytes) =
+                        commit_type_if_reserved(span_base, span_end - span_base, MEM_PRIVATE)
+                    && bytes > 0
+                {
+                    newly_private += bytes;
+                    committed_spans.push((span_base, span_end - span_base));
+                }
+            }
+        }
     }
-    note_demand_committed(newly_committed);
+    note_demand_committed(newly_committed, CommitSource::Ensure);
+    note_demand_private_committed(newly_private);
     for (span_base, span_len) in committed_spans {
         oathkeep_gpu::title_memory_committed(span_base, span_len);
     }
@@ -553,6 +863,8 @@ fn install_demand_commit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         oathkeep_gpu::set_commit_title_memory(ensure_committed);
+        oathkeep_gpu::set_demand_reserved_end(demand_private_end);
+        oathkeep_loader::set_demand_reserved_end(demand_private_end);
         unsafe extern "system" fn on_demand_commit(info: *mut EXCEPTION_POINTERS) -> i32 {
             // SAFETY: the system passes valid exception and context pointers.
             let (r, ctx) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
@@ -566,66 +878,169 @@ fn install_demand_commit() {
             if oathkeep_gpu::is_safe_copy_ip(ctx.Rip) {
                 return EXCEPTION_CONTINUE_SEARCH;
             }
+            let access = r.ExceptionInformation[0];
             let fault = r.ExceptionInformation[1];
             let page_addr = fault & !(PAGE - 1);
-            // Fast lock-free reject of non-SEC_RESERVE faults (watch guards, unmapped placeholders, etc.).
-            // SAFETY: plain data filled in by the query.
-            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-            // SAFETY: a valid out pointer of the right size.
-            if unsafe { VirtualQuery(fault as *const c_void, &mut mbi, size_of_val(&mbi)) } == 0
-                || mbi.State != MEM_RESERVE
-                || mbi.Type != MEM_MAPPED
-            {
-                return EXCEPTION_CONTINUE_SEARCH;
-            }
-            let mut notify = [0usize; 8];
-            let mut notify_len = 0usize;
-            let mut notify_extra: Vec<usize> = Vec::new();
-            let newly;
-            {
-                let demand = DEMAND.read().unwrap_or_else(|e| e.into_inner());
-                let Some((&base, view)) = demand
-                    .views
-                    .range(..=fault)
-                    .next_back()
-                    .filter(|(b, v)| fault < **b + v.len)
-                else {
-                    return EXCEPTION_CONTINUE_SEARCH;
-                };
-                let page_off = (page_addr - base) / PAGE;
-                let sec_index = view.slice.index + page_off;
-                if !commit(page_addr, PAGE) {
+            let lazy = demand_commit();
+            let lazy_private = demand_commit_private();
+
+            for attempt in 0..4 {
+                let seq_before = oathkeep_gpu::title_memory_remapping_seq();
+                let waited = oathkeep_gpu::wait_if_title_memory_remapping();
+
+                // SAFETY: plain data filled in by the query.
+                let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: a valid out pointer of the right size.
+                if unsafe { VirtualQuery(fault as *const c_void, &mut mbi, size_of_val(&mbi)) } == 0
+                {
+                    if attempt < 3
+                        && (waited || oathkeep_gpu::title_memory_remapping_seq() != seq_before)
+                    {
+                        continue;
+                    }
                     return EXCEPTION_CONTINUE_SEARCH;
                 }
-                newly = view.slice.section.mark_committed(sec_index);
-                notify[notify_len] = page_addr;
-                notify_len += 1;
-                if let Some(addrs) = demand.shown.get(&view.slice.key(page_off)) {
-                    for &alias in addrs.as_slice() {
-                        if alias != page_addr && commit_if_reserved(alias, PAGE) {
-                            if notify_len < notify.len() {
-                                notify[notify_len] = alias;
-                                notify_len += 1;
-                            } else {
-                                notify_extra.push(alias);
+
+                // Demand-commit untouched pages in SEC_RESERVE mapped views.
+                if lazy && mbi.State == MEM_RESERVE && mbi.Type == MEM_MAPPED {
+                    let mut notify = [0usize; 8];
+                    let mut notify_len = 0usize;
+                    let mut notify_extra: Vec<usize> = Vec::new();
+                    let mut newly = false;
+                    let mut handled = false;
+                    {
+                        let demand = DEMAND.read().unwrap_or_else(|e| e.into_inner());
+                        if let Some((&base, view)) = demand
+                            .views
+                            .range(..=fault)
+                            .next_back()
+                            .filter(|(b, v)| fault < **b + v.len)
+                        {
+                            let page_off = (page_addr - base) / PAGE;
+                            let sec_index = view.slice.index + page_off;
+                            if !commit(page_addr, PAGE) {
+                                return EXCEPTION_CONTINUE_SEARCH;
                             }
+                            newly = view.slice.section.mark_committed(sec_index);
+                            notify[notify_len] = page_addr;
+                            notify_len += 1;
+                            if let Some(addrs) = demand.shown.get(&view.slice.key(page_off)) {
+                                for &alias in addrs.as_slice() {
+                                    if alias != page_addr && commit_if_reserved(alias, PAGE) {
+                                        if notify_len < notify.len() {
+                                            notify[notify_len] = alias;
+                                            notify_len += 1;
+                                        } else {
+                                            notify_extra.push(alias);
+                                        }
+                                    }
+                                }
+                            }
+                            handled = true;
                         }
                     }
+                    if handled {
+                        if newly {
+                            let src = if access == 0 {
+                                CommitSource::FaultRead
+                            } else {
+                                CommitSource::FaultWrite
+                            };
+                            note_demand_committed(1, src);
+                        }
+                        for &addr in &notify[..notify_len] {
+                            oathkeep_gpu::title_memory_committed(addr, PAGE);
+                        }
+                        for addr in notify_extra {
+                            oathkeep_gpu::title_memory_committed(addr, PAGE);
+                        }
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                    if attempt < 3
+                        && (oathkeep_gpu::wait_if_title_memory_remapping()
+                            || oathkeep_gpu::title_memory_remapping_seq() != seq_before)
+                    {
+                        continue;
+                    }
+                    return EXCEPTION_CONTINUE_SEARCH;
                 }
+
+                // Demand-commit untouched pages in large XMemVirtualAlloc / audio private pools.
+                if lazy_private && mbi.State == MEM_RESERVE && mbi.Type == MEM_PRIVATE {
+                    let committed_range = {
+                        let demand = DEMAND.read().unwrap_or_else(|e| e.into_inner());
+                        demand
+                            .private_pools
+                            .range(..=fault)
+                            .next_back()
+                            .filter(|&(_, &pool_end)| fault < pool_end)
+                            .and_then(|(&pool_base, &pool_end)| {
+                                let commit_base = page_addr.max(pool_base);
+                                let commit_end = commit_base.saturating_add(PAGE).min(pool_end);
+                                let commit_len = commit_end.saturating_sub(commit_base);
+                                (commit_len > 0 && commit(commit_base, commit_len))
+                                    .then_some((commit_base, commit_len))
+                            })
+                    };
+                    if let Some((commit_base, commit_len)) = committed_range {
+                        note_demand_private_committed(commit_len as u64);
+                        oathkeep_gpu::title_memory_committed(commit_base, commit_len);
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+
+                // Another thread may have committed this page or finished splitting/remapping
+                // a coalesced view between the CPU fault and our VirtualQuery.
+                if mbi.State == MEM_COMMIT
+                    && (mbi.Protect & PAGE_GUARD) == 0
+                    && (mbi.Type == MEM_MAPPED
+                        || (lazy_private
+                            && mbi.Type == MEM_PRIVATE
+                            && demand_private_end(fault).is_some()))
+                {
+                    let prot = mbi.Protect & 0xff;
+                    if access == 0
+                        && matches!(
+                            prot,
+                            PAGE_READONLY
+                                | PAGE_READWRITE
+                                | PAGE_WRITECOPY
+                                | PAGE_EXECUTE_READ
+                                | PAGE_EXECUTE_READWRITE
+                                | PAGE_EXECUTE_WRITECOPY
+                        )
+                    {
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                    if access == 1
+                        && matches!(
+                            prot,
+                            PAGE_READWRITE
+                                | PAGE_WRITECOPY
+                                | PAGE_EXECUTE_READWRITE
+                                | PAGE_EXECUTE_WRITECOPY
+                        )
+                    {
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                    if access == 1 && prot == PAGE_READONLY && oathkeep_gpu::try_open_write(fault) {
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+
+                // If a view split/remap started right as we queried, wait for it and re-check.
+                if attempt < 3
+                    && (oathkeep_gpu::wait_if_title_memory_remapping()
+                        || oathkeep_gpu::title_memory_remapping_seq() != seq_before)
+                {
+                    continue;
+                }
+                return EXCEPTION_CONTINUE_SEARCH;
             }
-            if newly {
-                note_demand_committed(1);
-            }
-            for &addr in &notify[..notify_len] {
-                oathkeep_gpu::title_memory_committed(addr, PAGE);
-            }
-            for addr in notify_extra {
-                oathkeep_gpu::title_memory_committed(addr, PAGE);
-            }
-            EXCEPTION_CONTINUE_EXECUTION
+            EXCEPTION_CONTINUE_SEARCH
         }
-        // SAFETY: registered first (`first=1`); fast-rejects non-MEM_MAPPED/MEM_RESERVE faults
-        // and only touches the leaf `DEMAND` lock and `VirtualAlloc(..., MEM_COMMIT)`.
+        // SAFETY: registered first (`first=1`); handles demand-commit faults and transient
+        // view-split remapping gaps without acquiring `PHYSICAL`.
         unsafe {
             AddVectoredExceptionHandler(1, Some(on_demand_commit));
         }
@@ -768,7 +1183,8 @@ impl View {
         if !commit(at.Value as usize, len) {
             return None;
         }
-        slice.section.mark_range_committed(slice.index, n);
+        let newly = slice.section.mark_range_committed(slice.index, n);
+        note_demand_committed(newly, CommitSource::ViewMap);
         Some(view)
     }
 
@@ -999,9 +1415,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     let lazy = demand_commit();
-    if lazy {
-        install_demand_commit();
-    }
+    install_demand_commit();
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -1734,5 +2148,134 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
         assert_eq!(XMemMapPhysicalPages(b, 2, std::ptr::null()), b);
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn concurrent_remap_split_and_demand_commit_never_fault_out() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const N: usize = 32;
+        let pages = allocate(N);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            N * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, N, pages.as_ptr()), a);
+        let base = a as usize;
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::new();
+        for tid in 0..4usize {
+            let stop = stop.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut ops = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let page = 4 + ((ops as usize + tid * 7) % (N - 4));
+                    let ptr = (base + page * PAGE + tid * 8) as *mut u64;
+                    // SAFETY: pages 4..N stay mapped by the title while page 0 is unmapped/remapped.
+                    unsafe {
+                        ptr.write_volatile(ops);
+                        assert_eq!(ptr.read_volatile(), ops);
+                    }
+                    ops += 1;
+                }
+                ops
+            }));
+        }
+        for _ in 0..200 {
+            assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+            assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            assert!(w.join().expect("worker did not crash") > 0);
+        }
+        assert_eq!(XMemMapPhysicalPages(a, N, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn demand_commit_private_pool_defers_commit_and_supports_write_watch() {
+        if !demand_commit_private() {
+            return;
+        }
+        let os_state = |ptr: *const c_void| -> u32 {
+            // SAFETY: plain data filled in by VirtualQuery.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: valid out pointer.
+            assert_ne!(unsafe { VirtualQuery(ptr, &mut mbi, size_of_val(&mbi)) }, 0);
+            mbi.State
+        };
+        let p = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * MIB,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!p.is_null());
+        let page1 = p.wrapping_byte_add(PAGE);
+        let page2 = p.wrapping_byte_add(2 * PAGE);
+        assert_eq!(os_state(p), MEM_RESERVE);
+        assert_eq!(os_state(page1), MEM_RESERVE);
+        assert_eq!(query(p).host.State, MEM_COMMIT);
+        assert_eq!(query(page1).host.State, MEM_COMMIT);
+
+        // WriteWatch succeeds even before any page is committed.
+        let (mut found, mut count, mut granularity) = ([0usize; 16], 16, 0);
+        // SAFETY: room for `count` addresses.
+        assert_eq!(
+            unsafe {
+                windows_sys::Win32::System::Memory::GetWriteWatch(
+                    1,
+                    p,
+                    4 * MIB,
+                    found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            },
+            0
+        );
+
+        // Touching page 1 demand-commits only page 1 and triggers WriteWatch.
+        // SAFETY: demand-committed by VEH.
+        unsafe { page1.cast::<u8>().write(0x5A) };
+        assert_eq!(os_state(p), MEM_RESERVE);
+        assert_eq!(os_state(page1), MEM_COMMIT);
+        assert_eq!(os_state(page2), MEM_RESERVE);
+        assert_eq!(unsafe { page1.cast::<u8>().read() }, 0x5A);
+
+        count = 16;
+        // SAFETY: room for `count` addresses.
+        assert_eq!(
+            unsafe {
+                windows_sys::Win32::System::Memory::GetWriteWatch(
+                    1,
+                    p,
+                    4 * MIB,
+                    found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            },
+            0
+        );
+        assert!(
+            found[..count].contains(&(page1 as usize)),
+            "WriteWatch tracked demand-committed write"
+        );
+
+        // kernel_will_write pre-commits page 2 before kernel I/O.
+        oathkeep_gpu::kernel_will_write(page2 as usize, 128);
+        assert_eq!(os_state(page2), MEM_COMMIT);
+        assert_eq!(os_state(p), MEM_RESERVE);
+
+        private_freed(p, 0, MEM_RELEASE);
+        assert!(demand_private_end(p as usize).is_none());
+        // SAFETY: our own reservation.
+        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
     }
 }
