@@ -6939,7 +6939,7 @@ impl HostList {
                 Step::Texture(staging) => {
                     let (start, len) = staging.memory();
                     if batch.texture_due_range(staging, start, len) {
-                        batch.pending_textures.push(staging.clone());
+                        batch.push_pending_texture(staging.clone(), start, len);
                     }
                     continue;
                 }
@@ -6963,14 +6963,27 @@ fn wide_refresh() -> bool {
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     index: std::collections::HashMap<usize, usize>,
+    refresh_min: usize,
+    refresh_max: usize,
     textures: std::collections::HashMap<usize, (usize, usize)>,
+    textures_min: usize,
+    textures_max: usize,
     pending_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
+    pending_tex_min: usize,
+    pending_tex_max: usize,
     after_textures: Vec<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
+        if self.refreshes.is_empty() {
+            self.refresh_min = address;
+            self.refresh_max = end;
+        } else {
+            self.refresh_min = self.refresh_min.min(address);
+            self.refresh_max = self.refresh_max.max(end);
+        }
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
             Some(&at) => {
@@ -7016,15 +7029,40 @@ impl Batch {
     }
 
     fn texture_due_range<T>(&mut self, staging: &std::sync::Arc<T>, start: usize, len: usize) -> bool {
+        let end = start.saturating_add(len);
+        if self.textures.is_empty() {
+            self.textures_min = start;
+            self.textures_max = end;
+        } else {
+            self.textures_min = self.textures_min.min(start);
+            self.textures_max = self.textures_max.max(end);
+        }
         let key = std::sync::Arc::as_ptr(staging) as *const () as usize;
-        self.textures
-            .insert(key, (start, start.saturating_add(len)))
-            .is_none()
+        self.textures.insert(key, (start, end)).is_none()
+    }
+
+    fn push_pending_texture(
+        &mut self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        start: usize,
+        len: usize,
+    ) {
+        let end = start.saturating_add(len);
+        if self.pending_textures.is_empty() {
+            self.pending_tex_min = start;
+            self.pending_tex_max = end;
+        } else {
+            self.pending_tex_min = self.pending_tex_min.min(start);
+            self.pending_tex_max = self.pending_tex_max.max(end);
+        }
+        self.pending_textures.push(staging);
     }
 
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        self.textures_min = 0;
+        self.textures_max = 0;
     }
 
     fn title_written_range(&mut self, dst: usize, len: usize) {
@@ -7032,51 +7070,76 @@ impl Batch {
             return;
         }
         let end = dst.saturating_add(len);
-        let mut overlapping_shadows = Vec::new();
-        let mut i = 0;
-        while i < self.refreshes.len() {
-            if self.refreshes[i]
-                .1
-                .iter()
-                .any(|&(a, b)| a < end && b > dst)
-            {
-                let (shadow, spans) = self.refreshes.swap_remove(i);
-                self.index
-                    .remove(&(std::sync::Arc::as_ptr(&shadow) as usize));
-                if let Some(moved) = self.refreshes.get(i) {
+        if !self.refreshes.is_empty() && dst < self.refresh_max && end > self.refresh_min {
+            let mut overlapping_shadows = Vec::new();
+            let mut i = 0;
+            while i < self.refreshes.len() {
+                if self.refreshes[i]
+                    .1
+                    .iter()
+                    .any(|&(a, b)| a < end && b > dst)
+                {
+                    let (shadow, spans) = self.refreshes.swap_remove(i);
                     self.index
-                        .insert(std::sync::Arc::as_ptr(&moved.0) as usize, i);
+                        .remove(&(std::sync::Arc::as_ptr(&shadow) as usize));
+                    if let Some(moved) = self.refreshes.get(i) {
+                        self.index
+                            .insert(std::sync::Arc::as_ptr(&moved.0) as usize, i);
+                    }
+                    overlapping_shadows.push((shadow, spans));
+                } else {
+                    i += 1;
                 }
-                overlapping_shadows.push((shadow, spans));
-            } else {
-                i += 1;
+            }
+            if self.refreshes.is_empty() {
+                self.refresh_min = 0;
+                self.refresh_max = 0;
+            }
+            for (shadow, spans) in overlapping_shadows {
+                for (from, to) in spans {
+                    Self::update(&shadow, from, to);
+                }
             }
         }
-        for (shadow, spans) in overlapping_shadows {
-            for (from, to) in spans {
-                Self::update(&shadow, from, to);
+        if !self.pending_textures.is_empty()
+            && dst < self.pending_tex_max
+            && end > self.pending_tex_min
+        {
+            let mut overlapping_textures = Vec::new();
+            let mut i = 0;
+            while i < self.pending_textures.len() {
+                let (t_start, t_len) = self.pending_textures[i].memory();
+                let t_end = t_start.saturating_add(t_len);
+                if t_start < end && t_end > dst {
+                    overlapping_textures.push(self.pending_textures.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            if self.pending_textures.is_empty() {
+                self.pending_tex_min = 0;
+                self.pending_tex_max = 0;
+            }
+            for staging in overlapping_textures {
+                staging.refresh();
             }
         }
-        let mut overlapping_textures = Vec::new();
-        let mut i = 0;
-        while i < self.pending_textures.len() {
-            let (t_start, t_len) = self.pending_textures[i].memory();
-            let t_end = t_start.saturating_add(t_len);
-            if t_start < end && t_end > dst {
-                overlapping_textures.push(self.pending_textures.swap_remove(i));
-            } else {
-                i += 1;
+        if !self.textures.is_empty() && dst < self.textures_max && end > self.textures_min {
+            self.textures
+                .retain(|_, &mut (t_start, t_end)| t_end <= dst || t_start >= end);
+            if self.textures.is_empty() {
+                self.textures_min = 0;
+                self.textures_max = 0;
             }
         }
-        for staging in overlapping_textures {
-            staging.refresh();
-        }
-        self.textures
-            .retain(|_, &mut (t_start, t_end)| t_end <= dst || t_start >= end);
     }
 
     fn flush(&mut self) {
         self.index.clear();
+        self.refresh_min = 0;
+        self.refresh_max = 0;
+        self.pending_tex_min = 0;
+        self.pending_tex_max = 0;
         let mut ranges: Vec<(usize, usize)> = self
             .refreshes
             .iter()

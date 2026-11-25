@@ -37,7 +37,7 @@ impl Pending {
                 .unwrap_or_default()
                 .as_bytes(),
         );
-        let is_compute = graphics.is_none() && shaders.iter().any(|s| s.stage == "compute");
+        let is_compute = matches!(shaders.as_slice(), [s] if s.stage == "compute");
         Pending {
             shaders,
             graphics: Mutex::new(graphics),
@@ -530,5 +530,12 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &active_gfx));
         assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &stale_gfx));
         assert!(queue.pop(true).is_none());
+    }
+
+    #[test]
+    fn stream_compute_pipeline_counts_as_compute() {
+        let cs = crate::pipeline::shader("compute", &[1, 2, 3, 4]);
+        let p = Pending::new(vec![cs], Some(Box::new(GraphicsState::default())));
+        assert!(p.is_compute);
     }
 }

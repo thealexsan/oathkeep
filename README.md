@@ -9,7 +9,7 @@ It runs unmodified x86-64 console executables directly on a Windows host by prov
 > **Legal & Clean-Room Notice:** This repository contains **zero** copyrighted software, executables, keys, shaders, textures, audio, archives, or extracted data. You must supply your own legally obtained console software. Oathkeep is an independent open-source interoperability project and is not affiliated with, endorsed by, or connected to any console manufacturer, game developer, or publisher. See [docs/asset-policy.md](docs/asset-policy.md).
 
 <!-- oathkeep:progress:start -->
-## Compatibility & Performance Progress (90%)
+## Compatibility & Performance Progress (91%)
 
 Live dashboard: [thealexsan.github.io/oathkeep](https://thealexsan.github.io/oathkeep/) • Auto-generated from [docs/progress.toml](docs/progress.toml) via `cargo xtask progress`.
 
@@ -17,8 +17,8 @@ Live dashboard: [thealexsan.github.io/oathkeep](https://thealexsan.github.io/oat
 
 | Run | Commit | FPS | Frame | GPU | Preparing | Status |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| pending run59 | `40200b5` | 0.0 | 0.0 ms | testing | testing | Verifying zero TDR + scoped copy/write sync |
-| diag-run58b | `a76d93e` | 3.2 | 312.0 ms | 297 ms TDR | 74 ms | Root-caused 2561af95 execz loop-guard TDR |
+| diag-run60 | `perf/commit-reduction` | 2.7 | 376.1 ms | 135.6 ms (9 ML) | 108 ms (cold) | Zero TDR; all 9/9 ML shaders dumped for DP4A diff |
+| diag-run59b | `40200b5` | 5.8 | 172.1 ms | 27.7 ms (no ML) | 59.7 ms | Zero TDR; 2561af95 0.36 ms/frame; ask_once 4.5 ms |
 | diag-run56-gpu | `542b511` | 5.4 | 185.0 ms | 118 ms | 75 ms | DP4A sped 5/9 ML shaders; 4/9 regressed |
 | diag-run54b | `a9461b1` | 6.2 | 161.0 ms | 127 ms | 76 ms | Baseline GPU timing (9 ML shaders 83 ms) |
 | diag-run52c | `f78ba1b` | 4.9 | 204.0 ms | ~130 ms | 78 ms | World entry baseline (cold PSOs) |

@@ -17,7 +17,7 @@ pub(crate) struct WriteStamp {
     pub(crate) ranged: u64,
 }
 
-const WRITE_RANGE_LOG_CAP: usize = 256;
+const WRITE_RANGE_LOG_CAP: usize = 4096;
 
 struct WriteRangeLog {
     seq: u64,

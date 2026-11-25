@@ -128,15 +128,15 @@
       <div class="mono muted">
         <a href="https://github.com/thealexsan/oathkeep">GitHub</a> ·
         <a href="https://discord.gg/PM6pr4Azzk">Discord</a> ·
-        40200b5 (perf/commit-reduction) · 2026-11-25
+        perf/commit-reduction (perf/commit-reduction) · 2026-11-25
       </div>
     </header>
 
     <section class="stats">
-      <div class="card"><div class="k">Overall Matrix</div><div class="v green mono">90%</div></div>
-      <div class="card"><div class="k">Latest World FPS</div><div class="v mono">verifying</div></div>
-      <div class="card"><div class="k">Frame / GPU</div><div class="v mono">pending run59 / 127 ms -&gt; target &lt;65 ms</div></div>
-      <div class="card"><div class="k">CPU Preparing</div><div class="v mono">76 ms -&gt; target &lt;15 ms</div></div>
+      <div class="card"><div class="k">Overall Matrix</div><div class="v green mono">91%</div></div>
+      <div class="card"><div class="k">Latest World FPS</div><div class="v mono">5.8 fps (timing)</div></div>
+      <div class="card"><div class="k">Frame / GPU</div><div class="v mono">172 ms (timing) / 27.7 ms base + 135 ms ML</div></div>
+      <div class="card"><div class="k">CPU Preparing</div><div class="v mono">59.7 ms (ask_once 4.5 ms)</div></div>
     </section>
 
     <div class="svg-wrap">
@@ -146,11 +146,11 @@
     <h2>Playability Milestones</h2>
     <section class="milestones">
       <div class="milestone"><span class="box l4 "></span><span class="mlabel">Executable boot &amp; HLE init</span><span class="mono muted">verified</span></div>
-<div class="milestone"><span class="box l4 "></span><span class="mlabel">Intro &amp; menus interactive</span><span class="mono muted">verified</span></div>
+<div class="milestone"><span class="box l4 "></span><span class="mlabel">Intro &amp; menus interactive</span><span class="mono muted">30-35 fps</span></div>
 <div class="milestone"><span class="box l4 "></span><span class="mlabel">World entry &amp; full 3D render</span><span class="mono muted">verified</span></div>
-<div class="milestone"><span class="box l4 "></span><span class="mlabel">Zero-TDR lighting (2561af95)</span><span class="mono muted">40200b5</span></div>
-<div class="milestone"><span class="box l3 active"></span><span class="mlabel">CPU preparing &lt;15 ms</span><span class="mono muted">verifying run59</span></div>
-<div class="milestone"><span class="box l2 active"></span><span class="mlabel">All 9 ML DP4A shaders fast</span><span class="mono muted">5/9 fast</span></div>
+<div class="milestone"><span class="box l4 "></span><span class="mlabel">Zero-TDR lighting (2561af95)</span><span class="mono muted">0.36 ms/frame</span></div>
+<div class="milestone"><span class="box l3 active"></span><span class="mlabel">CPU preparing &lt;15 ms</span><span class="mono muted">59.7 ms -&gt; &lt;15 ms</span></div>
+<div class="milestone"><span class="box l2 active"></span><span class="mlabel">All 9 ML DP4A shaders fast</span><span class="mono muted">9/9 dumped</span></div>
 <div class="milestone"><span class="box l1 "></span><span class="mlabel">1:1 console visuals verified</span><span class="mono muted">next</span></div>
 <div class="milestone"><span class="box l0 "></span><span class="mlabel">Playable first mission (20-30+ FPS)</span><span class="mono muted">target</span></div>
 
@@ -166,10 +166,10 @@
 <tr><td class="name">Audio (XMA / Opus)</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span><span class="box l3"></span><span class="box l2"></span><span class="box l2"></span></td><td class="mono num">83%</td><td class="muted">XMA2 &amp; Opus decode pipelines active</td></tr>
 <tr><td class="name">D3D12.x Command Host</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span></td><td class="mono num">95%</td><td class="muted">Async relay queue, bindless heaps, indirect mesh/compute</td></tr>
 <tr><td class="name">RDNA 2 -&gt; DXIL Core</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span></td><td class="mono num">98%</td><td class="muted">SM 6.6 dynamic resources, mesh/compute/pixel translation</td></tr>
-<tr><td class="name">Wave64 -&gt; Wave32</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span></td><td class="mono num">95%</td><td class="muted">Loop-guarding s_cbranch_execz preserved (TDR fixed at 40200b5)</td></tr>
-<tr><td class="name">DP4A / ML Compute</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span><span class="box l2"></span><span class="box l1"></span><span class="box l0"></span><span class="box l0"></span></td><td class="mono num">63%</td><td class="muted">5/9 ML shaders 1.24x-2.87x faster; fixing 4 regressed shaders next</td></tr>
-<tr><td class="name">Pipeline Cache &amp; Queue</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span><span class="box l2"></span></td><td class="mono num">90%</td><td class="muted">Versioned library cache, active-frame &amp; compute priority</td></tr>
-<tr><td class="name">Shadow &amp; Page Sync</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span><span class="box l2"></span></td><td class="mono num">90%</td><td class="muted">Range-scoped copy &amp; write invalidation (preparing &lt;15 ms target)</td></tr>
+<tr><td class="name">Wave64 -&gt; Wave32</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span></td><td class="mono num">98%</td><td class="muted">2561af95 verified 0.36 ms/frame (down from 297 ms TDR); zero TDR</td></tr>
+<tr><td class="name">DP4A / ML Compute</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span><span class="box l2"></span><span class="box l2"></span><span class="box l0"></span><span class="box l0"></span></td><td class="mono num">65%</td><td class="muted">All 9/9 ML shaders dumped; 5 fast, diffing 4 regressed shaders next</td></tr>
+<tr><td class="name">Pipeline Cache &amp; Queue</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l2"></span></td><td class="mono num">93%</td><td class="muted">Fixed stream-compute priority (is_compute) so ML shaders compile immediately</td></tr>
+<tr><td class="name">Shadow &amp; Page Sync</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span><span class="box l2"></span></td><td class="mono num">90%</td><td class="muted">ask_once 15.9 -&gt; 4.5 ms; 4096 write log + Batch bbox skip; batch_flush next</td></tr>
 <tr><td class="name">Texture Streaming</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span><span class="box l2"></span></td><td class="mono num">90%</td><td class="muted">Levels-on-demand budgeting for 8 GB VRAM, zero-wait upload</td></tr>
 <tr><td class="name">Display &amp; Input</td><td class="boxes"><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l4"></span><span class="box l3"></span><span class="box l3"></span></td><td class="mono num">95%</td><td class="muted">1080p presentation, XInput + keyboard fallback, Agility SDK 620</td></tr>
 </tbody>
@@ -180,8 +180,8 @@
     <div class="card" style="padding: 4px 12px; overflow-x: auto;">
       <table>
         <thead><tr><th>Run</th><th>Commit</th><th class="num">FPS</th><th class="num">Frame</th><th class="num">GPU</th><th class="num">Preparing</th><th>Status</th></tr></thead>
-        <tbody><tr><td class="mono">pending run59</td><td class="mono">40200b5</td><td class="mono num">0.0</td><td class="mono num">0.0 ms</td><td class="mono num">testing</td><td class="mono num">testing</td><td>Verifying zero TDR + scoped copy/write sync</td></tr>
-<tr><td class="mono">diag-run58b</td><td class="mono">a76d93e</td><td class="mono num">3.2</td><td class="mono num">312.0 ms</td><td class="mono num">297 ms TDR</td><td class="mono num">74 ms</td><td>Root-caused 2561af95 execz loop-guard TDR</td></tr>
+        <tbody><tr><td class="mono">diag-run60</td><td class="mono">perf/commit-reduction</td><td class="mono num">2.7</td><td class="mono num">376.1 ms</td><td class="mono num">135.6 ms (9 ML)</td><td class="mono num">108 ms (cold)</td><td>Zero TDR; all 9/9 ML shaders dumped for DP4A diff</td></tr>
+<tr><td class="mono">diag-run59b</td><td class="mono">40200b5</td><td class="mono num">5.8</td><td class="mono num">172.1 ms</td><td class="mono num">27.7 ms (no ML)</td><td class="mono num">59.7 ms</td><td>Zero TDR; 2561af95 0.36 ms/frame; ask_once 4.5 ms</td></tr>
 <tr><td class="mono">diag-run56-gpu</td><td class="mono">542b511</td><td class="mono num">5.4</td><td class="mono num">185.0 ms</td><td class="mono num">118 ms</td><td class="mono num">75 ms</td><td>DP4A sped 5/9 ML shaders; 4/9 regressed</td></tr>
 <tr><td class="mono">diag-run54b</td><td class="mono">a9461b1</td><td class="mono num">6.2</td><td class="mono num">161.0 ms</td><td class="mono num">127 ms</td><td class="mono num">76 ms</td><td>Baseline GPU timing (9 ML shaders 83 ms)</td></tr>
 <tr><td class="mono">diag-run52c</td><td class="mono">f78ba1b</td><td class="mono num">4.9</td><td class="mono num">204.0 ms</td><td class="mono num">~130 ms</td><td class="mono num">78 ms</td><td>World entry baseline (cold PSOs)</td></tr>

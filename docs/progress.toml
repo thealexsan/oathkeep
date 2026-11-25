@@ -1,13 +1,14 @@
 [meta]
 updated = "2026-11-25"
-commit = "40200b5"
+commit = "perf/commit-reduction"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "verifying"
-current_frame_ms = "pending run59"
-current_gpu_ms = "127 ms -> target <65 ms"
-current_preparing_ms = "76 ms -> target <15 ms"
+current_fps = "5.8 fps (timing)"
+current_frame_ms = "172 ms (timing)"
+current_gpu_ms = "27.7 ms base + 135 ms ML"
+current_preparing_ms = "59.7 ms (ask_once 4.5 ms)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
+eta = "~1.5-2.5 hours (DP4A ML fix + batch_flush sync + cache warm & verify)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -42,23 +43,23 @@ note = "SM 6.6 dynamic resources, mesh/compute/pixel translation"
 
 [[subsystems]]
 name = "Wave64 -> Wave32"
-cells = [4, 4, 4, 4, 4, 4, 4, 4, 3, 3]
-note = "Loop-guarding s_cbranch_execz preserved (TDR fixed at 40200b5)"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 4, 3]
+note = "2561af95 verified 0.36 ms/frame (down from 297 ms TDR); zero TDR"
 
 [[subsystems]]
 name = "DP4A / ML Compute"
-cells = [4, 4, 4, 4, 3, 3, 2, 1, 0, 0]
-note = "5/9 ML shaders 1.24x-2.87x faster; fixing 4 regressed shaders next"
+cells = [4, 4, 4, 4, 3, 3, 2, 2, 0, 0]
+note = "All 9/9 ML shaders dumped; 5 fast, diffing 4 regressed shaders next"
 
 [[subsystems]]
 name = "Pipeline Cache & Queue"
-cells = [4, 4, 4, 4, 4, 4, 4, 3, 3, 2]
-note = "Versioned library cache, active-frame & compute priority"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 3, 2]
+note = "Fixed stream-compute priority (is_compute) so ML shaders compile immediately"
 
 [[subsystems]]
 name = "Shadow & Page Sync"
 cells = [4, 4, 4, 4, 4, 4, 4, 3, 3, 2]
-note = "Range-scoped copy & write invalidation (preparing <15 ms target)"
+note = "ask_once 15.9 -> 4.5 ms; 4096 write log + Batch bbox skip; batch_flush next"
 
 [[subsystems]]
 name = "Texture Streaming"
@@ -80,7 +81,7 @@ detail = "verified"
 label = "Intro & menus interactive"
 state = "done"
 level = 4
-detail = "verified"
+detail = "30-35 fps"
 
 [[milestones]]
 label = "World entry & full 3D render"
@@ -92,19 +93,19 @@ detail = "verified"
 label = "Zero-TDR lighting (2561af95)"
 state = "done"
 level = 4
-detail = "40200b5"
+detail = "0.36 ms/frame"
 
 [[milestones]]
 label = "CPU preparing <15 ms"
 state = "active"
 level = 3
-detail = "verifying run59"
+detail = "59.7 ms -> <15 ms"
 
 [[milestones]]
 label = "All 9 ML DP4A shaders fast"
 state = "active"
 level = 2
-detail = "5/9 fast"
+detail = "9/9 dumped"
 
 [[milestones]]
 label = "1:1 console visuals verified"
@@ -146,19 +147,19 @@ preparing_ms = "75 ms"
 status = "DP4A sped 5/9 ML shaders; 4/9 regressed"
 
 [[runs]]
-label = "diag-run58b"
-commit = "a76d93e"
-fps = 3.2
-frame_ms = 312.0
-gpu_ms = "297 ms TDR"
-preparing_ms = "74 ms"
-status = "Root-caused 2561af95 execz loop-guard TDR"
+label = "diag-run59b"
+commit = "40200b5"
+fps = 5.8
+frame_ms = 172.1
+gpu_ms = "27.7 ms (no ML)"
+preparing_ms = "59.7 ms"
+status = "Zero TDR; 2561af95 0.36 ms/frame; ask_once 4.5 ms"
 
 [[runs]]
-label = "pending run59"
-commit = "40200b5"
-fps = 0.0
-frame_ms = 0.0
-gpu_ms = "testing"
-preparing_ms = "testing"
-status = "Verifying zero TDR + scoped copy/write sync"
+label = "diag-run60"
+commit = "perf/commit-reduction"
+fps = 2.7
+frame_ms = 376.1
+gpu_ms = "135.6 ms (9 ML)"
+preparing_ms = "108 ms (cold)"
+status = "Zero TDR; all 9/9 ML shaders dumped for DP4A diff"
