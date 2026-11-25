@@ -43,11 +43,45 @@ const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
 const SHADER_RESOURCE: u32 = 0x40 | 0x80;
 
+#[derive(Clone, Copy)]
+struct PassBudget {
+    ms: u64,
+    bytes: u64,
+    bake: bool,
+}
+
 thread_local! {
     static TESTED_DEPTH: std::cell::Cell<(usize, bool)> =
         const { std::cell::Cell::new((0, false)) };
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    static PASS_BUDGET: std::cell::Cell<Option<PassBudget>> = const { std::cell::Cell::new(None) };
+    static PLACED_BYTES_CACHE: std::cell::RefCell<std::collections::HashMap<[u32; 14], Option<u64>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn placed_bytes_cached(resource: &[u32; 14]) -> Option<u64> {
+    PLACED_BYTES_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(&known) = cache.get(resource) {
+            return known;
+        }
+        let bytes = crate::resource::placed_bytes(resource);
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(*resource, bytes);
+        bytes
+    })
+}
+
+fn texture_stage_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("OATHKEEP_TEXTURE_STAGE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(4)
+    })
 }
 
 fn early_budgets() -> (u64, u64) {
@@ -60,11 +94,45 @@ fn early_budgets() -> (u64, u64) {
                 .unwrap_or(default)
         };
         (
-            ms("OATHKEEP_EARLY_TEXTURES_MS", 12),
+            ms("OATHKEEP_EARLY_TEXTURES_MS", texture_stage_ms()),
             ms("OATHKEEP_BAKE_TEXTURES_MS", 32),
         )
     })
 }
+
+struct FrameTextureBudget {
+    frame: AtomicU64,
+    used_us: AtomicU64,
+}
+
+impl FrameTextureBudget {
+    const fn new() -> Self {
+        Self {
+            frame: AtomicU64::new(u64::MAX),
+            used_us: AtomicU64::new(0),
+        }
+    }
+
+    fn begin_frame(&self, frame: u64) {
+        if self.frame.load(Ordering::Relaxed) != frame
+            && self.frame.swap(frame, Ordering::Relaxed) != frame
+        {
+            self.used_us.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn remaining_us(&self, frame: u64, budget_us: u64) -> u64 {
+        self.begin_frame(frame);
+        budget_us.saturating_sub(self.used_us.load(Ordering::Relaxed))
+    }
+
+    fn record(&self, frame: u64, elapsed_us: u64) {
+        self.begin_frame(frame);
+        self.used_us.fetch_add(elapsed_us, Ordering::Relaxed);
+    }
+}
+
+static FRAME_TEX_BUDGET: FrameTextureBudget = FrameTextureBudget::new();
 
 const BAKE_PIXEL_SHADERS: [&str; 4] = [
     "c0a7fe77b1862e10",
@@ -239,7 +307,11 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 // consume `HEAP_BUFFER_MICROS` / `HEAP_BUFFER_PASSES`, which `host.rs` swaps).
 static LOG_BUF_PASSES: AtomicU64 = AtomicU64::new(0);
 static LOG_BUF_US: AtomicU64 = AtomicU64::new(0);
+static LOG_BUF_MIRROR_US: AtomicU64 = AtomicU64::new(0);
+static LOG_BUF_SPANS_US: AtomicU64 = AtomicU64::new(0);
+static LOG_BUF_REFRESH_US: AtomicU64 = AtomicU64::new(0);
 static LOG_BUF_REBUILDS: AtomicU64 = AtomicU64::new(0);
+static LOG_BUF_REBUILT_SHADOWS: AtomicU64 = AtomicU64::new(0);
 static LOG_BUF_SLOTS: AtomicU64 = AtomicU64::new(0);
 static LOG_TEX_PASSES: AtomicU64 = AtomicU64::new(0);
 static LOG_TEX_US: AtomicU64 = AtomicU64::new(0);
@@ -273,7 +345,11 @@ fn maybe_log_heap_breakdown() {
         return;
     }
     let buf_us = LOG_BUF_US.swap(0, Ordering::Relaxed);
+    let buf_mirror_us = LOG_BUF_MIRROR_US.swap(0, Ordering::Relaxed);
+    let buf_spans_us = LOG_BUF_SPANS_US.swap(0, Ordering::Relaxed);
+    let buf_refresh_us = LOG_BUF_REFRESH_US.swap(0, Ordering::Relaxed);
     let buf_rebuilds = LOG_BUF_REBUILDS.swap(0, Ordering::Relaxed);
+    let buf_rebuilt_shadows = LOG_BUF_REBUILT_SHADOWS.swap(0, Ordering::Relaxed);
     let buf_slots = LOG_BUF_SLOTS.swap(0, Ordering::Relaxed);
     let tex_us = LOG_TEX_US.swap(0, Ordering::Relaxed);
     let tex_prep_us = LOG_TEX_PREP_US.swap(0, Ordering::Relaxed);
@@ -286,10 +362,13 @@ fn maybe_log_heap_breakdown() {
     let tex_div = tex_passes.max(1) as f64;
     let early_div = early_passes.max(1) as f64;
     tracing::info!(
-        "heap pass breakdown (5s): buffers {buf_passes} passes avg {:.2} ms ({buf_rebuilds} span rebuilds, {buf_slots} slots); \
+        "heap pass breakdown (5s): buffers {buf_passes} passes avg {:.2} ms (mirror {:.2} ms, spans {:.2} ms, refresh {:.2} ms, {buf_rebuilds} span rebuilds / {buf_rebuilt_shadows} shadows, {buf_slots} slots); \
          heap_textures {tex_passes} passes avg {:.2} ms (prep {:.2} ms, due {:.2} ms, loop {:.2} ms, {tex_batches} batches, {tex_seen} slots); \
          early_textures {early_passes} passes avg {:.2} ms",
         buf_us as f64 / 1e3 / buf_div,
+        buf_mirror_us as f64 / 1e3 / buf_div,
+        buf_spans_us as f64 / 1e3 / buf_div,
+        buf_refresh_us as f64 / 1e3 / buf_div,
         tex_us as f64 / 1e3 / tex_div,
         tex_prep_us as f64 / 1e3 / tex_div,
         tex_due_us as f64 / 1e3 / tex_div,
@@ -319,12 +398,20 @@ fn speculative_room_cached(force: bool) -> bool {
     room
 }
 
+struct ShadowSlots<T> {
+    item: T,
+    slots: std::collections::HashMap<u32, (u64, u64)>,
+    spans: Vec<(usize, usize)>,
+    bytes: u64,
+    dirty: bool,
+}
+
 struct BufferSpanCache<T> {
     passes: u64,
-    ranges: std::collections::HashMap<u32, (T, u64, u64)>,
-    spans: Vec<(T, Vec<(usize, usize)>)>,
+    slot_owner: std::collections::HashMap<u32, usize>,
+    shadows: std::collections::HashMap<usize, ShadowSlots<T>>,
+    dirty_keys: Vec<usize>,
     bytes: u64,
-    spans_dirty: bool,
     rebuilds: u64,
 }
 
@@ -332,74 +419,139 @@ impl<T> Default for BufferSpanCache<T> {
     fn default() -> Self {
         Self {
             passes: 0,
-            ranges: std::collections::HashMap::new(),
-            spans: Vec::new(),
+            slot_owner: std::collections::HashMap::new(),
+            shadows: std::collections::HashMap::new(),
+            dirty_keys: Vec::new(),
             bytes: 0,
-            spans_dirty: false,
             rebuilds: 0,
         }
     }
 }
 
-impl<T: Clone> BufferSpanCache<T> {
+impl<T> BufferSpanCache<T> {
     fn clear(&mut self) {
-        if !self.ranges.is_empty() || !self.spans.is_empty() {
-            self.ranges.clear();
-            self.spans.clear();
+        if !self.slot_owner.is_empty() || !self.shadows.is_empty() || !self.dirty_keys.is_empty() {
+            self.slot_owner.clear();
+            self.shadows.clear();
+            self.dirty_keys.clear();
             self.bytes = 0;
-            self.spans_dirty = false;
         }
+    }
+
+    fn slot_count(&self) -> usize {
+        self.slot_owner.len()
+    }
+
+    fn collect_stale_slots(
+        &self,
+        shadow_matches: impl Fn(&T) -> bool,
+        range_matches: impl Fn(u64, u64) -> bool,
+    ) -> Vec<u32> {
+        let mut stale = Vec::new();
+        for entry in self.shadows.values() {
+            if !shadow_matches(&entry.item) {
+                continue;
+            }
+            for (&index, &(from, to)) in &entry.slots {
+                if range_matches(from, to) {
+                    stale.push(index);
+                }
+            }
+        }
+        stale
     }
 
     fn set(&mut self, index: u32, entry: Option<(T, u64, u64)>, key_of: impl Fn(&T) -> usize) {
         match entry {
             Some((item, from, to)) => {
                 let new_key = key_of(&item);
-                let unchanged = self.ranges.get(&index).is_some_and(|(old, old_from, old_to)| {
-                    *old_from == from && *old_to == to && key_of(old) == new_key
-                });
-                if !unchanged {
-                    self.ranges.insert(index, (item, from, to));
-                    self.spans_dirty = true;
+                if let Some(&old_key) = self.slot_owner.get(&index) {
+                    if old_key == new_key {
+                        if let Some(shadow) = self.shadows.get_mut(&new_key) {
+                            if shadow.slots.get(&index) == Some(&(from, to)) {
+                                return;
+                            }
+                            shadow.slots.insert(index, (from, to));
+                            if !shadow.dirty {
+                                shadow.dirty = true;
+                                self.dirty_keys.push(new_key);
+                            }
+                        }
+                        return;
+                    }
+                    if let Some(old_shadow) = self.shadows.get_mut(&old_key) {
+                        old_shadow.slots.remove(&index);
+                        if !old_shadow.dirty {
+                            old_shadow.dirty = true;
+                            self.dirty_keys.push(old_key);
+                        }
+                    }
+                }
+                self.slot_owner.insert(index, new_key);
+                let shadow = self
+                    .shadows
+                    .entry(new_key)
+                    .or_insert_with(|| ShadowSlots {
+                        item,
+                        slots: std::collections::HashMap::new(),
+                        spans: Vec::new(),
+                        bytes: 0,
+                        dirty: false,
+                    });
+                shadow.slots.insert(index, (from, to));
+                if !shadow.dirty {
+                    shadow.dirty = true;
+                    self.dirty_keys.push(new_key);
                 }
             }
             None => {
-                if self.ranges.remove(&index).is_some() {
-                    self.spans_dirty = true;
+                if let Some(old_key) = self.slot_owner.remove(&index)
+                    && let Some(old_shadow) = self.shadows.get_mut(&old_key)
+                {
+                    old_shadow.slots.remove(&index);
+                    if !old_shadow.dirty {
+                        old_shadow.dirty = true;
+                        self.dirty_keys.push(old_key);
+                    }
                 }
             }
         }
     }
 
-    fn ensure_spans(&mut self, key_of: impl Fn(&T) -> usize) -> (&[(T, Vec<(usize, usize)>)], u64, bool) {
-        if !self.spans_dirty {
-            return (&self.spans, self.bytes, false);
+    fn ensure_spans(&mut self) -> (&std::collections::HashMap<usize, ShadowSlots<T>>, u64, usize) {
+        if self.dirty_keys.is_empty() {
+            return (&self.shadows, self.bytes, 0);
         }
-        self.spans.clear();
-        let mut by_key: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::with_capacity(self.spans.capacity());
-        for (item, from, to) in self.ranges.values() {
-            let key = key_of(item);
-            let slot = match by_key.entry(key) {
-                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let idx = self.spans.len();
-                    self.spans.push((item.clone(), Vec::new()));
-                    e.insert(idx);
-                    idx
-                }
+        let mut rebuilt = 0usize;
+        for key in self.dirty_keys.drain(..) {
+            let Some(entry) = self.shadows.get_mut(&key) else {
+                continue;
             };
-            crate::shadow::merge_refresh_ranges(&mut self.spans[slot].1, *from as usize, *to as usize);
+            if !entry.dirty {
+                continue;
+            }
+            self.bytes -= entry.bytes;
+            if entry.slots.is_empty() {
+                self.shadows.remove(&key);
+            } else {
+                entry.spans.clear();
+                for &(from, to) in entry.slots.values() {
+                    crate::shadow::merge_refresh_ranges(&mut entry.spans, from as usize, to as usize);
+                }
+                entry.bytes = entry
+                    .spans
+                    .iter()
+                    .map(|&(from, to)| (to - from) as u64)
+                    .sum();
+                self.bytes += entry.bytes;
+                entry.dirty = false;
+            }
+            rebuilt += 1;
         }
-        self.bytes = self
-            .spans
-            .iter()
-            .flat_map(|s| s.1.iter())
-            .map(|&(from, to)| (to - from) as u64)
-            .sum();
-        self.spans_dirty = false;
-        self.rebuilds += 1;
-        (&self.spans, self.bytes, true)
+        if rebuilt > 0 {
+            self.rebuilds += 1;
+        }
+        (&self.shadows, self.bytes, rebuilt)
     }
 }
 
@@ -1393,27 +1545,25 @@ impl State {
         let evicted = crate::shadow::take_in_place_evicted();
         let mut slots = if cache.passes % rebuild_every == 0 {
             cache.clear();
+            let all = host.buffer_slots();
             if !evicted.is_empty() {
-                for &index in &host.buffer_slots() {
+                for &index in &all {
                     host.unmake_slot(index);
                 }
             }
-            host.buffer_slots()
+            all
         } else {
             changed
         };
         if !evicted.is_empty() && cache.passes % rebuild_every != 0 {
-            let stale: Vec<u32> = cache
-                .ranges
-                .iter()
-                .filter(|(_, (shadow, from, to))| {
-                    shadow.is_in_place()
-                        && evicted
-                            .iter()
-                            .any(|&(ev_start, ev_end)| *from < ev_end && *to > ev_start)
-                })
-                .map(|(&index, _)| index)
-                .collect();
+            let stale = cache.collect_stale_slots(
+                |shadow| shadow.is_in_place(),
+                |from, to| {
+                    evicted
+                        .iter()
+                        .any(|&(ev_start, ev_end)| from < ev_end && to > ev_start)
+                },
+            );
             for index in stale {
                 host.unmake_slot(index);
                 slots.push(index);
@@ -1424,63 +1574,80 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive =
             !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        let mirror_started = std::time::Instant::now();
         for (n, &index) in slots.iter().enumerate() {
-            let resolved = heap
-                .handle(index)
-                .and_then(|handle| host.mirror(index, handle, true))
-                .and_then(|view| {
-                    if alive
-                        && n % 64 == 63
-                        && let Some(why) = crate::descriptor::host::device_removed()
-                    {
-                        alive = false;
-                        GONE.store(true, Ordering::Relaxed);
-                        let last: Vec<String> = slots[n - 63..=n]
-                            .iter()
-                            .filter_map(|&i| {
-                                crate::descriptor::view(heap.handle(i)?)
-                                    .map(|v| format!("{i}: {v:?}"))
-                            })
-                            .map(|s| s.chars().take(200).collect())
-                            .collect();
-                        tracing::error!(
-                            why,
-                            slot = index,
-                            "the host device went while buffer views of the heap were made; one of: {last:#?}"
-                        );
-                        crate::host::log_removal_context();
-                    }
-                    let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
-                    #[cfg(feature = "diagnostics")]
-                    if host.shows(index, &shadow.buffer) == Some(false) {
-                        HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Some((shadow, address, address + len))
-                });
+            let resolved = heap.handle(index).and_then(|handle| {
+                let mirrored = host.mirror_buffer(index, handle)?;
+                if alive
+                    && n % 64 == 63
+                    && let Some(why) = crate::descriptor::host::device_removed()
+                {
+                    alive = false;
+                    GONE.store(true, Ordering::Relaxed);
+                    let last: Vec<String> = slots[n - 63..=n]
+                        .iter()
+                        .filter_map(|&i| {
+                            crate::descriptor::view(heap.handle(i)?)
+                                .map(|v| format!("{i}: {v:?}"))
+                        })
+                        .map(|s| s.chars().take(200).collect())
+                        .collect();
+                    tracing::error!(
+                        why,
+                        slot = index,
+                        "the host device went while buffer views of the heap were made; one of: {last:#?}"
+                    );
+                    crate::host::log_removal_context();
+                }
+                let (shadow, address, len) = mirrored.copy?;
+                #[cfg(feature = "diagnostics")]
+                if mirrored.shows == Some(false) {
+                    HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                }
+                Some((shadow, address, address + len))
+            });
             cache.set(index, resolved, key_of);
         }
-        let views = cache.ranges.len() as u32;
-        let (spans, bytes, rebuilt) = cache.ensure_spans(key_of);
-        let copies = spans.len();
-        static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> =
-            std::sync::Mutex::new(None);
-        {
-            let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
-            let whole = whole.get_or_insert_with(Default::default);
-            for (shadow, shadow_spans) in spans {
-                if shadow.is_in_place() {
-                    list.keep(&shadow.buffer);
+        let mirror_us = mirror_started.elapsed().as_micros() as u64;
+        let views = cache.slot_count() as u32;
+        let spans_started = std::time::Instant::now();
+        let (shadows, bytes, rebuilt_shadows) = cache.ensure_spans();
+        let spans_us = spans_started.elapsed().as_micros() as u64;
+        let copies = shadows.len();
+        let refresh_started = std::time::Instant::now();
+        static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let every = *EVERY.get_or_init(|| {
+            std::env::var("OATHKEEP_UNWATCHED_FRAMES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1)
+        });
+        if every <= 1 {
+            for entry in shadows.values() {
+                if entry.item.is_in_place() {
+                    list.keep(&entry.item.buffer);
                     continue;
                 }
-                if shadow.unwatched() {
-                    let key = shadow.id() as usize;
-                    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-                    let every = *EVERY.get_or_init(|| {
-                        std::env::var("OATHKEEP_UNWATCHED_FRAMES")
-                            .ok()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(1)
-                    });
+                for &(from, to) in &entry.spans {
+                    entry
+                        .item
+                        .refresh(list, from as u64, (to - from) as u64);
+                }
+            }
+        } else {
+            static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> =
+                std::sync::Mutex::new(None);
+            let mut whole_guard = None;
+            for entry in shadows.values() {
+                if entry.item.is_in_place() {
+                    list.keep(&entry.item.buffer);
+                    continue;
+                }
+                if entry.item.unwatched() {
+                    let guard = whole_guard
+                        .get_or_insert_with(|| WHOLE.lock().unwrap_or_else(|e| e.into_inner()));
+                    let whole = guard.get_or_insert_with(Default::default);
+                    let key = entry.item.id() as usize;
                     match whole.get(&key) {
                         Some(&last) if frame < last + every => continue,
                         _ => {
@@ -1488,11 +1655,14 @@ impl State {
                         }
                     }
                 }
-                for &(from, to) in shadow_spans {
-                    shadow.refresh(list, from as u64, (to - from) as u64);
+                for &(from, to) in &entry.spans {
+                    entry
+                        .item
+                        .refresh(list, from as u64, (to - from) as u64);
                 }
             }
         }
+        let refresh_us = refresh_started.elapsed().as_micros() as u64;
         drop(kept);
         let buffer_us = started.elapsed().as_micros() as u64;
         let tex_started = std::time::Instant::now();
@@ -1503,8 +1673,12 @@ impl State {
         HEAP_TEXTURE_MICROS.fetch_add(tex_us, Ordering::Relaxed);
         LOG_BUF_PASSES.fetch_add(1, Ordering::Relaxed);
         LOG_BUF_US.fetch_add(buffer_us, Ordering::Relaxed);
-        if rebuilt {
+        LOG_BUF_MIRROR_US.fetch_add(mirror_us, Ordering::Relaxed);
+        LOG_BUF_SPANS_US.fetch_add(spans_us, Ordering::Relaxed);
+        LOG_BUF_REFRESH_US.fetch_add(refresh_us, Ordering::Relaxed);
+        if rebuilt_shadows > 0 {
             LOG_BUF_REBUILDS.fetch_add(1, Ordering::Relaxed);
+            LOG_BUF_REBUILT_SHADOWS.fetch_add(rebuilt_shadows as u64, Ordering::Relaxed);
         }
         LOG_BUF_SLOTS.fetch_add(slots.len() as u64, Ordering::Relaxed);
         maybe_log_heap_breakdown();
@@ -1531,22 +1705,35 @@ impl State {
             return;
         }
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-        static BAKED_MS: AtomicU64 = AtomicU64::new(0);
+        static BAKED_US: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
         let first = FRAME.load(Ordering::Relaxed) != frame
             && FRAME.swap(frame, Ordering::Relaxed) != frame;
         if first {
-            BAKED_MS.store(0, Ordering::Relaxed);
+            BAKED_US.store(0, Ordering::Relaxed);
         }
-        let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
-        let bake = left > 0
+        let left_us = bake_ms
+            .saturating_mul(1000)
+            .saturating_sub(BAKED_US.load(Ordering::Relaxed));
+        let bake = left_us > 0
             && p.stages
                 .iter()
                 .any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
         let budget = if bake {
-            (left, 2 << 30)
-        } else if first && early_ms > 0 {
-            (early_ms, 64 << 20)
+            PassBudget {
+                ms: left_us.div_ceil(1000),
+                bytes: 2 << 30,
+                bake: true,
+            }
+        } else if first
+            && early_ms > 0
+            && FRAME_TEX_BUDGET.remaining_us(frame, early_ms.saturating_mul(1000)) > 0
+        {
+            PassBudget {
+                ms: early_ms,
+                bytes: 64 << 20,
+                bake: false,
+            }
         } else {
             return;
         };
@@ -1584,7 +1771,7 @@ impl State {
         LOG_EARLY_PASSES.fetch_add(1, Ordering::Relaxed);
         LOG_EARLY_US.fetch_add(elapsed_us, Ordering::Relaxed);
         if bake {
-            BAKED_MS.fetch_add(elapsed_us / 1000, Ordering::Relaxed);
+            BAKED_US.fetch_add(elapsed_us, Ordering::Relaxed);
         }
     }
 
@@ -1664,10 +1851,28 @@ impl State {
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
     ) {
+        use crate::descriptor::host::TextureSlotUpdate;
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("OATHKEEP_HEAP_TEXTURES").is_none_or(|v| v != "0"))
         {
             return;
+        }
+        let frame = crate::frame::current();
+        let base_ms = texture_stage_ms();
+        static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let catchup = *CATCHUP
+            .get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_CATCHUP").is_some_and(|v| v == "1"));
+        let pass_budget = PASS_BUDGET.get();
+        let is_bake = pass_budget.is_some_and(|b| b.bake);
+        if !is_bake {
+            let max_budget_us = match pass_budget {
+                Some(b) => b.ms.saturating_mul(1000),
+                None if catchup => base_ms.saturating_mul(3000),
+                None => base_ms.saturating_mul(1000),
+            };
+            if FRAME_TEX_BUDGET.remaining_us(frame, max_budget_us) == 0 {
+                return;
+            }
         }
         let total_started = std::time::Instant::now();
         static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1679,7 +1884,6 @@ impl State {
         }) << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
-        let frame = crate::frame::current();
         if FRAME.load(Ordering::Relaxed) != frame && FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
         }
@@ -1703,20 +1907,9 @@ impl State {
             .saturating_sub(PASSED.swap(now, Ordering::Relaxed))
             .max(1);
         let most = (4000 / took).clamp(16, 256);
-        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let base_span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("OATHKEEP_TEXTURE_STAGE_MS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(4)
-        }));
-        static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let catchup = *CATCHUP
-            .get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_CATCHUP").is_some_and(|v| v == "1"));
-        let pass_budget = PASS_BUDGET.get();
         let spent_initial = SPENT.load(Ordering::Relaxed);
         let max_possible_bytes = match pass_budget {
-            Some((_, bytes)) => spent_initial.saturating_add(bytes),
+            Some(b) => spent_initial.saturating_add(b.bytes),
             None if catchup => per_frame * 3,
             None => per_frame,
         };
@@ -1744,17 +1937,28 @@ impl State {
             count.store(now, Ordering::Relaxed);
         }
         Self::card_accounting(heap, host, frame, room);
-        let (per_frame, span) = if catchup && census[1] >= 1024 {
-            (per_frame * 3, base_span * 3)
+        let (per_frame, exact_ms) = if catchup && census[1] >= 1024 {
+            (per_frame * 3, base_ms.saturating_mul(3))
         } else {
-            (per_frame, base_span)
+            (per_frame, base_ms)
         };
-        let (span, bytes_at_most) = match pass_budget {
-            Some((ms, bytes)) => (
-                std::time::Duration::from_millis(ms),
-                spent_initial.saturating_add(bytes),
+        let (pass_span, bytes_at_most) = match pass_budget {
+            Some(b) if b.bake => (
+                std::time::Duration::from_millis(b.ms),
+                spent_initial.saturating_add(b.bytes),
             ),
-            None => (span, per_frame),
+            Some(b) => (
+                std::time::Duration::from_micros(
+                    FRAME_TEX_BUDGET.remaining_us(frame, b.ms.saturating_mul(1000)),
+                ),
+                spent_initial.saturating_add(b.bytes),
+            ),
+            None => (
+                std::time::Duration::from_micros(
+                    FRAME_TEX_BUDGET.remaining_us(frame, exact_ms.saturating_mul(1000)),
+                ),
+                per_frame,
+            ),
         };
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -1771,14 +1975,15 @@ impl State {
         let mut seen = 0usize;
         let mut mirrored = 0usize;
         let mut last_mirrored: Option<(u32, Option<View>)> = None;
-        let mut stop = batch.is_empty();
+        let mut stop = batch.is_empty() || total_started.elapsed() >= pass_span;
+        let mut updates: Vec<TextureSlotUpdate> = Vec::with_capacity(BATCH_SIZE);
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         while !stop {
             let batch_len = batch.len();
             for slot in &batch {
                 let (index, write) = (slot.index, slot.write);
                 let spent_now = SPENT.load(Ordering::Relaxed);
-                if spent_now >= bytes_at_most || began.elapsed() > span {
+                if spent_now >= bytes_at_most || total_started.elapsed() >= pass_span {
                     stop = true;
                     break;
                 }
@@ -1795,16 +2000,20 @@ impl State {
                     if crate::texture::fingerprint(at, len) == print {
                         HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                         match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                            Some(wait) => host.texture_slot_recheck(
+                            Some(wait) => updates.push(TextureSlotUpdate::Recheck {
                                 index,
                                 write,
-                                frame + wait,
-                                (at, len),
+                                due: frame + wait,
+                                at: (at, len),
                                 print,
-                                looks + 1,
+                                looks: looks + 1,
                                 uploaded,
-                            ),
-                            None => host.texture_slot_done(index, write, None),
+                            }),
+                            None => updates.push(TextureSlotUpdate::Done {
+                                index,
+                                write,
+                                again: None,
+                            }),
                         }
                         continue;
                     }
@@ -1827,18 +2036,28 @@ impl State {
                 match current_view {
                     Some(View::Placed(false, resource, desc)) => {
                         let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                        let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
+                        let len = placed_bytes_cached(&resource).unwrap_or(1);
                         let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                         if mapped == 0 {
                             HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                             host.texture_slot_gone(index);
-                            host.texture_slot_later(index, write, frame, most);
+                            updates.push(TextureSlotUpdate::Later {
+                                index,
+                                write,
+                                frame,
+                                most,
+                            });
                             continue;
                         }
                         if mapped < len {
                             if mapped <= slot.mapped {
                                 HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
-                                host.texture_slot_later(index, write, frame, most);
+                                updates.push(TextureSlotUpdate::Later {
+                                    index,
+                                    write,
+                                    frame,
+                                    most,
+                                });
                                 continue;
                             }
                             if !crate::texture::committed(address as *const u8, 1) {
@@ -1851,7 +2070,11 @@ impl State {
                         if crate::resource::buffer_bytes(object as This).is_none()
                             && !crate::resource::title_fills(object as This) =>
                     {
-                        host.texture_slot_done(index, write, None);
+                        updates.push(TextureSlotUpdate::Done {
+                            index,
+                            write,
+                            again: None,
+                        });
                         continue;
                     }
                     _ => {}
@@ -1863,7 +2086,11 @@ impl State {
                     if !has_its_texture {
                         refused += 1;
                         if full_card_pass() {
-                            host.texture_slot_held(index, write, frame + most);
+                            updates.push(TextureSlotUpdate::Held {
+                                index,
+                                write,
+                                due: frame + most,
+                            });
                             if refused > 1024 {
                                 stop = true;
                                 break;
@@ -1883,22 +2110,35 @@ impl State {
                         );
                     }
                 }
-                let view = handle.and_then(|handle| host.mirror(index, handle, true));
-                let placed = view
-                    .as_ref()
-                    .and_then(crate::descriptor::host::placed_texture);
+                if total_started.elapsed() >= pass_span {
+                    stop = true;
+                    break;
+                }
+                let mirrored_tex = handle.and_then(|handle| host.mirror_texture(index, handle));
+                let (view, placed) = match mirrored_tex {
+                    Some((v, p)) => (Some(v), p),
+                    None => (None, None),
+                };
                 let resolved = placed.as_ref().or(view.as_ref());
                 let resource = match resolved {
                     Some(&View::Shader(resource, _)) => resource as This,
                     _ => {
-                        host.texture_slot_done(index, write, None);
+                        updates.push(TextureSlotUpdate::Done {
+                            index,
+                            write,
+                            again: None,
+                        });
                         continue;
                     }
                 };
                 let title_fills =
                     crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
                 if !title_fills {
-                    host.texture_slot_done(index, write, None);
+                    updates.push(TextureSlotUpdate::Done {
+                        index,
+                        write,
+                        again: None,
+                    });
                     continue;
                 }
                 let tabled = crate::texture::is_staged(resource);
@@ -1917,12 +2157,25 @@ impl State {
                                 "the host device went while textures picked by index were made ready; last: {text}"
                             );
                             crate::host::log_removal_context();
+                            host.texture_apply_updates(&mut updates);
+                            FRAME_TEX_BUDGET
+                                .record(frame, total_started.elapsed().as_micros() as u64);
                             return;
                         }
                         last_mirrored = None;
                     } else {
                         last_mirrored = Some((index, view));
                     }
+                }
+                if tabled && let Some(mapped) = partly {
+                    HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
+                    HEAP_TEXTURES_TABLED.fetch_add(1, Ordering::Relaxed);
+                    updates.push(TextureSlotUpdate::Done {
+                        index,
+                        write,
+                        again: Some((frame + 1, mapped)),
+                    });
+                    continue;
                 }
                 let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
                 let again = match partly {
@@ -1934,7 +2187,11 @@ impl State {
                 }
                 if tabled {
                     HEAP_TEXTURES_TABLED.fetch_add(1, Ordering::Relaxed);
-                    host.texture_slot_done(index, write, again);
+                    updates.push(TextureSlotUpdate::Done {
+                        index,
+                        write,
+                        again,
+                    });
                     continue;
                 }
                 let memory = if again.is_none() && heap_recheck() {
@@ -1949,17 +2206,21 @@ impl State {
                 match memory {
                     Some((at, len)) => {
                         let print = crate::texture::fingerprint(at, len);
-                        host.texture_slot_recheck(
+                        updates.push(TextureSlotUpdate::Recheck {
                             index,
                             write,
-                            frame + RECHECK_FRAMES[0],
-                            (at, len),
+                            due: frame + RECHECK_FRAMES[0],
+                            at: (at, len),
                             print,
-                            0,
-                            frame,
-                        );
+                            looks: 0,
+                            uploaded: frame,
+                        });
                     }
-                    None => host.texture_slot_done(index, write, again),
+                    None => updates.push(TextureSlotUpdate::Done {
+                        index,
+                        write,
+                        again,
+                    }),
                 }
             }
             if stop
@@ -1968,19 +2229,20 @@ impl State {
                 || seen >= MAX_PER_PASS
                 || batch_len < BATCH_SIZE
                 || SPENT.load(Ordering::Relaxed) >= bytes_at_most
-                || began.elapsed() > span
+                || total_started.elapsed() >= pass_span
             {
                 break;
             }
             let next_cap = BATCH_SIZE.min(MAX_PER_PASS - seen);
             let next_due = std::time::Instant::now();
-            host.texture_slots_due_batch(frame, next_cap, false, &mut batch);
+            host.texture_batch_step(frame, next_cap, &mut updates, &mut batch);
             extra_due_us += next_due.elapsed().as_micros() as u64;
             batches_taken += 1;
             if batch.is_empty() {
                 break;
             }
         }
+        host.texture_apply_updates(&mut updates);
         if let Some((index, view)) = last_mirrored
             && !GONE.load(Ordering::Relaxed)
             && let Some(why) = crate::descriptor::host::device_removed()
@@ -1996,6 +2258,7 @@ impl State {
         }
         let loop_us = began.elapsed().as_micros() as u64;
         let total_us = total_started.elapsed().as_micros() as u64;
+        FRAME_TEX_BUDGET.record(frame, total_us);
         LOG_TEX_PASSES.fetch_add(1, Ordering::Relaxed);
         LOG_TEX_US.fetch_add(total_us, Ordering::Relaxed);
         LOG_TEX_PREP_US.fetch_add(prep_us, Ordering::Relaxed);
@@ -3433,66 +3696,110 @@ mod tests {
     use super::*;
 
     #[test]
-    fn buffer_span_cache_reuses_clean_spans_and_invalidates_on_mutations() {
+    fn buffer_span_cache_reuses_clean_spans_and_rebuilds_only_dirty_shadows() {
         let mut cache: BufferSpanCache<usize> = BufferSpanCache::default();
         let key_of = |&id: &usize| id;
 
         // Initial empty cache does not rebuild.
-        let (spans, bytes, rebuilt) = cache.ensure_spans(key_of);
-        assert!(spans.is_empty());
+        let (shadows, bytes, rebuilt) = cache.ensure_spans();
+        assert!(shadows.is_empty());
         assert_eq!(bytes, 0);
-        assert!(!rebuilt);
+        assert_eq!(rebuilt, 0);
         assert_eq!(cache.rebuilds, 0);
 
-        // Adding slots marks dirty and merges nearby ranges per shadow.
+        // Adding slots marks only the affected shadows dirty and merges nearby ranges per shadow.
         cache.set(1, Some((100, 0x1000, 0x2000)), key_of);
         cache.set(2, Some((100, 0x2000, 0x3000)), key_of);
         cache.set(3, Some((200, 0x100_0000, 0x100_4000)), key_of);
-        let (spans, bytes, rebuilt) = cache.ensure_spans(key_of);
-        assert!(rebuilt);
-        assert_eq!(spans.len(), 2);
-        assert_eq!(bytes, 0x2000 + 0x4000);
+        cache.set(4, Some((300, 0x200_0000, 0x200_8000)), key_of);
+        let (shadows, bytes, rebuilt) = cache.ensure_spans();
+        assert_eq!(rebuilt, 3);
+        assert_eq!(shadows.len(), 3);
+        assert_eq!(bytes, 0x2000 + 0x4000 + 0x8000);
         assert_eq!(cache.rebuilds, 1);
 
         // Clean frame reuses cached spans with zero rebuilds.
-        let (_, bytes2, rebuilt2) = cache.ensure_spans(key_of);
-        assert!(!rebuilt2);
-        assert_eq!(bytes2, 0x6000);
+        let (_, bytes2, rebuilt2) = cache.ensure_spans();
+        assert_eq!(rebuilt2, 0);
+        assert_eq!(bytes2, 0xe000);
         assert_eq!(cache.rebuilds, 1);
 
         // Re-setting a slot to the identical (shadow, from, to) stays clean.
         cache.set(1, Some((100, 0x1000, 0x2000)), key_of);
-        let (_, _, rebuilt3) = cache.ensure_spans(key_of);
-        assert!(!rebuilt3);
+        let (_, _, rebuilt3) = cache.ensure_spans();
+        assert_eq!(rebuilt3, 0);
         assert_eq!(cache.rebuilds, 1);
 
-        // Updating a slot to a new range invalidates and rebuilds.
+        // Updating one slot only rebuilds that single shadow, leaving the other two untouched.
         cache.set(2, Some((100, 0x2000, 0x5000)), key_of);
-        let (_, bytes4, rebuilt4) = cache.ensure_spans(key_of);
-        assert!(rebuilt4);
-        assert_eq!(bytes4, 0x4000 + 0x4000);
+        let (_, bytes4, rebuilt4) = cache.ensure_spans();
+        assert_eq!(rebuilt4, 1);
+        assert_eq!(bytes4, 0x4000 + 0x4000 + 0x8000);
         assert_eq!(cache.rebuilds, 2);
 
-        // Removing a slot invalidates and shrinks spans.
-        cache.set(3, None, key_of);
-        let (spans5, bytes5, rebuilt5) = cache.ensure_spans(key_of);
-        assert!(rebuilt5);
-        assert_eq!(spans5.len(), 1);
-        assert_eq!(bytes5, 0x4000);
+        // Moving a slot from shadow 200 to shadow 300 dirties only those two shadows and removes empty shadow 200.
+        cache.set(3, Some((300, 0x200_8000, 0x200_c000)), key_of);
+        let (shadows5, bytes5, rebuilt5) = cache.ensure_spans();
+        assert_eq!(rebuilt5, 2);
+        assert_eq!(shadows5.len(), 2);
+        assert!(!shadows5.contains_key(&200));
+        assert_eq!(bytes5, 0x4000 + 0xc000);
         assert_eq!(cache.rebuilds, 3);
 
-        // Removing a non-existent slot does not dirty.
+        // Removing a slot invalidates only its owner shadow and shrinks bytes incrementally.
+        cache.set(3, None, key_of);
+        let (shadows6, bytes6, rebuilt6) = cache.ensure_spans();
+        assert_eq!(rebuilt6, 1);
+        assert_eq!(shadows6.len(), 2);
+        assert_eq!(bytes6, 0x4000 + 0x8000);
+        assert_eq!(cache.rebuilds, 4);
+
+        // Removing a non-existent slot does not dirty anything.
         cache.set(999, None, key_of);
-        let (_, _, rebuilt6) = cache.ensure_spans(key_of);
-        assert!(!rebuilt6);
-        assert_eq!(cache.rebuilds, 3);
+        let (_, _, rebuilt7) = cache.ensure_spans();
+        assert_eq!(rebuilt7, 0);
+        assert_eq!(cache.rebuilds, 4);
+
+        // Adding and removing a slot on a new shadow before ensure_spans cleans up cleanly.
+        cache.set(50, Some((400, 0x1000, 0x2000)), key_of);
+        cache.set(50, None, key_of);
+        let (shadows8, bytes8, rebuilt8) = cache.ensure_spans();
+        assert_eq!(rebuilt8, 1);
+        assert!(!shadows8.contains_key(&400));
+        assert_eq!(bytes8, 0xc000);
+
+        // collect_stale_slots filters by shadow and range accurately.
+        let stale = cache.collect_stale_slots(|&id| id == 100, |from, to| from < 0x3000 && to > 0x1500);
+        assert!(stale.contains(&1));
+        assert!(stale.contains(&2));
+        assert_eq!(stale.len(), 2);
 
         // Clearing (rebuild/eviction) resets spans and bytes cleanly.
         cache.clear();
-        let (spans7, bytes7, rebuilt7) = cache.ensure_spans(key_of);
-        assert!(!rebuilt7);
-        assert!(spans7.is_empty());
-        assert_eq!(bytes7, 0);
+        let (shadows9, bytes9, rebuilt9) = cache.ensure_spans();
+        assert_eq!(rebuilt9, 0);
+        assert!(shadows9.is_empty());
+        assert_eq!(bytes9, 0);
+        assert_eq!(cache.slot_count(), 0);
+    }
+
+    #[test]
+    fn frame_texture_budget_caps_combined_passes_and_resets_each_frame() {
+        let budget = FrameTextureBudget::new();
+        // Frame 10 starts with full 4000 us budget.
+        assert_eq!(budget.remaining_us(10, 4000), 4000);
+        // First pass (e.g. early_textures) spends 2500 us.
+        budget.record(10, 2500);
+        assert_eq!(budget.remaining_us(10, 4000), 1500);
+        // Second pass (e.g. heap_buffers -> heap_textures) spends 2000 us, exhausting the 4000 us cap.
+        budget.record(10, 2000);
+        assert_eq!(budget.remaining_us(10, 4000), 0);
+        // Larger budget (e.g. catchup 12000 us) still sees remaining room on the same frame.
+        assert_eq!(budget.remaining_us(10, 12000), 7500);
+        // Advancing to frame 11 resets the accumulator.
+        assert_eq!(budget.remaining_us(11, 4000), 4000);
+        budget.record(11, 4100);
+        assert_eq!(budget.remaining_us(11, 4000), 0);
     }
 
     #[test]
