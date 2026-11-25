@@ -192,12 +192,17 @@ const IDLE_MOST: (usize, u64) = (32, 64 << 20);
 
 #[cfg(windows)]
 pub(crate) fn trim_idle() {
-    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-    while idle.0.len() > 8 {
-        if let Some(Idle(_, bytes)) = idle.0.pop() {
-            idle.1 = idle.1.saturating_sub(bytes);
+    let mut dropped = Vec::new();
+    {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        while idle.0.len() > 8 {
+            if let Some(entry) = idle.0.pop() {
+                idle.1 = idle.1.saturating_sub(entry.1);
+                dropped.push(entry);
+            }
         }
     }
+    drop(dropped);
 }
 
 #[cfg(windows)]
@@ -218,7 +223,14 @@ fn fresh_list() -> Option<crate::host::HostList> {
     };
     match idle {
         Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        None => crate::host::host().and_then(|h| match h.new_list() {
+            Ok(list) => Some(list),
+            Err(e) => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(error = %e, "no host command list"));
+                None
+            }
+        }),
     }
 }
 

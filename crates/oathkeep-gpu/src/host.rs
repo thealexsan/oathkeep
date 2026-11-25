@@ -185,10 +185,7 @@ fn sweep() {
     crate::resource::let_go_idle();
     if available_commit().is_some_and(|c| c < (3u64 << 30)) {
         crate::list::trim_idle();
-        PRELUDE_POOL
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .truncate(4);
+        trim_prelude_pool(4);
     }
 }
 
@@ -718,6 +715,12 @@ pub(crate) struct HostList {
 
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
+struct StoredPrelude(Prelude);
+
+// SAFETY: D3D12 command allocators and command lists are free-threaded;
+// a pooled prelude is untouched while parked in `PRELUDE_POOL`.
+unsafe impl Send for StoredPrelude {}
+
 struct PooledPrelude(Option<Prelude>);
 
 // SAFETY: D3D12 command allocators and command lists are free-threaded;
@@ -725,15 +728,21 @@ struct PooledPrelude(Option<Prelude>);
 // pool only once its submission's GPU fence has completed.
 unsafe impl Send for PooledPrelude {}
 
-static PRELUDE_POOL: Mutex<Vec<PooledPrelude>> = Mutex::new(Vec::new());
+static PRELUDE_POOL: Mutex<Vec<StoredPrelude>> = Mutex::new(Vec::new());
 
 impl Drop for PooledPrelude {
     fn drop(&mut self) {
         if let Some(prelude) = self.0.take() {
-            let mut pool = PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner());
-            if pool.len() < 16 {
-                pool.push(PooledPrelude(Some(prelude)));
-            }
+            let overflow = {
+                let mut pool = PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+                if pool.len() < 16 {
+                    pool.push(StoredPrelude(prelude));
+                    None
+                } else {
+                    Some(prelude)
+                }
+            };
+            drop(overflow);
         }
     }
 }
@@ -742,8 +751,21 @@ fn take_prelude(host: &Host) -> Option<PooledPrelude> {
     let popped = PRELUDE_POOL
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .pop();
+        .pop()
+        .map(|stored| PooledPrelude(Some(stored.0)));
     popped.or_else(|| host.make_prelude().map(|p| PooledPrelude(Some(p))))
+}
+
+fn trim_prelude_pool(keep: usize) {
+    let dropped: Vec<StoredPrelude> = {
+        let mut pool = PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() > keep {
+            pool.drain(keep..).collect()
+        } else {
+            Vec::new()
+        }
+    };
+    drop(dropped);
 }
 
 #[cfg(feature = "diagnostics")]
