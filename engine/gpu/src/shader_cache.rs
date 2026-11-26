@@ -44,7 +44,7 @@ pub(crate) fn counts() -> (u64, u64) {
 fn build() -> [u8; 32] {
     // The view heap's null slot differs by host GPU: a translation cached
     // without the clamp must not be served (`host_settings` below).
-    crate::descriptor::host::probe_view_limit();
+    crate::descriptors::host_heap::probe_view_limit();
     static FIXED: OnceLock<Vec<u8>> = OnceLock::new();
     let fixed = FIXED.get_or_init(|| {
         let limit = oathkeep_shader::emit::loop_limit();
@@ -105,7 +105,7 @@ pub(crate) fn translation() -> [u8; 32] {
 /// not translate. The host is opened first, as a run does: what the card
 /// can do decides the form of some programs.
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
-    let _ = crate::host::host();
+    let _ = crate::backend::host();
     let misses = MISSES.load(Ordering::Relaxed);
     host_shader(container)?;
     // (Counts other threads' misses too: the caller only adds them up.)

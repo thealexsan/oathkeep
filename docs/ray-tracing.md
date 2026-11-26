@@ -31,4 +31,4 @@ Oathkeep runs builder and traversal shaders as translated DXIL and emulates the 
 - `engine/shader/src/bvh/` — Rust reference for ray/node intersection.
 - `engine/shader/src/emit/lower/` — DXIL lowering for BVH instructions and raw memory accesses (`Lower::memory`).
 - `engine/shader/src/resource/` — descriptor and raw-address tracking.
-- `engine/gpu/src/pipeline.rs`, `engine/gpu/src/draw.rs` — builder gating, root views, and title memory binding.
+- `engine/gpu/src/d3d12/pipeline/`, `engine/gpu/src/execution/draw/` — builder gating, root views, and title memory binding.
