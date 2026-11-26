@@ -1,9 +1,13 @@
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use super::{HostHeap, VIEW_TAG, View, view_at};
-use super::flips::{BEFORE, FLIPPED, LATE, PendingListFlip, neutral_for, note_before, remove_pending_list_flip, show_after, take_pending_list_flip};
+#[cfg(feature = "diagnostics")]
+use super::flips::{BEFORE, note_before};
+use super::flips::{FLIPPED, LATE, PendingListFlip, neutral_for, remove_pending_list_flip, show_after, take_pending_list_flip};
 use super::diag::{is_texture_view, twinned};
 use super::staged::buffer_range;
-use super::kin::{Kin, Copied, KEPT_VIEWS, keep_shown, keep_views, kin, quick_mirror, rewritten, same_bytes, same_placed_texture};
+#[cfg(feature = "diagnostics")]
+use super::kin::same_bytes;
+use super::kin::{Kin, Copied, KEPT_VIEWS, keep_shown, keep_views, kin, quick_mirror, rewritten, same_placed_texture};
 use super::make::{make, make_twinned_with_copy};
 use super::null_views::null_for;
 use super::queue::{COPIED_FRAMES, COPIED_GRACE, TABLED_READ, tabled_out};

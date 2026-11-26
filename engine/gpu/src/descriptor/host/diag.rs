@@ -1,6 +1,7 @@
 use std::sync::Mutex;
 use super::{View, super::record_at, super::view_at};
-use super::flips::{BEFORE, LATE};
+#[cfg(feature = "diagnostics")]
+use super::flips::BEFORE;
 use windows::Win32::Graphics::Direct3D12::*;
 use crate::host::host;
 use crate::descriptor::with_view_heap;

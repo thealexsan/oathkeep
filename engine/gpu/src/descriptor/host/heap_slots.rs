@@ -1,6 +1,7 @@
 use windows::Win32::Graphics::Direct3D12::*;
 use super::{HostHeap, View, host, view_at};
 use super::diag::{OBJECT_TEXTURE_SLOTS, PLACED_TEXTURE_SLOTS, is_texture_view, twinned, view_stride_and_kind, view_stride_word};
+#[cfg(feature = "diagnostics")]
 use super::flips::note_before;
 use super::kin::placed_texture;
 use super::listed::{LIST_VIEWS, ListView, ListViews, Listed};

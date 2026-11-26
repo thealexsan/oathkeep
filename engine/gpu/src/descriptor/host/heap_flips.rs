@@ -1,7 +1,11 @@
 use windows::Win32::Graphics::Direct3D12::*;
 use super::{HostHeap, VIEW_TAG, View, view_at};
-use super::flips::{RESHOWN_AFTER, neutral_for, FLIPPED, FLIPS, Flip, LATE, NEXT_PENDING_FLIP, PENDING_LIST_COUNT, PENDING_LIST_FLIPS, PendingListFlip, note_before, record_key, remove_pending_list_flip, show_after, take_pending_list_flip};
-use super::kin::{Kin, placed_texture, same_placed_texture, keep_shown, keep_views, kin, rewritten, same_bytes};
+#[cfg(feature = "diagnostics")]
+use super::flips::note_before;
+use super::flips::{RESHOWN_AFTER, neutral_for, FLIPPED, FLIPS, Flip, LATE, NEXT_PENDING_FLIP, PENDING_LIST_COUNT, PENDING_LIST_FLIPS, PendingListFlip, record_key, remove_pending_list_flip, show_after, take_pending_list_flip};
+#[cfg(feature = "diagnostics")]
+use super::kin::same_bytes;
+use super::kin::{Kin, placed_texture, same_placed_texture, keep_shown, keep_views, kin, rewritten};
 use super::make::make;
 use super::null_views::{null_for, null_view};
 use super::spans::{STALE, stale_rule};

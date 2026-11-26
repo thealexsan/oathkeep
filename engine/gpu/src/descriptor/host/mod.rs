@@ -37,9 +37,10 @@ use crate::host::host;
 
 pub(crate) use buffer_views::{TWINS, move_raw};
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) use diag::{describe_slots, near_heaps, shown_bytes, slot_story};
+pub(crate) use diag::{describe_slots, shown_bytes, slot_story};
 pub(crate) use diag::{
     OBJECT_TEXTURE_SLOTS, PLACED_TEXTURE_SLOTS, REFUSED_VIEWS, device_removed, is_texture_view,
+    near_heaps,
 };
 pub(crate) use flips::{
     FLIPPED, PendingListFlip, flip_now, levels_changed, levels_changed_after, levels_waiting,
