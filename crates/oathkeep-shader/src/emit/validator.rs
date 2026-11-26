@@ -1,3 +1,10 @@
+//! The DXIL validator in `dxil.dll` (`IDxcValidator`), for tests and the
+//! offline batch. Translated shaders do not need it: they carry the
+//! container hash we compute (`container::hash`).
+//!
+//! The DLL is found at `OATHKEEP_DXIL` if set, else the newest Windows SDK's
+//! `bin\<version>\x64\dxil.dll`, else wherever `LoadLibrary` finds it.
+
 use std::ffi::c_void;
 use std::path::PathBuf;
 
@@ -20,11 +27,13 @@ const IID_IDXC_VALIDATOR: Guid = Guid(
     0x4826,
     [0x98, 0x11, 0x28, 0x57, 0xe7, 0x97, 0xf4, 0x9a],
 );
+/// `DxcValidatorFlags_InPlaceEdit`: sign the container we pass.
 const IN_PLACE_EDIT: u32 = 1;
 
 type CreateInstance =
     unsafe extern "system" fn(*const Guid, *const Guid, *mut *mut c_void) -> Hresult;
 
+/// COM object: a pointer to a table of method pointers.
 type Object = *mut *const usize;
 
 unsafe fn method<F: Copy>(obj: Object, slot: usize) -> F {
@@ -39,6 +48,8 @@ unsafe fn release(obj: Object) {
     }
 }
 
+/// An `IDxcBlob` over our bytes: QueryInterface, AddRef, Release,
+/// GetBufferPointer, GetBufferSize. Lives on the caller's stack.
 #[repr(C)]
 struct Blob {
     vtable: *const BlobVtable,
@@ -46,6 +57,7 @@ struct Blob {
     len: usize,
 }
 
+/// IUnknown and IDxcBlob, as raw GUID bytes.
 const IUNKNOWN: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
 const IDXC_BLOB: [u8; 16] = [
     0x08, 0xfb, 0xa5, 0x8b, 0x95, 0x51, 0xe2, 0x40, 0xac, 0x58, 0x0d, 0x98, 0x9c, 0x3a, 0x01, 0x02,
@@ -63,7 +75,7 @@ unsafe extern "system" fn blob_qi(
             0
         } else {
             *out = std::ptr::null_mut();
-            0x8000_4002_u32 as i32
+            0x8000_4002_u32 as i32 // E_NOINTERFACE
         }
     }
 }
@@ -105,6 +117,7 @@ pub struct Validator {
 unsafe impl Send for Validator {}
 
 impl Validator {
+    /// Where `dxil.dll` is looked for.
     pub fn default_path() -> Option<PathBuf> {
         if let Some(p) = std::env::var_os("OATHKEEP_DXIL") {
             return Some(p.into());
@@ -120,6 +133,7 @@ impl Validator {
         versions.pop()
     }
 
+    /// Loads `path`'s validator (or `dxil.dll` from the DLL search path).
     pub fn load(path: Option<&std::path::Path>) -> Result<Self, String> {
         let name: Vec<u16> = path
             .map_or_else(|| "dxil.dll".into(), |p| p.as_os_str().to_owned())
@@ -147,6 +161,8 @@ impl Validator {
         }
     }
 
+    /// Validates `container` and signs it in place; the error text if it
+    /// is rejected.
     pub fn validate(&mut self, container: &mut [u8]) -> Result<(), String> {
         let mut blob = Blob {
             vtable: &BLOB_VTABLE,

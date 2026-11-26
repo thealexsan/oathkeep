@@ -1,3 +1,19 @@
+//! The console's audio DSP (`chad.dll`): streams that convolve blocks of
+//! float samples with an impulse response (reverb), or run other block
+//! transforms, on a coprocessor.
+//!
+//! A title connects once with a memory block for the DSP, activates
+//! streams, and submits one command per block (gains, an input and an
+//! output buffer). Activation hands back a status block whose second word is
+//! the ticket of the last completed command and whose fourth is its result;
+//! the title checks it one block later and treats a late command as an
+//! overrun. Commands complete when submitted here.
+//!
+//! The transforms themselves are not computed: the hardware takes impulse
+//! responses already in its own partitioned frequency-domain layout, which
+//! is not known. Outputs are silence, so reverb returns are dry.
+// shortcut: no convolution or block transform; outputs are zeros. Needs the
+// coprocessor's impulse response and spectrum layouts to do better.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -12,6 +28,7 @@ const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 
 const CONVOLUTION: u32 = 1;
+/// Option bits that need a stereo stream, and one convolution refuses.
 const STEREO_OPTIONS: u32 = 2 | 8;
 const NOT_FOR_CONVOLUTION: u32 = 4;
 
@@ -20,6 +37,7 @@ pub struct Dsp {
     active: Mutex<u32>,
 }
 
+/// What activation describes.
 #[repr(C, packed)]
 pub struct StreamDesc {
     kind: u32,
@@ -30,6 +48,7 @@ pub struct StreamDesc {
     ir: *const f32,
 }
 
+/// The status block a stream's owner polls.
 #[repr(C)]
 pub struct Status {
     submitted: u32,
@@ -45,6 +64,7 @@ pub struct Stream {
     status: Box<Status>,
 }
 
+/// One block of work.
 #[repr(C)]
 pub struct Command {
     gains: [f32; 2],
@@ -175,6 +195,7 @@ pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     S_OK
 }
 
+/// Completes the command at once: its output block is silence.
 pub extern "system" fn XDspSubmitCommand(
     stream: *mut Stream,
     command: *const Command,
@@ -239,6 +260,7 @@ mod tests {
             S_OK
         );
         let ir = vec![0f32; 0x800];
+        // Stereo convolution with option 2, as the title asks for.
         let desc = StreamDesc {
             kind: CONVOLUTION,
             options: 2,
@@ -265,6 +287,7 @@ mod tests {
         assert!(output.iter().all(|&s| s == 0.0));
         assert_eq!(XDspDeactivate(stream), S_OK);
 
+        // Mono streams refuse stereo options; transforms are mono only.
         let bad = StreamDesc {
             channels: 1,
             ..desc

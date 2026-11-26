@@ -1,3 +1,5 @@
+//! Loading a prepared image as a real Windows module and binding it.
+
 use std::collections::HashSet;
 use std::ffi::{CString, c_void};
 use std::os::windows::ffi::OsStrExt;
@@ -17,6 +19,8 @@ use crate::{
     prepare,
 };
 
+/// A title image mapped into this process. A clone names the same mapping
+/// (no reference of its own): unload one copy only.
 #[derive(Debug, Clone)]
 pub struct LoadedImage {
     module: HMODULE,
@@ -36,6 +40,7 @@ pub struct MissingImport {
     pub symbol: String,
 }
 
+/// Outcome of [`LoadedImage::bind_imports`].
 #[derive(Debug, Default, Clone)]
 pub struct BindReport {
     pub hle: usize,
@@ -44,6 +49,9 @@ pub struct BindReport {
     pub missing: Vec<MissingImport>,
 }
 
+/// Writes the prepared copy into `dir` and maps it with the Windows loader.
+///
+/// `dir` receives derived game data, so it must be outside the repository.
 pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     oathkeep_core::ensure_outside_repo(dir)?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -71,6 +79,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         path,
         info: prepared.info.clone(),
     };
+    // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
@@ -85,6 +94,10 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     Ok(loaded)
 }
 
+/// Maps the DLLs the title ships in `title_dir` that `main` imports,
+/// directly or through each other, in initialisation order (dependencies
+/// first). Only DLL names `wanted` accepts are considered, so DLLs the host
+/// or our runtime provide stay with them. Imports are not bound.
 pub fn load_title_dlls(
     main: &ImageInfo,
     title_dir: &Path,
@@ -97,6 +110,10 @@ pub fn load_title_dlls(
     Ok(loaded)
 }
 
+/// Maps the DLL `name` from `title_dir` like [`load_title_dlls`] does, with
+/// the title DLLs it imports (dependencies first, `name` last); empty if
+/// `wanted` refuses it or the folder has no such file. For DLLs a title
+/// loads itself; `wanted` must refuse those already mapped.
 pub fn load_title_dll(
     name: &str,
     title_dir: &Path,
@@ -142,6 +159,7 @@ fn map_dll(
     Ok(())
 }
 
+/// Resolves through `inner`, then through the exports of the title's DLLs.
 pub struct WithTitleDlls<'a> {
     pub inner: &'a dyn ImportResolver,
     pub dlls: &'a [(String, LoadedImage)],
@@ -165,13 +183,8 @@ impl ImportResolver for WithTitleDlls<'_> {
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
-    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
-        return Ok(());
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
-    Ok(())
+    crate::publish::write_if_changed(path, bytes)
+        .with_context(|| format!("publishing {}", path.display()))
 }
 
 impl LoadedImage {
@@ -179,10 +192,12 @@ impl LoadedImage {
         self.module as usize
     }
 
+    /// Parsed from the original image (imports, entry point, TLS callbacks).
     pub fn info(&self) -> &ImageInfo {
         &self.info
     }
 
+    /// Address of an export of the image, if it has one by that name.
     pub fn export(&self, name: &str) -> Option<usize> {
         let name = CString::new(name).ok()?;
         // SAFETY: valid module handle and NUL-terminated name.
@@ -190,6 +205,7 @@ impl LoadedImage {
             .map(|f| f as *const () as usize)
     }
 
+    /// Address of an export, by name or ordinal.
     pub fn export_symbol(&self, symbol: &ImportSymbol) -> Option<usize> {
         match symbol {
             ImportSymbol::Name { name, .. } => self.export(name),
@@ -199,6 +215,10 @@ impl LoadedImage {
         }
     }
 
+    /// Fills every IAT slot of the image.
+    ///
+    /// Each import goes to `resolver`; whatever it cannot resolve gets an
+    /// unimplemented-import stub that behaves according to `policy`.
     pub fn bind_imports(
         &self,
         resolver: &dyn ImportResolver,
@@ -208,6 +228,8 @@ impl LoadedImage {
         let mut slots: Vec<(u32, usize)> = Vec::with_capacity(self.info.import_count());
         let mut unresolved: Vec<(u32, &str, &ImportSymbol)> = Vec::new();
 
+        // Delay-load slots are bound eagerly too, so the title's own
+        // delay-load helper (which would ask the host) never runs.
         for module in self.info.imports.iter().chain(&self.info.delay_imports) {
             for entry in &module.entries {
                 match resolver.resolve(&module.dll, &entry.symbol) {
@@ -257,6 +279,8 @@ impl LoadedImage {
         Ok(report)
     }
 
+    /// Protects and restores each slot on its own: import tables can sit in
+    /// sections with different protections (delay-load tables in `.didat`).
     fn write_slots(&self, slots: &[(u32, usize)]) -> Result<()> {
         for &(rva, address) in slots {
             let slot = (self.base() + rva as usize) as *mut u64;
@@ -277,11 +301,17 @@ impl LoadedImage {
         Ok(())
     }
 
+    /// Calls the image's TLS callbacks with `reason` (e.g. `DLL_PROCESS_ATTACH`).
+    ///
+    /// # Safety
+    /// Runs title code. Imports must be bound first.
     pub unsafe fn run_tls_callbacks(&self, reason: u32) {
         // SAFETY: forwarded from the caller.
         unsafe { self.tls_callbacks(reason, std::ptr::null_mut()) }
     }
 
+    /// # Safety
+    /// See [`Self::run_tls_callbacks`].
     unsafe fn tls_callbacks(&self, reason: u32, reserved: *mut c_void) {
         let Some(tls) = &self.info.tls else { return };
         for &rva in &tls.callback_rvas {
@@ -293,6 +323,13 @@ impl LoadedImage {
         }
     }
 
+    /// Initialises a DLL as the Windows loader would: its TLS callbacks,
+    /// then `DllMain(DLL_PROCESS_ATTACH)`. From then on it hears of every
+    /// thread start and end (see `threads`).
+    ///
+    /// # Safety
+    /// Runs title code. Imports must be bound first, and the DLLs this one
+    /// depends on attached.
     pub unsafe fn attach(&self) -> Result<()> {
         // SAFETY: forwarded from the caller.
         if unsafe { self.notify(DLL_PROCESS_ATTACH, true, std::ptr::null_mut()) } == Some(0) {
@@ -302,12 +339,24 @@ impl LoadedImage {
         Ok(())
     }
 
+    /// `DLL_PROCESS_DETACH` as `FreeLibrary` sends it (TLS callbacks, then
+    /// `DllMain`); the image hears of no more threads.
+    ///
+    /// # Safety
+    /// Runs title code. The image must have been attached (or its attach
+    /// failed), and no other thread may be using it.
     pub unsafe fn detach(&self) {
         crate::threads::detached(self.base());
         // SAFETY: forwarded from the caller.
         unsafe { self.notify(DLL_PROCESS_DETACH, true, std::ptr::null_mut()) };
     }
 
+    /// Runs the image's TLS callbacks with `reason`, then, if `dll_main` and
+    /// the image is a DLL with an entry point, its `DllMain`, whose result
+    /// is returned. `reserved` is the entry points' third argument.
+    ///
+    /// # Safety
+    /// Runs title code. Imports must be bound first.
     pub(crate) unsafe fn notify(
         &self,
         reason: u32,
@@ -327,6 +376,13 @@ impl LoadedImage {
         Some(unsafe { main(self.module, reason, reserved) })
     }
 
+    /// Starts the title: on a new thread with the stack size from the image
+    /// header, attaches `dlls` in order (see [`Self::attach`]), runs the
+    /// image's TLS callbacks (`DLL_PROCESS_ATTACH`), then its original entry
+    /// point. Returns the thread so the caller can join it.
+    ///
+    /// # Safety
+    /// Runs title code. Imports of the image and of `dlls` must be bound.
     pub unsafe fn spawn_main(
         self: Arc<Self>,
         dlls: Vec<(String, LoadedImage)>,
@@ -358,6 +414,11 @@ impl LoadedImage {
             .context("spawning title main thread")
     }
 
+    /// Unmaps the image.
+    ///
+    /// # Safety
+    /// No title code may be running or run later, and no pointer into the
+    /// image may be used afterwards.
     pub unsafe fn unload(self) {
         crate::threads::unmapped(self.base());
         // SAFETY: guaranteed by the caller.

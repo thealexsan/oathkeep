@@ -1,3 +1,14 @@
+//! The DXIL program inside a container's `DXIL` (or `STAT`) part.
+//!
+//! ```text
+//! 0x00  program version u32   (kind << 16 | major << 4 | minor)
+//! 0x04  size in dwords u32
+//! 0x08  "DXIL"                <- bitcode offset is relative to here
+//! 0x0C  dxil version u32
+//! 0x10  bitcode offset u32    (16 in standard PC DXIL)
+//! 0x14  bitcode size u32
+//! ```
+
 use crate::ShaderError;
 use crate::dxbc::u32_at;
 
@@ -56,14 +67,20 @@ pub struct DxilProgram<'a> {
     pub kind: ShaderKind,
     pub shader_model: (u8, u8),
     pub dxil_version: u32,
+    /// LLVM bitcode (starts with `BC C0 DE`).
     pub bitcode: &'a [u8],
+    /// Bytes between the bitcode header and the bitcode. Empty on PC.
     pub prefix: &'a [u8],
+    /// Bytes after the bitcode, up to the program size. Empty on PC.
     pub trailer: &'a [u8],
 }
 
+/// Xbox additions recognised around the bitcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct XboxExtras {
+    /// The prefix starts with an `XDAT` table.
     pub xdat: bool,
+    /// The trailer contains an `xbop` blob (compiler options).
     pub xbop: bool,
 }
 
@@ -103,6 +120,7 @@ impl<'a> DxilProgram<'a> {
         })
     }
 
+    /// True for a program laid out exactly like PC DXIL.
     pub fn is_standard_layout(&self) -> bool {
         self.prefix.is_empty() && self.trailer.is_empty()
     }
@@ -115,6 +133,7 @@ impl<'a> DxilProgram<'a> {
     }
 }
 
+/// Builds a standard PC-layout program around `bitcode` (test helper).
 #[cfg(test)]
 pub fn build_standard(kind: u16, sm: (u8, u8), dxil_version: u32, bitcode: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -154,12 +173,13 @@ mod tests {
 
     #[test]
     fn detects_xbox_layout() {
+        // Xbox layout: XDAT table before the bitcode, xbop blob after it.
         let bitcode = fake_bitcode();
         let xdat = b"XDAT\x01\x00\x00\x00";
         let trailer = b"xbop\x02\x00\x00\x00";
         let mut bytes = Vec::new();
         let size = 24 + xdat.len() + bitcode.len() + trailer.len();
-        bytes.extend_from_slice(&((5u32 << 16) | 0x65).to_le_bytes());
+        bytes.extend_from_slice(&((5u32 << 16) | 0x65).to_le_bytes()); // cs_6_5
         bytes.extend_from_slice(&((size / 4) as u32).to_le_bytes());
         bytes.extend_from_slice(b"DXIL");
         bytes.extend_from_slice(&0x105u32.to_le_bytes());

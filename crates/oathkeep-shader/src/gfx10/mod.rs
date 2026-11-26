@@ -1,3 +1,19 @@
+//! GFX10 machine code: instruction boundaries, encodings and opcodes.
+//!
+//! Instructions are found by following control flow from offset 0, not by a
+//! linear sweep: compilers place data (constant tables) in the code region
+//! after the end of the program. [`Instruction::fields`] decodes the operand
+//! fields and [`Instruction::text`] prints them in AMD's SP3 syntax.
+//!
+//! Encodings by the top bits of the first dword:
+//!
+//! ```text
+//! 0xxxxxxx  VOP2; 0111111 VOP1; 0111110 VOPC
+//! 10        SOP2; 1011 SOPK; 101111101 SOP1; 101111110 SOPC; 101111111 SOPP
+//! 110010 VINTRP  110011 VOP3P  110101 VOP3  110110 DS  110111 FLAT/GLOBAL/SCRATCH
+//! 111000 MUBUF   111010 MTBUF  111100 MIMG  111101 SMEM  111110 EXP
+//! ```
+
 mod fields;
 mod opcodes;
 mod sp3;
@@ -34,18 +50,31 @@ pub enum Encoding {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instruction {
+    /// Byte offset in the program.
     pub offset: usize,
     pub encoding: Encoding,
     pub opcode: u16,
+    /// Every dword of the instruction, including literals and extra dwords.
     pub words: Vec<u32>,
+    /// [`name`] of `encoding` and `opcode`, resolved once at decode time.
+    /// The translator asks about every instruction eight times; the table is
+    /// a binary search.
+    name: Option<&'static str>,
 }
 
 impl Instruction {
+    /// An instruction of these words, its name resolved.
+    pub fn new(offset: usize, encoding: Encoding, opcode: u16, words: Vec<u32>) -> Self {
+        Self { offset, encoding, opcode, words, name: name(encoding, opcode) }
+    }
+
+    /// AMD's name for the opcode, if it is in our table.
     pub fn name(&self) -> Option<&'static str> {
-        name(self.encoding, self.opcode)
+        self.name
     }
 }
 
+/// Decodes every instruction reachable from offset 0, sorted by offset.
 pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     if !code.len().is_multiple_of(4) {
         return Err(isa(code.len(), "code size is not a multiple of 4"));
@@ -81,14 +110,19 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     Ok(list)
 }
 
+/// Where execution goes after an instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Flow {
     Next,
+    /// End of the program, or an indirect jump that is not a far jump.
     Stop,
     Jump(usize),
+    /// Conditional: to the target or the next instruction.
     Branch(usize),
 }
 
+/// Control flow after `inst`, resolving far jumps. `before(at)` returns the
+/// decoded instruction with the highest offset below `at`, if any.
 pub(crate) fn control<'a>(
     inst: &Instruction,
     len: usize,
@@ -118,11 +152,17 @@ fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError
         (Encoding::Sopp, "s_branch") => Flow::Jump(target()?),
         (Encoding::Sopp, name) if name.starts_with("s_cbranch_") => Flow::Branch(target()?),
         (Encoding::Sopk, "s_call_b64") => Flow::Branch(target()?),
+        // Indirect jump; `decode` resolves the compiler's far-jump form.
         (Encoding::Sop1, "s_setpc_b64") => Flow::Stop,
         _ => Flow::Next,
     })
 }
 
+/// Resolves the far jump compilers emit beyond the reach of a branch offset:
+/// `s_getpc_b64 s[n:n+1]`, `s_add_u32|s_sub_u32 sn, sn, literal`, a carry
+/// into s(n+1), `s_setpc_b64 s[n:n+1]`, looking back over the straight-line
+/// run just decoded. Any other `s_setpc_b64` (e.g. a handover to the next
+/// merged stage through registers) gives `None`.
 fn far_jump<'a>(
     before: impl Fn(usize) -> Option<&'a Instruction>,
     setpc: &Instruction,
@@ -144,11 +184,14 @@ fn far_jump<'a>(
             (Encoding::Sop2, Some(op @ ("s_add_u32" | "s_sub_u32")))
                 if sdst == n && ssrc0 == n && ssrc1 == 0xFF && delta.is_none() =>
             {
+                // The low dword of a signed 64-bit offset: a backward jump
+                // adds a negative one (its high dword is -1).
                 let literal = i64::from(prev.words[1] as i32);
                 delta = Some(if op == "s_add_u32" { literal } else { -literal });
             }
             (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
                 let Some(delta) = delta else { break };
+                // s_getpc_b64 yields the address of the instruction after it.
                 return usize::try_from(prev.offset as i64 + 4 + delta)
                     .ok()
                     .filter(|&t| t < len)
@@ -171,6 +214,7 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
     let w = word(0)?;
     let (encoding, opcode, len) = if w >> 31 == 0 {
         let src0 = w & 0x1FF;
+        // Literal constant, SDWA, DPP16, DPP8, DPP8 with fetch-inactive.
         let extra = usize::from(matches!(src0, 0xFF | 0xF9 | 0xFA | 0xE9 | 0xEA));
         match w >> 25 {
             0x3F => (Encoding::Vop1, (w >> 9) & 0xFF, 1 + extra),
@@ -236,6 +280,7 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
                 (w >> 16) & 0x7 | (word(1)? >> 21 & 1) << 3,
                 2,
             ),
+            // Bits 2:1 count extra dwords of non-sequential address registers.
             0x3C => (
                 Encoding::Mimg,
                 (w >> 18) & 0x7F | (w & 1) << 7,
@@ -246,11 +291,13 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
             _ => return Err(isa(offset, "unknown encoding")),
         }
     };
+    let opcode = opcode as u16;
     Ok(Instruction {
         offset,
         encoding,
-        opcode: opcode as u16,
+        opcode,
         words: (0..len).map(word).collect::<Result<_, _>>()?,
+        name: name(encoding, opcode),
     })
 }
 
@@ -266,6 +313,7 @@ fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
         Encoding::Vop2 => (t::VOP2, opcode),
         Encoding::Vop1 => (t::VOP1, opcode),
         Encoding::Vopc => (t::VOPC, opcode),
+        // VOP3 also encodes the VOPC, VOP2 and VOP1 opcodes at fixed bases.
         Encoding::Vop3 => match opcode {
             0x000..0x100 => (t::VOPC, opcode),
             0x100..0x140 => (t::VOP2, opcode - 0x100),
@@ -298,6 +346,7 @@ mod tests {
     use super::*;
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+    /// s_branch / s_cbranch_scc0 with a dword offset relative to the next instruction.
     const fn sopp(op: u32, simm16: i16) -> u32 {
         0xBF80_0000 | op << 16 | simm16 as u16 as u32
     }
@@ -312,6 +361,21 @@ mod tests {
             .iter()
             .map(|i| (i.offset, i.words.len(), i.name().unwrap_or("?")))
             .collect()
+    }
+
+    #[test]
+    fn flat_offsets_ignore_bit_eleven() {
+        let offset = |word0: u32| {
+            let code = bytes(&[word0, 0x0000_0001, S_ENDPGM]);
+            match decode(&code).unwrap()[0].fields(false) {
+                Fields::Flat { offset, .. } => offset,
+                fields => panic!("{fields:?}"),
+            }
+        };
+        // flat_load_dword v0, v[1:2]: the FLAT offset is 11-bit and
+        // unsigned, so bit 11 is ignored (0x800 -> 0, 0xfff -> 0x7ff).
+        assert_eq!(offset(0xDC30_0800), 0);
+        assert_eq!(offset(0xDC30_0FFF), 0x7FF);
     }
 
     #[test]
@@ -345,16 +409,16 @@ mod tests {
     fn lengths_and_names() {
         let code = [
             0xBE80_03FF,
-            0x3F80_0000,
-            0x0600_0000,
+            0x3F80_0000, // s_mov_b32 s0, literal
+            0x0600_0000, // v_add_f32 v0, s0, v0
             0xD54B_0000,
             0x03FE_0000,
-            0x4000_0000,
+            0x4000_0000, // v_fma_f32 with a literal src2
             0xF080_0F0A,
             0,
-            0,
+            0, // image_sample (2D) with one extra address dword
             0xF800_080F,
-            0,
+            0, // exp
             S_ENDPGM,
         ];
         assert_eq!(
@@ -373,11 +437,11 @@ mod tests {
     #[test]
     fn follows_branches_and_skips_data() {
         let code = [
-            sopp(0x04, 1),
-            sopp(0x02, 1),
+            sopp(0x04, 1), // s_cbranch_scc0 -> 8
+            sopp(0x02, 1), // s_branch -> 12
             S_ENDPGM,
             S_ENDPGM,
-            S_ENDPGM,
+            S_ENDPGM, // data follows the program end
             0xFFFF_FFFF,
         ];
         let found: Vec<_> = summary(&code).iter().map(|i| i.0).collect();
@@ -387,12 +451,12 @@ mod tests {
     #[test]
     fn follows_far_jumps() {
         let code = [
-            0xBE88_1F00,
+            0xBE88_1F00, // s_getpc_b64 s[8:9]
             0x8008_FF08,
-            20,
-            0x8209_8009,
-            0xBE80_2008,
-            0xFFFF_FFFF,
+            20,          // s_add_u32 s8, s8, 20  -> 4 + 20 = 24
+            0x8209_8009, // s_addc_u32 s9, s9, 0
+            0xBE80_2008, // s_setpc_b64 s[8:9]
+            0xFFFF_FFFF, // not code
             S_ENDPGM,
         ];
         let found: Vec<_> = summary(&code).iter().map(|i| (i.0, i.2)).collect();
@@ -406,19 +470,22 @@ mod tests {
                 (24, "s_endpgm"),
             ]
         );
+        // Through other registers (a handover to another stage): the path ends.
         assert_eq!(summary(&[0xBE80_2018, S_ENDPGM]).len(), 1);
     }
 
     #[test]
     fn follows_far_jumps_backward() {
+        // The compiler's backward far jump adds a negative offset: the low
+        // dword as a 32-bit literal, the high dword as -1 with the carry.
         let code = [
-            sopp(0x02, 1),
-            S_ENDPGM,
-            0xBE88_1F00,
+            sopp(0x02, 1), // s_branch -> 8, past the jump target
+            S_ENDPGM,      // the far jump's target: only it reaches here
+            0xBE88_1F00,   // s_getpc_b64 s[8:9]
             0x8008_FF08,
-            0xFFFF_FFF8,
-            0x8209_C109,
-            0xBE80_2008,
+            0xFFFF_FFF8, // s_add_u32 s8, s8, -8 -> 12 - 8 = 4
+            0x8209_C109, // s_addc_u32 s9, s9, -1
+            0xBE80_2008, // s_setpc_b64 s[8:9]
         ];
         let found: Vec<_> = summary(&code).iter().map(|i| (i.0, i.2)).collect();
         assert_eq!(
@@ -449,6 +516,7 @@ mod tests {
             decode(&bytes(&[0xE400_0000, 0])).is_err(),
             "unknown encoding"
         );
+        // s_cbranch_scc0 into the literal of the s_mov_b32 at 4.
         assert!(decode(&bytes(&[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM])).is_err());
     }
 }

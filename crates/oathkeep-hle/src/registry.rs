@@ -1,16 +1,24 @@
+//! The table of everything we implement.
+
 use std::sync::LazyLock;
 
 use crate::modules;
 
+/// One function we implement, under the name the title imports (`#n` for an
+/// ordinal).
 #[derive(Debug, Clone, Copy)]
 pub struct HleExport {
     pub name: &'static str,
     pub address: usize,
 }
 
+/// A group of implementations and the DLL names they answer for.
 #[derive(Debug)]
 pub struct HleModule {
+    /// Human-readable name, e.g. "kernel".
     pub name: &'static str,
+    /// Lower-case DLL names served. A trailing `*` matches a prefix, which
+    /// covers versioned API sets (`api-ms-win-core-libraryloader-l1-2-0.dll`).
     pub dlls: &'static [&'static str],
     pub exports: Vec<HleExport>,
 }
@@ -27,6 +35,7 @@ impl HleModule {
     }
 }
 
+/// Declares an export whose Rust name equals the imported name.
 #[macro_export]
 macro_rules! hle_export {
     ($f:ident) => {
@@ -39,6 +48,7 @@ macro_rules! hle_export {
 
 static REGISTRY: LazyLock<Vec<HleModule>> = LazyLock::new(modules::all);
 
+/// All modules we implement.
 pub fn registry() -> &'static [HleModule] {
     &REGISTRY
 }

@@ -1,3 +1,14 @@
+//! Virtual drives over host folders: on the console, title storage is a
+//! drive of its own, and titles build paths on that assumption.
+//!
+//! Every title import that takes a path is bound here. A path on a virtual
+//! drive (`X:\..`, `X:/..`, `X:`, `\\?\X:\..`) is rewritten to the host
+//! folder behind it and handed to the host's own function; any other path
+//! goes to the host unchanged. A rewritten narrow path goes to the host's
+//! wide twin, so host folders outside the ANSI code page work; never to our
+//! wide wrapper, which would rewrite the host path a second time when its
+//! drive letter is mounted too. Letters are chosen among those the host
+//! does not use, so no host drive is hidden.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
@@ -12,6 +23,7 @@ use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
 use crate::{HleExport, HleModule, hle_export};
 
+/// The host's own function: what the import would have been bound to.
 macro_rules! host {
     ($dll:literal, $name:literal: $ty:ty) => {{
         static ADDRESS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -25,12 +37,16 @@ macro_rules! host {
 }
 pub(crate) use host;
 
+/// Mounted drives: upper-case letter and host root (UTF-16, no trailing
+/// separator, no NUL).
 static DRIVES: Mutex<Vec<(u16, Vec<u16>)>> = Mutex::new(Vec::new());
 
 fn drives() -> MutexGuard<'static, Vec<(u16, Vec<u16>)>> {
     DRIVES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Gives the host folder `root` a drive letter (the same one if it already
+/// has one): the highest letter neither the host nor another mount uses.
 pub fn mount(root: &Path) -> Option<char> {
     let wide = root_wide(root);
     let mut drives = drives();
@@ -47,6 +63,9 @@ pub fn mount(root: &Path) -> Option<char> {
     Some(letter.into())
 }
 
+/// Gives the host folder `root` a drive letter the console fixes (titles
+/// open their package as `G:\..` and temporary files as `T:\..`). A host
+/// drive of that letter is hidden from the title.
 pub fn mount_at(letter: char, root: &Path) {
     let letter = letter.to_ascii_uppercase();
     let Some(index) = u32::from(letter)
@@ -63,7 +82,16 @@ pub fn mount_at(letter: char, root: &Path) {
     drives.push((letter as u16, root_wide(root)));
 }
 
+/// `root` as UTF-16, absolute, without trailing separators (a drive root
+/// keeps its own). An empty root is the current directory, as it is to a
+/// path joined to it: it is the title's folder when the title is run by its
+/// file name alone (`oathkeep run title.exe`).
 fn root_wide(root: &Path) -> Vec<u16> {
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
     while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
@@ -75,8 +103,13 @@ fn root_wide(root: &Path) -> Vec<u16> {
 const SEPARATORS: [u16; 2] = [b'\\' as u16, b'/' as u16];
 const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
 
+/// Host paths from this length on take the `\\?\` form, which lifts the
+/// host's MAX_PATH limit (248 characters for a directory, 260 for a file).
 const LONG: usize = 248;
 
+/// `root` and the title's `tail` as a `\\?\` path. That form turns off the
+/// host's own clean-up, so `/` becomes `\` and `.` and `..` are resolved
+/// here (`..` stops at the root).
 fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
     let backslash = u16::from(b'\\');
     let mut out = if root.starts_with(&VERBATIM) {
@@ -109,6 +142,8 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
     out
 }
 
+/// The host path, NUL-terminated, for `path` (without its NUL) if it is on
+/// a virtual drive.
 pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let (prefix, rest) = match path.strip_prefix(&VERBATIM[..]) {
         Some(rest) => (&VERBATIM[..], rest),
@@ -132,6 +167,7 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     }
     let mut out = prefix.to_vec();
     out.extend_from_slice(root);
+    // `X:` and `X:name` are relative to the root.
     if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
         out.push(b'\\'.into());
     }
@@ -147,6 +183,8 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     Some(out)
 }
 
+/// A title's wide path: the host path when it is on a virtual drive, else
+/// the title's own pointer.
 struct Wide(*const u16, Option<Vec<u16>>);
 
 impl Wide {
@@ -169,6 +207,7 @@ fn wide(path: *const u16) -> Wide {
     Wide(path, host)
 }
 
+/// Every title path at debug level, with the host path if rewritten.
 fn trace(path: &[u16], host: Option<&[u16]>) {
     tracing::debug!(
         path = %String::from_utf16_lossy(path),
@@ -177,12 +216,15 @@ fn trace(path: &[u16], host: Option<&[u16]>) {
     );
 }
 
+/// A narrow path (ANSI code page, as the host decodes it) on a virtual
+/// drive, as a wide host path.
 fn narrow(path: *const c_char) -> Option<Vec<u16>> {
     if path.is_null() {
         return None;
     }
     // SAFETY: the title passes a NUL-terminated path.
     let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+    // The drive part is ASCII in every code page; decode only candidates.
     match bytes.strip_prefix(br"\\?\").unwrap_or(bytes) {
         [letter, b':', ..] if letter.is_ascii_alphabetic() => {}
         _ => {
@@ -203,6 +245,7 @@ fn narrow(path: *const c_char) -> Option<Vec<u16>> {
     host
 }
 
+/// An ASCII mode string (`"rb"`, `"w, ccs=UTF-8"`) for a wide CRT call.
 fn widen(mode: *const c_char) -> Vec<u16> {
     if mode.is_null() {
         return vec![0];
@@ -214,6 +257,8 @@ fn widen(mode: *const c_char) -> Vec<u16> {
 
 type Handle = *mut c_void;
 type File = *mut c_void;
+
+// kernel32 and its file API sets.
 
 pub extern "system" fn CreateFileW(
     path: *const u16,
@@ -271,6 +316,7 @@ pub extern "system" fn CreateFileA(
     }
 }
 
+/// Used by Bink.
 pub extern "system" fn CreateFile2(
     path: *const u16,
     access: u32,
@@ -373,6 +419,8 @@ pub extern "system" fn GetDiskFreeSpaceExW(
     )
 }
 
+/// Wants a volume root: a virtual drive answers for the host volume its
+/// folder is on.
 pub extern "system" fn GetDiskFreeSpaceW(
     root: *const u16,
     sectors_per_cluster: *mut u32,
@@ -448,6 +496,8 @@ pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
     }
 }
 
+// The C runtime (ucrtbase, which the title's CRT imports bind to).
+
 pub extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
     let p = wide(path);
     host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(p.ptr(), mode)
@@ -471,6 +521,13 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
     )
 }
 
+// Kernel reads into title memory. The GPU side leaves blocks of title GPU
+// buffers read-only to see the title's next write, and the kernel's writes
+// fail there instead of faulting into its handler; the title's
+// synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
+// destinations and retry a failed `ReadFile` forever. So the destination
+// is opened first, and not guarded again before the call is done.
+
 pub extern "system" fn ReadFile(
     file: *mut c_void,
     buffer: *mut u8,
@@ -478,36 +535,45 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    oathkeep_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    let writing = oathkeep_gpu::kernel_writing(buffer as usize, len as usize);
+    let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    // The call's error is the title's to ask for.
+    // SAFETY: plain calls.
+    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    // shortcut: a read that goes on after the call (overlapped) is written
+    // into pages the kernel has locked by now: it lands all the same, but a
+    // refresh that guards its blocks before it does will not see it.
+    if done == 0 && error == windows_sys::Win32::Foundation::ERROR_IO_PENDING {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::info!(len, "ReadFile: a read of the title's goes on after the call"));
+    }
+    if done == 0 && error == windows_sys::Win32::Foundation::ERROR_NOACCESS {
+        static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(n, buffer = format_args!("{buffer:p}"), len, "ReadFile: the title's buffer could not be written");
+        }
+    }
+    drop(writing);
+    // SAFETY: as above.
+    unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
+    done
 }
 
+/// The host CRT reads large requests straight into the caller's buffer
+/// through the kernel, whose write fails on a guarded block instead of
+/// faulting into the guard. So the bytes are read beside, a chunk at a time
+/// (a caller may ask for far more than the file holds), and copied in from
+/// user mode, where a guarded block faults into the guard like the title's
+/// own writes. Returns the items read, as the CRT does; the bytes of a
+/// partial last item are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    let read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
-    let total = size.saturating_mul(count);
-    if buffer.is_null() || total == 0 {
-        return read(buffer, size, count, stream);
-    }
-    const CHUNK: usize = 1 << 20;
-    let mut beside = vec![0u8; total.min(CHUNK)];
-    let mut done = 0;
-    while done < total {
-        let want = (total - done).min(CHUNK);
-        let n = read(beside.as_mut_ptr(), 1, want, stream);
-        if n > 0 {
-            oathkeep_gpu::kernel_will_write(buffer as usize + done, n);
-            // SAFETY: the caller's buffer holds `size * count` bytes, and
-            // `done + n` is at most that.
-            unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
-            done += n;
-        }
-        if n < want {
-            break;
-        }
-    }
-    done / size
+    let _writing = oathkeep_gpu::kernel_writing(buffer as usize, size.saturating_mul(count));
+    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+        buffer, size, count, stream,
+    )
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
@@ -541,6 +607,8 @@ pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_ch
     }
 }
 
+/// `_open(path, flags[, mode])` is variadic; on x64 the optional integer
+/// travels in the same register either way, so it is passed on as is.
 pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
     match narrow(path) {
         Some(p) => host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
@@ -554,6 +622,7 @@ pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
     }
 }
 
+/// See [`_open`]; used by libHttpClient.
 pub extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
     let p = wide(path);
     host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
@@ -604,9 +673,12 @@ pub extern "C" fn _wutime64(path: *const u16, times: *mut c_void) -> i32 {
     )
 }
 
+// The C++ library: `std::basic_filebuf::open` goes through `_Fiopen`.
+
 const FIOPEN: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z";
 const FIOPEN_WIDE: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z";
 
+/// `_Fiopen(const wchar_t* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File {
     let p = wide(path);
     host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
@@ -616,6 +688,7 @@ extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File 
     )
 }
 
+/// `_Fiopen(const char* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
     match narrow(path) {
         Some(p) => {
@@ -708,10 +781,7 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let (mut out, mut n) = ([0u8; 10], 0);
         let handle = file.as_raw_handle().cast();
-        assert_ne!(
-            ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()),
-            0
-        );
+        assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
@@ -719,9 +789,8 @@ mod tests {
     fn fread_reads_beside_in_chunks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.bin");
-        let bytes: Vec<u8> = (0..(5 << 19) + 1)
-            .map(|i| (i * 7 + i / 251) as u8)
-            .collect();
+        // Over two chunks, and not a whole number of 3-byte items.
+        let bytes: Vec<u8> = (0..(5 << 19) + 1).map(|i| (i * 7 + i / 251) as u8).collect();
         std::fs::write(&path, &bytes).unwrap();
         let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
         let open = || {
@@ -730,21 +799,16 @@ mod tests {
             f
         };
 
+        // Asked for far more than the file holds: the whole file, in items.
         let f = open();
         let mut out = vec![0xaau8; bytes.len() + 64];
         let items = fread(out.as_mut_ptr(), 3, out.len() / 3, f);
         assert_eq!(items, bytes.len() / 3);
-        assert_eq!(
-            &out[..bytes.len()],
-            &bytes[..],
-            "the partial last item's bytes too"
-        );
-        assert!(
-            out[bytes.len()..].iter().all(|&b| b == 0xaa),
-            "nothing past what was read"
-        );
+        assert_eq!(&out[..bytes.len()], &bytes[..], "the partial last item's bytes too");
+        assert!(out[bytes.len()..].iter().all(|&b| b == 0xaa), "nothing past what was read");
         fclose(f);
 
+        // Exact reads continue where the last one stopped.
         let f = open();
         let mut a = vec![0u8; 1000];
         let mut b = vec![0u8; (1 << 20) + 5];
@@ -785,6 +849,8 @@ mod tests {
         assert_eq!(tr("relative/path".into()), None);
         assert_eq!(tr(String::new()), None);
 
+        // Fixed letters, as the console's package drive; a later mount of
+        // the same letter replaces the earlier one.
         let package = tempfile::tempdir().unwrap();
         mount_at('g', dir.path());
         mount_at('G', package.path());
@@ -794,6 +860,7 @@ mod tests {
         );
         assert_ne!(mount(dir.path()), Some('G'), "free letters skip fixed ones");
 
+        // Long ones take the `\\?\` form, cleaned up as the host would.
         let long = "d".repeat(250);
         assert_eq!(
             tr(format!(r"G:/a/./b/../{long}//f")),
@@ -803,6 +870,17 @@ mod tests {
             verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
             w(r"\\?\UNC\server\share\y")[..22].to_vec()
         );
+    }
+
+    /// A title run by its file name alone has an empty folder: the drive
+    /// over it is the current directory, not the current drive's root.
+    #[test]
+    fn an_empty_root_is_the_current_directory() {
+        let letter = mount(Path::new("")).unwrap();
+        let path = format!(r"{letter}:\a.rpf");
+        let host = translate(&w(&path)[..path.len()]).map(|v| text(&v));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(host, Some(cwd.join("a.rpf").display().to_string()));
     }
 
     #[test]
@@ -883,6 +961,7 @@ mod tests {
         host!("ucrtbase.dll", "_close": extern "C" fn(i32) -> i32)(fd);
         assert!(dir.path().join("low.bin").is_file());
 
+        // Other paths pass through untouched.
         let host_path = format!("{}\0", dir.path().join("plain.txt").display());
         let f = fopen(host_path.as_ptr().cast(), c"wb".as_ptr());
         assert!(!f.is_null());
@@ -890,6 +969,11 @@ mod tests {
         assert!(dir.path().join("plain.txt").is_file());
     }
 
+    /// A narrow path is rewritten once, as its wide twin is. The inner
+    /// drive's folder lies on the outer virtual drive, as the title folder
+    /// does when it sits on a host `G:` drive and is mounted as `G:`. The
+    /// outer letter is no host drive, so the host finds nothing there; a
+    /// narrow call that reaches the outer folder rewrote the path twice.
     #[test]
     fn narrow_paths_are_rewritten_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -926,6 +1010,7 @@ mod tests {
         const OUT: i32 = 2;
         assert!(fiopen(path("d.txt").as_ptr().cast(), OUT, 0x40).is_null());
 
+        // Nothing was made behind a path rewritten twice.
         let names: Vec<_> = std::fs::read_dir(&folder)
             .unwrap()
             .map(|e| e.unwrap().file_name())

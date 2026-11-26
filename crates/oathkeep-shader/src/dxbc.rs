@@ -1,3 +1,15 @@
+//! The DXBC container: a header, then a table of FourCC-tagged parts.
+//!
+//! ```text
+//! 0x00  "DXBC"
+//! 0x04  digest[16]
+//! 0x14  version major u16, minor u16
+//! 0x18  total size u32
+//! 0x1C  part count u32
+//! 0x20  part offsets u32[count]
+//! part: fourcc[4], size u32, data[size]
+//! ```
+
 use crate::ShaderError;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -5,17 +17,19 @@ pub struct FourCC(pub [u8; 4]);
 
 impl FourCC {
     pub const DXIL: FourCC = FourCC(*b"DXIL");
+    /// Native code another compiler made, in place of `DXIL` (Oathkeep upstream 0b35b7f).
+    pub const ACCC: FourCC = FourCC(*b"ACCC");
     pub const STAT: FourCC = FourCC(*b"STAT");
     pub const RTS0: FourCC = FourCC(*b"RTS0");
     pub const PSV0: FourCC = FourCC(*b"PSV0");
     pub const ISG1: FourCC = FourCC(*b"ISG1");
     pub const OSG1: FourCC = FourCC(*b"OSG1");
+    /// Per-primitive outputs of a mesh shader.
     pub const PSG1: FourCC = FourCC(*b"PSG1");
     pub const SFI0: FourCC = FourCC(*b"SFI0");
     pub const HASH: FourCC = FourCC(*b"HASH");
     pub const ILDB: FourCC = FourCC(*b"ILDB");
     pub const ILDN: FourCC = FourCC(*b"ILDN");
-    pub const ACCC: FourCC = FourCC(*b"ACCC");
 }
 
 impl std::fmt::Debug for FourCC {
@@ -37,6 +51,7 @@ impl std::fmt::Display for FourCC {
 #[derive(Debug, Clone, Copy)]
 pub struct Part<'a> {
     pub fourcc: FourCC,
+    /// Offset of the part header within the container.
     pub offset: usize,
     pub data: &'a [u8],
 }
@@ -116,6 +131,7 @@ pub(crate) fn u64_at(data: &[u8], at: usize) -> Result<u64, ShaderError> {
         .ok_or(ShaderError::Malformed("truncated"))
 }
 
+/// Builds a container from parts (test helper).
 #[cfg(test)]
 pub fn build(parts: &[(FourCC, &[u8])]) -> Vec<u8> {
     let table = HEADER_SIZE + 4 * parts.len();
@@ -159,7 +175,7 @@ mod tests {
         assert_eq!(Container::parse(b"nope").unwrap_err(), ShaderError::NotDxbc);
         let mut bytes = build(&[(FourCC::SFI0, &[0; 8])]);
         let last = bytes.len() - 1;
-        bytes[0x20] = 0xFF;
+        bytes[0x20] = 0xFF; // corrupt the first part offset
         assert!(Container::parse(&bytes).is_err());
         bytes.truncate(last);
         assert!(Container::parse(&bytes).is_err());

@@ -1,9 +1,13 @@
+//! Instruction text in AMD's SP3 assembly syntax.
+
 use std::fmt::{self, Display, Write};
 
 use super::fields::{Cache, Dpp, Fields, NULL, Operand, Valu};
 use super::{Encoding, Instruction};
 
 impl Instruction {
+    /// The instruction in SP3 syntax, e.g. `v_add_f32 v1, 0.5, v8`.
+    /// Branch targets are written `label_<byte offset>`.
     pub fn text(&self, wave64: bool) -> String {
         let name = self.name().unwrap_or("?");
         let ops = operands(self, name, &self.fields(wave64));
@@ -133,6 +137,12 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             cache,
         } => {
             if let Some(data) = data {
+                let data = match (name, data) {
+                    ("s_atc_probe" | "s_atc_probe_buffer", Operand::Literal(imm)) => {
+                        atc_immediate(*imm)
+                    }
+                    _ => data.to_string(),
+                };
                 let off = match (soffset, offset) {
                     (Operand::Scalar { code: NULL, .. }, 0) => soffset.to_string(),
                     (Operand::Scalar { code: NULL, .. }, _) => {
@@ -141,7 +151,11 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
                     (_, 0) => soffset.to_string(),
                     _ => format!("{soffset} offset:0x{:06x}", offset & 0x1F_FFFF),
                 };
-                out = format!("{data}, {base}, {off}");
+                out = match name {
+                    // The data is a counter or the wave ID; these have no address.
+                    "s_memtime" | "s_memrealtime" | "s_get_waveid_in_workgroup" => data.to_string(),
+                    _ => format!("{data}, {base}, {off}"),
+                };
             }
             flags(&mut out, cache, false);
         }
@@ -195,7 +209,12 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             cache,
         } => {
             if let Some(data) = data {
-                out = format!("{data}, {addr}, {rsrc}, {soffset}");
+                // An LDS load returns its data to LDS, so vdata is unused.
+                out = if *lds && name.contains("_load_") {
+                    format!("{addr}, {rsrc}, {soffset}")
+                } else {
+                    format!("{data}, {addr}, {rsrc}, {soffset}")
+                };
                 if *idxen {
                     out.push_str(" idxen");
                 }
@@ -289,7 +308,11 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
                 dst.iter()
                     .map(|o| o.to_string())
                     .chain([addr])
-                    .chain(data.iter().chain(saddr).map(|o| o.to_string())),
+                    .chain(data.iter().map(|o| o.to_string()))
+                    .chain(saddr.map(|o| match o {
+                        Operand::Scalar { code: NULL, .. } => "off".into(),
+                        o => o.to_string(),
+                    })),
             );
             if *offset != 0 {
                 let _ = write!(out, " inst_offset:{offset}");
@@ -331,6 +354,16 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
     out
 }
 
+/// `s_atc_probe` immediate: 0..=64 in decimal, larger values in hex.
+fn atc_immediate(imm: u32) -> String {
+    if imm <= 64 {
+        imm.to_string()
+    } else {
+        format!("0x{imm:x}")
+    }
+}
+
+/// Cache flags; images write `dlc` first.
 fn flags(out: &mut String, cache: &Cache, dlc_first: bool) {
     let dlc = (cache.dlc, " dlc");
     let (first, last) = if dlc_first {
@@ -534,6 +567,7 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
             if bit(v.neg, i) {
                 s = format!("-{s}");
             }
+            // v_permlane*: the opsel bits are fi and bound_ctrl.
             if bit(v.opsel, i) && !name.starts_with("v_permlane") {
                 s = format!("sel_hi({s})");
             }
@@ -548,6 +582,7 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
         .collect();
     let mut order: Vec<usize> = (0..v.src.len()).collect();
     if name.starts_with("v_interp_") && order.len() > 1 {
+        // dst, i/j, attribute, then the p1 result for p2.
         order.swap(0, 1);
     }
     ops.extend(order.into_iter().map(src));
@@ -566,6 +601,18 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
         }
         if v.opsel & 2 != 0 {
             suffix("bound_ctrl:1");
+        }
+    }
+    if encoding == Encoding::Vop3p && !mix {
+        // `-src` above covers a source negated in both halves; LLVM syntax
+        // for the one-sided rest.
+        let n = v.src.len();
+        for (field, only) in [("neg_lo", v.neg & !v.neg_hi), ("neg_hi", v.neg_hi & !v.neg)] {
+            if (0..n).any(|i| bit(only, i)) {
+                let bits: Vec<String> =
+                    (0..n).map(|i| u8::from(bit(only, i)).to_string()).collect();
+                suffix(&format!("{field}:[{}]", bits.join(",")));
+            }
         }
     }
     if let Some(sdwa) = v.sdwa {
@@ -588,7 +635,7 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
                 unused[usize::from(sdwa.dst_unused & 3)]
             ));
         }
-        for (i, s) in sdwa.src_sel.iter().enumerate() {
+        for (i, s) in sdwa.src_sel.iter().take(v.src.len()).enumerate() {
             if *s != 6 {
                 suffix(&format!("src{i}_sel:{}", sel[usize::from(s & 7)]));
             }
@@ -653,11 +700,12 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::gfx10::{Fields, Operand, decode};
+    use crate::gfx10::{Cache, Fields, Operand, decode};
 
+    /// Text of each instruction in `words` (a straight-line program).
     fn texts(words: &[u32], wave64: bool) -> Vec<String> {
         let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        code.extend(0xBF81_0000u32.to_le_bytes());
+        code.extend(0xBF81_0000u32.to_le_bytes()); // s_endpgm
         let insts = decode(&code).unwrap();
         insts[..insts.len() - 1]
             .iter()
@@ -692,12 +740,75 @@ mod tests {
         );
     }
 
+    /// `s_atc_probe` / `s_atc_probe_buffer`: SDATA is a 7-bit immediate, the
+    /// buffer resource is 4 dwords, and GLC/DLC are not operands.
+    ///
+    /// Words checked with `llvm-mc -arch=amdgcn -mcpu=gfx1030 --disassemble`.
+    /// The offset keeps this printer's 6-digit hex (`0x000064`, not `0x64`).
+    #[test]
+    fn atc_probe_immediate_is_not_a_register() {
+        let cases = [
+            (
+                [0xF498_01C2, 0xFA00_0064],
+                "s_atc_probe 7, s[4:5], 0x000064",
+                Operand::Literal(7),
+                Operand::Scalar { code: 4, dwords: 2 },
+            ),
+            (
+                [0xF498_1FF4, 0x0A00_0001],
+                "s_atc_probe 0x7f, s[104:105], s5 offset:0x000001",
+                Operand::Literal(0x7f),
+                Operand::Scalar {
+                    code: 104,
+                    dwords: 2,
+                },
+            ),
+            (
+                [0xF498_0000, 0xFA00_0000],
+                "s_atc_probe 0, s[0:1], null",
+                Operand::Literal(0),
+                Operand::Scalar { code: 0, dwords: 2 },
+            ),
+            (
+                [0xF49C_01C4, 0xFA00_0020],
+                "s_atc_probe_buffer 7, s[8:11], 0x000020",
+                Operand::Literal(7),
+                Operand::Scalar { code: 8, dwords: 4 },
+            ),
+            (
+                [0xF499_41C2, 0xFA00_0000],
+                "s_atc_probe 7, s[4:5], null",
+                Operand::Literal(7),
+                Operand::Scalar { code: 4, dwords: 2 },
+            ),
+        ];
+        for (words, text, data, base) in cases {
+            assert_eq!(one(&words, false), text, "{words:08x?}");
+            assert_eq!(one(&words, true), text, "{words:08x?}");
+            let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            code.extend(0xBF81_0000u32.to_le_bytes());
+            let inst = &decode(&code).unwrap()[0];
+            let Fields::Smem {
+                data: got,
+                base: got_base,
+                cache,
+                ..
+            } = inst.fields(false)
+            else {
+                panic!("not an SMEM instruction");
+            };
+            assert_eq!(got, Some(data), "{words:08x?}");
+            assert_eq!(got_base, base, "{words:08x?}");
+            assert_eq!(cache, Cache::default(), "{words:08x?}");
+        }
+    }
+
     #[test]
     fn lane_masks_follow_the_wave_size() {
-        let cmp = [0x7C08_06F0];
+        let cmp = [0x7C08_06F0]; // v_cmp_gt_f32 with 0.5 and v3
         assert_eq!(one(&cmp, false), "v_cmp_gt_f32 vcc_lo, 0.5, v3");
         assert_eq!(one(&cmp, true), "v_cmp_gt_f32 vcc, 0.5, v3");
-        let vop3 = [0xD401_0106, 0x0001_E501];
+        let vop3 = [0xD401_0106, 0x0001_E501]; // v_cmp_lt_f32 to s6, |v1| < 1.0
         assert_eq!(one(&vop3, false), "v_cmp_lt_f32 s6, abs(v1), 1.0");
         assert_eq!(one(&vop3, true), "v_cmp_lt_f32 s[6:7], abs(v1), 1.0");
         assert_eq!(
@@ -755,7 +866,51 @@ mod tests {
     }
 
     #[test]
+    fn one_sided_packed_negation_is_printed() {
+        // Encodings from llvm-mc -mcpu=gfx1030. A source negated in both
+        // halves keeps the `-` prefix; one-sided bits get LLVM's suffixes.
+        let got = [
+            one(&[0xCC0F_4001, 0x1A02_0702], true),
+            one(&[0xCC0F_4001, 0x3A02_0702], true),
+            one(&[0xCC0F_4201, 0x1A02_0702], true),
+            one(&[0xCC0F_4101, 0x7A02_0702], true),
+        ];
+        assert_eq!(
+            got,
+            [
+                "v_pk_add_f16 v1, v2, v3",
+                "v_pk_add_f16 v1, v2, v3 neg_lo:[1,0]",
+                "v_pk_add_f16 v1, v2, v3 neg_hi:[0,1]",
+                "v_pk_add_f16 v1, -v2, v3 neg_lo:[0,1]",
+            ]
+        );
+    }
+
+    #[test]
+    fn fields_the_instruction_lacks_are_not_printed() {
+        // Encodings from llvm-mc -mcpu=gfx1030; s_get_waveid_in_workgroup is gfx1010 only.
+        let got = [
+            one(&[0xF490_0500, 0], true),
+            one(&[0xF4A8_0140, 0], true),
+            one(&[0xDC30_8000, 0x007D_0002], true),
+            one(&[0xE031_1000, 0x0001_0001], true),
+            one(&[0x7E02_02F9, 0x0005_0602], true),
+        ];
+        assert_eq!(
+            got,
+            [
+                "s_memtime s[20:21]",
+                "s_get_waveid_in_workgroup s5",
+                "global_load_dword v0, v[2:3], off",
+                "buffer_load_dword v1, s[4:7], s0 offen lds",
+                "v_mov_b32 v1, v2 src0_sel:WORD_1",
+            ]
+        );
+    }
+
+    #[test]
     fn image_d16_data_is_packed() {
+        // Three f16 channels occupy two VGPRs; NSA lists the addresses.
         let words = [0xF09C_070A, 0x8024_0801, 0x0000_0005];
         assert_eq!(
             one(&words, true),

@@ -1,3 +1,7 @@
+//! Persistent local storage: a host folder of the title's own
+//! (`runtime::Title::storage`, under the data directory, never the cache)
+//! with the quota its manifest declares, seen by the title as a drive
+//! (`files`).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::path::Path;
@@ -22,6 +26,8 @@ pub const IID: Guid = Guid::new(
     [0x8b, 0x27, 0x95, 0xfc, 0x02, 0xd0, 0xf7, 0x5d],
 );
 
+/// As the title (2026) asks for it; it calls 0x20 (path) and 0x28
+/// (space) with the same arguments.
 pub const IID_2026: Guid = Guid::new(
     0x41a4_e10c,
     0x5a7e,
@@ -36,6 +42,11 @@ const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 
 type This = *const Object;
 
+/// The path titles get: the root of a virtual drive over the folder. On the
+/// console storage is a drive of its own, and titles rely on it: Minecraft
+/// keeps only what precedes the path's last `:\` and mounts that as a
+/// drive, so a host folder such as `C:\Users\..` would make it write to the
+/// root of `C:`. None (the path calls fail) before the title is set.
 fn folder() -> Option<String> {
     let storage = runtime::title().storage;
     if storage.as_os_str().is_empty() {
@@ -54,6 +65,8 @@ extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
     }
 }
 
+/// A buffer too small for the path fails with `E_FAIL`, the documented
+/// Xbox result (a PC gets `ERROR_INSUFFICIENT_BUFFER`).
 extern "system" fn path(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     match folder() {
         Some(path) if size <= path.len() => E_FAIL,
@@ -65,9 +78,12 @@ extern "system" fn path(_: This, size: usize, buffer: *mut u8, used: *mut usize)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpaceInfo {
+    /// Writable now.
     pub available_free: u64,
+    /// Left in the quota.
     pub total_free: u64,
     pub used: u64,
+    /// The quota.
     pub total: u64,
 }
 
@@ -85,6 +101,7 @@ fn used_bytes(dir: &Path) -> u64 {
         .sum()
 }
 
+/// What the host disk under `dir` has free (unlimited if unknown).
 pub(crate) fn disk_free(dir: &Path) -> u64 {
     #[cfg(windows)]
     {
@@ -114,6 +131,7 @@ fn space() -> SpaceInfo {
     let used = used_bytes(&title.storage);
     let free = title.storage_bytes.saturating_sub(used);
     SpaceInfo {
+        // Writable now: the quota's rest, as far as the host disk allows.
         available_free: free.min(disk_free(&title.storage)),
         total_free: free,
         used,
@@ -125,8 +143,10 @@ extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
     put(out, space())
 }
 
+/// Tells our prompts apart from other calls on the same block.
 static PROMPT: u8 = 0;
 
+/// There is nobody to ask: granted when the quota has room, else declined.
 extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
     let hr = if bytes <= space().total_free {
         S_OK
@@ -145,11 +165,11 @@ static VTABLE: Methods<8> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    path_size as *const (),
-    path as *const (),
-    space_info as *const (),
-    prompt_for_space as *const (),
-    prompt_result as *const (),
+    path_size as *const (),        // 0x18
+    path as *const (),             // 0x20
+    space_info as *const (),       // 0x28
+    prompt_for_space as *const (), // 0x30
+    prompt_result as *const (),    // 0x38
 ]);
 
 #[cfg(test)]
@@ -174,6 +194,7 @@ mod tests {
             ..Default::default()
         });
 
+        // The path is a drive root, never the host folder.
         let mut size = 0;
         assert_eq!(method::<Size>(&OBJECT, 0x18)(this, &mut size), S_OK);
         assert_eq!(size, 4, "X:\\ and its NUL");
@@ -183,6 +204,7 @@ mod tests {
         assert_eq!(get(this, 3, buffer.as_mut_ptr(), &mut used), E_FAIL);
         let drive = std::str::from_utf8(&buffer[..3]).unwrap();
         assert!(drive.ends_with(":\\"), "{drive}");
+        // Title file calls on it reach the folder.
         let path = format!("{drive}save.dat\0");
         let mut attributes = [0u8; 36];
         let get_attributes = super::super::files::GetFileAttributesExW;

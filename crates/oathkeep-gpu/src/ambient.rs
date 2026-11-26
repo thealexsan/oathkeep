@@ -8,26 +8,31 @@
 //! memory held. Right after that program the light is raised to an estimate
 //! and bounded by a multiple of it.
 //!
-//! Ported from upstream GPL-3.0-or-later indirect-light stand-in work
-//! (see `THIRD_PARTY.md`): the light the visible surfaces send out (kept by
+//! That a stand-in can be put there, and in which of the program's images,
+//! is beloooo's find (Oathkeep-Belobug-AMD, 06031237, 4f45ab88, cd9f78ce,
+//! GPL-3.0-or-later), which puts a constant there, shaded in creases from the
+//! scene's depth. The estimate here is worked out from the frame instead, so
+//! it follows the hour, the room and its lamps by itself: the light the
+//! visible surfaces send out (the title keeps it for its own screen traces:
 //! `CS_CacheScreenSpaceRadiance`, the frame before) is averaged in 64x36
 //! cells, and every point gets the mean of the cells weighted by the share of
 //! its surroundings they cover, as a directional value (first-order harmonics
-//! at 160x90 points, taken between them by depth), shaded in creases from the
-//! scene's depth.
+//! at 160x90 points, taken between them by depth).
+//!
+//! What it assumes: what is not on screen sends out what is (with a slow
+//! mean of the last seconds, so that turning into a dark corner is not black
+//! at once). No occlusion but the creases'.
 //!
 //! `OATHKEEP_AMBIENT`:
-//! - unset: defaults to `0.8` (directional estimate) when `builder_runs()` is false.
-//! - `0` or `off`: the title's own output.
-//! - a number: that share of the estimate (`1`: all of it).
-//! - `constant:<level>`: a constant level, shaded in creases.
+//! - unset or `0`/`off`: the title's own output.
+//! - a number: that share of the estimate (1: all of it).
+//! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
 //! `OATHKEEP_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `OATHKEEP_AMBIENT_AIR`
-//! (default `1.5`, `0`/`off` disables) bounds what the air scatters by a
-//! multiple of the light around.
+//! bounds what the air scatters by a multiple of the light around.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -80,12 +85,7 @@ enum Set {
 
 fn parse(set: &str) -> Set {
     let set = set.trim();
-    let number = |t: &str| {
-        t.trim()
-            .parse::<f32>()
-            .ok()
-            .filter(|v| v.is_finite() && *v > 0.0)
-    };
+    let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
     match set.strip_prefix("constant:") {
         Some(level) => number(level).map_or(Set::Off, Set::Constant),
         None => number(set).map_or(Set::Off, Set::Estimate),
@@ -94,10 +94,7 @@ fn parse(set: &str) -> Set {
 
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let raw = std::env::var("OATHKEEP_AMBIENT").unwrap_or_else(|_| "0.8".to_owned());
-        parse(&raw)
-    })
+    *SET.get_or_init(|| parse(&std::env::var("OATHKEEP_AMBIENT").unwrap_or_default()))
 }
 
 /// Whether the stand-in is on: set, and the title's rays find nothing.
@@ -106,16 +103,12 @@ pub(crate) fn on() -> bool {
 }
 
 /// The most the air scatters, as a multiple of the light around
-/// (`OATHKEEP_AMBIENT_AIR=<multiple>`; default `1.5`, `0`/`off`: what the title has).
+/// (`OATHKEEP_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
 fn air() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
-        let set = std::env::var("OATHKEEP_AMBIENT_AIR").unwrap_or_else(|_| "1.5".to_owned());
-        set.trim()
-            .parse()
-            .ok()
-            .filter(|v: &f32| v.is_finite() && *v > 0.0)
-            .unwrap_or(0.0)
+        let set = std::env::var("OATHKEEP_AMBIENT_AIR").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
     })
 }
 
@@ -282,7 +275,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
     float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
     if (dot(n, c) > 0.0) n = -n;
-    // How open it is.
+    // How open it is (as in beloooo's cd9f78ce).
     float open = 1.0;
     float px = min(radius * size.y / (2.0 * tan_y * c.z), 128.0);
     float noise = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715))));
@@ -359,14 +352,10 @@ unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
 
-fn make(
-    device: &ID3D12Device,
-    buffer: impl Fn(u64) -> Option<ID3D12Resource>,
-) -> windows::core::Result<Pass> {
+fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code =
-            crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
@@ -374,10 +363,7 @@ fn make(
             }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: code.as_ptr().cast(),
-                    BytecodeLength: code.len(),
-                },
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
                 ..Default::default()
             };
             device.CreateComputePipelineState(&desc)
@@ -415,10 +401,7 @@ fn pass() -> Option<&'static Pass> {
 }
 
 fn uav_barrier(list: &ID3D12GraphicsCommandList) {
-    let barrier = D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        ..Default::default()
-    };
+    let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
     // SAFETY: an open list; the barrier names no resource.
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
@@ -462,13 +445,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
         if *said < 4 {
             *said += 1;
-            tracing::info!(
-                ?role,
-                size = ?views.size,
-                level,
-                constant,
-                "a stand-in for the indirect light"
-            );
+            tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
         }
     }
     list.keep(&pass.cells);
@@ -507,23 +484,13 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 run(&pass.mean, 1, 1, 1);
                 KEPT.store(true, Ordering::Relaxed);
             }
-            Role::Air => run(
-                &pass.air,
-                views.size[0].div_ceil(8),
-                views.size[1].div_ceil(8),
-                views.slices.div_ceil(2),
-            ),
+            Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
                 }
-                run(
-                    &pass.raise,
-                    views.size[0].div_ceil(8),
-                    views.size[1].div_ceil(8),
-                    1,
-                );
+                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
         }
     }
@@ -546,18 +513,9 @@ mod tests {
 
     #[test]
     fn roles_by_name() {
-        assert_eq!(
-            role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."),
-            Some(Role::Resolve)
-        );
-        assert_eq!(
-            role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."),
-            Some(Role::Radiance)
-        );
-        assert_eq!(
-            role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"),
-            Some(Role::Air)
-        );
+        assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
+        assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
+        assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 

@@ -1,3 +1,35 @@
+//! Clean-up of a finished module before it is written: the lowering emits
+//! one instruction after another as the console code names them, and
+//! nothing stands between it and the driver's compiler. Every pass here is
+//! exact: the module computes the same values and has the same effects for
+//! every input.
+//!
+//! - [`DEAD`]: instructions without an effect whose result nothing reads
+//!   are left out (the lowering computes every dword of every register a
+//!   console instruction writes; a guarded write reads the register's old
+//!   value whether anything reads the new one or not).
+//! - [`FOLD`]: integer arithmetic on constants is done here, and identities
+//!   (`x + 0`, `x & -1`, a select between a value and itself, a cast there
+//!   and back, a join of one value) give their operand. Float arithmetic is
+//!   left alone: `x + 0.0` and `x * 1.0` are not `x` for every `x`.
+//! - [`REUSE`]: an instruction without an effect whose operands are those
+//!   of an earlier one that every path to it has run gives that one's
+//!   result (a descriptor handle made again in each block, an index clamped
+//!   again, a register read as a float again).
+//! - [`FACTS`]: in the blocks only one side of a branch leads to, the
+//!   branch's condition is that side's constant, and so is what the
+//!   condition was made of (both terms of an `and` that held, the opposite
+//!   comparison). The lowering branches on a lane's condition and then
+//!   guards each instruction behind the branch with the same condition.
+//! - [`LOADS`]: within a block, a read of the same place as an earlier read
+//!   gives that one's result while no store, atomic, barrier or other call
+//!   with an effect stands between them (another thread's unsynchronised
+//!   store may fall between any two reads or before both: the title's code
+//!   cannot tell which).
+//!
+//! Which passes run is `emit::shader_opt()` (`OATHKEEP_SHADER_OPT`), part of
+//! the translation and so of the shader cache's key.
+
 use std::collections::HashMap;
 
 use super::{
@@ -5,25 +37,59 @@ use super::{
     successors,
 };
 
+/// Dead-code elimination.
 pub const DEAD: u32 = 1;
+/// Constants folded, identities removed.
 pub const FOLD: u32 = 2;
+/// One instruction for one value.
 pub const REUSE: u32 = 4;
+/// What a branch taken says about its condition.
 pub const FACTS: u32 = 8;
+/// One read for one place within a block, while nothing is stored.
 pub const LOADS: u32 = 16;
+/// Not a pass over the module: the lowering of a first-lane read in a
+/// wave64 program run as two host waves skips the exchange that asks which
+/// half has a lane where every lane is in EXEC (`lower.rs`,
+/// `v_readfirstlane_b32`).
 pub const FIRST: u32 = 32;
+/// Not a pass over the module either: the lowering reads the dwords of one
+/// console load (`s_buffer_load_dwordx2` to `x16` from an SRV, a
+/// `global_load_dwordx2` to `x4`) by one call for every four of them, not
+/// by a call each (`lower.rs`, `raw_dwords`). The same bytes are read.
+/// From fxceless/victory-fork c36971b2. On an RX 7900 XTX it is worth nothing:
+/// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
+/// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
+pub const WIDE: u32 = 64;
+/// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
-pub const ALL: u32 = MODULE | FIRST;
+/// Every pass.
+pub const ALL: u32 = MODULE | FIRST | WIDE;
+/// The passes that run when nothing says which: every one but [`WIDE`],
+/// which no card has shown a gain for yet (`OATHKEEP_SHADER_OPT=127` asks
+/// for it).
+pub const DEFAULT: u32 = ALL & !WIDE;
 
+/// What the instructions a module writes use, of the features a shader
+/// declares by flag (the validator's "flags must match usage").
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Usage {
+    /// A wave or quad operation.
     pub wave_ops: bool,
+    /// A rasterizer ordered view.
+    pub rovs: bool,
+    /// A 64-bit integer, as a result or an operand.
     pub int64: bool,
+    /// A typed load of several components from a UAV.
     pub typed_uav_loads: bool,
+    /// A handle from the view heap.
     pub heap_views: bool,
+    /// A handle from the sampler heap.
     pub heap_samplers: bool,
+    /// A 64-bit atomic.
     pub atomic64: bool,
 }
 
+/// What makes two instructions without an effect the same value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Key {
     Bin(u8, V, V),
@@ -36,12 +102,17 @@ enum Key {
     Load(V),
 }
 
+/// The blocks reached from the entry, each after the blocks that dominate
+/// it, and each block's children in the dominator tree.
 struct Tree {
     order: Vec<usize>,
     children: Vec<Vec<usize>>,
+    /// Per block: the reached blocks that branch to it, once per edge.
     preds: Vec<Vec<usize>>,
 }
 
+/// The comparison that holds exactly when `p` does not (floats 0-15,
+/// integers 32-41).
 fn opposite(p: u8) -> u8 {
     match p {
         0..=15 => 15 - p,
@@ -58,12 +129,15 @@ fn opposite(p: u8) -> u8 {
     }
 }
 
+/// What holds in the block being walked: values that are a known bit there,
+/// and comparisons (by their operands) with a known outcome.
 #[derive(Default)]
 struct Facts {
     bits: HashMap<V, bool>,
     compares: HashMap<(u8, V, V), bool>,
 }
 
+/// The facts a block added, to forget when its part of the tree is done.
 #[derive(Default)]
 struct Learned {
     bits: Vec<V>,
@@ -74,6 +148,7 @@ fn mask(bits: u32) -> u64 {
     if bits >= 64 { !0 } else { (1 << bits) - 1 }
 }
 
+/// `x` of `bits` bits as a signed number.
 fn signed(bits: u32, x: u64) -> i64 {
     if bits < 64 && x >> (bits - 1) & 1 != 0 {
         (x | !mask(bits)) as i64
@@ -82,6 +157,7 @@ fn signed(bits: u32, x: u64) -> i64 {
     }
 }
 
+/// What `v` stands for after the replacements so far.
 fn resolve(repl: &[Option<V>], mut v: V) -> V {
     while let V::Inst(i) = v {
         match repl[i as usize] {
@@ -92,6 +168,7 @@ fn resolve(repl: &[Option<V>], mut v: V) -> V {
     v
 }
 
+/// Replaces every value `op` reads by `f` of it.
 fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
     match op {
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
@@ -113,11 +190,20 @@ fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
     }
 }
 
+/// What a call does besides returning its result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Effect {
+    /// Nothing, and the result depends on the arguments alone for the whole
+    /// run of the shader (arithmetic, handles, inputs, constant buffers,
+    /// resource sizes).
     Pure,
+    /// Nothing, but the result depends on memory a store may change
+    /// (buffer and texture reads).
     Reads,
+    /// Nothing, but the result depends on which lanes run the instruction
+    /// (wave and quad operations).
     Lanes,
+    /// Stores, atomics, barriers, outputs, discards: always kept.
     Writes,
 }
 
@@ -125,6 +211,7 @@ pub(super) fn effect(f: &Func) -> Effect {
     let name = f.name.strip_prefix("dx.op.").unwrap_or(&f.name);
     match f.attr {
         Some(Attr::ReadNone) => Effect::Pure,
+        // A shader cannot write a constant buffer or resize a resource.
         Some(Attr::ReadOnly)
             if name.starts_with("cbufferLoadLegacy") || name.starts_with("getDimensions") =>
         {
@@ -132,14 +219,20 @@ pub(super) fn effect(f: &Func) -> Effect {
         }
         Some(Attr::ReadOnly) if name.starts_with("wave") => Effect::Lanes,
         Some(Attr::ReadOnly) => Effect::Reads,
+        // Declared with the attribute of calls that have effects, and have
+        // none: they read the other lanes' values.
         _ if name.starts_with("wave") || name.starts_with("quad") => Effect::Lanes,
         _ => Effect::Writes,
     }
 }
 
 impl Module {
+    /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
         if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
+            // Values merged in one round can make two joins the same in
+            // the next (a loop's registers that only go round), and a
+            // branch that goes one way leaves blocks with one way in.
             for _ in 0..4 {
                 let mut changed = self.merge(passes);
                 if passes & FOLD != 0 {
@@ -155,10 +248,12 @@ impl Module {
         }
     }
 
+    /// Per function: what a call of it does.
     pub(super) fn effects(&self) -> Vec<Effect> {
         self.funcs.iter().map(effect).collect()
     }
 
+    /// The blocks reached from the entry.
     pub(super) fn reached(&self) -> Vec<bool> {
         let mut seen = vec![false; self.blocks.len()];
         if self.blocks.is_empty() {
@@ -180,6 +275,7 @@ impl Module {
     fn dominator_tree(&self) -> Tree {
         let n = self.blocks.len();
         let succs = |b: usize| successors(self.blocks[b].term);
+        // Reverse postorder, as `write` lays the blocks out.
         let mut seen = vec![false; n];
         let mut post = Vec::new();
         let mut stack = vec![(0usize, 0usize)];
@@ -211,6 +307,7 @@ impl Module {
                 preds[s].push(b);
             }
         }
+        // Immediate dominators (Cooper, Harvey and Kennedy's iteration).
         let mut idom = vec![usize::MAX; n];
         idom[0] = 0;
         let mut changed = true;
@@ -254,6 +351,8 @@ impl Module {
         }
     }
 
+    /// Notes that `v` (an i1) is `holds` in the block being walked, and what
+    /// follows from it for the values `v` was made of.
     fn learn(&self, v: V, holds: bool, facts: &mut Facts, learned: &mut Learned, depth: u32) {
         let V::Inst(i) = v else { return };
         if facts.bits.contains_key(&v) {
@@ -265,6 +364,8 @@ impl Module {
             return;
         }
         match self.insts[i as usize].op {
+            // Both terms of an `and` that holds hold; neither of an `or`
+            // that does not.
             Op::Bin(Bin::And, a, b) if holds => {
                 self.learn(a, true, facts, learned, depth - 1);
                 self.learn(b, true, facts, learned, depth - 1);
@@ -281,6 +382,7 @@ impl Module {
                 };
                 self.learn(x, holds != (k != 0), facts, learned, depth - 1);
             }
+            // The opposite comparison of the same operands.
             Op::Cmp(p, a, b) => {
                 let key = (opposite(p), a, b);
                 if let std::collections::hash_map::Entry::Vacant(e) = facts.compares.entry(key) {
@@ -299,7 +401,8 @@ impl Module {
         }
     }
 
-    fn int_k(&self, v: V) -> Option<(u32, u64)> {
+    /// An integer constant's width and value (the bits of that width).
+    pub(crate) fn int_k(&self, v: V) -> Option<(u32, u64)> {
         let V::Const(i) = v else { return None };
         let (ty, Const::Int(x)) = &self.consts[i as usize] else {
             return None;
@@ -308,18 +411,103 @@ impl Module {
         Some((bits, *x as u64 & mask(bits)))
     }
 
+    /// The bits of a 32-bit float that is a constant, given as one or as a
+    /// cast of an integer constant.
+    pub(crate) fn float_k(&self, v: V) -> Option<f32> {
+        let (v, cast) = match v {
+            V::Inst(i) => match self.insts[i as usize].op {
+                Op::Cast(Cast::Bitcast, x) => (x, true),
+                _ => return None,
+            },
+            _ => (v, false),
+        };
+        let V::Const(i) = v else { return None };
+        match &self.consts[i as usize].1 {
+            Const::Float(bits) if !cast => Some(f32::from_bits(*bits)),
+            Const::Int(_) if cast => {
+                let (bits, x) = self.int_k(v)?;
+                (bits == 32).then_some(f32::from_bits(x as u32))
+            }
+            _ => None,
+        }
+    }
+
+    /// For a float that is a number and not an infinity whatever the program
+    /// reads: a power of two its magnitude does not pass.
+    pub(crate) fn bounded(&self, v: V, depth: u32) -> Option<f32> {
+        if let Some(k) = self.float_k(v) {
+            return k.is_finite().then(|| k.abs().max(1e-30).log2().ceil());
+        }
+        let V::Inst(i) = v else { return None };
+        let depth = depth.checked_sub(1)?;
+        let of = |v: V| self.bounded(v, depth);
+        // (A power that overflows, or might with rounding, is no bound.)
+        let held = |b: f32| (b < 126.0).then_some(b);
+        match &self.insts[i as usize].op {
+            Op::Cast(Cast::UiToFp | Cast::SiToFp, _) => Some(32.0),
+            Op::Cast(Cast::Bitcast, x) => match *x {
+                V::Inst(j) => match self.insts[j as usize].op {
+                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == self.type_of(v) => of(y),
+                    _ => None,
+                },
+                _ => None,
+            },
+            Op::Bin(Bin::Mul, a, b) => held(of(*a)? + of(*b)?),
+            Op::Bin(Bin::Add | Bin::Sub, a, b) => held(of(*a)?.max(of(*b)?) + 1.0),
+            Op::Select(_, a, b) => Some(of(*a)?.max(of(*b)?)),
+            Op::Call(_, args) => {
+                let (_, code) = self.int_k(*args.first()?)?;
+                match (code, &args[1..]) {
+                    // Saturated, a fraction, a cosine or sine (of a number).
+                    (7, [_]) => Some(0.0),
+                    (6, [x]) => of(*x),
+                    (22 | 12 | 13, [x]) => of(*x).map(|_| 0.0),
+                    (26..=29, [x]) => held(of(*x)? + 1.0),
+                    // Of two numbers; or one of them the other way round: the
+                    // minimum (36) of a constant and a maximum of another.
+                    (35 | 36, [a, b]) => match (of(*a), of(*b)) {
+                        (Some(x), Some(y)) => Some(x.max(y)),
+                        _ => {
+                            let other = if code == 35 { 36 } else { 35 };
+                            let (inner, k) = if self.float_k(*b).is_some() { (*a, *b) } else { (*b, *a) };
+                            let k = self.float_k(k).and_then(|_| of(k))?;
+                            let V::Inst(j) = inner else { return None };
+                            let Op::Call(_, inner) = &self.insts[j as usize].op else { return None };
+                            let (_, code) = self.int_k(*inner.first()?)?;
+                            let low = inner[1..].iter().find(|x| self.float_k(**x).is_some())?;
+                            (code == other).then_some(())?;
+                            Some(k.max(of(*low)?))
+                        }
+                    },
+                    (46, [a, b, c]) => held((of(*a)? + of(*b)?).max(of(*c)?) + 1.0),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The constant `x` of the integer type `ty`, kept sign-extended as
+    /// [`Module::i32`] and [`Module::bool`] keep theirs.
     fn k(&mut self, ty: Ty, bits: u32, x: u64) -> V {
         self.int_const(ty, signed(bits, x & mask(bits)))
     }
 
+    /// The value instruction `i` is known to have without it, if any: a
+    /// constant or an earlier value. May instead give `i` simpler operands
+    /// (`changed` says so).
     fn simplify(&mut self, i: u32, changed: &mut bool) -> Option<V> {
         let ty = self.insts[i as usize].ty;
         match self.insts[i as usize].op {
             Op::Bin(op, a, b) => {
+                // Floats: `x + 0.0`, `x * 1.0` and the like are not `x` for
+                // every `x` (a negative zero, a signalling NaN).
                 let bits = self.int_bits(ty)?;
                 let (ka, kb) = (self.int_k(a).map(|k| k.1), self.int_k(b).map(|k| k.1));
                 let all = mask(bits);
                 if let (Some(x), Some(y)) = (ka, kb) {
+                    // A shift by the width or more and a division by zero
+                    // have no defined result: left as they are.
                     let amount = u32::try_from(y).ok().filter(|&y| y < bits);
                     let r = match op {
                         Bin::Add => x.wrapping_add(y),
@@ -357,6 +545,8 @@ impl Module {
                 }
             }
             Op::Cmp(p, a, b) if p <= pred::TRUE => {
+                // Two float constants compare one way (`v_mul_legacy` asks
+                // whether its constant factor is zero).
                 let (V::Const(x), V::Const(y)) = (a, b) else {
                     return None;
                 };
@@ -367,6 +557,8 @@ impl Module {
                 };
                 let (x, y) = (f32::from_bits(*x), f32::from_bits(*y));
                 let unordered = x.is_nan() || y.is_nan();
+                // Bits 0-2 of a predicate: equal, greater, less; bit 3:
+                // or unordered.
                 let holds = if unordered {
                     p & 8 != 0
                 } else {
@@ -399,6 +591,7 @@ impl Module {
                 if a == b {
                     return Some(self.bool(holds(0, 0, 32)));
                 }
+                // A bit widened and tested again is the bit.
                 if p == pred::NE
                     && self.int_k(b).is_some_and(|k| k.1 == 0)
                     && let V::Inst(z) = a
@@ -413,6 +606,8 @@ impl Module {
                 if let Some((_, c)) = self.int_k(c) {
                     return Some(if c != 0 { t } else { f });
                 }
+                // Under the same condition an inner select is one of its
+                // operands (two guarded writes of one register in a row).
                 let mut inner = false;
                 while let V::Inst(x) = t
                     && let Op::Select(c2, t2, _) = self.insts[x as usize].op
@@ -455,6 +650,7 @@ impl Module {
                         if from == ty {
                             return Some(x);
                         }
+                        // There and back: the bits are the same.
                         if let Some((Cast::Bitcast, z)) = through
                             && self.type_of(z) == ty
                         {
@@ -482,6 +678,7 @@ impl Module {
                             };
                             return Some(self.k(ty, to, k));
                         }
+                        // Widened and narrowed again.
                         if op == Cast::Trunc
                             && let Some((Cast::ZExt | Cast::SExt, z)) = through
                             && self.type_of(z) == ty
@@ -497,6 +694,7 @@ impl Module {
         }
     }
 
+    /// What kind of instruction `i` is for merging.
     fn class(&self, effects: &[Effect], i: u32) -> Effect {
         match &self.insts[i as usize].op {
             Op::Bin(..)
@@ -506,6 +704,7 @@ impl Module {
             | Op::Extract(..)
             | Op::Gep(..) => Effect::Pure,
             Op::Load(p) => {
+                // A constant table reads the same whatever is stored.
                 let base = match *p {
                     V::Inst(g) => match &self.insts[g as usize].op {
                         Op::Gep(_, base, _) => *base,
@@ -528,6 +727,9 @@ impl Module {
         let inst = &self.insts[i as usize];
         Some(match &inst.op {
             Op::Bin(op, a, b) => {
+                // Integer sums, products and bit operations whichever way
+                // round; float ones as written (which NaN an operation of
+                // two NaNs gives is the hardware's choice by operand).
                 let commutes = matches!(op, Bin::Add | Bin::Mul | Bin::And | Bin::Or | Bin::Xor)
                     && self.int_bits(inst.ty).is_some();
                 let (a, b) = if commutes && b < a {
@@ -548,6 +750,8 @@ impl Module {
         })
     }
 
+    /// [`FOLD`], [`REUSE`], [`FACTS`] and [`LOADS`]: one walk over the
+    /// dominator tree. Returns whether anything changed.
     fn merge(&mut self, passes: u32) -> bool {
         if self.blocks.is_empty() {
             return false;
@@ -556,6 +760,8 @@ impl Module {
         let tree = self.dominator_tree();
         let mut repl: Vec<Option<V>> = vec![None; self.insts.len()];
         let mut changed = false;
+        // Joins of one value: until none is left (one gone can leave
+        // another with one value).
         if passes & FOLD != 0 {
             let mut again = true;
             while again {
@@ -590,7 +796,10 @@ impl Module {
                 }
             }
         }
+        // The values every path to the block being walked has computed
+        // (those of the blocks above it in the tree, and its own so far).
         let mut known: HashMap<Key, V> = HashMap::new();
+        // The reads of the block being walked since its last store.
         let mut read: HashMap<Key, V> = HashMap::new();
         let mut facts = Facts::default();
         let (yes, no) = (self.bool(true), self.bool(false));
@@ -616,6 +825,8 @@ impl Module {
                 }
             };
             let mut added = Vec::new();
+            // Reached from one block alone, by one side of its branch: the
+            // condition is that side's, here and in every block below.
             let mut learned = Learned::default();
             if passes & FACTS != 0
                 && let [p] = tree.preds[b][..]
@@ -630,6 +841,7 @@ impl Module {
                 None => v,
             };
             read.clear();
+            // Two joins of the same values from the same blocks are one.
             if passes & REUSE != 0 && self.blocks[b].phis.len() > 1 {
                 let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::new();
                 for &p in &self.blocks[b].phis {
@@ -645,6 +857,8 @@ impl Module {
                         .map(|&(v, from)| (from, resolve(&repl, v)))
                         .collect();
                     key.sort();
+                    // The type too: an undefined value of one type is not
+                    // that of another.
                     key.push((ty.0 as usize, V::Global(u32::MAX)));
                     match joins.get(&key) {
                         Some(&first) => {
@@ -693,6 +907,8 @@ impl Module {
                     known.insert(key.clone(), V::Inst(i));
                     added.push(key);
                 }
+                // Reads of memory, and wave operations (the same lanes run
+                // the whole block): the block's own earlier one.
                 if passes & LOADS != 0
                     && matches!(class, Effect::Reads | Effect::Lanes)
                     && let Some(key) = self.key(i)
@@ -722,6 +938,8 @@ impl Module {
         if !changed {
             return false;
         }
+        // Everything that read a replaced value reads its replacement
+        // (joins read values from blocks walked after them).
         for blk in &mut self.blocks {
             blk.phis.retain(|&p| repl[p as usize].is_none());
             if let Some(Term::CondBr(c, t, f)) = blk.term {
@@ -737,12 +955,17 @@ impl Module {
         true
     }
 
+    /// [`FOLD`]: a branch on a constant goes one way. The side not taken
+    /// loses the branching block's values at its joins, and so do the joins
+    /// of blocks that nothing reaches any more. Returns whether a branch
+    /// changed.
     fn prune(&mut self) -> bool {
         let mut changed = false;
         for b in 0..self.blocks.len() {
             let Some(Term::CondBr(c, t, f)) = self.blocks[b].term else {
                 continue;
             };
+            // Both sides one block: two edges into it, left as they are.
             if t == f {
                 continue;
             }
@@ -774,6 +997,7 @@ impl Module {
         true
     }
 
+    /// Whether instruction `i` must stay whatever reads it.
     fn has_effect(&self, effects: &[Effect], i: u32) -> bool {
         match &self.insts[i as usize].op {
             Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => true,
@@ -782,6 +1006,9 @@ impl Module {
         }
     }
 
+    /// [`DEAD`]: keeps the instructions with an effect, the branch
+    /// conditions, and what they read, transitively; the rest leave their
+    /// blocks. Blocks no branch reaches are emptied (they are not written).
     fn drop_dead(&mut self) {
         let effects = self.effects();
         let reached = self.reached();
@@ -826,10 +1053,13 @@ impl Module {
         self.drop_unused_tables();
     }
 
+    /// See [`Usage`]: over the blocks reached from the entry.
     pub(crate) fn usage(&self) -> Usage {
         let mut u = Usage::default();
         let reached = self.reached();
         let wide = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Int(64);
+        // The first field of a handle's annotation: its kind, with the UAV
+        // bit; the second: the component type and count.
         let annotation = |h: V| -> Option<(i64, i64)> {
             let V::Inst(a) = h else { return None };
             let Op::Call(f, args) = &self.insts[a as usize].op else {
@@ -869,6 +1099,8 @@ impl Module {
                         Some((_, 0)) => u.heap_views = true,
                         _ => u.heap_samplers = true,
                     }
+                } else if name == "annotateHandle" {
+                    u.rovs |= annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
                 } else if name.starts_with("atomic") && name.ends_with(".i64") {
                     u.atomic64 = true;
                 } else if name.starts_with("textureLoad") || name.starts_with("bufferLoad") {
@@ -881,6 +1113,9 @@ impl Module {
         u
     }
 
+    /// A constant table no remaining load reads leaves the module (the
+    /// validator refuses an internal declaration nothing uses). Shared
+    /// memory stays declared whether it is read or not.
     fn drop_unused_tables(&mut self) {
         let mut used: Vec<bool> = self.globals.iter().map(|g| g.init.is_none()).collect();
         if used.iter().all(|&u| u) {
@@ -926,6 +1161,9 @@ impl Module {
         }
     }
 
+    /// Declarations no remaining call names leave the module (the validator
+    /// refuses an external function nothing uses); the others keep their
+    /// order, so `main` stays function 0.
     fn drop_unused_functions(&mut self) {
         let mut used: Vec<bool> = self.funcs.iter().map(|f| f.body).collect();
         for blk in &self.blocks {
@@ -958,6 +1196,8 @@ impl Module {
             .enumerate()
             .map(|(i, f)| (f.name.clone(), i as u32))
             .collect();
+        // Instructions that left their block keep a stale number: nothing
+        // reads them again.
         for inst in &mut self.insts {
             if let Op::Call(f, _) = &mut inst.op
                 && used[*f as usize]
@@ -977,6 +1217,7 @@ impl Module {
 mod tests {
     use super::*;
 
+    /// `main` with one block and a function of each kind of effect.
     struct Kit {
         m: Module,
         b: usize,
@@ -1025,6 +1266,7 @@ mod tests {
         let dead = m.call(b, reads, vec![two, one]);
         let chain = m.bin(b, Bin::Add, dead, one);
         let _unread = m.call(b, pure, vec![chain, two]);
+        // A store's result is unread and stays, with what it reads.
         let kept = m.bin(b, Bin::Add, used, two);
         m.call(b, writes, vec![kept, one]);
         m.terminate(b, Term::Ret);
@@ -1046,6 +1288,8 @@ mod tests {
         let (zero, one) = (m.i32(0), m.i32(1));
         let (head, exit) = (m.new_block(), m.new_block());
         m.terminate(b, Term::Br(head));
+        // A counter that decides the branch, and a register that only
+        // feeds itself round the loop.
         let count = m.phi(head, i32t);
         let idle = m.phi(head, i32t);
         let next = m.bin(head, Bin::Add, count, one);
@@ -1082,6 +1326,8 @@ mod tests {
         k.m.terminate(k.b, Term::Ret);
         k.m.optimise(DEAD);
         assert_eq!(body(&k.m, k.b), 1, "the barrier");
+        // The declarations nothing calls any more are gone, and the call
+        // that stayed names its function by the new number.
         let names: Vec<&str> = k.m.funcs.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["main", "dx.op.barrier"]);
         let Op::Call(f, _) = k.m.insts[k.m.blocks[k.b].body[0] as usize].op else {
@@ -1091,6 +1337,7 @@ mod tests {
         k.m.write();
     }
 
+    /// The operands of each store left in block `b`.
     fn stores(m: &Module, b: usize) -> Vec<Vec<V>> {
         m.blocks[b]
             .body
@@ -1116,13 +1363,16 @@ mod tests {
         let (i32t, f32t) = (m.int(32), m.float());
         let (zero, one, all) = (m.i32(0), m.i32(1), m.i32(u32::MAX));
         let x = m.call(b, reads, vec![one, one]);
+        // x + 0, -1 & x, x >> 0, x * 1, x | x: all x.
         let a = m.bin(b, Bin::Add, x, zero);
         let a = m.bin(b, Bin::And, all, a);
         let a = m.bin(b, Bin::LShr, a, zero);
         let a = m.bin(b, Bin::Mul, a, one);
         let a = m.bin(b, Bin::Or, a, a);
+        // There and back.
         let f = m.cast(b, Cast::Bitcast, a, f32t);
         let a = m.cast(b, Cast::Bitcast, f, i32t);
+        // Constants: (262168 >> 16) & 127 = 4, 7 & 31 = 7, -8 >>s 1 = -4.
         let k = m.i32(262168);
         let sixteen = m.i32(16);
         let k = m.bin(b, Bin::LShr, k, sixteen);
@@ -1130,8 +1380,10 @@ mod tests {
         let k = m.bin(b, Bin::And, k, k127);
         let minus8 = m.i32(-8i32 as u32);
         let s = m.bin(b, Bin::AShr, minus8, one);
+        // A shift by the width is left alone.
         let k32 = m.i32(32);
         let wide = m.bin(b, Bin::Shl, one, k32);
+        // A select between a value and itself, and on a constant.
         let c = m.cmp(b, pred::IULT, zero, one);
         let sel = m.select(b, c, a, wide);
         let same = m.select(b, c, sel, sel);
@@ -1160,8 +1412,10 @@ mod tests {
         let y = m.call(b, input, vec![one, one]);
         let a = m.bin(b, Bin::Add, x, zero);
         let p = m.bin(b, Bin::Mul, a, one);
+        // The same sum the other way round is another instruction.
         let xy = m.bin(b, Bin::Add, x, y);
         let yx = m.bin(b, Bin::Add, y, x);
+        // Constants compare here: 1 < 2, and nothing equals a NaN.
         let nan = m.f32(f32::NAN.to_bits());
         let lt = m.cmp(b, pred::OLT, one, two);
         let eq = m.cmp(b, pred::OEQ, nan, nan);
@@ -1172,11 +1426,14 @@ mod tests {
         m.call(b, writes, vec![sel, p]);
         m.terminate(b, Term::Ret);
         m.optimise(ALL);
+        // Two inputs, x + 0.0, * 1.0, x + y and the store: y + x and the
+        // selects are gone.
         assert_eq!(body(&m, b), 6);
         assert_eq!(stores(&m, b), [[xy, p]]);
         m.write();
     }
 
+    /// entry: `c = x < y`, branch to `then` or `other`, which join.
     struct Diamond {
         k: Kit,
         x: V,
@@ -1227,6 +1484,8 @@ mod tests {
             join,
             ..
         } = diamond();
+        // The entry's value again in a branch; a branch's value again in
+        // the other branch and in the join (neither is on every path).
         let top = m.call(b, pure, vec![x, y]);
         m.call(b, writes, vec![top, top]);
         let again = m.call(then, pure, vec![x, y]);
@@ -1266,6 +1525,8 @@ mod tests {
         let d = m.call(b, reads, vec![three, three]);
         let d = m.cmp(b, pred::NE, d, three);
         let both = m.bin(b, Bin::And, c, d);
+        // Behind the branch: the condition again (a guard), its opposite
+        // comparison, and a guarded write.
         let guard = m.bin(then, Bin::And, c, d);
         let old = m.select(then, guard, x, y);
         let not = m.cmp(then, pred::IUGE, x, y);
@@ -1273,9 +1534,11 @@ mod tests {
         m.call(then, writes, vec![new, new]);
         let kept = m.select(other, c, x, y);
         m.call(other, writes, vec![kept, kept]);
+        // After the join nothing is known.
         let open = m.select(join, c, x, y);
         m.call(join, writes, vec![open, open]);
         m.optimise(FOLD | FACTS);
+        // then: select(d, x, y) and the store; other: y is stored.
         assert_eq!(body(&m, then), 2);
         let V::Inst(sel) = stores(&m, then)[0][0] else {
             panic!()
@@ -1286,6 +1549,7 @@ mod tests {
         let _ = both;
         m.write();
 
+        // Both terms of an `and` that held hold behind it.
         let Diamond {
             k:
                 Kit {
@@ -1310,6 +1574,7 @@ mod tests {
         let z = m.select(inner, d, a, y);
         m.call(inner, writes, vec![z, z]);
         m.terminate(inner, Term::Br(out));
+        // Where the `and` did not hold either term may.
         let w = m.select(out, d, x, y);
         m.call(out, writes, vec![w, w]);
         m.terminate(out, Term::Ret);
@@ -1333,6 +1598,8 @@ mod tests {
             join,
         } = diamond();
         let i32t = m.int(32);
+        // Behind the branch the same test again: its other side is never
+        // run, and the join behind it has one value.
         let (deep, never, meet) = (m.new_block(), m.new_block(), m.new_block());
         m.terminate(then, Term::CondBr(c, deep, never));
         m.terminate(deep, Term::Br(meet));
@@ -1375,6 +1642,8 @@ mod tests {
             ..
         } = diamond();
         let i32t = m.int(32);
+        // The entry reads (1, 1) for x: again in the entry it is x; in the
+        // next block it is read again.
         let one = m.i32(1);
         let again = m.call(b, reads, vec![one, one]);
         m.call(b, writes, vec![again, y]);
@@ -1384,6 +1653,7 @@ mod tests {
         m.call(b, writes, vec![sum, sum]);
         let below = m.call(then, reads, vec![one, one]);
         m.call(then, writes, vec![below, below]);
+        // A constant buffer cannot change: one load for the function.
         let cfty = m.func_ty(i32t, vec![i32t, i32t]);
         let cb = m.function(
             "dx.op.cbufferLoadLegacy.i32",
@@ -1446,6 +1716,10 @@ mod tests {
         m.write();
     }
 
+    // ---- the passes against an interpreter, on random programs ----
+
+    /// Runs `m` on `inputs`: the stores it makes, in order (and how it
+    /// ended). Reads a value before its definition ran: a panic.
     fn run(m: &Module, inputs: &[u32]) -> Vec<(String, Vec<u64>)> {
         let mut vals: Vec<Option<u64>> = vec![None; m.insts.len()];
         let mut memory = [0u64; 16];
@@ -1466,6 +1740,7 @@ mod tests {
         let (mut b, mut from) = (0usize, usize::MAX);
         for _ in 0..4000 {
             let blk = &m.blocks[b];
+            // Joins take their values together, before any is assigned.
             let joined: Vec<(u32, u64)> = blk
                 .phis
                 .iter()
@@ -1611,6 +1886,9 @@ mod tests {
         trace
     }
 
+    /// A random structured program over a few registers, as the lowering
+    /// makes them: every register joined at every join, conditions tested
+    /// again behind their branch, values computed again.
     struct Gen {
         k: Kit,
         rng: u64,
@@ -1620,6 +1898,8 @@ mod tests {
         input: V,
         table: V,
         wave: V,
+        /// The operands of the block's last read (to read the place again,
+        /// and to store to it).
         last: Option<(V, V)>,
     }
 
@@ -1636,6 +1916,7 @@ mod tests {
             self.regs[n]
         }
 
+        /// A register or a small constant.
         fn value(&mut self) -> V {
             match self.next(4) {
                 0 => {
@@ -1698,6 +1979,7 @@ mod tests {
                     self.k.m.bin(c, op, x, by)
                 }
                 5 | 6 => {
+                    // A guarded write: the old value where the guard fails.
                     let g = self.cond();
                     let x = self.value();
                     self.k.m.select(self.cur, g, x, self.regs[d])
@@ -1717,6 +1999,7 @@ mod tests {
                     self.k.m.call(c, self.k.reads, vec![x, y])
                 }
                 10 => {
+                    // A store, half the time to the place read last.
                     let (mut x, y) = (self.value(), self.value());
                     let there = self.next(2) == 0;
                     if let Some((a, b)) = self.last
@@ -1728,6 +2011,7 @@ mod tests {
                     return;
                 }
                 11 => {
+                    // Float arithmetic, read back as bits.
                     let (x, y) = (self.value(), self.value());
                     let (x, y) = (
                         self.k.m.cast(c, Cast::Bitcast, x, f32t),
@@ -1765,6 +2049,7 @@ mod tests {
             }
         }
 
+        /// if / else, every register joined.
         fn branch(&mut self, depth: u32) {
             let c = self.cond();
             let i32t = self.k.m.int(32);
@@ -1800,6 +2085,8 @@ mod tests {
             self.last = None;
         }
 
+        /// A loop that runs at most a few times, every register joined at
+        /// its head.
         fn repeat(&mut self, depth: u32) {
             let i32t = self.k.m.int(32);
             let (head, exit) = (self.k.m.new_block(), self.k.m.new_block());
@@ -1876,6 +2163,7 @@ mod tests {
         }
         g.code(3);
         g.code(2);
+        // Every register is read at the end.
         for r in 0..g.regs.len() {
             let at = g.k.m.i32(r as u32);
             g.k.m.call(g.cur, g.k.writes, vec![at, g.regs[r]]);
@@ -1934,6 +2222,7 @@ mod tests {
                 m.write();
             }
         }
+        // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
     }
 }

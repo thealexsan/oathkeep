@@ -1,3 +1,6 @@
+//! XSystem: the console's identity and sandbox, and how analytics describe
+//! the device. Fixed values: one offline retail console, the model the user
+//! chose ([`oathkeep_gpu::console`]).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use super::xgameruntime::{
@@ -11,6 +14,8 @@ pub const PROVIDER: Guid = Guid::new(
     [0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f],
 );
 
+/// The interface as Minecraft (2022) asks for it; an older table
+/// ended before the device id.
 pub const IID: Guid = Guid::new(
     0x6fd7_1f09,
     0x7513,
@@ -18,6 +23,7 @@ pub const IID: Guid = Guid::new(
     [0x89, 0xbc, 0xbf, 0xaf, 0x5d, 0xf6, 0xf8, 0x52],
 );
 
+/// Analytics information; its interface id is the provider's.
 pub const ANALYTICS: Guid = Guid::new(
     0xb884_675d,
     0xb738,
@@ -25,13 +31,18 @@ pub const ANALYTICS: Guid = Guid::new(
     [0x81, 0x5d, 0x9a, 0x9a, 0x1e, 0x0c, 0x6c, 0x9b],
 );
 
+/// 38 characters (39 bytes with the NUL).
 const CONSOLE_ID: &str = "00000000000000000000000000000000000001";
+/// The retail sandbox.
 const SANDBOX: &str = "RETAIL";
+/// Base64 of 32 bytes: 44 characters (45 bytes with the NUL).
 const DEVICE_ID: &str = "VkljdG9yeSBvZmZsaW5lIGRldmljZSBpZGVudGl0eSE=";
 
 pub static OBJECT: Object = Object::new("system", &VTABLE);
 pub static ANALYTICS_OBJECT: Object = Object::new("analytics", &ANALYTICS_VTABLE);
 
+/// The interface as the title (2026) asks for it; it calls the
+/// same three slots (0x18, 0x20, 0x28) with the same arguments.
 pub const IID_2026: Guid = Guid::new(
     0x1861_cf2e,
     0xe18b,
@@ -53,6 +64,7 @@ extern "system" fn console_id(_: This, size: usize, buffer: *mut u8, used: *mut 
 extern "system" fn sandbox_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     put_string(SANDBOX, size, buffer, used)
 }
+/// The device id this title sees (titles see different ones).
 extern "system" fn device_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     put_string(DEVICE_ID, size, buffer, used)
 }
@@ -70,6 +82,7 @@ pub struct Version {
 pub struct AnalyticsInfo {
     pub os: Version,
     pub hosting_os: Version,
+    /// NUL-terminated.
     pub family: [u8; 64],
     pub form: [u8; 64],
 }
@@ -87,6 +100,8 @@ fn text(s: &str) -> [u8; 64] {
     out
 }
 
+/// A struct this large comes back through the caller's buffer, whose
+/// address is also the return value.
 extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut AnalyticsInfo {
     let info = AnalyticsInfo {
         os: OS,
@@ -103,18 +118,21 @@ static VTABLE: Methods<6> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    console_id as *const (),
-    sandbox_id as *const (),
-    device_id as *const (),
+    console_id as *const (), // 0x18, by the older table; titles seen do not call it
+    sandbox_id as *const (), // 0x20
+    device_id as *const (),  // 0x28
 ]);
 
 static ANALYTICS_VTABLE: Methods<4> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    analytics_info as *const (),
+    analytics_info as *const (), // 0x18
 ]);
 
+/// The device type is not a runtime call: code linked into the title reads
+/// `ConsoleMode` from this key (`RegOpenKeyW`, `RegQueryValueExW`) and
+/// takes a missing value for a PC.
 #[cfg(windows)]
 mod device_type {
     #![allow(non_snake_case)]
@@ -136,11 +154,13 @@ mod device_type {
     const MORE_DATA: u32 = 234;
     const DWORD: u32 = 4;
 
+    /// Stands for the key; never a host handle value.
     static OEM: u8 = 0;
     fn oem() -> Key {
         (&raw const OEM).cast_mut().cast()
     }
 
+    /// What the title's code maps to each model's device type.
     pub(super) fn console_mode(console: Console) -> u32 {
         match console {
             Console::SeriesX => 0x64,
@@ -160,6 +180,8 @@ mod device_type {
         text.eq_ignore_ascii_case(expected)
     }
 
+    /// Opens our key for its path; the key has no subkeys. `None`: not
+    /// ours, ask the host.
     fn open(root: Key, sub: *const u16, out: *mut Key) -> Option<u32> {
         if root == oem() {
             return Some(FILE_NOT_FOUND);
@@ -172,6 +194,8 @@ mod device_type {
         None
     }
 
+    // Our titles import only these registry functions (and `RegOpenKeyExW`
+    // below), so no other call can reach the host with our key.
     pub extern "system" fn RegOpenKeyW(root: Key, sub: *const u16, out: *mut Key) -> u32 {
         open(root, sub, out).unwrap_or_else(|| {
             host!("advapi32.dll", "RegOpenKeyW": extern "system" fn(Key, *const u16, *mut Key) -> u32)(

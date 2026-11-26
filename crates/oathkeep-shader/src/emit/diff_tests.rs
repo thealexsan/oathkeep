@@ -1,3 +1,11 @@
+//! Differential tests: HLSL compiled by the console's shader compiler and
+//! translated, against the same HLSL compiled for PC, both drawn (or
+//! dispatched) on the host GPU with the same inputs.
+//!
+//! Needs `OATHKEEP_CONSOLE_DXC` (the console SDK's `dxc.exe`) and a PC
+//! `dxc.exe` (`OATHKEEP_PC_DXC`, else the newest Windows SDK's); skipped
+//! without them. Set `OATHKEEP_WARP=1` to draw on WARP.
+
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -30,6 +38,7 @@ V vs(float4 p : POSITION, float2 uv : TEXCOORD0) {
 }
 "#;
 
+/// Pixel shaders, each `ps`.
 const CASES: &[(&str, &str)] = &[
     (
         "constant",
@@ -49,6 +58,9 @@ const CASES: &[(&str, &str)] = &[
             return r;
         }"#,
     ),
+    // A wave-wide range scalarises a per-pixel loop (as the title's light
+    // lists do): the console's 64-lane sections become host wave operations;
+    // the result is the same for any wave the pixel lands in.
     (
         "wave range",
         r#"[RootSignature(RS)] float4 ps(V i) : SV_Target {
@@ -128,6 +140,9 @@ const CASES: &[(&str, &str)] = &[
                 tex.CalculateLevelOfDetailUnclamped(smp, i.uv * 7), 0, 1);
         }"#,
     ),
+    // 16-bit outputs and inputs (one value per dword with the 2020
+    // compiler; the title's two per dword cannot be compiled
+    // here) and the front face.
     (
         "16-bit varyings and front face",
         r#"struct V16 { float4 pos : SV_Position; half2 uv : TEXCOORD0; float4 col : COLOR0; half4 h : TEXCOORD1; };
@@ -185,6 +200,8 @@ TextureCube cubet : register(t8, space2);
             uint3 d : SV_DispatchThreadID, uint i : SV_GroupIndex)
 "#;
 
+/// Compute shaders, each `cs`, dispatched as 2×2 groups of 8×8 threads
+/// over a 16×16 texture and a 256-dword buffer.
 const CS_CASES: &[(&str, &str)] = &[
     (
         "ids and stores",
@@ -228,6 +245,8 @@ const CS_CASES: &[(&str, &str)] = &[
             outt[d.xy] = c + float4(s.c, a.yz);
         }"#,
     ),
+    // (The 2020 compiler branches around every narrowed region, so these
+    // become branches, not guards.)
     (
         "conditional memory access",
         r#"CS {
@@ -238,6 +257,8 @@ const CS_CASES: &[(&str, &str)] = &[
             if (i & 8) outt[d.xy] = float4(v, 0, 0, 1);
         }"#,
     ),
+    // Each side of a per-group branch leaves a compare in VCC; the select
+    // after the join reads the joined mask (as `postfx_splines` does).
     (
         "select on joined compares",
         r#"CS {
@@ -256,6 +277,8 @@ const CS_CASES: &[(&str, &str)] = &[
             outt[d.xy] = float4(o, r, v, 1);
         }"#,
     ),
+    // One host wave of 32 lanes holds the group, as the console's wave of 64
+    // does, so lane numbers agree with the PC compile.
     (
         "lane reads",
         r#"[RootSignature(RS)] [numthreads(8, 4, 1)]
@@ -268,6 +291,8 @@ const CS_CASES: &[(&str, &str)] = &[
             outt[d.xy] = float4(v, w, QuadReadAcrossY(v), lane);
         }"#,
     ),
+    // Bytes and halves: SDWA operand and result selection, byte permutes,
+    // f16 conversions.
     (
         "sub-dword operations",
         r#"CS {
@@ -282,6 +307,7 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store4(16 * n, uint4(asuint(a), asuint(b) ^ p, q, asuint(float(s)) + u));
         }"#,
     ),
+    // 64-bit additions (VALU carries as lane masks) and explicit gradients.
     (
         "carries and gradients",
         r#"CS {
@@ -293,6 +319,7 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store4(16 * n, uint4(uint(s), uint(s >> 32) ^ uint(u), uint(u >> 32), asuint(gr.x + gr.y * 3)));
         }"#,
     ),
+    // Comparison sampling at level 0 with an immediate comparison sampler.
     (
         "comparison sampling",
         r#"CS {
@@ -300,6 +327,7 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store(4 * (d.y * 16 + d.x), asuint(r));
         }"#,
     ),
+    // 16-bit texture results, two channels per register (`d16`).
     (
         "16-bit texture reads",
         r#"Texture2D<half4> htex : register(t0);
@@ -310,6 +338,8 @@ const CS_CASES: &[(&str, &str)] = &[
                 asuint(float(a.y) * a.z), asuint(float(b.x)), asuint(float(b.y) - b.z)));
         }"#,
     ),
+    // Sizes: the console compiler computes them from descriptor bits
+    // (width, height, levels, record counts).
     (
         "sizes from descriptors",
         r#"CS {
@@ -324,6 +354,10 @@ const CS_CASES: &[(&str, &str)] = &[
                 uint4(w * 7 + h, l + asuint(r), n * 5 + ns * 3 + st, b + raw.Load(4 * (i & 31))));
         }"#,
     ),
+    // Typed loads (`tbuffer_load_format_*`, the title's vertex
+    // fetch) convert by the format the instruction names: the PC reads the
+    // same bytes through typed views in those formats. Channels past the
+    // format's read (0, 0, 0, 1); a byte format at unaligned offsets.
     (
         "typed loads",
         r#"CS {
@@ -353,6 +387,10 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store4(16 * n, v);
         }"#,
     ),
+    // Wave operations: the console expands them into whole-wave sections
+    // (DPP, `v_permlanex16`, lane reads) and lane masks read as numbers
+    // (`s_bcnt1`, `s_ff1`, `v_mbcnt`). 32 threads: one wave on the console
+    // (lanes 32-63 inactive) and on the host; the branch leaves lanes out.
     (
         "wave operations",
         r#"[RootSignature(RS)] [numthreads(8, 4, 1)]
@@ -373,6 +411,9 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store4(16 * n, o);
         }"#,
     ),
+    // Atomics the console aggregates per wave (one add of the lane count,
+    // each lane's offset from `v_mbcnt`), and texture atomics. Results
+    // that depend on the lanes' order are left out.
     (
         "aggregated and texture atomics",
         r#"CS {
@@ -388,6 +429,11 @@ const CS_CASES: &[(&str, &str)] = &[
             InterlockedXor(ut[p + uint2(0, 4)], u);
         }"#,
     ),
+    // A loop whose count comes from a view that reads zeros (as a null or
+    // not yet mirrored one does) runs four billion times on the console;
+    // the translation leaves it after `LOOP_LIMIT` iterations. Run on WARP
+    // only (`OATHKEEP_WARP=1`), ours only: without the limit it would hang
+    // the GPU.
     (
         "terminates on zero data",
         r#"CS {
@@ -396,6 +442,10 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store(4 * (d.y * 16 + d.x), s);
         }"#,
     ),
+    // Cube sampling: the console computes face coordinates (`v_cube*`)
+    // and samples the face; the host samples the direction rebuilt from
+    // them. Every face and texel: a major axis of ±2 and the others at
+    // texel centres, so both sides compute them exactly.
     (
         "cube sampling",
         r#"CS {
@@ -408,6 +458,8 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store4(16 * (d.y * 16 + d.x), asuint(p + q * 3));
         }"#,
     ),
+    // A local array indexed per lane (M0-relative VGPR moves), bit fields
+    // and first bits from the top.
     (
         "indexed registers and bit fields",
         r#"CS {
@@ -423,6 +475,7 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store4(16 * n, uint4(v, bf, fb, arr[n % 24]));
         }"#,
     ),
+    // Size queries at a level known per lane (`image_get_resinfo`).
     (
         "size queries",
         r#"CS {
@@ -433,6 +486,7 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store4(16 * (d.y * 16 + d.x), uint4(w * 7 + h, l + asuint(r), cw * 3 + ch, cl));
         }"#,
     ),
+    // Gathers with offsets computed per lane (programmable offsets).
     (
         "gather with offsets",
         r#"CS {
@@ -442,6 +496,9 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store4(16 * (d.y * 16 + d.x), asuint(r + q * 3));
         }"#,
     ),
+    // Constant arrays: the console compiler appends them to the code and
+    // reads them through `s_getpc_b64` (scalar loads for a uniform index,
+    // global loads per lane, 16-bit ones too).
     (
         "constant tables",
         r#"static const uint tbl[16] = { 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3 };
@@ -457,6 +514,8 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store4(16 * n, uint4(a, asuint(f), h, tbl[(n + u) & 15]));
         }"#,
     ),
+    // 16-bit arithmetic (scalar and packed), 16-bit compares, typed stores
+    // of halves (`buffer_store_format_d16`), 64-bit shifts and compares.
     (
         "16-bit and 64-bit arithmetic",
         r#"RWBuffer<half4> hb : register(u3);
@@ -483,6 +542,11 @@ struct V { float4 pos : SV_Position; float4 col : COLOR0; float2 uv : TEXCOORD0;
 #define MS_ATTR [RootSignature(RS)] [outputtopology("triangle")]
 "#;
 
+/// Mesh shaders, each `ms` (the console runs one thread per output lane, so
+/// groups of 32 run as 64 lanes there), with their group counts. Drawn
+/// with `mps` into 16×16 targets. The 2020 compiler's containers do not
+/// record the thread count, so cases reading the group id keep
+/// max(threads, vertices, primitives) at the lane count (see `emit`).
 const MS_CASES: &[(&str, u32, &str)] = &[
     (
         "one triangle",
@@ -498,6 +562,8 @@ const MS_CASES: &[(&str, u32, &str)] = &[
             if (i == 0) tris[0] = uint3(0, 1, 2);
         }"#,
     ),
+    // A quad per group in its quadrant; a run-time vertex count, and a
+    // primitive count per group whose third triangle is culled.
     (
         "groups, counts and culling",
         4,
@@ -521,6 +587,8 @@ const MS_CASES: &[(&str, u32, &str)] = &[
             }
         }"#,
     ),
+    // Two waves per group, as the title's mesh programs run: the
+    // second wave's lanes are threads 64-127.
     (
         "two waves",
         1,
@@ -537,6 +605,8 @@ const MS_CASES: &[(&str, u32, &str)] = &[
             tris[i] = i & 1 ? uint3(c + 1, c + 10, c + 9) : uint3(c, c + 1, c + 9);
         }"#,
     ),
+    // Quad reads (DPP quad permutations on the console; the title's
+    // tessellating mesh programs swizzle within quads too).
     (
         "quad reads",
         1,
@@ -557,6 +627,8 @@ const MS_CASES: &[(&str, u32, &str)] = &[
             tris[i] = i & 1 ? uint3(cc + 1, cc + 10, cc + 9) : uint3(cc, cc + 1, cc + 9);
         }"#,
     ),
+    // Vertices and indices written by other threads than their lanes: the
+    // console passes them through shared memory, with a loop and barriers.
     (
         "grid through shared memory",
         2,
@@ -604,6 +676,8 @@ fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec
         .arg(&output)
         .arg(&input)
         .args(src.contains("half").then_some("-enable-16bit-types"))
+        // `CONSOLE` marks the console compile (cases spell console-only
+        // intrinsics there).
         .args(
             std::env::var_os("OATHKEEP_CONSOLE_DXC")
                 .is_some_and(|c| Path::new(&c) == dxc)
@@ -619,14 +693,18 @@ fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec
     std::fs::read(output).unwrap()
 }
 
+/// Root arguments for a translated stage: user data from the root values.
 fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
     let mut data = vec![0; (s.user_data_dwords() as usize).max(1)];
     for u in &s.user_data {
         data[u.index as usize] = match (u.root, u.slot) {
             (RootType::Constants, 0) => k[u.dword as usize],
+            // The texture and sampler tables start at heap index 1, the UAV
+            // table (compute) at 5, in the console's units.
             (RootType::Table, 1) => 32,
             (RootType::Table, 2) => 16,
             (RootType::Table, 3) => 5 * 32,
+            // The typed views of `raw` (compute) from 9.
             (RootType::Table, 6) => 9 * 32,
             other => panic!("unexpected user data {other:?}"),
         };
@@ -640,11 +718,14 @@ fn translated_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
-    let dir = std::env::temp_dir().join(format!("oathkeep-diff-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("victory-diff-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
     let texels: Vec<[f32; 4]> = (0..16)
@@ -677,9 +758,11 @@ fn translated_shaders_draw_as_pc_ones() {
             D3D12_TEXTURE_ADDRESS_MODE_WRAP,
         ),
     ];
+    // A full-screen triangle: POSITION (4 floats), TEXCOORD0 (2 floats).
     let vertices = [
-        -1.0, -1.0, 0.5, 1.0, 0.0, 1.0, -1.0, 3.0, 0.5, 1.0, 0.0, -1.0, 3.0, -1.0, 0.5, 1.0, 2.0,
-        1.0,
+        -1.0, -1.0, 0.5, 1.0, 0.0, 1.0, //
+        -1.0, 3.0, 0.5, 1.0, 0.0, -1.0, //
+        3.0, -1.0, 0.5, 1.0, 2.0, 1.0,
     ];
     let textures: [(u32, u32, &[[f32; 4]]); 2] = [(1, 1, &dummy), (4, 4, &texels)];
     let draw = |roots| Draw {
@@ -697,6 +780,7 @@ fn translated_shaders_draw_as_pc_ones() {
         .iter()
         .filter(|c| only.as_ref().is_none_or(|o| o == c.0))
     {
+        // A case may bring its own vertex shader.
         let vs = if src.contains(" vs16(") { "vs16" } else { "vs" };
         let vs_c = translate(&compile(&console, &dir, src, vs, "vs_6_5")).unwrap();
         let ps_c = match translate(&compile(&console, &dir, src, "ps", "ps_6_5")) {
@@ -793,11 +877,14 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
-    let dir = std::env::temp_dir().join(format!("oathkeep-diff-ms-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("victory-diff-ms-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
     let draw = |roots, mesh_groups| Draw {
@@ -878,6 +965,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
             worst.0, worst.1, worst.2, worst.3
         );
         if worst.0.is_nan() || worst.0 > 1e-3 || drawn == 0 {
+            // Which texels each drew (alpha set), row by row.
             for (o, t) in ours.chunks(16).zip(theirs.chunks(16)) {
                 let row = |r: &[[f32; 4]]| -> String {
                     r.iter()
@@ -893,6 +981,15 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// Where PC code and the console differ by design, the translation must
+/// give the console's results: float-to-int conversions saturate and give
+/// 0 for NaN (`v_cvt_i32/u32_f32`), the legacy multiply the compiler
+/// uses for `*` gives 0 for 0 × NaN, `frac` never reaches 1.0 (it gives
+/// the largest value below; some hosts' own `frac` gives 1.0), and sine
+/// and cosine take turns: the sine of a half turn and the cosine of a
+/// quarter turn are exactly +0 (the host's functions of the rounded angle
+/// give about 1e-7). The compiler takes whole turns off itself, so large
+/// angles cannot be tried from here.
 #[test]
 fn float_semantics_are_the_consoles() {
     use super::host::{Dispatch, View};
@@ -900,11 +997,14 @@ fn float_semantics_are_the_consoles() {
         eprintln!("no console compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
-    let dir = std::env::temp_dir().join(format!("oathkeep-float-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("victory-float-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = r#"[RootSignature(RS)] [numthreads(4, 1, 1)]
         void cs(uint i : SV_GroupIndex) {
@@ -920,6 +1020,7 @@ fn float_semantics_are_the_consoles() {
         }"#;
     let cs = translate(&compile(&console, &dir, src, "cs", "cs_6_5")).unwrap();
     let (root, pso) = host.compute_pipeline(&cs).unwrap();
+    // 1e30, NaN, 3.5, 0.
     let k = [1e30f32.to_bits(), 0x7FC0_0000, 3.5f32.to_bits(), 0];
     let views = [
         View::Texture(1, 1, &[[0.0; 4]]),
@@ -949,26 +1050,31 @@ fn float_semantics_are_the_consoles() {
             0x7FFF_FFFF,
             0x8000_0000,
             0,
-            3,
+            3, // int
             u32::MAX,
             0,
             0,
-            3,
+            3, // uint
             0,
             0,
             0,
-            0,
+            0, // x * 0, NaN included
             0x3F7F_FFFF,
             0.5f32.to_bits(),
             0x3F7F_FFFF,
-            0.75f32.to_bits(),
+            0.75f32.to_bits(), // frac
         ]
     );
+    // sin(pi), sin(-pi) and cos(pi/2): the compiler turns radians into
+    // exactly 0.5, -0.5 and 0.25 turns.
     assert_eq!([out[0][16], out[0][18], out[0][19]], [0, 0, 0]);
+    // An ordinary angle is untouched: sin(1 rad).
     let one = f32::from_bits(out[0][17]);
     assert!((one - 0.841_470_96).abs() < 1e-4, "{one}");
 }
 
+/// Equal bits, both zero (the console's legacy multiply gives +0 where PC
+/// code gives -0), or two normal floats within 1e-3 relative.
 fn close(a: u32, b: u32) -> bool {
     let (x, y) = (f32::from_bits(a), f32::from_bits(b));
     a == b
@@ -983,11 +1089,14 @@ fn translated_compute_matches_pc() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
-    let dir = std::env::temp_dir().join(format!("oathkeep-diff-cs-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("victory-diff-cs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
     let texels: Vec<[f32; 4]> = (0..16)
@@ -1004,6 +1113,8 @@ fn translated_compute_matches_pc() {
             ]
         })
         .collect();
+    // Buffers: 16 float4, 8 structures of 16 bytes, 32 raw dwords; the
+    // root CBV's 16 float4 and the root SRV's 32 dwords.
     let floats = |n: usize, scale: f32| -> Vec<u32> {
         (0..n).map(|i| (i as f32 * scale - 3.0).to_bits()).collect()
     };
@@ -1053,7 +1164,7 @@ fn translated_compute_matches_pc() {
             typed_view(DXGI_FORMAT_R8_UNORM, 1),
             typed_view(DXGI_FORMAT_R16_FLOAT, 2),
             typed_view(DXGI_FORMAT_R8G8B8A8_SNORM, 4),
-            View::Cube(4, &cube_texels),
+            View::Cube(4, 1, &cube_texels),
         ])
         .collect();
     let root_cbv = floats(64, -0.125);
@@ -1105,22 +1216,55 @@ fn translated_compute_matches_pc() {
         }
         let (root_t, pso_t) = match host.compute_pipeline(&cs_c) {
             Ok(p) => p,
+            // WARP runs no fixed wave size of 64.
             Err(e) if std::env::var("OATHKEEP_WARP").is_ok_and(|v| v == "1") => {
                 eprintln!("{name}: skipped on WARP ({e})");
                 continue;
             }
             Err(e) => panic!("{name}: {e}"),
         };
+        // Our root views follow the user data in root parameter order.
         let mut roots = vec![(0, Root::Constants(user_data(&cs_c, &k)))];
         let mut root_views: Vec<(u8, bool)> = cs_c.root_cbvs.iter().map(|&s| (s, false)).collect();
         root_views.extend(cs_c.root_srvs.iter().map(|&s| (s, true)));
         root_views.sort_unstable();
+        let view_strides: Vec<u32> = views
+            .iter()
+            .map(|v| match *v {
+                View::RawUav(_) => 1,
+                View::HalfUav(_) => 8,
+                View::Buffer { stride, .. } => match stride {
+                    Stride::Raw => 1,
+                    Stride::Typed => 16,
+                    Stride::Structured(s) => s,
+                    Stride::Format(f, bytes) => {
+                        let kind = match f.0 as u32 {
+                            3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => {
+                                super::VIEW_INTEGER
+                            }
+                            4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => {
+                                super::VIEW_INTEGER | super::VIEW_SIGNED
+                            }
+                            _ => 0,
+                        };
+                        bytes | kind
+                    }
+                },
+                _ => 0,
+            })
+            .collect();
         for (n, (slot, srv)) in root_views.into_iter().enumerate() {
-            assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
-            let data = if srv {
-                root_srv.clone()
+            let data = if srv
+                && (slot == super::SLOT_STRIDES || slot == super::SLOT_TABLE_STRIDES)
+            {
+                view_strides.clone()
             } else {
-                root_cbv.clone()
+                assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
+                if srv {
+                    root_srv.clone()
+                } else {
+                    root_cbv.clone()
+                }
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }

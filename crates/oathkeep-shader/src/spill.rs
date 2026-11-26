@@ -1,16 +1,41 @@
+//! The spilled user-data table of a compute program.
+//!
+//! A compute program has as many user SGPRs as `COMPUTE_PGM_RSRC2` says. A
+//! root signature that needs more dwords than that keeps none of its
+//! parameters in registers: user-data dwords 0 and 1 then hold the 40-bit
+//! address of a table in memory (`s0`, and `s1 & 0xff` as bits 32-39), and
+//! the parameter the layout declares at user-data index N (16 or above) is
+//! at byte `4 * (N - 16)` of that table. The code reads it with
+//! `s_load_dword*` through that pointer. (Every compute program of the
+//! console's ray-tracing structure builder, `XboxBvhBuilder.dll`, is of this
+//! kind; measured there: 118 of 118 such loads land on a declared parameter.)
+//!
+//! [`user_data`] rewrites those loads away: each dword they read becomes the
+//! entry value of the SGPR its user-data index names, as if the parameter
+//! had arrived in a register. Resource tracking and lowering then treat a
+//! spilled parameter like any other (the host binds user data by root slot
+//! and dword, not by register).
+
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{self, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, StageIo};
 
+/// The user-data index of the table's first dword.
 const FIRST: u32 = 16;
 
+/// [`ir::build`] of `native`'s code as the hardware runs it, with the loads
+/// of a spilled user-data table rewritten ([`user_data`]).
 pub fn build(native: &NativeProgram) -> Result<Program, ShaderError> {
     let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     user_data(&mut p, native);
     Ok(p)
 }
 
+/// Whether `native` is a compute program that keeps its root parameters in
+/// a spilled user-data table (see the module): the entries no register
+/// holds, as (first user-data index, dwords), if the table starts at index
+/// 16 and the program has the two registers of its address.
 fn spilled(native: &NativeProgram) -> Option<Vec<(u32, u32)>> {
     let StageIo::Cs(cs) = &native.io else {
         return None;
@@ -25,13 +50,23 @@ fn spilled(native: &NativeProgram) -> Option<Vec<(u32, u32)>> {
         .filter(|e| e.sgprs > 0 && u32::from(e.user_data) >= registers)
         .map(|e| (u32::from(e.user_data), e.sgprs))
         .collect();
+    // Only the one arrangement seen: the table starts at index 16.
     (spilled.iter().map(|e| e.0).min() == Some(FIRST) && registers >= 2).then_some(spilled)
 }
 
+/// Whether `native` reads its root parameters from a spilled user-data
+/// table. (In the title exactly the compute programs of the
+/// console's ray-tracing structure builder do.)
 pub fn is_spilled(native: &NativeProgram) -> bool {
     spilled(native).is_some()
 }
 
+/// Rewrites the loads of `native`'s spilled user-data table in `p`; returns
+/// how many loads it replaced. Nothing changes unless the program is a
+/// compute program whose layout has entries past its user SGPRs, the first
+/// at index 16. A load is left alone (and resource tracking then refuses it
+/// as before) when its offset is not a constant on a dword, or when a dword
+/// it reads and the program uses is in no layout entry.
 pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
     let Some(spilled) = spilled(native) else {
         return 0;
@@ -41,9 +76,12 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
         return 0;
     };
 
+    // The pointer's halves: `s0` and its copies, `s1 & 0xff` and its copies.
     let mut lows = vec![low];
     let mut highs: Vec<Value> = Vec::new();
     let mut raw_highs = vec![high];
+    // Instructions that only form the pointer: dropped when nothing reads
+    // them any more.
     let mut forming: Vec<(usize, usize)> = Vec::new();
     loop {
         let mut changed = false;
@@ -95,6 +133,7 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
         return 0;
     }
 
+    // Values some instruction or phi reads.
     let mut read_somewhere = std::collections::HashSet::new();
     for block in &p.blocks {
         read_somewhere.extend(block.phis.iter().flat_map(|phi| phi.args.iter().copied()));
@@ -114,6 +153,7 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
         .max()
         .unwrap_or(0);
 
+    // Each load through the pointer: its dwords become entry values.
     let mut replaced: std::collections::HashMap<Value, Value> = Default::default();
     let mut gone: Vec<(usize, usize)> = Vec::new();
     let mut inputs = p.inputs.clone();
@@ -130,16 +170,11 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
                 continue;
             };
             if !inst.name().starts_with("s_load_dword")
-                || !matches!(
-                    soffset,
-                    Operand::Scalar { code: NULL, .. } | Operand::Const(128)
-                )
+                || !matches!(soffset, Operand::Scalar { code: NULL, .. } | Operand::Const(128))
                 || offset < 0
                 || offset % 4 != 0
                 || !inst.read(Reg::S(base)).is_some_and(|v| lows.contains(&v))
-                || !inst
-                    .read(Reg::S(base + 1))
-                    .is_some_and(|v| highs.contains(&v))
+                || !inst.read(Reg::S(base + 1)).is_some_and(|v| highs.contains(&v))
             {
                 continue;
             }
@@ -159,6 +194,7 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
                     }
                     continue;
                 }
+                // SGPR codes end at 105; no root signature reaches there.
                 let Ok(code) = u8::try_from(index) else {
                     continue 'insts;
                 };
@@ -199,6 +235,8 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
             inst.reads.iter_mut().for_each(|r| renamed(&mut r.1));
         }
     }
+    // The loads go, then what only formed the pointer (last first, so a
+    // copy goes before what it copied).
     let mut drop = gone.clone();
     loop {
         let read_somewhere = {
@@ -231,6 +269,7 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
             !drop.contains(&(b, i - 1))
         });
     }
+    // The pointer's registers are no inputs once nothing reads them.
     let mut read = std::collections::HashSet::new();
     for block in &p.blocks {
         read.extend(block.phis.iter().flat_map(|phi| phi.args.iter().copied()));
@@ -257,6 +296,8 @@ mod tests {
         }
     }
 
+    /// A compute program with `registers` user SGPRs and the group id after
+    /// them.
     fn native(words: &[u32], registers: u32, layout: Vec<RootParam>) -> NativeProgram {
         NativeProgram {
             stage: HwStage::Cs,
@@ -272,6 +313,8 @@ mod tests {
         }
     }
 
+    // s_and_b32 s3, s1, 0xff; s_mov_b32 s2, s0; s_load_dword s5, s[2:3],
+    // 0x10; s_load_dwordx2 s[0:1], s[2:3], 0; s_endpgm.
     const TABLE: [u32; 8] = [
         0x8703_FF01,
         0x0000_00FF,
@@ -296,13 +339,10 @@ mod tests {
         );
         let mut p = ir::build(&n.code, false, 256).unwrap();
         assert_eq!(user_data(&mut p, &n), 2);
-        let names: Vec<&str> = p
-            .blocks
-            .iter()
-            .flat_map(|b| &b.insts)
-            .map(|i| i.name())
-            .collect();
+        let names: Vec<&str> = p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
         assert!(!names.iter().any(|n| n.starts_with("s_load_")), "{names:?}");
+        // The pointer is gone with the loads; byte 0x10 is index 20, the
+        // first root constant, and bytes 0-7 are the first root view.
         let mut regs: Vec<Reg> = p.inputs.iter().map(|i| i.0).collect();
         regs.sort();
         assert_eq!(regs, [Reg::S(16), Reg::S(17), Reg::S(20)]);
@@ -310,6 +350,7 @@ mod tests {
 
     #[test]
     fn parameters_in_registers_are_left_alone() {
+        // The same code where s0 and s1 are a root view the layout declares.
         let n = native(&TABLE, 6, vec![param(RootType::Descriptor, 0, 2, 0)]);
         let mut p = ir::build(&n.code, false, 256).unwrap();
         let before = p.clone();
@@ -319,6 +360,8 @@ mod tests {
 
     #[test]
     fn a_used_dword_no_parameter_declares_keeps_its_load() {
+        // As above with `s_mov_b32 s6, s5` before the end: the dword at
+        // byte 0x10 (index 20) is read, and here nothing declares it.
         let mut words = TABLE.to_vec();
         words.insert(7, 0xBE86_0305);
         let n = native(&words, 4, vec![param(RootType::Descriptor, 16, 2, 0)]);
@@ -331,6 +374,7 @@ mod tests {
             .filter(|i| i.name().starts_with("s_load_"))
             .count();
         assert_eq!(loads, 1);
+        // The pointer is still read, by the load that stays.
         assert!(p.inputs.iter().any(|i| i.0 == Reg::S(0)));
     }
 }

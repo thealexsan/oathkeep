@@ -1,4 +1,11 @@
+//! `gameinput.dll`: input devices from the host. Gamepads come from XInput
+//! (host slots 0-3); while none is connected, the keyboard drives one
+//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
+//! too. A poll thread turns host state into readings (a new one per change)
+//! and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
+// Title code calls these through the objects, passing pointers the real API
+// would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::collections::VecDeque;
@@ -14,17 +21,21 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+/// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
 pub const READING_NOT_FOUND: HRESULT = 0x838A_0003_u32 as i32;
 pub const REFERENCE_TOO_OLD: HRESULT = 0x838A_0004_u32 as i32;
 const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 
+/// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
 const GAMEPAD_KIND: u32 = 0x4_0000;
+/// Device status of a connected device: connected, input enabled.
 const STATUS_CONNECTED: u32 = 0x3;
 const ASYNC_ENUMERATION: u32 = 1;
 
+/// Gamepad buttons; the title maps each bit to one of its pad buttons.
 const MENU: u32 = 0x1;
 const VIEW: u32 = 0x2;
 const A: u32 = 0x4;
@@ -40,22 +51,26 @@ const RIGHT_SHOULDER: u32 = 0x800;
 const LEFT_STICK: u32 = 0x1000;
 const RIGHT_STICK: u32 = 0x2000;
 
+/// Devices: host pad slots, the keyboard's stand-in pad, the keyboard.
 const PADS: usize = 4;
 const FALLBACK: usize = PADS;
 const KEYBOARD: usize = PADS + 1;
 const DEVICES: usize = PADS + 2;
 
+/// Readings kept per device for next/previous lookups.
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
+/// The keyboard's stand-in gamepad (virtual key, button); README lists it.
+/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
 const FALLBACK_BUTTONS: [(u8, u32); 14] = [
-    (0x1B, MENU),
-    (0x09, VIEW),
-    (0x0D, A),
-    (0x08, B),
+    (0x1B, MENU), // Esc
+    (0x09, VIEW), // Tab
+    (0x0D, A),    // Enter
+    (0x08, B),    // Backspace
     (b'X', X),
     (b'Y', Y),
-    (0x26, UP),
+    (0x26, UP), // arrows
     (0x28, DOWN),
     (0x25, LEFT),
     (0x27, RIGHT),
@@ -65,6 +80,7 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'H', RIGHT_STICK),
 ];
 
+/// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct PadState {
@@ -77,6 +93,7 @@ struct PadState {
     right_y: f32,
 }
 
+/// One key held down: scan code (0xE0xx when extended), character, key.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct KeyState {
@@ -88,9 +105,13 @@ struct KeyState {
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
+/// Host input, or a fake in tests.
 trait Source: Send {
+    /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
+    /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
@@ -116,11 +137,38 @@ fn fallback(keys: &[KeyState]) -> PadState {
     }
 }
 
+/// Two pads as one: buttons of both, and of each axis and trigger the one
+/// pushed further.
+fn merged(a: PadState, b: PadState) -> PadState {
+    let further = |x: f32, y: f32| if y.abs() > x.abs() { y } else { x };
+    PadState {
+        buttons: a.buttons | b.buttons,
+        left_trigger: further(a.left_trigger, b.left_trigger),
+        right_trigger: further(a.right_trigger, b.right_trigger),
+        left_x: further(a.left_x, b.left_x),
+        left_y: further(a.left_y, b.left_y),
+        right_x: further(a.right_x, b.right_x),
+        right_y: further(a.right_y, b.right_y),
+    }
+}
+
+/// Whether the title sees one pad that is always there, fed by the keyboard
+/// and by every host pad (on by default; `OATHKEEP_ONE_PAD=0` shows each host
+/// pad as a device of its own, and the stand-in only while there is none).
+/// The title keeps to the pad it started with: with the stand-in taken away
+/// when a pad was switched on, it showed its controller-disconnected screen
+/// until the pad was off again. It also keeps a pad the host lists twice (its
+/// own slot and a remapper's) from being two players.
+fn one_pad() -> bool {
+    std::env::var_os("OATHKEEP_ONE_PAD").is_none_or(|v| v != "0")
+}
+
 #[repr(C)]
 struct Table<const N: usize>([*const (); N]);
 // SAFETY: function addresses only.
 unsafe impl<const N: usize> Sync for Table<N> {}
 
+/// The input object; one per hub.
 #[repr(C)]
 pub struct Object {
     vtable: &'static Table<22>,
@@ -135,9 +183,11 @@ pub struct Device {
     info: DeviceInfo,
 }
 
+/// What a device says about itself. The title reads `id` (+0x20); the rest
+/// follows the public layout and is zero where we have nothing to say.
 #[repr(C)]
 #[derive(Default)]
-#[allow(dead_code)]
+#[allow(dead_code)] // read by title code
 struct DeviceInfo {
     size: u32,
     vendor: u16,
@@ -153,6 +203,7 @@ struct DeviceInfo {
     capabilities: u32,
     supported_input: u32,
     rumble_motors: u32,
+    /// Counts and optional detail pointers.
     rest: [u64; 26],
 }
 
@@ -176,7 +227,8 @@ impl Device {
             id,
             root_id: id,
             supported_input: kind(index),
-            rumble_motors: if index < PADS { 0x3 } else { 0 },
+            // Low and high frequency.
+            rumble_motors: if index <= FALLBACK { 0x3 } else { 0 },
             ..Default::default()
         };
         Device {
@@ -218,6 +270,7 @@ impl Reading {
     }
 }
 
+/// A counted reference to a reading.
 struct Ref(NonNull<Reading>);
 
 impl Ref {
@@ -225,6 +278,7 @@ impl Ref {
         Ref(NonNull::from(Box::leak(Box::new(reading))))
     }
 
+    /// Another reference, for the title.
     fn share(&self) -> *const Reading {
         reading_add_ref(self.0.as_ptr());
         self.0.as_ptr()
@@ -250,6 +304,7 @@ type DeviceCallback = extern "system" fn(u64, *mut c_void, *const Device, u64, u
 #[derive(Clone, Copy)]
 struct Registration {
     token: u64,
+    /// One device's address, or 0 for any.
     device: usize,
     kind: u32,
     status: u32,
@@ -292,15 +347,22 @@ struct Slot {
 struct State {
     slots: [Slot; DEVICES],
     callbacks: Vec<Registration>,
+    /// Asynchronous enumerations, delivered by the next poll.
     pending: Vec<Event>,
+    /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
 }
 
 pub struct Hub {
     object: Object,
     devices: [Device; DEVICES],
+    /// Apart from the state: XInput can be slow, and the title reads
+    /// readings every frame.
     source: Mutex<Box<dyn Source>>,
+    /// The title sees one pad ([`one_pad`]).
+    one_pad: bool,
     state: Mutex<State>,
+    /// A device callback returned.
     returned: Condvar,
 }
 
@@ -316,12 +378,13 @@ unsafe impl Sync for Hub {}
 
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+/// Microseconds, the clock of every timestamp we hand out.
 fn now() -> u64 {
     START.elapsed().as_micros() as u64
 }
 
 impl Hub {
-    fn new(source: Box<dyn Source>) -> &'static Hub {
+    fn new(source: Box<dyn Source>, one_pad: bool) -> &'static Hub {
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
@@ -329,6 +392,7 @@ impl Hub {
             },
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
+            one_pad,
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
@@ -347,8 +411,9 @@ impl Hub {
         }
     }
 
+    /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source);
+        let hub = Hub::new(source, one_pad());
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -363,16 +428,20 @@ impl Hub {
         lock(&self.state)
     }
 
+    /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
         let (pads, keys) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             (pads, source.keys())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
         self.deliver(events);
     }
 
+    /// Runs callbacks, never under our lock: they call back into us. One
+    /// unregistered since the event was taken does not run, and
+    /// `UnregisterCallback` waits for one that runs.
     fn deliver(&self, events: Vec<Event>) {
         let me = std::thread::current().id();
         for e in events {
@@ -409,11 +478,18 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
+        one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        if one_pad {
+            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
+            self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
+            return events;
+        }
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
@@ -424,6 +500,8 @@ impl State {
         events
     }
 
+    /// Records a device's state: a reading when it changed, callbacks when
+    /// the device came or went.
     fn update(
         &mut self,
         devices: &[Device; DEVICES],
@@ -493,6 +571,7 @@ static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));
 type This = *const Object;
 type Out = *mut *const c_void;
 
+/// The DLL's only export (ordinal 1): the input object, static and shared.
 pub extern "system" fn GameInputCreate(out: *mut This) -> HRESULT {
     tracing::info!("GameInputCreate");
     if out.is_null() {
@@ -508,6 +587,7 @@ fn hub(this: This) -> &'static Hub {
     unsafe { &*(*this).hub }
 }
 
+/// Clears a COM out pointer and returns `hr`.
 fn fail(out: Out, hr: HRESULT) -> HRESULT {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a pointer.
@@ -516,6 +596,7 @@ fn fail(out: Out, hr: HRESULT) -> HRESULT {
     hr
 }
 
+/// Gives the title a reference to `reading`, or fails as with none.
 fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
     match reading {
         _ if out.is_null() => E_INVALIDARG,
@@ -532,6 +613,7 @@ extern "system" fn no_interface(_: *const c_void, _iid: *const c_void, out: Out)
     tracing::warn!("input QueryInterface not implemented");
     fail(out, E_NOINTERFACE)
 }
+/// The input object and devices live as long as the process.
 extern "system" fn add_ref(_: *const c_void) -> u32 {
     1
 }
@@ -575,6 +657,7 @@ extern "system" fn current_reading(
     hand(out, found)
 }
 
+/// The reading after (`forward`) or before `reference` on its device.
 fn relative(
     this: This,
     reference: *const Reading,
@@ -589,6 +672,9 @@ fn relative(
     let hub = hub(this);
     // SAFETY: a reading we handed out and the title still holds.
     let reference = unsafe { &*reference };
+    // shortcut: with no device given only the reference's device is walked,
+    // not every device's readings in time order; the title walks
+    // only keyboard readings (one device) and the current pad's previous one.
     let Some(index) = hub.index(reference.device) else {
         return fail(out, E_INVALIDARG);
     };
@@ -636,6 +722,7 @@ extern "system" fn previous_reading(
 ) -> HRESULT {
     relative(this, reference, kind, device, out, false)
 }
+/// The device's reading at `time`, among those still kept.
 extern "system" fn temporal_reading(
     this: This,
     time: u64,
@@ -661,6 +748,8 @@ fn token(out: *mut u64) -> HRESULT {
     S_OK
 }
 
+// shortcut: reading callbacks never run; the title registers none
+// (it polls).
 extern "system" fn register_reading(
     _: This,
     _device: *const c_void,
@@ -674,6 +763,10 @@ extern "system" fn register_reading(
     token(out)
 }
 
+/// Device callbacks run on our poll thread when a device comes or goes.
+/// Enumeration reports the devices already there: blocking on the caller's
+/// thread before we return (the title registers holding a lock its callback
+/// takes again), asynchronous on the next poll.
 extern "system" fn register_device(
     this: This,
     device: *const Device,
@@ -724,6 +817,7 @@ extern "system" fn register_device(
     hub.deliver(found);
     S_OK
 }
+/// Guide button and keyboard layout callbacks: neither ever changes here.
 extern "system" fn register_other(
     _: This,
     _device: *const c_void,
@@ -742,6 +836,9 @@ fn forget(this: This, token: u64) {
 extern "system" fn stop_callback(this: This, token: u64) {
     forget(this, token);
 }
+/// Stops the callback, then waits up to `timeout` µs for a call of it that
+/// is running; false on time-out, or from inside that callback (it cannot
+/// wait for itself), as documented. Either way it is never called again.
 extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> bool {
     forget(this, token);
     let hub = hub(this);
@@ -757,10 +854,7 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub
-                .returned
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner),
+            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -772,6 +866,7 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
     }
 }
 
+/// Dispatcher and aggregate device: no title of ours asks for them.
 extern "system" fn create_dispatcher(_: This, out: Out) -> HRESULT {
     tracing::warn!("input dispatcher not implemented");
     fail(out, E_NOTIMPL)
@@ -795,6 +890,8 @@ extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRES
         None => fail(out, DEVICE_NOT_FOUND),
     }
 }
+/// Lookup by object, platform handle or platform string: our devices have
+/// none of these.
 extern "system" fn find_device(_: This, _value: *const c_void, out: Out) -> HRESULT {
     fail(out, DEVICE_NOT_FOUND)
 }
@@ -810,28 +907,28 @@ extern "system" fn enable_oem_device(
 extern "system" fn set_focus_policy(_: This, _policy: u32) {}
 
 static INPUT: Table<22> = Table([
-    no_interface as *const (),
-    add_ref as *const (),
-    add_ref as *const (),
-    timestamp as *const (),
-    current_reading as *const (),
-    next_reading as *const (),
-    previous_reading as *const (),
-    temporal_reading as *const (),
-    register_reading as *const (),
-    register_device as *const (),
-    register_other as *const (),
-    register_other as *const (),
-    stop_callback as *const (),
-    unregister_callback as *const (),
-    create_dispatcher as *const (),
-    create_aggregate as *const (),
-    find_by_id as *const (),
-    find_device as *const (),
-    find_device as *const (),
-    find_device as *const (),
-    enable_oem_device as *const (),
-    set_focus_policy as *const (),
+    no_interface as *const (),        // 0x00
+    add_ref as *const (),             // 0x08 AddRef
+    add_ref as *const (),             // 0x10 Release
+    timestamp as *const (),           // 0x18
+    current_reading as *const (),     // 0x20
+    next_reading as *const (),        // 0x28
+    previous_reading as *const (),    // 0x30
+    temporal_reading as *const (),    // 0x38
+    register_reading as *const (),    // 0x40
+    register_device as *const (),     // 0x48
+    register_other as *const (),      // 0x50 guide button
+    register_other as *const (),      // 0x58 keyboard layout
+    stop_callback as *const (),       // 0x60
+    unregister_callback as *const (), // 0x68
+    create_dispatcher as *const (),   // 0x70
+    create_aggregate as *const (),    // 0x78
+    find_by_id as *const (),          // 0x80
+    find_device as *const (),         // 0x88 by object
+    find_device as *const (),         // 0x90 by platform handle
+    find_device as *const (),         // 0x98 by platform string
+    enable_oem_device as *const (),   // 0xa0
+    set_focus_policy as *const (),    // 0xa8
 ]);
 
 extern "system" fn device_info(this: *const Device) -> *const DeviceInfo {
@@ -847,10 +944,15 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
+// shortcut: trigger motors are dropped (XInput has none). The host API that
+// drives them without a redistributable is Windows.Gaming.Input (WinRT
+// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
+// diagnostics builds; the title sends trigger levels in slot 0x50.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
-    if device.index >= PADS {
+    let one_pad = device.hub().one_pad;
+    if device.index >= PADS && !(one_pad && device.index == FALLBACK) {
         return;
     }
     let [low, high, ..] = if params.is_null() {
@@ -860,7 +962,17 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
         unsafe { *params }
     };
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    let mut source = lock(&device.hub().source);
+    if one_pad {
+        // The one pad is every host pad.
+        for slot in 0..PADS {
+            if source.pad(slot).is_some() {
+                source.rumble(slot, speed(low), speed(high));
+            }
+        }
+    } else {
+        source.rumble(device.index, speed(low), speed(high));
+    }
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -871,27 +983,27 @@ extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
 }
 
 static DEVICE: Table<21> = Table([
-    no_interface as *const (),
-    add_ref as *const (),
-    add_ref as *const (),
-    device_info as *const (),
-    device_status as *const (),
-    unsupported::<0x28> as *const (),
-    unsupported::<0x30> as *const (),
-    unsupported::<0x38> as *const (),
-    unsupported::<0x40> as *const (),
-    unsupported::<0x48> as *const (),
-    set_rumble as *const (),
-    unsupported::<0x58> as *const (),
-    unsupported::<0x60> as *const (),
-    unsupported::<0x68> as *const (),
-    unsupported::<0x70> as *const (),
-    unsupported::<0x78> as *const (),
-    unsupported::<0x80> as *const (),
-    unsupported::<0x88> as *const (),
-    unsupported::<0x90> as *const (),
-    unsupported::<0x98> as *const (),
-    unsupported::<0xa0> as *const (),
+    no_interface as *const (),        // 0x00
+    add_ref as *const (),             // 0x08 AddRef
+    add_ref as *const (),             // 0x10 Release
+    device_info as *const (),         // 0x18
+    device_status as *const (),       // 0x20
+    unsupported::<0x28> as *const (), // battery
+    unsupported::<0x30> as *const (), // force feedback
+    unsupported::<0x38> as *const (), //
+    unsupported::<0x40> as *const (), //
+    unsupported::<0x48> as *const (), // haptics
+    set_rumble as *const (),          // 0x50
+    unsupported::<0x58> as *const (), // input synchronization
+    unsupported::<0x60> as *const (), //
+    unsupported::<0x68> as *const (), // power off
+    unsupported::<0x70> as *const (), // raw device access
+    unsupported::<0x78> as *const (), //
+    unsupported::<0x80> as *const (), //
+    unsupported::<0x88> as *const (), //
+    unsupported::<0x90> as *const (), //
+    unsupported::<0x98> as *const (), //
+    unsupported::<0xa0> as *const (), //
 ]);
 
 fn reading<'a>(this: *const Reading) -> &'a Reading {
@@ -957,42 +1069,44 @@ extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bo
         _ => false,
     }
 }
+/// Kinds our devices do not have: no count, no state.
 extern "system" fn nothing(_: *const c_void) -> usize {
     0
 }
 
 static READING: Table<25> = Table([
-    no_interface as *const (),
-    reading_add_ref as *const (),
-    reading_release as *const (),
-    input_kind as *const (),
-    sequence_number as *const (),
-    reading_timestamp as *const (),
-    reading_device as *const (),
-    nothing as *const (),
-    nothing as *const (),
-    nothing as *const (),
-    nothing as *const (),
-    nothing as *const (),
-    nothing as *const (),
-    nothing as *const (),
-    key_count as *const (),
-    key_state as *const (),
-    nothing as *const (),
-    nothing as *const (),
-    nothing as *const (),
-    nothing as *const (),
-    nothing as *const (),
-    nothing as *const (),
-    gamepad_state as *const (),
-    nothing as *const (),
-    nothing as *const (),
+    no_interface as *const (),      // 0x00
+    reading_add_ref as *const (),   // 0x08
+    reading_release as *const (),   // 0x10
+    input_kind as *const (),        // 0x18
+    sequence_number as *const (),   // 0x20
+    reading_timestamp as *const (), // 0x28
+    reading_device as *const (),    // 0x30
+    nothing as *const (),           // 0x38 raw report
+    nothing as *const (),           // 0x40 controller axes, buttons, switches
+    nothing as *const (),           // 0x48
+    nothing as *const (),           // 0x50
+    nothing as *const (),           // 0x58
+    nothing as *const (),           // 0x60
+    nothing as *const (),           // 0x68
+    key_count as *const (),         // 0x70
+    key_state as *const (),         // 0x78
+    nothing as *const (),           // 0x80 mouse
+    nothing as *const (),           // 0x88 touch
+    nothing as *const (),           // 0x90
+    nothing as *const (),           // 0x98 motion
+    nothing as *const (),           // 0xa0 arcade stick
+    nothing as *const (),           // 0xa8 flight stick
+    gamepad_state as *const (),     // 0xb0
+    nothing as *const (),           // 0xb8 racing wheel
+    nothing as *const (),           // 0xc0 UI navigation
 ]);
 
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "gameinput",
         dlls: &["gameinput.dll"],
+        // Titles import it by ordinal only.
         exports: vec![HleExport {
             name: "#1",
             address: GameInputCreate as *const () as usize,
@@ -1000,6 +1114,7 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+/// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
@@ -1022,6 +1137,7 @@ mod host {
 
     use super::*;
 
+    /// Asking XInput about an empty slot is slow; look again this often.
     const EMPTY_SLOT_RECHECK: Duration = Duration::from_secs(1);
 
     const BUTTONS: [(u16, u32); 14] = [
@@ -1041,6 +1157,7 @@ mod host {
         (XINPUT_GAMEPAD_RIGHT_THUMB, RIGHT_STICK),
     ];
 
+    /// Raw values, no dead zone: titles apply their own.
     pub(super) fn convert(pad: &XINPUT_GAMEPAD) -> PadState {
         let stick = |v: i16| (f32::from(v) / 32767.0).max(-1.0);
         PadState {
@@ -1076,12 +1193,13 @@ mod host {
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
-            #[cfg(feature = "diagnostics")]
+            // The scripted keys (`OATHKEEP_KEYS`) also press the first
+            // pad's buttons, by the stand-in pad's table: with a real pad
+            // connected the stand-in is not there, and a title that listens
+            // to the pad (the title's start screen) saw nothing.
             if slot == 0 {
                 for vk in scripted() {
-                    if let Some(&(_, button)) =
-                        super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk)
-                    {
+                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
                     }
                 }
@@ -1090,11 +1208,10 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
             if focused() {
+                // Left/right modifier keys only, as devices report them; no
+                // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
                     // SAFETY: plain queries.
@@ -1107,6 +1224,8 @@ mod host {
                     // SAFETY: plain query.
                     scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
                     virtual_key: vk,
+                    // shortcut: no characters (code point 0);
+                    // the title reads scan codes and virtual keys only.
                     ..Default::default()
                 })
                 .collect()
@@ -1122,9 +1241,13 @@ mod host {
         }
     }
 
-    #[cfg(feature = "diagnostics")]
+    /// Debugging aid: `OATHKEEP_KEYS=<seconds>:<key>,...` holds each key for
+    /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
+    /// time), with or without focus. A key is a
+    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
+    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("OATHKEEP_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
@@ -1142,21 +1265,24 @@ mod host {
                     }
                     _ => return None,
                 };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
+                let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
+                let (from, to) = match at.split_once('-') {
+                    Some((from, to)) => (time(from)?, time(to)?),
+                    None => (time(at)?, time(at)? + Duration::from_millis(200)),
+                };
+                Some((from, to, vk))
             });
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
+            .filter(|&&(from, to, _)| (from..to).contains(&now))
+            .map(|&(_, _, vk)| vk)
             .collect()
     }
 
+    /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
@@ -1221,8 +1347,12 @@ mod tests {
     }
 
     fn fake() -> (&'static Hub, Arc<Mutex<FakeHost>>) {
+        fake_with(false)
+    }
+
+    fn fake_with(one_pad: bool) -> (&'static Hub, Arc<Mutex<FakeHost>>) {
         let host = Arc::new(Mutex::new(FakeHost::default()));
-        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))));
+        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), one_pad);
         hub.poll();
         (hub, host)
     }
@@ -1242,6 +1372,7 @@ mod tests {
         unsafe { std::mem::transmute_copy(&f) }
     }
 
+    /// Device callbacks seen: device index, current and previous status.
     type Log = Mutex<Vec<(usize, u32, u32)>>;
 
     extern "system" fn record(
@@ -1349,6 +1480,8 @@ mod tests {
         let (hub, host) = fake();
         let log = Log::default();
         register(hub, GAMEPAD_KIND, 2, &log);
+        // Blocking enumeration ran before registration returned: with no
+        // host pad the keyboard's stand-in is the only one.
         assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
 
         host.lock().unwrap().pads[1] = Some(PadState {
@@ -1365,6 +1498,7 @@ mod tests {
         let first = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(pad(first).buttons, A);
         assert_eq!(pad(first).left_x, 0.5);
+        // No change, no new reading.
         hub.poll();
         let again = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(again, first);
@@ -1380,6 +1514,7 @@ mod tests {
         assert!(t2 > t1 && s2 == s1 + 1);
         assert!(t2 <= now());
 
+        // The title's edge check: previous of current, and back again.
         assert_eq!(walk(hub, 0x30, second), Ok(first));
         assert_eq!(walk(hub, 0x28, first), Ok(second));
         assert_eq!(walk(hub, 0x28, second), Err(READING_NOT_FOUND));
@@ -1395,6 +1530,7 @@ mod tests {
             [(1, 0, STATUS_CONNECTED), (FALLBACK, STATUS_CONNECTED, 0)]
         );
         assert_eq!(current(hub, GAMEPAD_KIND, 1), Err(DEVICE_DISCONNECTED));
+        // The stand-in is back, at rest.
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
@@ -1432,7 +1568,39 @@ mod tests {
             }
         );
         release(r);
+        // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn a_host_pad_feeds_the_one_pad_which_never_goes() {
+        let (hub, host) = fake_with(true);
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 2, &log);
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+        let pad = |hub: &Hub| match &hub.state().slots[FALLBACK].history.back().unwrap().value {
+            Value::Pad(p) => *p,
+            Value::Keys(_) => unreachable!(),
+        };
+        host.lock().unwrap().keys = vec![key(b'D')];
+        hub.poll();
+        assert_eq!(pad(hub).left_x, 1.0);
+        // A pad is switched on, in any slot: its input arrives, beside the
+        // keyboard's, and no device comes or goes.
+        host.lock().unwrap().pads[2] = Some(PadState { buttons: A, left_y: -0.5, ..Default::default() });
+        hub.poll();
+        let p = pad(hub);
+        assert_eq!((p.buttons, p.left_x, p.left_y), (A, 1.0, -0.5));
+        let device: *const Device = &hub.devices[FALLBACK];
+        set_rumble(device, &[1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(host.lock().unwrap().rumble, [(2, u16::MAX, 0)]);
+        // And off again.
+        host.lock().unwrap().pads[2] = None;
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        assert_eq!(pad(hub), PadState::default());
+        assert_eq!(log.lock().unwrap().len(), 1);
+        assert!(!hub.state().slots[2].connected);
     }
 
     #[test]
@@ -1465,6 +1633,7 @@ mod tests {
             _: u32,
             _: u32,
         ) {
+            // From inside its own callback, unregistering fails at once.
             let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(context, 0x68);
             if !unregister(context.cast(), token, 0) {
                 FROM_INSIDE.fetch_add(1, Ordering::SeqCst);
@@ -1489,16 +1658,7 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(
-                &hub.object,
-                std::ptr::null(),
-                GAMEPAD_KIND,
-                1,
-                0,
-                context,
-                Some(slow),
-                &mut token
-            ),
+            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1507,10 +1667,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(
-            !unregister(&hub.object, token, 5000),
-            "times out while it runs"
-        );
+        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);

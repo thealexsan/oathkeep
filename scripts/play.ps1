@@ -7,8 +7,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Exe,
-    [ValidateSet('safe', 'fast', 'nvidia8gb')][string]$Profile = 'safe',
-    [ValidateSet('auto', 'series-x', 'series-s')][string]$Console = 'auto',
+    [ValidateSet('safe', 'fast', 'nvidia8gb', 'pareto')][string]$Profile = 'pareto',
+    [ValidateSet('auto', 'series-x', 'series-s')][string]$Console = 'series-s',
     [switch]$Diag,
     [switch]$Dred,
     [string]$Cache = "$env:LOCALAPPDATA\oathkeep\cache",
@@ -68,7 +68,11 @@ foreach ($v in @(
     'OATHKEEP_WINDOW_TAILS', 'OATHKEEP_TITLE_MEMORY_MB', 'OATHKEEP_SPILL_SHADERS',
     'OATHKEEP_PIPELINE_WORKERS', 'OATHKEEP_EARLY_PIPELINE_COMMIT_MB',
     'OATHKEEP_COMMIT_HEADROOM_MB', 'OATHKEEP_DEMAND_COMMIT', 'OATHKEEP_DEMAND_PRIVATE',
-    'OATHKEEP_CAPTURE_WORLD', 'OATHKEEP_CARD_ACCOUNTING'
+    'OATHKEEP_CAPTURE_WORLD', 'OATHKEEP_CARD_ACCOUNTING',
+    'OATHKEEP_AMBIENT', 'OATHKEEP_AMBIENT_AIR', 'OATHKEEP_RELAY_COPY',
+    'OATHKEEP_CARD_STEPS', 'OATHKEEP_INDIRECT_BATCH', 'OATHKEEP_MAP_THREADS',
+    'OATHKEEP_CARD_AWAKE', 'OATHKEEP_SHOW_AFTER', 'OATHKEEP_THIN',
+    'OATHKEEP_JOIN_PARTS', 'OATHKEEP_UPLOAD_AHEAD', 'OATHKEEP_CARD_BUFFERS_MIN_KB'
 )) {
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
 }
@@ -100,32 +104,48 @@ switch ($Profile) {
         $env:OATHKEEP_INPLACE_MIN_MB = '1'
         $env:OATHKEEP_PIPELINE_WAIT_MS = '16'
     }
+    'pareto' {
+        $env:OATHKEEP_AMBIENT = '0.8'
+        $env:OATHKEEP_AMBIENT_AIR = '1.5'
+        $env:OATHKEEP_TEXTURE_NO_WAIT = '1'
+        $env:OATHKEEP_RELAY = '2'
+        $env:OATHKEEP_WIDE_BACK = '1'
+        $env:OATHKEEP_CARD_REHASH_RUNS = '1'
+        $env:OATHKEEP_JOIN_COPIES = '1'
+        $env:OATHKEEP_INDIRECT_WINDOW = '1'
+        $env:OATHKEEP_RELAY_COPY = '1'
+        $env:OATHKEEP_CARD_STEPS = '2'
+        $env:OATHKEEP_INDIRECT_BATCH = '2'
+        $env:OATHKEEP_MAP_THREADS = '1'
+        $env:OATHKEEP_CARD_AWAKE = '1'
+        $env:OATHKEEP_SHOW_AFTER = '1'
+        $env:OATHKEEP_THIN = '1'
+        $env:OATHKEEP_JOIN_PARTS = '8'
+        $env:OATHKEEP_UPLOAD_AHEAD = '1'
+        $env:OATHKEEP_LEVELS_ON_DEMAND = '1'
+        $env:OATHKEEP_CARD_BUFFERS_MIN_KB = '64'
+    }
     'nvidia8gb' {
         $env:OATHKEEP_DISPLAY_MODE = '1920x1080'
-        $env:OATHKEEP_SHADER_LOOP_LIMIT = '256'
-        $env:OATHKEEP_LATE_WAIT = '3'
-        $env:OATHKEEP_WIDE_BACK = '1'
-        $env:OATHKEEP_WIDE_REFRESH = '1'
-        $env:OATHKEEP_WIDE_MERGE = '1'
-        $env:OATHKEEP_JOIN_COPIES = '1'
-        $env:OATHKEEP_CARD_REHASH_RUNS = '1'
-        $env:OATHKEEP_CARD_BUFFERS_MIN_MB = '1'
-        $env:OATHKEEP_CARD_BUFFERS_MB = '1024'
-        $env:OATHKEEP_LEVELS_ON_DEMAND = '1'
-        $env:OATHKEEP_LEVELS_MIN_KB = '128'
+        $env:OATHKEEP_AMBIENT = '0.8'
+        $env:OATHKEEP_AMBIENT_AIR = '1.5'
         $env:OATHKEEP_TEXTURE_NO_WAIT = '1'
-        $env:OATHKEEP_PAGE_WRITES = '1'
-        $env:OATHKEEP_COMMITTED_QUERY = '1'
+        $env:OATHKEEP_RELAY = '2'
+        $env:OATHKEEP_WIDE_BACK = '1'
+        $env:OATHKEEP_CARD_REHASH_RUNS = '1'
+        $env:OATHKEEP_JOIN_COPIES = '1'
         $env:OATHKEEP_INDIRECT_WINDOW = '1'
-        $env:OATHKEEP_INPLACE = '2'
-        $env:OATHKEEP_INPLACE_MIN_MB = '1'
-        $env:OATHKEEP_PIPELINE_WAIT_MS = '16'
-        $env:OATHKEEP_TEXTURE_CATCHUP = '0'
-        $env:OATHKEEP_TEXTURE_STAGE_MS = '14'
-        $env:OATHKEEP_TEXTURE_STAGE_MB = '32'
-        $env:OATHKEEP_BAKE_TEXTURES_MS = '30'
-        $env:OATHKEEP_WINDOW_KB = '1024'
-        $env:OATHKEEP_WINDOW_TAILS = '1'
+        $env:OATHKEEP_RELAY_COPY = '1'
+        $env:OATHKEEP_CARD_STEPS = '2'
+        $env:OATHKEEP_INDIRECT_BATCH = '2'
+        $env:OATHKEEP_MAP_THREADS = '1'
+        $env:OATHKEEP_CARD_AWAKE = '1'
+        $env:OATHKEEP_SHOW_AFTER = '1'
+        $env:OATHKEEP_THIN = '1'
+        $env:OATHKEEP_JOIN_PARTS = '8'
+        $env:OATHKEEP_UPLOAD_AHEAD = '1'
+        $env:OATHKEEP_LEVELS_ON_DEMAND = '1'
+        $env:OATHKEEP_CARD_BUFFERS_MIN_KB = '64'
     }
 }
 

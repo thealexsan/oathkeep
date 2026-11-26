@@ -1,9 +1,17 @@
+//! Debugging aid: `OATHKEEP_AUDIO_CAPTURE=<file.wav>` records what the title
+//! plays, 48 kHz stereo 16-bit, through process loopback: our own process
+//! tree only, never the rest of the host's mix. Stretches where nothing was
+//! played are written as silence, so the file keeps real time.
+//!
+//! The recorder runs in a child copy of this executable: an audio client
+//! in the title's process raises that process's timer resolution, which
+//! changes how the title's own waits behave.
+
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
@@ -15,6 +23,7 @@ use windows::Win32::Media::Audio::{
     VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVE_FORMAT_PCM, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_SYNCHRONIZE, Sleep, WaitForSingleObject,
 };
@@ -23,6 +32,7 @@ use windows::core::{HRESULT, IUnknown, Interface, Ref, implement};
 const RATE: u32 = 48_000;
 const FRAME_BYTES: usize = 4;
 
+/// Activation completes asynchronously; the recording thread polls for it.
 #[implement(IActivateAudioInterfaceCompletionHandler)]
 struct Activated;
 
@@ -35,12 +45,16 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
     }
 }
 
+/// Names the process to record, in the recorder's environment.
 const TARGET: &str = "OATHKEEP_AUDIO_CAPTURE_OF";
 
+/// Starts the recorder if `OATHKEEP_AUDIO_CAPTURE` names a file. With this
+/// module's debug log, also logs once a second what a `Sleep(1)` takes in
+/// this process (the title's millisecond waits get the same).
 pub fn start() {
     if tracing::enabled!(tracing::Level::DEBUG) {
         let _ = std::thread::Builder::new()
-            .name("oathkeep timing probe".into())
+            .name("victory timing probe".into())
             .spawn(|| {
                 loop {
                     std::thread::sleep(Duration::from_secs(1));
@@ -63,6 +77,8 @@ pub fn start() {
     }
 }
 
+/// In the recorder (a child started by [`start`]): records until the
+/// target exits and returns true; false in any other process.
 pub fn child() -> bool {
     let (Some(pid), Some(path)) = (
         std::env::var(TARGET).ok().and_then(|p| p.parse().ok()),
@@ -114,6 +130,7 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 },
             },
         };
+        /// A `PROPVARIANT` holding a blob (`VT_BLOB`).
         #[repr(C)]
         struct Blob {
             vt: u16,
@@ -136,6 +153,7 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let client = loop {
             let (mut hr, mut client) = (HRESULT(0), None::<IUnknown>);
+            // Fails (`E_ILLEGAL_METHOD_CALL`) until activation completes.
             if operation.GetActivateResult(&mut hr, &mut client).is_ok() {
                 hr.ok()?;
                 break client.ok_or("no audio client")?.cast::<IAudioClient>()?;
@@ -173,6 +191,7 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             while capture.GetNextPacketSize()? > 0 {
                 let (mut data, mut frames, mut flags, mut qpc) = (std::ptr::null_mut(), 0, 0, 0);
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
+                // Where this packet belongs, from its time stamp (100 ns).
                 let at = (qpc - *first.get_or_insert(qpc)) * u64::from(RATE) / 10_000_000;
                 if at > written + u64::from(RATE / 500) {
                     tracing::debug!(
@@ -196,6 +215,7 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 capture.ReleaseBuffer(frames)?;
             }
             if ended || patched.elapsed() >= Duration::from_secs(1) {
+                // Valid sizes at any time: runs end by being killed.
                 file.seek(SeekFrom::Start(0))?;
                 file.write_all(&header(written))?;
                 file.seek(SeekFrom::End(0))?;

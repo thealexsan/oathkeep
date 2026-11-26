@@ -1,10 +1,13 @@
-use std::io::Write;
+use std::fs::File;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
 use crate::Converter;
 
+/// Identifies one conversion result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheKey(blake3::Hash);
 
@@ -23,12 +26,14 @@ impl CacheKey {
     }
 }
 
+/// Content-addressed store under the user's cache directory.
 #[derive(Debug, Clone)]
 pub struct Cache {
     root: PathBuf,
 }
 
 impl Cache {
+    /// Opens (creating) a cache at `root`. Refuses locations inside the repo.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         oathkeep_core::ensure_outside_repo(&root)?;
@@ -41,6 +46,7 @@ impl Cache {
         self.root.join(&hex[..2]).join(&hex[2..])
     }
 
+    /// Returns the cached output for `input`, converting it first if needed.
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
         let path = self.path_for(&key);
@@ -53,11 +59,8 @@ impl Cache {
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
-        let tmp = tempfile_in(dir);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        // Write-then-rename so readers never see partial output.
+        let (tmp, mut file) = tempfile_in(dir)?;
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
@@ -69,11 +72,31 @@ impl Cache {
     }
 }
 
-fn tempfile_in(dir: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
+fn tempfile_in(dir: &Path) -> io::Result<(PathBuf, File)> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    dir.join(format!(".tmp-{}-{n}", std::process::id()))
+    create_tempfile_in(dir, &COUNTER)
+}
+
+fn create_tempfile_in(dir: &Path, counter: &AtomicU64) -> io::Result<(PathBuf, File)> {
+    // An interrupted writer can leave a file behind, and process IDs are
+    // reused. Keep it intact and try a new name rather than failing a miss.
+    for _ in 0..128 {
+        let n = counter.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(".tmp-{}-{n}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a unique cache staging file after 128 attempts",
+    ))
 }
 
 #[cfg(test)]
@@ -131,6 +154,65 @@ mod tests {
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1
         );
+    }
+
+    #[test]
+    fn staging_retries_collisions_without_changing_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = AtomicU64::new(0);
+        for n in 0..2 {
+            std::fs::write(
+                dir.path().join(format!(".tmp-{}-{n}", std::process::id())),
+                b"stale",
+            )
+            .unwrap();
+        }
+
+        let (path, mut file) = create_tempfile_in(dir.path(), &counter).unwrap();
+        file.write_all(b"fresh").unwrap();
+        drop(file);
+        assert_eq!(
+            path.file_name().unwrap(),
+            format!(".tmp-{}-2", std::process::id()).as_str()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
+        for n in 0..2 {
+            assert_eq!(
+                std::fs::read(dir.path().join(format!(".tmp-{}-{n}", std::process::id()))).unwrap(),
+                b"stale"
+            );
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn staging_collision_retries_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = AtomicU64::new(0);
+        for n in 0..128 {
+            std::fs::write(
+                dir.path().join(format!(".tmp-{}-{n}", std::process::id())),
+                b"stale",
+            )
+            .unwrap();
+        }
+
+        let error = create_tempfile_in(dir.path(), &counter).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(counter.load(Ordering::Relaxed), 128);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 128);
+    }
+
+    #[test]
+    fn staging_does_not_retry_other_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = AtomicU64::new(0);
+        let missing = dir.path().join("missing");
+
+        let error = create_tempfile_in(&missing, &counter).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert!(!missing.exists());
     }
 
     #[test]

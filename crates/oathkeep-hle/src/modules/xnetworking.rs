@@ -1,3 +1,7 @@
+//! XNetworking as an offline console answers it: the network stack is up
+//! (titles wait for that before anything else) but reaches nothing, the
+//! connectivity hint never changes, and the title's security allow list,
+//! which comes from the service, cannot be fetched.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
@@ -14,6 +18,8 @@ pub const PROVIDER: Guid = Guid::new(
     [0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a],
 );
 
+/// As the title (2026) asks for it; the slots it calls (0x18-0x88)
+/// take the same arguments as under the provider's own id (older titles).
 pub const IID_2026: Guid = Guid::new(
     0xbf23_46b2,
     0x39af,
@@ -25,10 +31,13 @@ pub static OBJECT: Object = Object::new("networking", &VTABLE);
 pub const INTERFACES: &[Interface] =
     &[(PROVIDER, PROVIDER, &OBJECT), (PROVIDER, IID_2026, &OBJECT)];
 
+/// `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)`: what needs the service.
 pub const UNREACHABLE: HRESULT = 0x8007_04CF_u32 as i32;
 
+/// The documented default for the preferred local UDP multiplayer port.
 const UDP_PORT: u16 = 3074;
 
+/// The connectivity hint: level, cost, interface type, then four flags.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectivityHint {
@@ -41,6 +50,7 @@ pub struct ConnectivityHint {
     pub roaming: bool,
 }
 
+/// Initialized, no connectivity (level 1), cost unknown (0).
 const OFFLINE: ConnectivityHint = ConnectivityHint {
     level: 1,
     cost: 0,
@@ -57,6 +67,7 @@ extern "system" fn udp_port(_: This, out: *mut u16) -> HRESULT {
     put(out, UDP_PORT)
 }
 
+/// Tells our port queries apart from other calls on the same block.
 static PORT: u8 = 0;
 
 extern "system" fn udp_port_async(_: This, block: *mut AsyncBlock) -> HRESULT {
@@ -68,6 +79,15 @@ extern "system" fn udp_port_result(_: This, block: *mut AsyncBlock, out: *mut u1
 
 static SECURITY: u8 = 0;
 
+fn wide(text: *const u16) -> Option<String> {
+    // SAFETY: the title passes a NUL-terminated UTF-16 string or null.
+    (!text.is_null()).then(|| unsafe {
+        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+        String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
+    })
+}
+
+/// The allow list comes from the service: unreachable offline.
 extern "system" fn security_info_async(
     _: This,
     url: *const c_char,
@@ -76,6 +96,17 @@ extern "system" fn security_info_async(
     tracing::debug!(
         url = text(url).unwrap_or_default(),
         "security information: offline"
+    );
+    xasync::finished(block, (&raw const SECURITY).cast(), UNREACHABLE)
+}
+extern "system" fn security_info_utf16_async(
+    _: This,
+    url: *const u16,
+    block: *mut AsyncBlock,
+) -> HRESULT {
+    tracing::debug!(
+        url = wide(url).unwrap_or_default(),
+        "security information (utf16): offline"
     );
     xasync::finished(block, (&raw const SECURITY).cast(), UNREACHABLE)
 }
@@ -99,6 +130,7 @@ extern "system" fn security_info_result(
     )
 }
 
+/// No security information can exist offline, so no certificate passes.
 extern "system" fn verify_certificate(
     _: This,
     _request: *mut c_void,
@@ -111,6 +143,7 @@ extern "system" fn connectivity_hint(_: This, out: *mut ConnectivityHint) -> HRE
     put(out, OFFLINE)
 }
 
+/// The hint and preferred port never change offline, so callbacks never run.
 extern "system" fn register(
     _: This,
     _queue: *const c_void,
@@ -128,21 +161,21 @@ static VTABLE: Methods<18> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    udp_port as *const (),
-    udp_port_async as *const (),
-    udp_port_result as *const (),
-    missing::<6> as *const (),
-    missing::<7> as *const (),
-    security_info_async as *const (),
-    security_info_size as *const (),
-    security_info_result as *const (),
-    missing::<11> as *const (),
-    missing::<12> as *const (),
-    missing::<13> as *const (),
-    verify_certificate as *const (),
-    connectivity_hint as *const (),
-    register as *const (),
-    unregister as *const (),
+    udp_port as *const (),                  // 0x18
+    udp_port_async as *const (),            // 0x20
+    udp_port_result as *const (),           // 0x28
+    register as *const (),                  // 0x30 port changed (never)
+    unregister as *const (),                // 0x38
+    security_info_async as *const (),       // 0x40
+    security_info_size as *const (),        // 0x48
+    security_info_result as *const (),      // 0x50
+    security_info_utf16_async as *const (), // 0x58
+    security_info_size as *const (),        // 0x60
+    security_info_result as *const (),      // 0x68
+    verify_certificate as *const (),        // 0x70
+    connectivity_hint as *const (),         // 0x78
+    register as *const (),                  // 0x80 hint changed (never)
+    unregister as *const (),                // 0x88
 ]);
 
 #[cfg(test)]
@@ -178,6 +211,28 @@ mod tests {
         assert_eq!(method::<Port>(&OBJECT, 0x28)(this, &mut b, &mut port), S_OK);
         assert_eq!(port, 3074);
 
+        type Register = extern "system" fn(
+            This,
+            *const c_void,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
+        type Unregister = extern "system" fn(This, u64, bool) -> bool;
+        let mut token = 0;
+        assert_eq!(
+            method::<Register>(&OBJECT, 0x30)(
+                this,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut token,
+            ),
+            S_OK
+        );
+        assert_ne!(token, 0);
+        assert!(method::<Unregister>(&OBJECT, 0x38)(this, token, false));
+
         type Url = extern "system" fn(This, *const c_char, *mut AsyncBlock) -> HRESULT;
         type Size = extern "system" fn(This, *mut AsyncBlock, *mut usize) -> HRESULT;
         let mut b = block();
@@ -192,5 +247,33 @@ mod tests {
             method::<Size>(&OBJECT, 0x48)(this, &mut b, &mut size),
             UNREACHABLE
         );
+
+        type UrlUtf16 = extern "system" fn(This, *const u16, *mut AsyncBlock) -> HRESULT;
+        let mut b = block();
+        let url_utf16: Vec<u16> = "https://example.invalid/\0".encode_utf16().collect();
+        assert_eq!(
+            method::<UrlUtf16>(&OBJECT, 0x58)(this, url_utf16.as_ptr(), &mut b),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), UNREACHABLE);
+        let mut size = 0;
+        assert_eq!(
+            method::<Size>(&OBJECT, 0x60)(this, &mut b, &mut size),
+            UNREACHABLE
+        );
+
+        token = 0;
+        assert_eq!(
+            method::<Register>(&OBJECT, 0x80)(
+                this,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut token,
+            ),
+            S_OK
+        );
+        assert_ne!(token, 0);
+        assert!(method::<Unregister>(&OBJECT, 0x88)(this, token, false));
     }
 }

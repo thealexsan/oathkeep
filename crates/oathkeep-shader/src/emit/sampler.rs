@@ -1,11 +1,26 @@
-use crate::ShaderError;
-use crate::dxbc::u32_at;
+//! Immediate samplers: the console's four sampler words (the GPU's public
+//! `SQ_IMG_SAMP_WORD0-3` layout) as a D3D12 static sampler.
+//!
+//! Word 0: address modes x, y, z (bits 0-8, 3 each), log2 of the maximum
+//! anisotropy (9-11), comparison function (12-14), reduction (29-30: 0
+//! filtering, 1 minimum, 2 maximum). Word 1: minimum and maximum LOD
+//! (0-11, 12-23, unsigned 4.8). Word 2: LOD bias (0-13, signed 5.8),
+//! magnification and minification filters (20-21, 22-23: point, linear,
+//! anisotropic point, anisotropic linear), mip filter (26-27: none, point,
+//! linear). Word 3: border colour (30-31: transparent black, opaque black,
+//! opaque white, custom).
+//!
+//! Comparison is the sampling instruction's, not the sampler's: the console
+//! encodes a comparison function in every sampler (D3D's default, less or
+//! equal, when unused).
 
-const MAX_RTS0_SAMPLERS: usize = 2048;
-
+/// A static sampler in D3D12 terms; the integers are the `D3D12_FILTER`,
+/// `D3D12_TEXTURE_ADDRESS_MODE`, `D3D12_COMPARISON_FUNC` and
+/// `D3D12_STATIC_BORDER_COLOR` values.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StaticSampler {
     pub filter: u32,
+    /// U, V, W.
     pub address: [u32; 3],
     pub mip_lod_bias: f32,
     pub max_anisotropy: u32,
@@ -15,11 +30,27 @@ pub struct StaticSampler {
     pub max_lod: f32,
 }
 
+// The floats come from fixed-point fields: never NaN.
 impl Eq for StaticSampler {}
 
 impl StaticSampler {
+    /// The filter supported by the host device. Anisotropic point-mip
+    /// filtering is optional (`D3D12_OPTIONS19`); older devices retain the
+    /// previous linear-mip approximation. Comparison/min/max reduction
+    /// bits and the sampler's LOD bounds are unchanged.
+    pub fn filter_for_host(&self, aniso_point_mip_supported: bool) -> u32 {
+        if !aniso_point_mip_supported && self.filter & !0x180 == 0x54 {
+            self.filter | 1
+        } else {
+            self.filter
+        }
+    }
+
+    /// Decodes the four sampler words.
     pub fn from_words(w: [u32; 4]) -> Self {
         let bits = |word: u32, at: u32, n: u32| word >> at & ((1 << n) - 1);
+        // wrap, mirror, clamp, mirror once; the half-border modes have no
+        // D3D form and become their nearest.
         let address = |m: u32| [1, 2, 3, 5, 3, 5, 4, 5][m as usize];
         let (mag, min, mip) = (bits(w[2], 20, 2), bits(w[2], 22, 2), bits(w[2], 26, 2));
         let reduction = match bits(w[0], 29, 2) {
@@ -28,11 +59,12 @@ impl StaticSampler {
             _ => 0,
         };
         let filter = if mag >= 2 || min >= 2 {
-            0x55 | reduction << 7
+            0x54 | u32::from(mip == 2) | reduction << 7
         } else {
             (min & 1) << 4 | (mag & 1) << 2 | u32::from(mip == 2) | reduction << 7
         };
         let lod = |v: u32| v as f32 / 256.0;
+        // Without a mip filter the base level is sampled.
         let (min_lod, max_lod) = if mip == 0 {
             (0.0, 0.0)
         } else {
@@ -44,53 +76,12 @@ impl StaticSampler {
             mip_lod_bias: ((bits(w[2], 0, 14) << 18) as i32 >> 18) as f32 / 256.0,
             max_anisotropy: 1 << bits(w[0], 9, 3).min(4),
             comparison: bits(w[0], 12, 3) + 1,
+            // shortcut: a custom border colour (type 3, a table entry) becomes
+            // transparent black; upgrade when a title uses one.
             border: bits(w[3], 30, 2) % 3,
             min_lod,
             max_lod,
         }
-    }
-
-    pub fn from_rts0(part: &[u8]) -> Result<Vec<Self>, ShaderError> {
-        let version = u32_at(part, 0)?;
-        let stride = match version {
-            1 | 2 => 52usize,
-            3 => 56usize,
-            _ => return Err(ShaderError::Malformed("unknown RTS0 version")),
-        };
-        let count = u32_at(part, 0x0c)? as usize;
-        if count > MAX_RTS0_SAMPLERS {
-            return Err(ShaderError::Malformed("implausible RTS0 static sampler count"));
-        }
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        let offset = u32_at(part, 0x10)? as usize;
-        let end = count
-            .checked_mul(stride)
-            .and_then(|bytes| offset.checked_add(bytes))
-            .ok_or(ShaderError::Malformed("RTS0 static sampler table overflow"))?;
-        if end > part.len() {
-            return Err(ShaderError::Malformed("RTS0 static sampler table out of bounds"));
-        }
-        let mut out = Vec::with_capacity(count);
-        for i in 0..count {
-            let at = offset + i * stride;
-            out.push(StaticSampler {
-                filter: u32_at(part, at)?,
-                address: [
-                    u32_at(part, at + 4)?,
-                    u32_at(part, at + 8)?,
-                    u32_at(part, at + 12)?,
-                ],
-                mip_lod_bias: f32::from_bits(u32_at(part, at + 16)?),
-                max_anisotropy: u32_at(part, at + 20)?,
-                comparison: u32_at(part, at + 24)?,
-                border: u32_at(part, at + 28)?,
-                min_lod: f32::from_bits(u32_at(part, at + 32)?),
-                max_lod: f32::from_bits(u32_at(part, at + 36)?),
-            });
-        }
-        Ok(out)
     }
 }
 
@@ -100,6 +91,8 @@ mod tests {
 
     #[test]
     fn console_compiled_samplers_decode() {
+        // Words the console compiler wrote for static samplers of known
+        // descriptions.
         let point = StaticSampler::from_words([0x3088, 0x0054_0100, 0x1400_0080, 0x8000_0000]);
         assert_eq!(
             point,
@@ -143,93 +136,52 @@ mod tests {
     }
 
     #[test]
-    fn parses_rts0_static_samplers() {
-        let mut rts = Vec::new();
-        // Version 1.1 (2), 0 params, 2 static samplers at offset 24
-        for w in [2u32, 0, 24, 2, 24, 0] {
-            rts.extend_from_slice(&w.to_le_bytes());
+    fn anisotropic_samplers_preserve_mip_point_filtering() {
+        for (reduction, base) in [(0u32, 0x54u32), (1, 0x154), (2, 0x1D4)] {
+            let w0 = reduction << 29;
+            for mip in [0u32, 1] {
+                let w2 = (mip << 26) | 0x00F0_0000; // mag = 3, min = 3
+                let s = StaticSampler::from_words([w0, 0x00FF_F000, w2, 0]);
+                assert_eq!(s.filter, base, "reduction={reduction} mip={mip}");
+            }
+            let w2 = (2 << 26) | 0x00F0_0000; // mip = 2 (linear)
+            let s = StaticSampler::from_words([w0, 0x00FF_F000, w2, 0]);
+            assert_eq!(s.filter, base | 1, "reduction={reduction} mip=2");
         }
-        // Sampler 0: linear clamp
-        for w in [
-            0x15u32,
-            3,
-            3,
-            3,
-            (-0.5f32).to_bits(),
-            16,
-            4,
-            2,
-            0.0f32.to_bits(),
-            f32::MAX.to_bits(),
-            0,
-            0,
-            0,
-        ] {
-            rts.extend_from_slice(&w.to_le_bytes());
-        }
-        // Sampler 1: point wrap
-        for w in [
-            0u32,
-            1,
-            1,
-            1,
-            0.25f32.to_bits(),
-            1,
-            1,
-            0,
-            1.0f32.to_bits(),
-            8.0f32.to_bits(),
-            1,
-            0,
-            0,
-        ] {
-            rts.extend_from_slice(&w.to_le_bytes());
-        }
-        let parsed = StaticSampler::from_rts0(&rts).unwrap();
-        assert_eq!(
-            parsed,
-            [
-                StaticSampler {
-                    filter: 0x15,
-                    address: [3, 3, 3],
-                    mip_lod_bias: -0.5,
-                    max_anisotropy: 16,
-                    comparison: 4,
-                    border: 2,
-                    min_lod: 0.0,
-                    max_lod: f32::MAX,
-                },
-                StaticSampler {
-                    filter: 0,
-                    address: [1, 1, 1],
-                    mip_lod_bias: 0.25,
-                    max_anisotropy: 1,
-                    comparison: 1,
-                    border: 0,
-                    min_lod: 1.0,
-                    max_lod: 8.0,
-                },
-            ]
-        );
+        // Mixed anisotropic mag (2) with linear min (1) and point mip (1).
+        let mixed = StaticSampler::from_words([0, 0, (1 << 26) | (1 << 22) | (2 << 20), 0]);
+        assert_eq!(mixed.filter, 0x54);
+    }
 
-        // Version 1.2 (3) uses 56-byte entries.
-        let mut rts12 = Vec::new();
-        for w in [3u32, 0, 24, 1, 24, 0] {
-            rts12.extend_from_slice(&w.to_le_bytes());
+    #[test]
+    fn host_filter_falls_back_without_changing_reduction_or_lod() {
+        for (filter, fallback) in [(0x54, 0x55), (0xD4, 0xD5), (0x154, 0x155), (0x1D4, 0x1D5)] {
+            for mip in [0u32, 1] {
+                let s = StaticSampler {
+                    filter,
+                    ..StaticSampler::from_words([0, 0x0054_0100, (mip << 26) | 0x00F0_0000, 0])
+                };
+                assert_eq!(s.filter_for_host(false), fallback);
+                assert_eq!(s.filter_for_host(true), filter);
+                assert_eq!(
+                    (s.min_lod, s.max_lod),
+                    if mip == 0 { (0.0, 0.0) } else { (1.0, 5.25) }
+                );
+            }
         }
-        rts12.extend_from_slice(&rts[24..24 + 52]);
-        rts12.extend_from_slice(&0u32.to_le_bytes());
-        assert_eq!(StaticSampler::from_rts0(&rts12).unwrap(), [parsed[0]]);
+    }
 
-        // Empty sampler table and error checks.
-        let empty: Vec<u8> = [2u32, 0, 24, 0, 24, 0]
-            .into_iter()
-            .flat_map(u32::to_le_bytes)
-            .collect();
-        assert!(StaticSampler::from_rts0(&empty).unwrap().is_empty());
-        assert!(StaticSampler::from_rts0(&rts[..rts.len() - 4]).is_err());
-        let mut bad_ver = rts.clone();
-        bad_ver[0] = 9;
-        assert!(StaticSampler::from_rts0(&bad_ver).is_err());
+    #[test]
+    fn host_filter_keeps_other_filters_unchanged() {
+        for reduction in [0, 0x80, 0x100, 0x180] {
+            for base in [0, 1, 4, 5, 0x10, 0x11, 0x14, 0x15, 0x55] {
+                let s = StaticSampler {
+                    filter: base | reduction,
+                    ..StaticSampler::from_words([0; 4])
+                };
+                assert_eq!(s.filter_for_host(false), s.filter);
+                assert_eq!(s.filter_for_host(true), s.filter);
+            }
+        }
     }
 }

@@ -1,3 +1,6 @@
+//! The DXGI side of the device: one adapter with one output, reached from
+//! the device by interface query. Tables follow the PC interfaces' order
+//! (IUnknown, the object methods, then each interface's methods).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{
@@ -5,6 +8,7 @@ use crate::object::{
     Object, S_OK, Table, This, guid,
 };
 
+/// The DXGI device interfaces, base first (as on PC).
 pub(crate) const DEVICE_IIDS: [Iid; 3] = [
     guid(
         0x54ec77fa,
@@ -81,10 +85,20 @@ pub(crate) fn device() -> This {
     &DEVICE
 }
 
+/// `found` if `iid` is one of `known`.
 fn query(kind: usize, iid: *const Iid, known: &[Iid], found: This, out: *mut This) -> HRESULT {
     object::answer(kind, iid, object::is(iid, known).then_some(found), out)
 }
 
+fn enumeration_not_found(out: *mut This) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: the caller supplies a writable output slot when non-null.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    NOT_FOUND
+}
+
+/// The DXGI device also answers for the D3D12 device.
 extern "system" fn device_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     if crate::device::is_device(iid) {
         return object::answer(DXGI_DEVICE, iid, Some(crate::device::device()), out);
@@ -106,7 +120,7 @@ extern "system" fn adapter_parent(_: This, iid: *const Iid, out: *mut This) -> H
 }
 extern "system" fn adapter_outputs(_: This, index: u32, out: *mut This) -> HRESULT {
     if index != 0 {
-        return NOT_FOUND;
+        return enumeration_not_found(out);
     }
     object::answer(ADAPTER, &OUTPUT_IIDS[0], Some(&OUTPUT_OBJECT), out)
 }
@@ -135,7 +149,9 @@ extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) ->
     for (slot, unit) in name.iter_mut().zip("Oathkeep console GPU".encode_utf16()) {
         *slot = unit;
     }
-    let (gpu_optimal, standard) = crate::console::current().reported_title_memory();
+    // shortcut: memory sizes are the title's split (GPU-optimal, standard),
+    // not measured; revisit once memory is emulated.
+    let (gpu_optimal, standard) = crate::console::current().title_memory();
     let description = AdapterDescription {
         name,
         vendor: AMD,
@@ -157,7 +173,7 @@ extern "system" fn factory_query(this: This, iid: *const Iid, out: *mut This) ->
 }
 extern "system" fn factory_adapters(_: This, index: u32, out: *mut This) -> HRESULT {
     if index != 0 {
-        return NOT_FOUND;
+        return enumeration_not_found(out);
     }
     object::answer(FACTORY, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out)
 }
@@ -169,31 +185,36 @@ extern "system" fn output_parent(_: This, iid: *const Iid, out: *mut This) -> HR
     query(OUTPUT, iid, &ADAPTER_IIDS, &ADAPTER_OBJECT, out)
 }
 
+/// IUnknown 3, object 4, device 5 + 2 + 3.
 static DEVICE_FUNCTIONS: Table<32> = {
     let mut f = object::missing_table::<DXGI_DEVICE, 32>();
     f[0] = device_query as *const ();
-    f[6] = device_parent as *const ();
-    f[7] = device_adapter as *const ();
+    f[6] = device_parent as *const (); // 0x30
+    f[7] = device_adapter as *const (); // 0x38
     Table(f)
 };
 
+/// IUnknown 3, object 4, adapter 3 + 1 + 1.
 static ADAPTER_FUNCTIONS: Table<24> = {
     let mut f = object::missing_table::<ADAPTER, 24>();
     f[0] = adapter_query as *const ();
-    f[6] = adapter_parent as *const ();
-    f[7] = adapter_outputs as *const ();
-    f[8] = adapter_description as *const ();
+    f[6] = adapter_parent as *const (); // 0x30
+    f[7] = adapter_outputs as *const (); // 0x38
+    f[8] = adapter_description as *const (); // 0x40
     Table(f)
 };
 
+/// IUnknown 3, object 4, factory 5 + 2 + 11.
 static FACTORY_FUNCTIONS: Table<32> = {
     let mut f = object::missing_table::<FACTORY, 32>();
     f[0] = factory_query as *const ();
-    f[7] = factory_adapters as *const ();
-    f[12] = factory_adapters as *const ();
+    f[7] = factory_adapters as *const (); // 0x38
+    f[12] = factory_adapters as *const (); // 0x60, the same for version 1
     Table(f)
 };
 
+/// A display mode as the console lists it: size, refresh rate (numerator,
+/// denominator), format, scanline order, scaling, flags.
 #[repr(C)]
 struct Mode {
     width: u32,
@@ -206,6 +227,11 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
+/// The size of the display the console reports: `OATHKEEP_DISPLAY_MODE=WxH`
+/// if set (as a console reports the television it is plugged into: a
+/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
+/// shortcut: not yet the host display's own size by default; make it so
+/// once a title is seen to render for the mode it is given.
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
@@ -217,15 +243,15 @@ fn display_size() -> (u32, u32) {
             Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
             _ => (3840, 2160),
         };
-        tracing::info!(
-            width = size.0,
-            height = size.1,
-            "display mode reported to the title"
-        );
+        tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
         size
     })
 }
 
+/// The console's mode list: one 4K mode at 60 Hz (the title looks
+/// for a 120 Hz one to allow 120 Hz frame intervals).
+/// shortcut: fixed mode, not the host display's; report the host's rates if
+/// a title paces by them.
 extern "system" fn modes(
     _: This,
     _format: u32,
@@ -251,7 +277,7 @@ extern "system" fn modes(
         height,
         refresh: [60, 1],
         format: 0,
-        scanlines: 1,
+        scanlines: 1, // progressive
         scaling: 0,
         flags: 0,
     };
@@ -260,11 +286,12 @@ extern "system" fn modes(
     S_OK
 }
 
+/// IUnknown 3, object 4, output 15 (12 as on PC, then 3 console ones).
 static OUTPUT_FUNCTIONS: Table<32> = {
     let mut f = object::missing_table::<OUTPUT, 32>();
     f[0] = output_query as *const ();
-    f[6] = output_parent as *const ();
-    f[21] = modes as *const ();
+    f[6] = output_parent as *const (); // 0x30
+    f[21] = modes as *const (); // 0xa8
     Table(f)
 };
 
@@ -278,6 +305,8 @@ mod tests {
     type Indexed = extern "system" fn(This, u32, *mut This) -> HRESULT;
     type Describe = extern "system" fn(This, *mut AdapterDescription) -> HRESULT;
 
+    /// Minecraft's startup: device → DXGI device (newest first) → adapter →
+    /// description, factory, first output.
     #[test]
     fn startup_walks_from_device_to_output() {
         let d3d = crate::device::device();
@@ -316,5 +345,19 @@ mod tests {
         assert_eq!(outputs(adapter, 0, &mut output), S_OK);
         assert!(!output.is_null());
         assert_eq!(outputs(adapter, 1, &mut output), NOT_FOUND);
+    }
+
+    #[test]
+    fn out_of_range_enumeration_clears_output() {
+        for (object, offset, method) in [
+            (&FACTORY_OBJECT, 0x38, "EnumAdapters"),
+            (&FACTORY_OBJECT, 0x60, "EnumAdapters1"),
+            (&ADAPTER_OBJECT, 0x38, "EnumOutputs"),
+        ] {
+            let enumerate = slot::<Indexed>(object, offset);
+            let mut out = object as This;
+            assert_eq!(enumerate(object, 1, &mut out), NOT_FOUND, "{method}");
+            assert!(out.is_null(), "{method} left a stale output pointer");
+        }
     }
 }

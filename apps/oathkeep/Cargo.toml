@@ -1,15 +1,11 @@
 [package]
 name = "oathkeep"
-description = "Oathkeep command-line front end: inspect, census, convert, run."
+description = "Command-line front end: inspect, census, convert, run."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-
-[[bin]]
-name = "oathkeep"
-path = "src/main.rs"
 
 [dependencies]
 oathkeep-core.workspace = true

@@ -1,15 +1,38 @@
+//! Our implementation of the Xbox system API surface.
+//!
+//! A title imports from three kinds of DLLs, and each gets its own policy:
+//!
+//! | kind | examples | handled by |
+//! |------|----------|------------|
+//! | Windows API sets the console shares with PC | `api-ms-win-core-synch-*`, `ws2_32.dll` | host pass-through, overridden here where console behaviour differs (paths, memory) |
+//! | console-only system APIs | `xgameruntime.dll`, `xmem.dll`, `d3d12_xs.dll` | implemented here, in [`modules`] |
+//! | anything else | | an unimplemented-import stub from the loader |
+//!
+//! Resolution order for every import: an implementation in [`modules`],
+//! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
+
 mod host;
+mod image_watch;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use oathkeep_gpu::frame_phase;
+
 pub mod modules;
 mod registry;
 pub mod runtime;
 
 pub use host::HostPolicy;
-pub use oathkeep_gpu::console;
 pub use registry::{HleExport, HleModule, registry};
+pub use oathkeep_gpu::console;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use oathkeep_gpu::replay;
+
+#[cfg(windows)]
+pub use oathkeep_gpu::pipeline::known as known_pipelines;
 
 use oathkeep_loader::{ImportResolver, Provenance, Resolution};
 use oathkeep_pe::ImportSymbol;
 
+/// Resolves a title's imports against our runtime and the host.
 #[derive(Debug, Default)]
 pub struct HleResolver {
     pub host: HostPolicy,
@@ -20,6 +43,7 @@ impl HleResolver {
         HleResolver { host }
     }
 
+    /// Where an import would come from, without binding anything.
     pub fn classify(&self, dll: &str, symbol: &ImportSymbol) -> Option<Provenance> {
         match self.resolve(dll, symbol) {
             Resolution::Found { provenance, .. } => Some(provenance),
@@ -30,6 +54,7 @@ impl HleResolver {
 
 impl ImportResolver for HleResolver {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+        // Ordinal imports look up `#n`.
         if let Some(address) = registry::lookup(dll, &symbol.to_string()) {
             return Resolution::Found {
                 address,
@@ -46,6 +71,8 @@ impl ImportResolver for HleResolver {
     }
 }
 
+// The registry is code-only, so the "Missing" outcome can be checked on any
+// host; host pass-through itself needs Windows.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +110,7 @@ mod tests {
             r.classify("api-ms-win-core-synch-l1-2-0.dll", &name("Sleep")),
             Some(Provenance::Host)
         );
+        // Console-only DLLs never pass through.
         assert_eq!(
             r.classify("xmem.dll", &name("XMemSetAllocationHooks")),
             None
@@ -100,5 +128,31 @@ mod tests {
             ),
             Some(Provenance::Hle)
         );
+    }
+
+    // #510: the RPC runtime's GUID calls are ours, so the DLL itself stays
+    // outside the host policy (its own `ws2_32` imports would be a network
+    // path `modules::net` never sees).
+    #[test]
+    fn the_rpc_runtime_is_implemented_here() {
+        let r = HleResolver::new(HostPolicy::none());
+        for call in [
+            "UuidCreate",
+            "UuidCreateSequential",
+            "UuidFromStringA",
+            "UuidFromStringW",
+            "UuidToStringA",
+            "UuidToStringW",
+            "RpcStringFreeA",
+            "RpcStringFreeW",
+        ] {
+            assert_eq!(
+                r.classify("rpcrt4.dll", &name(call)),
+                Some(Provenance::Hle),
+                "{call}"
+            );
+        }
+        // A call we do not implement is not passed to the host either.
+        assert_eq!(r.classify("rpcrt4.dll", &name("RpcServerRegisterIf")), None);
     }
 }

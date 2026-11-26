@@ -1,3 +1,6 @@
+//! The title's own id (from its manifest), which runtime areas exist, and
+//! game invites and events. Offline no invite arrives and events go
+//! nowhere.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{CStr, c_char, c_void};
@@ -7,18 +10,21 @@ use super::xgameruntime::{
 };
 use crate::runtime;
 
+/// Title id and launching another title.
 pub const TITLE_PROVIDER: Guid = Guid::new(
     0x973a_344e,
     0x24bf,
     0x4d0f,
     [0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29],
 );
+/// As Minecraft (2022) asks for it.
 pub const TITLE_IID: Guid = Guid::new(
     0x2549_f142,
     0x6419,
     0x4a06,
     [0x97, 0xb5, 0x93, 0x1a, 0xab, 0x7c, 0x2f, 0x34],
 );
+/// Feature checks; the interface id is the provider's, as for the next two.
 pub const FEATURES: Guid = Guid::new(
     0x8836_fe87,
     0xedb9,
@@ -56,31 +62,41 @@ extern "system" fn title_id(_: This, out: *mut u32) -> HRESULT {
     put(out, runtime::title().id)
 }
 
+/// As documented: the title ends (suspended first, as on any end) and the
+/// game starts again in a new process; this never returns.
+/// The title relaunches itself (its own path from `GetModuleFileNameA`) with
+/// arguments from its configuration. The new `victory run` gets the same
+/// options, the new executable, and the title's arguments after `--`
+/// (the title reads the whole command line).
 extern "system" fn launch_new_game(
     _: This,
     exe: *const c_char,
     args: *const c_char,
     _user: *const c_void,
 ) {
-    let (exe, args) = (
-        text(exe).unwrap_or_default(),
-        text(args).unwrap_or_default(),
-    );
+    let (exe, args) = (text(exe).unwrap_or_default(), text(args).unwrap_or_default());
     tracing::info!(exe, args, "XLaunchNewGame");
     let current = runtime::main_image()
         .and_then(runtime::image_path)
         .unwrap_or_default();
     let ours: Vec<_> = std::env::args_os().skip(1).collect();
     let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
-    super::lifecycle::end_title(
-        "XLaunchNewGame",
-        Box::new(move || super::lifecycle::relaunch(command)),
-    );
-    loop {
-        std::thread::park();
+    #[cfg(windows)]
+    {
+        super::lifecycle::end_title(
+            "XLaunchNewGame",
+            Box::new(move || super::lifecycle::relaunch(command)),
+        );
+        loop {
+            std::thread::park();
+        }
     }
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
+/// Our own arguments for the relaunch: the title's executable replaced by
+/// `exe`, earlier title arguments dropped, `args` after `--`.
 fn relaunch_args(
     ours: Vec<std::ffi::OsString>,
     current: &std::ffi::OsStr,
@@ -88,18 +104,63 @@ fn relaunch_args(
     args: &str,
 ) -> Vec<std::ffi::OsString> {
     let mut out: Vec<_> = ours.into_iter().take_while(|a| a != "--").collect();
+    // `runtime` makes the image path absolute when it maps the title, so a
+    // relative launch argument is not textually equal to it. Normalise the
+    // same way before matching, or a relaunch would run the old executable.
     if !exe.is_empty()
-        && let Some(slot) = out.iter_mut().find(|a| a.as_os_str() == current)
+        && let Some(slot) = out.iter_mut().find(|a| {
+            a.as_os_str() == current
+                || std::path::absolute(a).is_ok_and(|p| p.as_os_str() == current)
+        })
     {
         *slot = exe.into();
     }
     if !args.trim().is_empty() {
         out.push("--".into());
-        out.extend(args.split_whitespace().map(Into::into));
+        out.extend(split_args(args).into_iter().map(Into::into));
     }
     out
 }
 
+/// Splits the title's command-line tail into arguments, keeping double-quoted
+/// strings together (including empty ones). Windows command lines quote only
+/// with `"`: an apostrophe is ordinary text, as in `O'Brien`.
+fn split_args(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    for c in args.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            c if !quoted && c.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(current);
+    }
+    out
+}
+
+/// Runtime areas by number, in the public feature list's order, that we
+/// serve: accessibility (0), app capture (1), async calls and providers
+/// (2, 3), display (4), game (5), invites (6), game saves (7), game UI (8),
+/// launcher (9), networking (10), packages (11), persistent local storage
+/// (12), speech synthesis (13), store (14), system (15), task queues (16),
+/// users (18), error reports (19), game events (20). Not threads (17) or
+/// game streaming (21).
 const AVAILABLE: [u32; 20] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20,
 ];
@@ -108,6 +169,7 @@ extern "system" fn is_feature_available(_: This, feature: u32) -> bool {
     AVAILABLE.contains(&feature)
 }
 
+/// Nothing raises these events offline, so the callback never runs.
 extern "system" fn register(
     _: This,
     _queue: *const c_void,
@@ -121,6 +183,7 @@ extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
     true
 }
 
+/// Accepted and dropped; the name goes to the debug log.
 extern "system" fn write_event(
     _: This,
     _user: *const c_void,
@@ -142,30 +205,30 @@ static TITLE_VTABLE: Methods<5> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    title_id as *const (),
-    launch_new_game as *const (),
+    title_id as *const (),        // 0x18
+    launch_new_game as *const (), // 0x20
 ]);
 
 static FEATURES_VTABLE: Methods<4> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    is_feature_available as *const (),
+    is_feature_available as *const (), // 0x18
 ]);
 
 static INVITES_VTABLE: Methods<5> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    register as *const (),
-    unregister as *const (),
+    register as *const (),   // 0x18
+    unregister as *const (), // 0x20
 ]);
 
 static EVENTS_VTABLE: Methods<4> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    write_event as *const (),
+    write_event as *const (), // 0x18
 ]);
 
 #[cfg(test)]
@@ -175,35 +238,49 @@ mod tests {
 
     #[test]
     fn a_relaunch_keeps_our_options() {
-        let ours: Vec<std::ffi::OsString> = [
-            "run",
-            "G:/game.exe",
-            "--execute",
-            "--console",
-            "series-s",
-            "--",
-            "-old",
-        ]
-        .map(Into::into)
-        .into();
+        let ours: Vec<std::ffi::OsString> =
+            ["run", "G:/game.exe", "--execute", "--console", "series-s", "--", "-old"]
+                .map(Into::into)
+                .into();
         let current = std::ffi::OsStr::new("G:/game.exe");
         let again = relaunch_args(ours.clone(), current, "G:/game.exe", " -config=x  -y ");
-        let expected = [
-            "run",
-            "G:/game.exe",
-            "--execute",
-            "--console",
-            "series-s",
-            "--",
-        ];
+        let expected = ["run", "G:/game.exe", "--execute", "--console", "series-s", "--"];
         assert_eq!(again[..6], expected.map(std::ffi::OsString::from));
-        assert_eq!(
-            again[6..],
-            ["-config=x", "-y"].map(std::ffi::OsString::from)
-        );
+        assert_eq!(again[6..], ["-config=x", "-y"].map(std::ffi::OsString::from));
         let other = relaunch_args(ours, current, "G:/other.exe", "");
         assert_eq!(other.len(), 5);
         assert_eq!(other[1], "G:/other.exe");
+    }
+
+    #[test]
+    fn a_relaunch_replaces_a_relative_startup_executable() {
+        // `runtime::set_image_path` makes this absolute before the launch.
+        let current = std::path::absolute("game.exe").unwrap();
+        let ours: Vec<std::ffi::OsString> =
+            ["run", "game.exe", "--execute", "--console", "series-s", "--", "-old"]
+                .map(Into::into)
+                .into();
+        let again = relaunch_args(
+            ours,
+            current.as_os_str(),
+            "other.exe",
+            r#"--config="C:\Program Files\game" "" -name=O'Brien -y"#,
+        );
+        let expected: Vec<std::ffi::OsString> = [
+            "run",
+            "other.exe",
+            "--execute",
+            "--console",
+            "series-s",
+            "--",
+            r"--config=C:\Program Files\game",
+            "",
+            "-name=O'Brien",
+            "-y",
+        ]
+        .map(Into::into)
+        .into();
+        assert_eq!(again, expected, "the requested exe and quoted args survive");
     }
 
     #[test]

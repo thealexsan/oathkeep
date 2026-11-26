@@ -4,6 +4,37 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+#[cfg(any(windows, test))]
+const SKIP_CPU_CHECK_ENV: &str = "OATHKEEP_SKIP_CPU_CHECK";
+
+#[cfg(any(windows, test))]
+fn skip_cpu_check(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(any(windows, test))]
+fn check_cpu_features_with(has_avx2: bool, skip_env: Option<&str>) -> Result<()> {
+    if has_avx2 || skip_cpu_check(skip_env) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this CPU does not support AVX2, which Xbox Series titles require; \
+         set {SKIP_CPU_CHECK_ENV}=1 to bypass this check (for example under CPU emulation such as Intel SDE)"
+    );
+}
+
+/// Pre-flight check before executing title code: Xbox Series binaries are
+/// compiled for Zen 2 and require AVX2.
+#[cfg(windows)]
+fn check_cpu_features() -> Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let has_avx2 = true;
+    let skip = std::env::var(SKIP_CPU_CHECK_ENV).ok();
+    check_cpu_features_with(has_avx2, skip.as_deref())
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -12,10 +43,14 @@ pub fn run(
     execute: bool,
     console: Console,
 ) -> Result<()> {
+    use std::sync::Arc;
     use oathkeep_hle::{HleResolver, HostPolicy};
     use oathkeep_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
-    use std::sync::Arc;
 
+    if execute {
+        check_cpu_features()?;
+    }
+    // A title that relaunched itself: the old process must be gone first.
     oathkeep_hle::modules::lifecycle::wait_for_previous();
     let cfg = oathkeep_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
@@ -29,6 +64,11 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     oathkeep_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = oathkeep_loader::load(&prepared, &images)?;
+    // The program is mapped from the copy `load` wrote: the file's bytes
+    // and their patched copy are not read again, and were held for the
+    // whole run (two blocks of 114.7 MB each for the title, in
+    // physical memory: run 65's memory map).
+    let image_name = prepared.file_name();
     drop(prepared);
     drop(original);
     oathkeep_hle::runtime::set_main_image(image.base());
@@ -45,6 +85,7 @@ pub fn run(
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     let title_dir = exe.parent().unwrap_or(Path::new("."));
+    // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
     let title = oathkeep_hle::runtime::Title::from_manifest(&manifest);
@@ -55,6 +96,7 @@ pub fn run(
         storage.display(),
         title.storage_bytes >> 20
     );
+    // The console's fixed drives: the package as `G:`, temporary files `T:`.
     oathkeep_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     oathkeep_hle::modules::files::mount_at('T', &temp);
@@ -68,6 +110,32 @@ pub fn run(
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
         oathkeep_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+    }
+    let imported: Vec<&str> = image
+        .info()
+        .imports
+        .iter()
+        .map(|m| m.dll.as_str())
+        .collect();
+    let mapped: Vec<&str> = dlls.iter().map(|(name, _)| name.as_str()).collect();
+    let absent = absent_title_dlls(&imported, &mapped, &wanted);
+    if !absent.is_empty() {
+        let message = format!(
+            "{} not in {}, and neither the host nor Oathkeep provides {}: the package is \
+             incomplete; copy every file of the package next to the executable",
+            absent.join(", "),
+            title_dir.display(),
+            if absent.len() == 1 { "it" } else { "them" },
+        );
+        println!("missing dlls   {message}");
+        // None of their imports can be bound, so the title stops at its first
+        // call into one during system initialization with nothing saying why.
+        // Stubs only if asked for.
+        if execute && matches!(unimplemented, Unimplemented::Trap) {
+            anyhow::bail!(
+                "the title's own DLLs are missing: {message} (`--unimplemented zero` runs it anyway)"
+            );
+        }
     }
 
     let policy = match unimplemented {
@@ -95,6 +163,11 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, and nothing of it has run yet.
+        unsafe { oathkeep_loader::write_sites::apply_asked(&image_name, image.base(), size) };
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
@@ -124,11 +197,17 @@ pub fn run(
     Ok(())
 }
 
+/// The debugging aids (README): scheduled stack dumps, watched values and
+/// memory saved on a crash.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &oathkeep_loader::LoadedImage, cfg: &oathkeep_core::Config) {
     oathkeep_loader::dump_stacks_on_schedule();
+    oathkeep_loader::profile_on_schedule(oathkeep_hle::frame_phase);
     oathkeep_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    poke(image.base(), image.info().size_of_image as usize);
+    // Debugging aid: `OATHKEEP_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
+    // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;
     let ranges = std::env::var("OATHKEEP_CRASH_SAVE").unwrap_or_default();
     let hex = |s: &str| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
@@ -146,6 +225,8 @@ fn diagnostics(image: &oathkeep_loader::LoadedImage, cfg: &oathkeep_core::Config
     );
 }
 
+/// Debugging aid: `OATHKEEP_WATCH=<rva>,...` (hex) logs the u32 at each
+/// title+rva whenever it changes, polled every 5 ms (an engine's state, say).
 #[cfg(all(windows, feature = "diagnostics"))]
 fn watch(base: usize, size: usize) {
     let Ok(list) = std::env::var("OATHKEEP_WATCH") else {
@@ -172,29 +253,86 @@ fn watch(base: usize, size: usize) {
     });
 }
 
+/// Debugging aid: `OATHKEEP_POKE=<rva>:<byte>,...` (hex) writes the byte at
+/// each title+rva twice a second. A title that ends itself when its main
+/// loop has not ticked for a while (e.g. a 30 s watchdog) runs on
+/// through slower frames with its tick flag poked. The address must be
+/// writable title data.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn poke(base: usize, size: usize) {
+    let Ok(list) = std::env::var("OATHKEEP_POKE") else {
+        return;
+    };
+    let hex = |s: &str| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    let pokes: Vec<(usize, u8)> = list
+        .split(',')
+        .filter_map(|p| p.split_once(':'))
+        .filter_map(|(rva, byte)| Some((hex(rva)?, u8::try_from(hex(byte)?).ok()?)))
+        .filter(|&(rva, _)| rva < size)
+        .collect();
+    std::thread::spawn(move || {
+        loop {
+            for &(rva, byte) in &pokes {
+                // SAFETY: a byte inside the mapped image, checked above.
+                unsafe { ((base + rva) as *mut u8).write_volatile(byte) };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    });
+}
+
+/// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
 fn title_dll(host: &oathkeep_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !oathkeep_hle::registry().iter().any(|m| m.serves(dll))
 }
 
+/// The DLLs among `imported` (the main image's static imports) that must
+/// come from the title's folder (`wanted`) but were not mapped from it:
+/// none of their imports can be bound. Each named once, case ignored.
+#[cfg(any(windows, test))]
+fn absent_title_dlls(
+    imported: &[&str],
+    mapped: &[&str],
+    wanted: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut absent: Vec<String> = Vec::new();
+    for &dll in imported {
+        let known = |list: &[&str]| list.iter().any(|m| m.eq_ignore_ascii_case(dll));
+        if wanted(dll) && !known(mapped) && !absent.iter().any(|a| a.eq_ignore_ascii_case(dll)) {
+            absent.push(dll.to_owned());
+        }
+    }
+    absent
+}
+
+/// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
+/// e.g. The title's upscaler behind its FidelityFX loader.
 #[cfg(windows)]
 struct LateDlls {
     host: oathkeep_hle::HostPolicy,
     title_dir: std::path::PathBuf,
     cache_dir: std::path::PathBuf,
     policy: oathkeep_loader::UnimplementedPolicy,
+    /// Every title DLL mapped so far, to bind new ones against.
     mapped: std::sync::Mutex<Vec<(String, oathkeep_loader::LoadedImage)>>,
     lock: LoaderLock,
 }
 
 #[cfg(windows)]
 impl LateDlls {
+    /// Every `LoadLibrary` of the title comes here first. Returns a title
+    /// image called `file`, mapping it and the title DLLs it needs first,
+    /// binding them and running their `DllMain` on the calling thread, as
+    /// the Windows loader would; `None` if `file` is no title image.
     fn load(
         &self,
         file: &str,
         show: impl Fn(&str, oathkeep_loader::BindReport),
     ) -> Result<Option<usize>> {
         use oathkeep_hle::runtime::{forget_image, image_named, set_image_path};
+        // Waits while another thread initialises a DLL; a `DllMain` that
+        // loads another DLL re-enters.
         self.lock.hold(|| {
             if let Some(base) = image_named(file) {
                 return Ok(Some(base));
@@ -225,6 +363,7 @@ impl LateDlls {
                     show(name, dll.bind_imports(&resolver, self.policy)?);
                     set_image_path(dll.base(), &self.title_dir.join(name));
                 }
+                // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());
                 new
             };
@@ -238,6 +377,8 @@ impl LateDlls {
             let Some((i, error)) = failed else {
                 return Ok(new.last().map(|(_, dll)| dll.base()));
             };
+            // As `LoadLibrary` does when a `DllMain` fails: detach what this
+            // load attached (the failed one too) and unmap all of it.
             let bases: Vec<_> = new.iter().map(|(_, d)| d.base()).collect();
             self.mapped
                 .lock()
@@ -257,6 +398,8 @@ impl LateDlls {
     }
 }
 
+/// The Windows loader lock's shape: one thread at a time, re-entered by
+/// the thread that holds it.
 #[cfg(windows)]
 #[derive(Default)]
 struct LoaderLock {
@@ -287,6 +430,42 @@ impl LoaderLock {
     }
 }
 
+#[cfg(test)]
+mod absent_tests {
+    use super::absent_title_dlls;
+
+    #[test]
+    fn title_dlls_missing_from_the_folder_are_named_once() {
+        // The host provides kernel32, our runtime d3d12_xs; the rest are the
+        // title's own (#930: the four DLLs beside the executable missing).
+        let wanted = |dll: &str| {
+            !["KERNEL32.dll", "d3d12_xs.dll"]
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(dll))
+        };
+        let imported = [
+            "KERNEL32.dll",
+            "d3d12_xs.dll",
+            "XboxBvhBuilder.dll",
+            "MSVCP140.dll",
+            "Bink2Scarlett.dll",
+            "xboxbvhbuilder.dll",
+        ];
+        let mapped = ["msvcp140.dll"];
+        assert_eq!(
+            absent_title_dlls(&imported, &mapped, &wanted),
+            ["XboxBvhBuilder.dll", "Bink2Scarlett.dll"]
+        );
+    }
+
+    #[test]
+    fn a_complete_package_has_nothing_absent() {
+        let wanted = |dll: &str| dll.starts_with("Title");
+        assert!(absent_title_dlls(&["Title.dll", "Host.dll"], &["TITLE.DLL"], &wanted).is_empty());
+        assert!(absent_title_dlls(&[], &[], &wanted).is_empty());
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -307,6 +486,45 @@ mod tests {
         });
         other.join().unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
+    }
+
+    #[test]
+    fn cpu_feature_check_matches_host() {
+        let skip = std::env::var(super::SKIP_CPU_CHECK_ENV).ok();
+        #[cfg(target_arch = "x86_64")]
+        let expected_ok =
+            std::arch::is_x86_feature_detected!("avx2") || skip.as_deref() == Some("1");
+        #[cfg(not(target_arch = "x86_64"))]
+        let expected_ok = true;
+        assert_eq!(super::check_cpu_features().is_ok(), expected_ok);
+    }
+}
+
+#[cfg(test)]
+mod cpu_check_tests {
+    use super::{SKIP_CPU_CHECK_ENV, check_cpu_features_with};
+
+    #[test]
+    fn avx2_present_passes() {
+        assert!(check_cpu_features_with(true, None).is_ok());
+        assert!(check_cpu_features_with(true, Some("0")).is_ok());
+        assert!(check_cpu_features_with(true, Some("1")).is_ok());
+    }
+
+    #[test]
+    fn avx2_missing_fails_with_clear_error() {
+        for skip in [None, Some(""), Some("0"), Some("true")] {
+            let err = check_cpu_features_with(false, skip).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("AVX2"), "unexpected error: {msg}");
+            assert!(msg.contains("Xbox Series"), "unexpected error: {msg}");
+            assert!(msg.contains(SKIP_CPU_CHECK_ENV), "unexpected error: {msg}");
+        }
+    }
+
+    #[test]
+    fn skip_env_var_bypasses_missing_avx2() {
+        assert!(check_cpu_features_with(false, Some("1")).is_ok());
     }
 }
 

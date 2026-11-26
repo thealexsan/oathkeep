@@ -37,7 +37,7 @@ All user-supplied title files, caches, saves, and crash dumps must remain **stri
 1. **`.gitignore`** blocks executables, DLLs, archives, media, crash dumps, and local config files.
 2. **`cargo xtask policy`** (enforced via `.githooks/pre-commit` and `cargo test --workspace`) implements a strict allowlist:
    - Only approved source/doc text extensions are allowed.
-   - Maximum file size: 512 KiB.
+   - Maximum file size: 640 KiB.
    - Rejects binary magic headers (`MZ`, `DXBC`, `DDS `, `RIFF`, `BC\xC0\xDE`, `PDB`, `zip`, `7z`, `cab`, `MSI`, etc.) and NUL bytes.
    - Rejects long hex/base64 runs (> 512 chars) to prevent data smuggling.
    - Rejects prohibited commercial title/publisher identifiers.

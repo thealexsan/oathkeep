@@ -1,3 +1,9 @@
+//! Fingerprint of the translator's own source, for the shader cache key
+//! (`oathkeep-gpu`'s `shader_cache`): a rebuilt executable whose translator did
+//! not change keeps its cached translations. Also lists every `OATHKEEP_*`
+//! switch the translator reads, whose values join the key at run time.
+//! Reads only this crate's `src` folder; writes nothing but cargo directives.
+
 use std::path::{Path, PathBuf};
 
 fn files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -14,6 +20,8 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// FNV-1a, 64 bits, two lanes with different offsets: a mismatch only costs
+/// a cache miss, so this need not be cryptographic.
 fn fnv(state: &mut [u64; 2], bytes: &[u8]) {
     for &b in bytes {
         for (i, s) in state.iter_mut().enumerate() {
@@ -33,11 +41,7 @@ fn main() {
     let mut state = [0xcbf2_9ce4_8422_2325u64, 0x8422_2325_cbf2_9ce4u64];
     let mut switches = std::collections::BTreeSet::new();
     for p in &list {
-        let rel = p
-            .strip_prefix(&src)
-            .unwrap_or(p)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = p.strip_prefix(&src).unwrap_or(p).to_string_lossy().replace('\\', "/");
         let text = std::fs::read(p).unwrap_or_default();
         fnv(&mut state, rel.as_bytes());
         fnv(&mut state, &(text.len() as u64).to_le_bytes());
@@ -55,13 +59,7 @@ fn main() {
             rest = &tail[end..];
         }
     }
-    println!(
-        "cargo:rustc-env=OATHKEEP_SHADER_SOURCE_HASH={:016x}{:016x}",
-        state[0], state[1]
-    );
+    println!("cargo:rustc-env=OATHKEEP_SHADER_SOURCE_HASH={:016x}{:016x}", state[0], state[1]);
     let joined: Vec<_> = switches.into_iter().collect();
-    println!(
-        "cargo:rustc-env=OATHKEEP_SHADER_SWITCHES={}",
-        joined.join(",")
-    );
+    println!("cargo:rustc-env=OATHKEEP_SHADER_SWITCHES={}", joined.join(","));
 }

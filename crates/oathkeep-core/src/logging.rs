@@ -1,8 +1,16 @@
+//! One tracing setup for every binary.
+//!
+//! Filter with `OATHKEEP_LOG` (falls back to `RUST_LOG`), e.g.
+//! `OATHKEEP_LOG=oathkeep_loader=trace,info`. Debug and trace output exist
+//! only in builds with the `diagnostics` feature; a plain release build
+//! logs info and above whatever the filter asks for.
+
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+/// The most verbose level this build can log.
 const CAP: LevelFilter = if cfg!(feature = "diagnostics") {
     LevelFilter::TRACE
 } else {

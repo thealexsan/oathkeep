@@ -1,3 +1,6 @@
+//! Jump threading for uniform diamonds. One arm can set a flag that fixes
+//! the join's next branch. Registers recycled on that arm then never reach
+//! the other successor, even if an ordinary SSA phi joins their values.
 use crate::gfx10::{Fields, Operand, Valu};
 use crate::ir::{Exit, Program, Reg, Value};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -50,6 +53,8 @@ pub(super) fn constant_edges(p: &Program, st: &Structured) -> Vec<(usize, usize,
         if when == Bool::TRUE || when == Bool::FALSE {
             continue;
         }
+        // Keep memory accesses and wave operations at their original
+        // reconvergence point. Only duplicate scalar ALU and comparisons.
         if !block.insts.iter().all(|i| match &i.fields {
             Fields::Sop { .. } => true,
             Fields::Sopp { .. } => i.name().starts_with("s_cbranch_"),
@@ -61,6 +66,8 @@ pub(super) fn constant_edges(p: &Program, st: &Structured) -> Vec<(usize, usize,
         let [a, b] = block.preds.as_slice() else {
             continue;
         };
+        // A triangle has a direct edge from the fork to the join. A full
+        // diamond has an unconditional jump at the end of each arm.
         let arm_from = |arm: usize| match p.blocks[arm].preds.as_slice() {
             &[fork] if p.blocks[arm].exit == Exit::Jump(join) => Some(fork),
             _ => None,
@@ -94,6 +101,9 @@ pub(super) fn constant_edges(p: &Program, st: &Structured) -> Vec<(usize, usize,
                     .map_or(v, |p| p.args[edge]);
                 constants.get(&input).copied()
             };
+            // Restrict the branch's decision diagram to known comparisons.
+            // Unknown tests stop the proof. Keep the original join for the
+            // other arm, which may still go either way.
             let mut cond = when;
             while let Some((Atom::Lane(id), lo, hi)) = st.bools.node(cond) {
                 let Some(inst) = block
@@ -143,10 +153,21 @@ mod tests {
     use crate::ir;
     use crate::structure;
 
+    // s8 initially holds a descriptor address. One arm overwrites it with
+    // a buffer load and sets v1. Only that arm can use s8 as the stored value.
     const WORDS: [u32; 19] = [
-        0xbe810380, 0xf4080200, 0xfa000000, 0xf4080300, 0xfa000020, 0x7e020280, 0xbf068002,
-        0xbf850003, 0xf4200204, 0xfa00000c, 0x7e020281, 0x7d840280, 0xbf870002, 0x7e060208,
-        0xbf820001, 0x7e060293, 0xe0700000, 0x80030300, 0xbf810000,
+        0xbe810380, // s1 = 0 (table address high)
+        0xf4080200, 0xfa000000, // load SRV into s[8:11]
+        0xf4080300, 0xfa000020, // load UAV into s[12:15]
+        0x7e020280, // v1 = 0
+        0xbf068002, 0xbf850003, // if s2 == 0, jump to join
+        0xf4200204, 0xfa00000c, // s8 = buffer.Load(12)
+        0x7e020281, // v1 = 1
+        0x7d840280, 0xbf870002, // join: if v1 == 0, jump to constant
+        0x7e060208, 0xbf820001, // v3 = s8, jump to store
+        0x7e060293, // constant: v3 = 19
+        0xe0700000, 0x80030300, // store v3 at byte 0
+        0xbf810000, // end
     ];
 
     fn program(words: &[u32]) -> Program {
@@ -184,13 +205,13 @@ mod tests {
     #[test]
     fn leaves_unknown_flags_and_divergent_forks_alone() {
         let mut words = WORDS;
-        words[5] = 0x7e020202;
-        words[10] = 0x7e020203;
+        words[5] = 0x7e020202; // v1 = s2
+        words[10] = 0x7e020203; // v1 = s3
         let p = program(&words);
         assert!(constant_edges(&p, &structure::structure(&p).unwrap()).is_empty());
         let mut words = WORDS;
-        words[6] = 0x7d840080;
-        words[7] = 0xbf870003;
+        words[6] = 0x7d840080; // compare 0 with lane-dependent v0
+        words[7] = 0xbf870003; // branch on VCC
         let p = program(&words);
         assert!(constant_edges(&p, &structure::structure(&p).unwrap()).is_empty());
     }

@@ -1,4 +1,23 @@
+//! `xgameruntime.dll`: the console game runtime (XGame*, XUser*, XTaskQueue*...).
+//!
+//! Titles rarely import it. A stub linked into the title loads the DLL with
+//! `LoadLibraryExA` (answered with a pseudo handle, see `kernel`), looks up
+//! the `*ApiImpl` functions and `XErrorReport` with `GetProcAddress`, and
+//! initialises. Each runtime API call then asks `QueryApiImpl` for a COM-style
+//! object of its area (provider and interface GUIDs), calls one method and
+//! releases it. Until an area is implemented its query fails, and the call
+//! returns that error without touching the object. An area's interface id
+//! changes when its method table does, so each object answers only the ids
+//! whose slots we know. Implemented, as an offline retail console with one
+//! signed-in user: task queues and async blocks (`xasync`), the user
+//! (`xuser`), system information (`xsystem`), title id, feature checks,
+//! invites and events (`xgame`), persistent local storage (`storage`), game
+//! saves (`xgamesave`), networking (`xnetworking`), the package
+//! (`xpackage`), the store (`xstore`), system dialogs (`xgameui`), speech
+//! (`speech`), HDR, URIs, display deferrals and screenshots (`display`).
 #![allow(non_snake_case)]
+// Title code calls these through its import table, passing pointers the real
+// API would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{CStr, c_char, c_void};
@@ -13,6 +32,7 @@ use crate::{HleModule, hle_export};
 
 pub type HRESULT = i32;
 pub const S_OK: HRESULT = 0;
+/// `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)`.
 pub const NOT_SUPPORTED: HRESULT = 0x8007_0032_u32 as i32;
 
 #[repr(C)]
@@ -46,9 +66,12 @@ impl std::fmt::Display for Guid {
     }
 }
 
+/// A runtime object as title code calls it: its first word points at the
+/// method table. Ours are static, so reference counting is a no-op.
 #[repr(C)]
 pub struct Object {
     vtable: *const *const (),
+    /// Named in the log when a title calls a method we lack.
     area: &'static str,
 }
 
@@ -64,11 +87,14 @@ impl Object {
     }
 }
 
+/// An object's method table, by slot (`QueryInterface`, `AddRef`,
+/// `Release`, then the area's methods from offset 0x18).
 pub struct Methods<const N: usize>(pub [*const (); N]);
 
 // SAFETY: function addresses only.
 unsafe impl<const N: usize> Sync for Methods<N> {}
 
+/// A (provider, interface id) pair a title may ask for, and our object.
 pub type Interface = (Guid, Guid, &'static Object);
 
 const AREAS: &[&[Interface]] = &[
@@ -86,10 +112,13 @@ const AREAS: &[&[Interface]] = &[
     speech::INTERFACES,
 ];
 
+/// `AddRef` and `Release`.
 pub extern "system" fn add_ref(_: *const Object) -> u32 {
     1
 }
 
+/// A slot nobody has needed yet; logged with its area. Wrong for a slot
+/// that returns `bool` or a value.
 pub extern "system" fn missing<const SLOT: usize>(this: *const Object) -> HRESULT {
     // SAFETY: title code calls methods on objects we handed out.
     let area = unsafe { (*this).area };
@@ -101,6 +130,7 @@ pub extern "system" fn missing<const SLOT: usize>(this: *const Object) -> HRESUL
     xasync::E_NOTIMPL
 }
 
+/// Writes `value` through `out` if it is non-null.
 pub fn put<T>(out: *mut T, value: T) -> HRESULT {
     if out.is_null() {
         return xasync::E_INVALIDARG;
@@ -110,6 +140,8 @@ pub fn put<T>(out: *mut T, value: T) -> HRESULT {
     S_OK
 }
 
+/// Copies `text` and a NUL into the title's `size`-byte buffer and reports
+/// the bytes used, as the runtime's string getters do.
 pub fn put_string(text: &str, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     let len = text.len() + 1;
     if buffer.is_null() || size < len {
@@ -127,16 +159,20 @@ pub fn put_string(text: &str, size: usize, buffer: *mut u8, used: *mut usize) ->
     S_OK
 }
 
+/// The title's NUL-terminated string, if any.
 pub fn text(s: *const c_char) -> Option<String> {
     // SAFETY: the title passes a NUL-terminated string or null.
     (!s.is_null()).then(|| unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned())
 }
 
+/// A new registration token for callbacks we never call (events nobody
+/// raises offline).
 pub fn token() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Calls method `slot` (byte offset) of `object` as title code would.
 #[cfg(test)]
 pub(crate) fn method<F: Copy>(object: &Object, slot: usize) -> F {
     // SAFETY: the caller names the slot's signature; tables cover the slots
@@ -153,6 +189,7 @@ pub extern "system" fn XGameRuntimeUninitialize() {
     tracing::info!("XGameRuntimeUninitialize");
 }
 
+/// The arguments identify the title's build of the stub; not checked.
 pub extern "system" fn InitializeApiImpl(version: u64, build: u64) -> HRESULT {
     tracing::info!(version, build, "InitializeApiImpl");
     S_OK
@@ -163,6 +200,9 @@ pub extern "system" fn InitializeApiImplEx(version: u64, build: u64, flags: u64)
     S_OK
 }
 
+/// The stub prefers this one when present. It passes the same three values
+/// and a pointer to the title's initialisation options, null unless the
+/// title initialises with options (the title does not).
 pub extern "system" fn InitializeApiImplEx2(
     version: u64,
     build: u64,
@@ -177,6 +217,8 @@ pub extern "system" fn UninitializeApiImpl() {
     tracing::info!("UninitializeApiImpl");
 }
 
+/// The object for an implemented (provider, interface id); others fail,
+/// each pair logged once.
 pub extern "system" fn QueryApiImpl(
     provider: *const Guid,
     iid: *const Guid,
@@ -190,6 +232,7 @@ pub extern "system" fn QueryApiImpl(
     };
     #[cfg(feature = "diagnostics")]
     if tracing::enabled!(tracing::Level::DEBUG) {
+        // Each runtime call site once: which title code uses which area, when.
         static CALLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
         let from = super::kernel::callers();
         let mut calls = CALLS.lock().unwrap_or_else(|e| e.into_inner());

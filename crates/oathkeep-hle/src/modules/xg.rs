@@ -1,4 +1,14 @@
+//! `xg_xs.dll`: the console's texture layout library. Titles ask it which
+//! swizzle mode a texture should use, how large it is, where each mip and
+//! slice lies, and to copy linear data into tiled memory and back. Served
+//! from `oathkeep_formats::texture`.
+//!
+//! The title imports `XGCreateTextureComputer` and
+//! `XGSuggestSwizzleMode` and calls these computer methods: Release (0x08),
+//! the layout (0x10), copies into (0x40) and out of (0x48) a subresource,
+//! and the 64 KiB tiling (0x50). The other slots log and fail.
 #![allow(non_snake_case)]
+// Title code passes pointers the real library would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -11,6 +21,8 @@ use crate::{HleModule, hle_export};
 
 const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 
+/// `D3D12_RESOURCE_DESC`, whose layout field carries `0x100 | swizzle
+/// mode` on the console (1 row major, 0 "pick one").
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceDesc {
@@ -35,6 +47,14 @@ const ALLOW_DEPTH_STENCIL: u32 = 2;
 const TEXTURE_1D: u32 = 2;
 const TEXTURE_3D: u32 = 4;
 
+/// The mode the console's library picks for a description: linear for 1D,
+/// the XOR render and depth modes for targets, else 4 KiB standard
+/// (`.ttpf` textures without a mode of their own use it).
+///
+/// shortcut: the rule of the library's older optimal-mode function (any
+/// size, 2D, 3D and cubes alike); `XGSuggestSwizzleMode` itself is newer
+/// than every copy we could check. Revisit if streamed textures come out
+/// scrambled.
 fn suggested(desc: &ResourceDesc) -> Swizzle {
     if desc.dimension == TEXTURE_1D {
         Swizzle::LINEAR
@@ -47,6 +67,8 @@ fn suggested(desc: &ResourceDesc) -> Swizzle {
     }
 }
 
+/// `(desc, flags, out layout)`; the title passes flags 0 and puts the
+/// result in the description's layout field.
 pub extern "system" fn XGSuggestSwizzleMode(
     desc: *const ResourceDesc,
     _flags: u32,
@@ -136,11 +158,15 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
         swizzle,
     })
     .ok()?;
+    // The layout struct has room for 15 mips.
     (texture.planes[0].layout.mips.len() <= MIPS).then_some(texture)
 }
 
 const MIPS: usize = 15;
 
+/// One mip in the layout the title reads (offsets 0x00, 0x08, 0x10 and
+/// 0x1c are read by the title; the rest follow the library's
+/// older public shape).
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MipOut {
@@ -150,6 +176,7 @@ pub struct MipOut {
     pub pitch_texels: u32,
     pub pitch_bytes: u32,
     pub alignment: u32,
+    /// Width, height in elements, depth or array size.
     pub padded: [u32; 3],
     pub elements: [u32; 2],
     pub texels: [u32; 2],
@@ -159,12 +186,14 @@ pub struct MipOut {
     pub bank_rotation: [u64; 2],
     pub slice_depth: u32,
     pub in_tail: u32,
+    /// Where a tail mip starts in elements: x bits 0-10, y 11-21.
     pub tail_position: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PlaneOut {
+    /// 1 data, 7 depth, 8 stencil (metadata planes are not made).
     pub usage: u32,
     pub size: u64,
     pub slice_size: u64,
@@ -190,6 +219,8 @@ const _: () = assert!(size_of::<MipOut>() == 0x70);
 const _: () = assert!(size_of::<PlaneOut>() == 0x6c8);
 const _: () = assert!(size_of::<LayoutOut>() == 0x1b40);
 
+/// The mode a tail mip is reported in: the 256-byte one of its kind (3 for
+/// the render kind, which GFX10 lacks), the depth mode itself.
 fn tail_swizzle(swizzle: Swizzle) -> u32 {
     match swizzle.0 {
         2 | 6 | 10 | 18 | 22 | 26 => Swizzle::SW_256B_D.0,
@@ -231,6 +262,7 @@ fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
             out.alignment = 256;
             out.swizzle = tail_swizzle(l.desc.swizzle);
             if l.thick {
+                // A 3D tail mip is placed by position, not by offset.
                 out.slice_size = l.alignment / u64::from(l.block[2]);
                 out.tail_position = t.x | t.y << 11;
             } else {
@@ -273,6 +305,8 @@ extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
     out.mips = c.mips;
     out.planes = c.texture.planes.len() as u32;
     out.dimension = c.desc.dimension;
+    // The library calls a depth plane "depth" only beside stencil or
+    // without mips.
     let depth =
         c.desc.flags & ALLOW_DEPTH_STENCIL != 0 && (c.texture.planes.len() > 1 || c.mips == 1);
     for (plane, p) in out.plane.iter_mut().zip(&c.texture.planes) {
@@ -296,6 +330,8 @@ extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
     S_OK
 }
 
+/// The plane, its mip and array slice for a subresource index, and the
+/// tiled bytes and the linear bytes the copy touches.
 struct CopyArgs<'a> {
     layout: &'a Layout,
     mip: u32,
@@ -335,6 +371,7 @@ fn result(r: Result<(), Error>) -> HRESULT {
     }
 }
 
+/// `(tiled base, plane, subresource, linear, row pitch, depth pitch)`.
 extern "system" fn copy_into(
     this: This,
     tiled: *mut u8,
@@ -368,6 +405,8 @@ extern "system" fn copy_into(
     result(r)
 }
 
+/// `(linear, plane, subresource, sample, tiled base, row pitch, depth
+/// pitch)`.
 #[allow(clippy::too_many_arguments)]
 extern "system" fn copy_from(
     this: This,
@@ -421,6 +460,13 @@ pub struct SubresourceTiling {
 
 const TILE: u64 = 64 << 10;
 
+/// `(total tiles, packed mips, tile shape in texels, in: room / out:
+/// count, first, subresource tilings)`, in 64 KiB tiles of plane 0, for 2D
+/// 64 KiB modes only (others fail, as on the console). The mip tail is the
+/// packed part, tile 0 of each slice; tilings list the standard mips of
+/// every slice in turn. With a tail the console's library lists two slices
+/// at most and zeroes all but the first; so do we (the title reads slice 0
+/// only).
 extern "system" fn tiling(
     this: This,
     tiles: *mut u32,
@@ -492,6 +538,10 @@ extern "system" fn tiling(
     S_OK
 }
 
+/// Slot 0x30 `(plane, mip, x, y, z or slice, sample, bit position)`: an
+/// element's byte offset from the texture's start. The title reads
+/// texels of a 128x4 `4KB_S` texture on the CPU through it (title+0x5151c90);
+/// an error returned as an offset made it read wild memory. 0 if outside.
 extern "system" fn element_offset(
     this: This,
     plane: u32,
@@ -519,6 +569,8 @@ extern "system" fn element_offset(
     }
 }
 
+/// Slots the title does not call: size, alignment, offsets, coordinates,
+/// view descriptor, tiled-resource query.
 extern "system" fn unused(this: This) -> HRESULT {
     tracing::warn!(desc = ?computer(this).desc, "unimplemented texture computer method");
     E_NOTIMPL
@@ -530,19 +582,19 @@ struct Vtable([*const (); 13]);
 unsafe impl Sync for Vtable {}
 
 static VTABLE: Vtable = Vtable([
-    add_ref as *const (),
-    release as *const (),
-    layout as *const (),
-    unused as *const (),
-    unused as *const (),
-    unused as *const (),
-    element_offset as *const (),
-    unused as *const (),
-    copy_into as *const (),
-    copy_from as *const (),
-    tiling as *const (),
-    unused as *const (),
-    unused as *const (),
+    add_ref as *const (),   // 0x00
+    release as *const (),   // 0x08
+    layout as *const (),    // 0x10
+    unused as *const (),    // 0x18 size
+    unused as *const (),    // 0x20 alignment
+    unused as *const (),    // 0x28 mip offset
+    element_offset as *const (), // 0x30
+    unused as *const (),    // 0x38 element coordinate
+    copy_into as *const (), // 0x40
+    copy_from as *const (), // 0x48
+    tiling as *const (),    // 0x50
+    unused as *const (),    // 0x58 view descriptor
+    unused as *const (),    // 0x60 tiled resource?
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -576,6 +628,7 @@ mod tests {
         }
     }
 
+    /// Method `index` of a computer, as the title calls it.
     fn slot<T: Copy>(c: This, index: usize) -> T {
         // SAFETY: the computer is live; T is the slot's function type.
         unsafe { std::mem::transmute_copy(&(*c).vtable.0[index]) }
@@ -587,6 +640,7 @@ mod tests {
         c
     }
 
+    /// Element offsets: linear rows of 1 KiB (128 elements), 0 outside.
     #[test]
     fn element_offsets_follow_the_layout() {
         type Offset = extern "system" fn(This, u32, u32, u64, u32, u32, u32, *mut u32) -> u64;
@@ -611,10 +665,16 @@ mod tests {
         d.flags = ALLOW_DEPTH_STENCIL;
         XGSuggestSwizzleMode(&d, 0, &mut out);
         assert_eq!(out, 0x118);
+        // A 1D texture has no tiled layout, whatever its use.
+        d.dimension = TEXTURE_1D;
+        XGSuggestSwizzleMode(&d, 0, &mut out);
+        assert_eq!(out, 0x100);
     }
 
+    /// The title's calls: layout, then a copy in and out of each mip.
     #[test]
     fn layout_and_copies_through_the_object() {
+        // 256x256 BC7, full chain, 64 KiB display mode.
         let c = create(&desc(256, 256, 0, 98, 0x10a));
         // SAFETY: plain data, filled by the call.
         let mut l: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
@@ -649,6 +709,7 @@ mod tests {
             );
             assert_eq!(back, rows, "mip {mip}");
         }
+        // 0x50: one tile for the tail, one for mip 0.
         type Tiling = extern "system" fn(
             This,
             *mut u32,
@@ -693,6 +754,7 @@ mod tests {
         assert_eq!((shape, n, subs[0].start), ([256, 256, 1], 1, 1));
         assert_eq!(release(c), 0);
 
+        // 4 KiB modes have no 64 KiB tiling.
         let null = std::ptr::null_mut::<u8>();
         let c = create(&desc(256, 256, 0, 98, 0x105));
         assert_eq!(
