@@ -609,7 +609,11 @@ fn scan_rdna2_isa(root: &Path) -> Result<Vec<IsaFamily>> {
     let gfx10_mod = read_module_sources(&shader_src.join("gfx10/mod.rs"))?;
     let ir_raw = read_module_sources(&shader_src.join("ir"))?;
     let lower_raw = read_module_sources(&shader_src.join("emit/lower"))?;
-    let intersect_raw = read_module_sources(&shader_src.join("emit/intersect"))?;
+    let intersect_raw = if collect_module_files(&shader_src.join("emit/intersect")).is_empty() {
+        String::new()
+    } else {
+        read_module_sources(&shader_src.join("emit/intersect"))?
+    };
 
     let ir_src = ir_raw.as_str();
     let lower_src = lower_raw.as_str();
