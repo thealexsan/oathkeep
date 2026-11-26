@@ -3036,9 +3036,11 @@ impl State {
         };
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
+        static FRAME_NS: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
+            FRAME_NS.store(0, Ordering::Relaxed);
         }
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
@@ -3085,9 +3087,11 @@ impl State {
             host.texture_slots_waiting(frame);
         }
         let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
-        let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
-        // (Those that are due later after all that are due.)
-        let on_time = due.len();
+        let (mut due, on_time, census) = if baking {
+            host.texture_slots_due_prioritized(frame, 1 << 16, 1 << 16, 512, 256)
+        } else {
+            host.texture_slots_due_prioritized(frame, 512, 1024, 64, 64)
+        };
         if baking {
             let known: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
             static AHEAD: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -3124,21 +3128,27 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        // Also within a time per pass: the pass runs on a thread that
-        // records the frame, and making and staging 192 MB of textures took
-        // 1.6-2.2 s of each of the world's first twenty frames (run 20).
-        // The rest waits for the next frames, as it does past the bytes.
-        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("OATHKEEP_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
-        }));
+        // Cap synchronous recording-thread wall time strictly in steady state
+        // (`5 ms` default, overridable via `OATHKEEP_TEXTURE_STAGE_MS`), with a
+        // modest `15 ms` allowance during cold boot when VRAM has room and a
+        // large fresh backlog is draining.
+        static SPAN_MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let asked_ms = *SPAN_MS.get_or_init(|| {
+            std::env::var("OATHKEEP_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok())
+        });
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
-        // surfaces at 192 MB a frame) gets three times the bytes and the time until it
-        // drains; `OATHKEEP_TEXTURE_CATCHUP=0` keeps the plain budget.
+        // surfaces at 192 MB a frame) gets three times the bytes until it drains;
+        // `OATHKEEP_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
+        let default_ms = if catchup && on_time >= 512 && room && !crate::residency::limited_host_ram() && frame < 600 {
+            15
+        } else {
+            5
+        };
+        let span = std::time::Duration::from_millis(asked_ms.unwrap_or(default_ms));
         let pool_room = crate::pool::texture_room();
-        let (per_frame, span) = heap_texture_pass_budget(
+        let (per_frame, _) = heap_texture_pass_budget(
             per_frame,
             span,
             on_time,
@@ -3152,12 +3162,12 @@ impl State {
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
-        let (span, bytes_at_most) = match PASS_BUDGET.get() {
+        let (pass_budget, span, bytes_at_most) = match PASS_BUDGET.get() {
             Some((ms, bytes, _)) => {
                 let bytes = clamp_pass_bytes_when_full(bytes, room, required, baking, pool_room);
-                (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
+                (true, std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
             }
-            None => (span, per_frame),
+            None => (false, span, per_frame),
         };
         // Apply the shared frame ceiling after early-pass and catch-up budgets.
         // A bake samples its inputs immediately and cannot retry that draw.
@@ -3173,13 +3183,37 @@ impl State {
             )
         };
 
+        let remaining_span = if pass_budget {
+            span
+        } else {
+            let already = std::time::Duration::from_nanos(FRAME_NS.load(Ordering::Relaxed));
+            span.saturating_sub(already)
+        };
+        if remaining_span.is_zero() || due.is_empty() {
+            if sync.is_none() && baking && due.is_empty() {
+                BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
+            }
+            return due.is_empty();
+        }
         let began = std::time::Instant::now();
+        let deadline = began + remaining_span;
+        struct FrameTimeGuard<'a>(&'a std::time::Instant, bool);
+        impl Drop for FrameTimeGuard<'_> {
+            fn drop(&mut self) {
+                if !self.1 {
+                    FRAME_NS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        let _frame_time_guard = FrameTimeGuard(&began, pass_budget);
         if sync.is_none() {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
         let mut served = true;
-        for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+        for (iter, (index, write)) in due.into_iter().enumerate() {
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most
+                || ((iter & 7) == 0 && std::time::Instant::now() >= deadline)
+            {
                 served = false;
                 break;
             }
