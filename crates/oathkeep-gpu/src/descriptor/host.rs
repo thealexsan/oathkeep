@@ -119,10 +119,25 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
+    /// Slot count the title originally requested (exceeds `count` when capped
+    /// by the host's 1,000,000-descriptor limit).
+    title_count: u32,
     /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps, none in
     /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
+    /// Peak concurrent dynamic slots allocated since heap creation.
+    peak_dynamic: std::sync::atomic::AtomicU32,
+    /// Highest direct-mapped title slot (`< count`) mirrored so far.
+    highest_direct: std::sync::atomic::AtomicU32,
+    /// Highest title slot (`>= count`) seen by `mirror` so far (0 if none).
+    highest_capped: std::sync::atomic::AtomicU32,
+    /// Counts of `mirror` calls for title slots `>= count`:
+    /// `[in_dynamic_shadow_zone, at_or_past_null_limit, for_draw_past_count]`.
+    capped_mirror: [std::sync::atomic::AtomicU64; 3],
+    /// Changed pages of a placed heap that overlapped the capped tail `>= count`
+    /// (diagnostic accounting for raw byte writes into per-draw table rings).
+    capped_raw_pages: std::sync::atomic::AtomicU64,
     sampler: bool,
     /// Where the raw twins of the title's slots start
     /// (`oathkeep_shader::emit::raw_views`; 0: there are none), and which of
@@ -1222,23 +1237,43 @@ fn view_elements(view: &View) -> Option<(u32, bool, u32)> {
 }
 
 /// Whether a buffer view that begins `offset` bytes into its host copy begins
-/// where no host view can: raw views begin on 16 bytes, others on a multiple
-/// of their elements (`stride` of a structured one, which is made raw where it
-/// can be, `element` of a typed one). The console's begin on any dword, and
-/// the title puts parameter blocks at ring positions: a raw view of 128 bytes
-/// at 8 (the colour table bakes'), structured ones of elements that are no
-/// divisor of their place (the culling's 456-byte constants). Such a view gets
-/// a copy of its own bytes ([`crate::shadow::exact`]). (A typed view of
-/// 12-byte elements at a multiple of 16 that is none of 12 is one of them: it
-/// was passed over, and stayed null.)
-fn off_elements(offset: u64, stride: u32, raw: bool, element: u64) -> bool {
+/// where no host view can (or where it cannot promote to a raw view).
+///
+/// - Raw views require 16-byte start alignment.
+/// - Structured views are promoted to raw (`raw_window`) whenever they start on
+///   16 bytes because translated shaders perform raw byte loads through them,
+///   and NVIDIA returns zeros for raw reads through a structured view (even when
+///   `offset` is a multiple of `stride`, e.g. stride 8 at offset 8 or stride 12
+///   at offset 12). Giving every non-16-byte-aligned structured view an exact
+///   copy guarantees 16-byte alignment (`offset == 0`) so `raw_window` always
+///   promotes it and its raw twin never becomes null.
+/// - Typed views require element alignment (and 16-byte alignment when
+///   `need_16_for_typed` is set for raw twins on adapters without `move_raw`).
+fn off_elements_for(offset: u64, stride: u32, raw: bool, element: u64, need_16_for_typed: bool) -> bool {
     if raw {
         !offset.is_multiple_of(16)
     } else if stride > 0 {
-        !offset.is_multiple_of(16) && !offset.is_multiple_of(u64::from(stride))
+        !offset.is_multiple_of(16)
     } else {
-        element > 0 && !offset.is_multiple_of(element)
+        (element > 0 && !offset.is_multiple_of(element))
+            || (need_16_for_typed && !offset.is_multiple_of(16))
     }
+}
+
+#[cfg(test)]
+fn off_elements(offset: u64, stride: u32, raw: bool, element: u64) -> bool {
+    off_elements_for(offset, stride, raw, element, false)
+}
+
+/// Whether raw twins are active on an adapter whose CPU descriptors cannot be
+/// shifted in-place by [`move_raw`] (non-AMD adapters with >2M view heaps):
+/// typed views off 16 bytes then also take an aligned [`crate::shadow::exact`] copy.
+fn typed_twin_needs_exact() -> bool {
+    if oathkeep_shader::emit::raw_views() == 0 {
+        return false;
+    }
+    static NON_AMD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NON_AMD.get_or_init(|| host().is_some_and(|h| !crate::indirect::amd(&h.device)))
 }
 
 /// Whether `view` has a raw twin when its host slot is made ([`raw_twins`]):
@@ -1255,7 +1290,7 @@ fn view_bytes() -> bool {
 }
 
 /// The copy the buffer view of `[start, start + len)` is made on: `shadow`, the one
-/// its buffer has, or one of the view's own bytes ([`off_elements`]).
+/// its buffer has, or one of the view's own bytes ([`off_elements_for`]).
 fn view_home(
     shadow: std::sync::Arc<crate::shadow::Shadow>,
     start: u64,
@@ -1269,7 +1304,7 @@ fn view_home(
         return shadow;
     }
     let element = crate::resource::element(format).map_or(0, |(bytes, _)| bytes);
-    if !off_elements(offset, stride, raw, element) {
+    if !off_elements_for(offset, stride, raw, element, typed_twin_needs_exact()) {
         return shadow;
     }
     crate::shadow::exact(start, len).unwrap_or(shadow)
@@ -1485,25 +1520,47 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `OATHKEEP_DYNAMIC_SLOTS`
-/// sets the most). 2^18 ran out in the title's bigger places (session
-/// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
-/// refused, with 2,639 indirect draws and dispatches).
+/// overrides on both capped and uncapped heaps, clamped safely).
 fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static OVERRIDE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let env_override = *OVERRIDE.get_or_init(|| {
         std::env::var("OATHKEEP_DYNAMIC_SLOTS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
     });
-    if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+    dynamic_slots_for(count, null, env_override)
+}
+
+/// Pure dynamic-slot budget resolver for a view heap of `count` title slots
+/// and shader clamp slot `null` (0: unclamped).
+///
+/// Architectural invariant on capped heaps (NVIDIA `PORTABLE_VIEWS = 1,000,000`,
+/// `null = 999,999`): `oathkeep-shader` emits `UMin(idx, null)` directly in DXIL
+/// for bindless `ResourceDescriptorHeap[idx]` indexing without an indirection
+/// table. Direct-mapped bindless slots `[0 .. fitted)` must therefore keep exact
+/// 1:1 index identity; per-draw descriptor tables past `fitted` are snapshotted
+/// into `[fitted .. null)` by `draw::State::tables`. Remapping bindless slots
+/// `>= null` would require coordinated shader-side indirection.
+fn dynamic_slots_for(count: u32, null: u32, env_override: Option<u32>) -> u32 {
+    const MIN_DYNAMIC: u32 = 1 << 16;
+    if null == 0 {
+        return env_override.unwrap_or(DYNAMIC).clamp(MIN_DYNAMIC, DYNAMIC << 2);
     }
-    null.saturating_sub(count).min(most).max(DYNAMIC)
+    if null < PORTABLE_VIEWS {
+        let max_dyn = (null / 2).max(1);
+        let min_dyn = MIN_DYNAMIC.min(max_dyn);
+        return env_override.unwrap_or(DYNAMIC).clamp(min_dyn, max_dyn);
+    }
+    let most = env_override.unwrap_or(DYNAMIC << 2);
+    null.saturating_sub(count)
+        .min(most)
+        .max(DYNAMIC)
+        .min(null.saturating_sub(1))
 }
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
+        let title_count = count;
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -1545,13 +1602,20 @@ impl HostHeap {
             }
         } else {
             let size = if raw == 0 { null + 1 } else { 2 * raw };
-            let fitted = if count + extra <= null {
+            let fitted = if count.saturating_add(extra) <= null {
                 count
             } else {
-                // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
-                null - extra
+                // Direct bindless slots `[0..fitted)` stay 1:1 for DXIL `UMin(idx, null)`.
+                // Per-draw descriptor tables past `fitted` are snapshotted into the
+                // `extra` dynamic slots `[fitted..null)` by `draw::State::tables`.
+                let fitted = null.saturating_sub(extra);
+                tracing::warn!(
+                    count,
+                    direct_slots = fitted,
+                    dynamic_slots = extra,
+                    "host view heap capped at {size}; views past it read a null slot"
+                );
+                fitted
             };
             match make(size) {
                 Ok(heap) => (heap, fitted, size),
@@ -1597,7 +1661,13 @@ impl HostHeap {
             cpu,
             step,
             count,
+            title_count,
             dynamic: extra,
+            peak_dynamic: std::sync::atomic::AtomicU32::new(0),
+            highest_direct: std::sync::atomic::AtomicU32::new(0),
+            highest_capped: std::sync::atomic::AtomicU32::new(0),
+            capped_mirror: [const { std::sync::atomic::AtomicU64::new(0) }; 3],
+            capped_raw_pages: std::sync::atomic::AtomicU64::new(0),
             sampler,
             raw,
             twins: (0..if raw == 0 { 0 } else { count + extra }).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
@@ -1769,9 +1839,42 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        let prev_free = self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        let used = self.dynamic.saturating_sub(prev_free.saturating_sub(n as u32));
+        if used > self.peak_dynamic.load(std::sync::atomic::Ordering::Relaxed) {
+            self.peak_dynamic.fetch_max(used, std::sync::atomic::Ordering::Relaxed);
+        }
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// Notes a changed placed-heap page that reached past `self.count` on a capped heap.
+    pub(crate) fn note_capped_raw_page(&self) {
+        self.capped_raw_pages.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Diagnostic snapshot for a capped view heap (`title_count > count`):
+    /// `(count, title_count, dynamic, peak_dynamic, highest_direct, highest_capped, [below_null, past_null, for_draw], raw_pages)`.
+    pub(crate) fn capped_telemetry(&self) -> Option<(u32, u32, u32, u32, u32, u32, [u64; 3], u64)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.sampler || self.title_count <= self.count {
+            return None;
+        }
+        let counts = [0, 1, 2].map(|i| self.capped_mirror[i].swap(0, Relaxed));
+        let raw_pages = self.capped_raw_pages.swap(0, Relaxed);
+        if counts == [0, 0, 0] {
+            return None;
+        }
+        Some((
+            self.count,
+            self.title_count,
+            self.dynamic,
+            self.peak_dynamic.load(Relaxed),
+            self.highest_direct.load(Relaxed),
+            self.highest_capped.load(Relaxed),
+            counts,
+            raw_pages,
+        ))
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -2823,7 +2926,7 @@ impl HostHeap {
                 views.recording = recording;
                 views.made.clear();
             }
-            let twins = self.twins.get(index as usize).is_some();
+            let twins = self.raw != 0 && self.twins.get(index as usize).is_some();
             if !views.made.contains_key(&words) {
                 let view = super::view_at(words[1], words[2])?;
                 let at = 2 * views.made.len() as u32;
@@ -2831,8 +2934,12 @@ impl HostHeap {
                 if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
                     return None;
                 }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let twin = twinned(&view) && twins;
+                // Only construct a raw twin when this heap actually has a raw-twin
+                // half (`self.raw != 0`); `ListViews` lives in a CPU-only heap so
+                // `move_raw` is safe there on adapters that support it.
+                let twin_slot = twin.then(|| (views.slot(at + 1), true));
+                let kept = make_twinned(&view, views.slot(at), twin_slot)?;
                 let stride_word = view_stride_word(&view);
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
@@ -2881,9 +2988,13 @@ impl HostHeap {
         self.keep(index, None);
     }
 
-    /// Where the raw twin of slot `index` is made.
-    fn twin(&self, index: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
-        (index < self.twins.len() as u32).then(|| staged(self.sampler, 1).unwrap_or_else(|| self.cpu(self.raw + index)))
+    /// Where the raw twin of slot `index` is made, and whether that handle
+    /// lies in a CPU-only staging heap (so `move_raw` may patch it before copy).
+    fn twin(&self, index: u32) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)> {
+        (index < self.twins.len() as u32).then(|| match staged(self.sampler, 1) {
+            Some(h) => (h, true),
+            None => (self.cpu(self.raw + index), false),
+        })
     }
 
     /// The raw twin of slot `index` was made by this thread ([`make_twinned`]),
@@ -3075,7 +3186,7 @@ impl HostHeap {
         self.put(index);
         // A program that reads it as raw bytes reads its twin.
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
-        if let Some(twin) = twin {
+        if let Some((twin, _)) = twin {
             // SAFETY: a live buffer that holds the range.
             let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
             let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -3218,18 +3329,30 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
+            use std::sync::atomic::Ordering::Relaxed;
+            let limit = self.count.saturating_add(self.dynamic);
+            self.capped_mirror[usize::from(index >= limit)].fetch_add(1, Relaxed);
+            if for_draw {
+                self.capped_mirror[2].fetch_add(1, Relaxed);
+            }
+            self.highest_capped.fetch_max(index, Relaxed);
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            if HIGHEST.fetch_max(index, Relaxed) < index {
                 tracing::warn!(
                     index,
                     count = self.count,
+                    title_count = self.title_count,
+                    dynamic_end = limit,
                     for_draw,
                     "title slot past the host heap"
                 );
             }
             return None;
+        }
+        if index > self.highest_direct.load(std::sync::atomic::Ordering::Relaxed) {
+            self.highest_direct.fetch_max(index, std::sync::atomic::Ordering::Relaxed);
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
@@ -3615,6 +3738,20 @@ fn view_extent() -> bool {
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    if let &View::Constant(address, size) = view {
+        let len = u64::from(size.min(64 << 10));
+        if len == 0 {
+            return None;
+        }
+        let shadow = crate::shadow::find(address, len)?;
+        if !shadow.can_bind_cbv(address, size)
+            && let Some(aligned) = crate::shadow::find_aligned_cbv(address, len)
+            && aligned.can_bind_cbv(address, size)
+        {
+            return Some((aligned, address, len));
+        }
+        return Some((shadow, address, len));
+    }
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
@@ -3780,16 +3917,20 @@ fn buffer_srv(
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
-    twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    twin: Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)>,
 ) -> Option<Kept> {
     let mut shadow = crate::shadow::find(address, len)?;
     let mut offset = shadow.offset(address);
     let unit = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let own = unsafe { &mut desc.Anonymous.Buffer };
-    let start = address + own.FirstElement * unit;
+    let start = own
+        .FirstElement
+        .checked_mul(unit)
+        .and_then(|off| address.checked_add(off))?;
+    let view_len = u64::from(own.NumElements).checked_mul(unit)?;
     let kind = (own.StructureByteStride, own.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, desc.Format.0 as u32);
-    let home = view_home(shadow.clone(), start, u64::from(own.NumElements) * unit, kind);
+    let home = view_home(shadow.clone(), start, view_len, kind);
     if !std::sync::Arc::ptr_eq(&home, &shadow) {
         // Its own bytes: it begins where they do.
         (shadow, offset) = (home, 0);
@@ -3850,7 +3991,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    if let Some(twin) = twin {
+    if let Some((twin, cpu_only)) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
         if let Some((first, count, by)) = window {
             desc.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -3866,7 +4007,7 @@ fn buffer_srv(
                     .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if by > 0 && !(cpu_only && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -3887,7 +4028,7 @@ fn buffer_uav(
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
-    twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    twin: Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)>,
 ) -> Option<Kept> {
     let mut shadow = crate::shadow::find(address, len)?;
     let unit = {
@@ -3903,9 +4044,13 @@ fn buffer_uav(
     };
     // SAFETY: a buffer view's union member.
     let own = unsafe { &mut desc.Anonymous.Buffer };
-    let start = address + own.FirstElement * unit;
+    let start = own
+        .FirstElement
+        .checked_mul(unit)
+        .and_then(|off| address.checked_add(off))?;
+    let view_len = u64::from(own.NumElements).checked_mul(unit)?;
     let kind = (own.StructureByteStride, own.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, desc.Format.0 as u32);
-    let home = view_home(shadow.clone(), start, u64::from(own.NumElements) * unit, kind);
+    let home = view_home(shadow.clone(), start, view_len, kind);
     let mut address = address;
     if !std::sync::Arc::ptr_eq(&home, &shadow) {
         // Its own bytes: it begins where they do.
@@ -3952,8 +4097,7 @@ fn buffer_uav(
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
-    // SAFETY: a live buffer.
-    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    let width = shadow.width();
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(
@@ -3973,7 +4117,7 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    if let Some(twin) = twin {
+    if let Some((twin, cpu_only)) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
         if let Some((first, count, by)) = window {
             desc.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -3990,7 +4134,7 @@ fn buffer_uav(
                     .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if by > 0 && !(cpu_only && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -4147,27 +4291,39 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     make_twinned(view, at, None)
 }
 
-/// [`make`]; `twin`: where the raw twin of a buffer view goes
+/// [`make`]; `twin`: where the raw twin of a buffer view goes, plus whether
+/// that handle lies in a CPU-only staging heap (`move_raw` safe)
 /// ([`raw_twins`]; a constant buffer's is the same view again, other views
 /// have none).
 fn make_twinned(
     view: &View,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
-    twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    twin: Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)>,
 ) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
-                return None;
+            let need = u64::from(size.min(64 << 10));
+            let mut shadow = crate::shadow::find(address, need)?;
+            if !shadow.can_bind_cbv(address, size) {
+                if need == 0 {
+                    return None;
+                }
+                if let Some(aligned) = crate::shadow::find_aligned_cbv(address, need)
+                    && aligned.can_bind_cbv(address, size)
+                {
+                    shadow = aligned;
+                } else {
+                    once!(
+                        address = format_args!("{address:#x}"),
+                        size,
+                        "constant buffer not 256-byte aligned on the host"
+                    );
+                    return None;
+                }
             }
+            let gpu = shadow.gpu(address);
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
                 SizeInBytes: constant_bytes(size),
@@ -4175,7 +4331,7 @@ fn make_twinned(
             // SAFETY: slots of our heap; the range lies in the host copy.
             unsafe {
                 device.CreateConstantBufferView(Some(&desc), at);
-                if let Some(twin) = twin {
+                if let Some((twin, _)) = twin {
                     device.CreateConstantBufferView(Some(&desc), twin);
                 }
             }
@@ -5218,24 +5374,170 @@ mod tests {
         }
     }
 
-    /// Views that begin where no host view can: raw ones off 16 bytes,
-    /// structured ones off their elements (and off 16 bytes, where they are
-    /// made raw), typed ones off theirs.
+    /// Views that begin where no host view can (or where a structured view
+    /// cannot promote to raw): raw and structured ones off 16 bytes, typed ones
+    /// off their elements (or off 16 bytes when non-AMD raw twins require it).
     #[test]
     fn views_off_their_elements_are_told() {
         // the colour table bakes' parameter block: raw, 8 bytes into its window
         assert!(off_elements(8, 0, true, 4));
         assert!(!off_elements(0, 0, true, 4));
         assert!(!off_elements(48, 0, true, 4));
-        // 456-byte elements: at one of them, on 16 bytes, at neither
-        assert!(!off_elements(456, 456, false, 0));
+        // Structured views: only 16-byte-aligned starts promote cleanly to raw
+        // (`raw_window`); stride-aligned non-16 offsets (456, 8, 12) must take
+        // an exact aligned copy so NVIDIA raw reads never return zeros.
+        assert!(off_elements(456, 456, false, 0));
+        assert!(off_elements(8, 8, false, 0));
+        assert!(off_elements(12, 12, false, 0));
         assert!(!off_elements(32, 456, false, 0));
         assert!(off_elements(100, 456, false, 0));
         // A typed view of 12-byte elements on 16 bytes and not on an element.
         assert!(off_elements(23_702_896, 0, false, 12));
         assert!(!off_elements(48, 0, false, 12));
+        // 2-byte aligned offset=6 for 4-byte elements.
+        assert!(off_elements(6, 0, false, 4));
         assert!(!off_elements(12, 0, false, 4));
         assert!(off_elements(12, 0, false, 8));
+        // Non-AMD raw twin mode also aligns typed views that start off 16 bytes.
+        assert!(off_elements_for(12, 0, false, 4, true));
+        assert!(!off_elements_for(16, 0, false, 4, true));
+    }
+
+    #[test]
+    fn unaligned_cbv_uses_aligned_slab_and_matches_buffer_copy() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let memory = vec![0x5au8; 2 << 16];
+        let page = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let unaligned = page + 0x90;
+        let view = View::Constant(unaligned, 320);
+        let kept = make(&view, heap.cpu(0)).expect("unaligned CBV must not become null");
+        let made_buf = kept.expect("CBV keeps backing buffer");
+        let (copy, addr, len) = buffer_copy(&view).expect("buffer_copy must resolve CBV");
+        assert_eq!((addr, len), (unaligned, 320));
+        assert!(copy.can_bind_cbv(unaligned, 320));
+        assert_eq!(copy.gpu(unaligned) % 256, 0);
+        use windows::core::Interface;
+        assert_eq!(made_buf.as_raw(), copy.buffer.as_raw());
+        // Zero-length unaligned CBV returns None cleanly (null CBV).
+        assert!(make(&View::Constant(unaligned, 0), heap.cpu(1)).is_none());
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn two_byte_aligned_and_structured_non16_views_use_exact_copies() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let memory = vec![0u64; 1 << 13];
+        let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        // SAFETY: plain CPU-side heap of one view.
+        let cpu: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                ..Default::default()
+            })
+        }
+        .unwrap();
+        // SAFETY: live heap.
+        let at = unsafe { cpu.GetCPUDescriptorHandleForHeapStart() };
+        // Typed R32_UINT (format 42, 4-byte element) placed at offset +6 (2-byte aligned).
+        let typed_at_6 = {
+            let resource: [u32; 14] = [1, 0, 0, 0, 64, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[42, 1, 5768, 0, 0, 0, 16, 0, 0, 0]);
+            let addr = start + 6;
+            (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+            View::Placed(false, resource, desc)
+        };
+        let made = make(&typed_at_6, at).expect("offset=6 element=4 view must succeed").expect("buffer");
+        let (copy, addr, bytes) = buffer_copy(&typed_at_6).expect("buffer_copy");
+        assert_eq!((copy.span(), addr, bytes), ((start + 6, 64), start + 6, 64));
+        // SAFETY: live buffer.
+        assert_eq!(unsafe { made.GetDesc() }.Width, 256);
+        use windows::core::Interface;
+        assert_eq!(made.as_raw(), copy.buffer.as_raw());
+
+        // Structured 8-byte elements at offset +8 (stride-aligned, non-16-byte aligned).
+        let struct_at_8 = {
+            let resource: [u32; 14] = [1, 0, 0, 0, 64, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[0, 1, 5768, 0, 0, 0, 8, 8, 0, 0]);
+            let addr = start + 8;
+            (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+            View::Placed(false, resource, desc)
+        };
+        let made_s = make(&struct_at_8, at).expect("structured offset=8 view must succeed").expect("buffer");
+        let (copy_s, addr_s, bytes_s) = buffer_copy(&struct_at_8).expect("buffer_copy");
+        assert_eq!((copy_s.span(), addr_s, bytes_s), ((start + 8, 64), start + 8, 64));
+        assert_eq!(made_s.as_raw(), copy_s.buffer.as_raw());
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn make_listed_skips_raw_twins_when_heap_has_no_raw_half() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        if heap.raw != 0 {
+            return; // adapter supports raw_twins; this test checks raw == 0 path
+        }
+        let memory = vec![0u64; 1 << 11];
+        let addr = (memory.as_ptr() as u64).next_multiple_of(4096) + 4;
+        let resource: [u32; 14] = [1, 0, 0, 0, 64, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let mut desc = [0u32; 16];
+        // R32_UINT at +4 (element-aligned, non-16-byte aligned).
+        desc[..10].copy_from_slice(&[42, 1, 5768, 0, 0, 0, 16, 0, 0, 0]);
+        (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+        let view = View::Placed(false, resource, desc);
+        let mut slot_mem = [0u32; 8];
+        crate::descriptor::record(slot_mem.as_mut_ptr() as u64, view);
+        let rec = [slot_mem[0], slot_mem[1], slot_mem[2]];
+        let dyn_slot = heap.dynamic(1).unwrap();
+        let before = TWINS[2].load(std::sync::atomic::Ordering::Relaxed);
+        assert!(heap.make_listed(0x9999_8888, rec, dyn_slot).is_some());
+        let after = TWINS[2].load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(before, after, "no null raw twin work when heap.raw == 0");
+    }
+
+    #[test]
+    fn capped_view_heap_dynamic_budget_and_telemetry() {
+        // NVIDIA 1,000,000 cap (null = 999,999) with 1,245,184 title slots.
+        assert_eq!(dynamic_slots_for(1_245_184, 999_999, None), DYNAMIC);
+        assert_eq!(999_999u32.saturating_sub(DYNAMIC), 737_855);
+        // Explicit OATHKEEP_DYNAMIC_SLOTS override works on capped heaps and clamps safely.
+        assert_eq!(dynamic_slots_for(1_245_184, 999_999, Some(1 << 17)), 1 << 17);
+        assert_eq!(dynamic_slots_for(1_245_184, 999_999, Some(1024)), 1 << 16);
+        assert_eq!(dynamic_slots_for(1_245_184, 999_999, Some(900_000)), 999_999 / 2);
+        // AMD uncapped (null = 2^21 - 1) leaves room for up to 4x DYNAMIC.
+        assert_eq!(
+            dynamic_slots_for(1_245_184, (1 << 21) - 1, None),
+            ((1 << 21) - 1) - 1_245_184
+        );
+        // Unclamped (null = 0).
+        assert_eq!(dynamic_slots_for(1024, 0, None), DYNAMIC);
+        assert_eq!(dynamic_slots_for(1024, 0, Some(1 << 19)), 1 << 19);
+
+        // Verify past-cap mirror telemetry records below-null vs past-null drops safely.
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let mut fake = [0u32; 8];
+        let handle = fake.as_mut_ptr() as u64;
+        assert!(heap.mirror(heap.count, handle, false).is_none());
+        assert!(heap.mirror(heap.count + heap.dynamic + 5, handle, true).is_none());
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(heap.capped_mirror[0].load(Relaxed), 1);
+        assert_eq!(heap.capped_mirror[1].load(Relaxed), 1);
+        assert_eq!(heap.capped_mirror[2].load(Relaxed), 1);
+        assert_eq!(heap.highest_capped.load(Relaxed), heap.count + heap.dynamic + 5);
     }
 
     /// Such a view is made on a copy of its own bytes, and that copy is the one

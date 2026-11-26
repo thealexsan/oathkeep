@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -102,6 +102,17 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Sub-allocated slot inside the shared 4 MiB 256-byte-aligned CBV slab
+    /// pool (`find_aligned_cbv`), if this shadow was created for an unaligned
+    /// constant buffer view.
+    cbv_slab: Option<CbvSlabSlot>,
+}
+
+/// Slot metadata for a 256-byte-aligned CBV sub-allocation inside [`CBV_SLAB_POOL`].
+struct CbvSlabSlot {
+    slab_idx: usize,
+    offset: u64,
+    size: u64,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2481,6 +2492,9 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if let Some(slot) = self.cbv_slab.take() {
+            release_cbv_slab_slot(slot);
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -2810,6 +2824,8 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let_go_idle_aligned_cbv(idle_ms, IDLE_FRAMES);
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -2817,7 +2833,6 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
@@ -2954,10 +2969,44 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
+    /// Whether `size` bytes at `address` can be bound directly as a D3D12
+    /// constant buffer view on this shadow: `BufferLocation` must be 256-byte
+    /// aligned and `constant_bytes(size)` must fit within this shadow's buffer.
+    pub(crate) fn can_bind_cbv(&self, address: u64, size: u32) -> bool {
+        let aligned = u64::from(size.min(64 << 10).next_multiple_of(256));
+        if address < self.start || !self.gpu(address).is_multiple_of(256) {
+            return false;
+        }
+        if let Some(slot) = &self.cbv_slab {
+            return (address - self.start)
+                .checked_add(aligned)
+                .is_some_and(|end| end <= slot.size);
+        }
+        self.offset(address)
+            .checked_add(aligned)
+            .is_some_and(|end| end <= self.width())
+    }
+
     /// The bytes of the host buffer.
     pub(crate) fn width(&self) -> u64 {
         // SAFETY: a live buffer.
         *self.width.get_or_init(|| unsafe { self.buffer.GetDesc() }.Width)
+    }
+
+    fn new_suballocated(
+        buffer: ID3D12Resource,
+        aligned_size: u64,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        cbv_slab: Option<CbvSlabSlot>,
+    ) -> Shadow {
+        let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+        let _ = shadow.width.set(aligned_size);
+        shadow.cbv_slab = cbv_slab;
+        seed_mapped_bytes(data, aligned_size, start, len);
+        shadow
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
@@ -2994,6 +3043,7 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            cbv_slab: None,
         }
     }
 
@@ -5340,63 +5390,432 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     Some(shadow)
 }
 
+/// Seeds a newly created or recycled CPU-mapped buffer slot with title bytes
+/// from `[start, start + len)` and zeroes trailing alignment padding up to
+/// `aligned_size`. `copied` remains zeroed so the next `Shadow::refresh` still
+/// tracks and refreshes subsequent title writes normally.
+fn seed_mapped_bytes(data: *mut u8, aligned_size: u64, start: u64, len: u64) {
+    let total = aligned_size as usize;
+    let copy_len = (len as usize).min(total);
+    if total == 0 || data.is_null() {
+        return;
+    }
+    // SAFETY: `data` points to `total` mapped bytes owned exclusively by this shadow.
+    let dst = unsafe { std::slice::from_raw_parts_mut(data, total) };
+    if copy_len > 0 && !crate::host::read_into(start as *const u8, &mut dst[..copy_len]) {
+        dst[..copy_len].fill(0);
+    }
+    if copy_len < total {
+        dst[copy_len..].fill(0);
+    }
+}
+
+/// Shared 4 MiB 256-byte-aligned slab pool for unaligned constant buffer views.
+const CBV_SLAB_BYTES: u64 = 4 << 20;
+/// Maximum D3D12 CBV size (64 KiB).
+const CBV_SLAB_MAX_SLOT: u64 = 64 << 10;
+
+struct CbvSlab {
+    buffer: ID3D12Resource,
+    data: usize,
+    gpu: u64,
+    next: u64,
+    cap: u64,
+    live: usize,
+}
+
+#[derive(Default)]
+struct CbvSlabPool {
+    slabs: Vec<CbvSlab>,
+    free: BTreeMap<u64, Vec<(usize, u64)>>,
+}
+
+static CBV_SLAB_POOL: Mutex<CbvSlabPool> = Mutex::new(CbvSlabPool {
+    slabs: Vec::new(),
+    free: BTreeMap::new(),
+});
+
+/// 256-byte-aligned CBV shadows keyed by guest start address.
+static ALIGNED_CBV: RwLock<BTreeMap<u64, Arc<Shadow>>> = RwLock::new(BTreeMap::new());
+static ALIGNED_CBV_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Pure slab-sizing rule for an unaligned CBV request: clamps to the 64 KiB
+/// D3D12 CBV limit and rounds up to 256 bytes. Returns `None` for empty/overflow.
+fn cbv_slab_sizes(address: u64, len: u64) -> Option<(u64, u64)> {
+    if address == 0 || len == 0 {
+        return None;
+    }
+    let need = len.min(CBV_SLAB_MAX_SLOT);
+    address.checked_add(need)?;
+    let aligned = need.checked_next_multiple_of(256)?;
+    Some((need, aligned))
+}
+
+fn release_cbv_slab_slot(slot: CbvSlabSlot) {
+    let mut pool = CBV_SLAB_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(slab) = pool.slabs.get_mut(slot.slab_idx) else {
+        return;
+    };
+    slab.live = slab.live.saturating_sub(1);
+    // `Shadow::drop` runs before `self.buffer` is dropped: `pool` (1) +
+    // `self.buffer` (1) + remaining `slab.live` shadows own all internal refs.
+    // Only recycle slab space when zero descriptor slots or command lists hold
+    // external references to this slab's `ID3D12Resource` (prevents CBV slab UAF).
+    let internal_refs = 2u32.saturating_add(slab.live as u32);
+    if crate::host::references(&slab.buffer) <= internal_refs {
+        if slab.live == 0 {
+            slab.next = 0;
+            pool.free.retain(|_, list| {
+                list.retain(|&(idx, _)| idx != slot.slab_idx);
+                !list.is_empty()
+            });
+        } else {
+            pool.free
+                .entry(slot.size)
+                .or_default()
+                .push((slot.slab_idx, slot.offset));
+        }
+    }
+}
+
+fn alloc_cbv_slab(aligned_size: u64) -> Option<(ID3D12Resource, *mut u8, u64, Option<CbvSlabSlot>)> {
+    if aligned_size == 0 || aligned_size > CBV_SLAB_MAX_SLOT {
+        let (buffer, data) = host()?.shared_buffer(aligned_size.max(256))?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        return Some((buffer, data, gpu, None));
+    }
+    {
+        let mut pool = CBV_SLAB_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((slab_idx, offset)) = pool.free.get_mut(&aligned_size).and_then(Vec::pop) {
+            let slab = &mut pool.slabs[slab_idx];
+            slab.live += 1;
+            return Some((
+                slab.buffer.clone(),
+                (slab.data + offset as usize) as *mut u8,
+                slab.gpu + offset,
+                Some(CbvSlabSlot {
+                    slab_idx,
+                    offset,
+                    size: aligned_size,
+                }),
+            ));
+        }
+        if let Some((slab_idx, slab)) = pool
+            .slabs
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .find(|(_, s)| s.cap.saturating_sub(s.next) >= aligned_size)
+        {
+            let offset = slab.next;
+            slab.next += aligned_size;
+            slab.live += 1;
+            return Some((
+                slab.buffer.clone(),
+                (slab.data + offset as usize) as *mut u8,
+                slab.gpu + offset,
+                Some(CbvSlabSlot {
+                    slab_idx,
+                    offset,
+                    size: aligned_size,
+                }),
+            ));
+        }
+    }
+    let (buffer, data) = host()?.shared_buffer(CBV_SLAB_BYTES)?;
+    crate::host::name(&buffer, || {
+        format!("aligned CBV slab ({} KiB)", CBV_SLAB_BYTES >> 10)
+    });
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut pool = CBV_SLAB_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let slab_idx = pool.slabs.len();
+    pool.slabs.push(CbvSlab {
+        buffer: buffer.clone(),
+        data: data as usize,
+        gpu,
+        next: aligned_size,
+        cap: CBV_SLAB_BYTES,
+        live: 1,
+    });
+    let slab_count = pool.slabs.len();
+    drop(pool);
+    tracing::info!(
+        slab_count,
+        slab_kib = CBV_SLAB_BYTES >> 10,
+        "aligned CBV slab allocated"
+    );
+    Some((
+        buffer,
+        data,
+        gpu,
+        Some(CbvSlabSlot {
+            slab_idx,
+            offset: 0,
+            size: aligned_size,
+        }),
+    ))
+}
+
+#[inline]
+pub(crate) fn has_aligned_cbv() -> bool {
+    ALIGNED_CBV_LEN.load(Ordering::Relaxed) != 0
+}
+
+/// Looks up an existing 256-byte-aligned CBV slab shadow covering `[address, address + len)`.
+pub(crate) fn find_aligned_cbv_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if !has_aligned_cbv() {
+        return None;
+    }
+    let (need, _) = cbv_slab_sizes(address, len)?;
+    let map = ALIGNED_CBV.read().unwrap_or_else(|e| e.into_inner());
+    let s = map.get(&address)?;
+    if s.len >= need {
+        s.used.store(crate::host::moment(), Ordering::Relaxed);
+        return Some(s.clone());
+    }
+    None
+}
+
+/// Returns or sub-allocates an exact-size 256-byte-aligned CBV shadow from the
+/// shared 4 MiB CBV slab pool for an unaligned `View::Constant`.
+pub(crate) fn find_aligned_cbv(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let (need, aligned) = cbv_slab_sizes(address, len)?;
+    if let Some(s) = find_aligned_cbv_existing(address, need) {
+        return Some(s);
+    }
+    let (buffer, data, gpu, slab_slot) = alloc_cbv_slab(aligned)?;
+    let candidate = Arc::new(Shadow::new_suballocated(
+        buffer, aligned, data, gpu, address, need, slab_slot,
+    ));
+    candidate.used.store(crate::host::moment(), Ordering::Relaxed);
+    let mut map = ALIGNED_CBV.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = map.get(&address)
+        && existing.len >= need
+    {
+        existing.used.store(crate::host::moment(), Ordering::Relaxed);
+        return Some(existing.clone());
+    }
+    if let Some(old) = map.insert(address, candidate.clone()) {
+        crate::host::retire(old);
+    }
+    let total = map.len();
+    ALIGNED_CBV_LEN.store(total, Ordering::Release);
+    if total <= 8 || total.is_power_of_two() {
+        tracing::info!(
+            view_start = format_args!("{address:#x}"),
+            view_len = need,
+            aligned_size = aligned,
+            aligned_cbv_shadows = total,
+            "aligned CBV slab shadow created"
+        );
+    }
+    Some(candidate)
+}
+
+/// Evicts idle aligned CBV shadows only when zero descriptor slots or in-flight
+/// command lists reference their backing resource (UAF-safe).
+fn let_go_idle_aligned_cbv(idle_ms: u64, idle_frames: u64) {
+    if !has_aligned_cbv() {
+        return;
+    }
+    let gone: Vec<Arc<Shadow>> = {
+        let mut map = ALIGNED_CBV.write().unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return;
+        }
+        let mut evict_keys = Vec::new();
+        let mut slab_counts: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+        for (&addr, s) in map.iter() {
+            let is_idle = Arc::strong_count(s) == 1
+                && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, idle_frames);
+            match &s.cbv_slab {
+                None => {
+                    if is_idle && crate::host::references(&s.buffer) == 1 {
+                        evict_keys.push(addr);
+                    }
+                }
+                Some(slot) => {
+                    let entry = slab_counts.entry(slot.slab_idx).or_insert((0, 0));
+                    entry.0 += 1;
+                    if is_idle {
+                        entry.1 += 1;
+                    }
+                }
+            }
+        }
+        let mut reclaim_slabs = Vec::new();
+        if !slab_counts.is_empty() {
+            let pool = CBV_SLAB_POOL.lock().unwrap_or_else(|e| e.into_inner());
+            for (slab_idx, (in_map, idle_in_map)) in slab_counts {
+                if let Some(slab) = pool.slabs.get(slab_idx)
+                    && slab.live > 0
+                    && in_map == slab.live
+                    && idle_in_map == slab.live
+                    && crate::host::references(&slab.buffer) <= 1u32.saturating_add(slab.live as u32)
+                {
+                    reclaim_slabs.push(slab_idx);
+                }
+            }
+        }
+        if !reclaim_slabs.is_empty() {
+            for (&addr, s) in map.iter() {
+                if let Some(slot) = &s.cbv_slab
+                    && reclaim_slabs.contains(&slot.slab_idx)
+                {
+                    evict_keys.push(addr);
+                }
+            }
+        }
+        let evicted: Vec<Arc<Shadow>> = evict_keys
+            .into_iter()
+            .filter_map(|k| map.remove(&k))
+            .collect();
+        ALIGNED_CBV_LEN.store(map.len(), Ordering::Release);
+        evicted
+    };
+    for shadow in gone {
+        crate::host::retire(shadow);
+    }
+}
+
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
-/// bytes), each with the asking that last took it; and the askings so far.
+/// bytes), each with the asking tick that last took it.
+struct ExactEntry {
+    shadow: Arc<Shadow>,
+    used: AtomicU64,
+}
+
+static EXACT_TICK: AtomicU64 = AtomicU64::new(0);
+static EXACT: RwLock<BTreeMap<(u64, u64), ExactEntry>> = RwLock::new(BTreeMap::new());
+
+/// Recycled idle `shared_buffer`s from evicted [`exact`] shadows, keyed by
+/// rounded byte size, to avoid `CreateCommittedResource` churn when ring-buffer
+/// views move across misaligned offsets every frame.
+const EXACT_POOL_MAX: usize = 64;
+const EXACT_POOL_MAX_BYTES: u64 = 1 << 20;
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT_POOL: Mutex<(usize, BTreeMap<u64, Vec<(ID3D12Resource, usize, u64)>>)> =
+    Mutex::new((0, BTreeMap::new()));
 
 /// Since the last frame line: askings for such copies, and copies made.
 static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+fn recycle_exact_buffer(shadow: &Shadow) {
+    let alloc_size = shadow.width();
+    if alloc_size == 0 || alloc_size > EXACT_POOL_MAX_BYTES || shadow.card.is_some() || shadow.place.is_some() {
+        return;
+    }
+    let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.0 >= EXACT_POOL_MAX {
+        return;
+    }
+    pool.0 += 1;
+    pool.1
+        .entry(alloc_size)
+        .or_default()
+        .push((shadow.buffer.clone(), shadow.data as usize, shadow.gpu));
+}
+
+fn take_exact_buffer(aligned: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    if aligned <= EXACT_POOL_MAX_BYTES {
+        let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let (total, buckets) = &mut *pool;
+        if let Some(list) = buckets.get_mut(&aligned) {
+            while let Some((buf, data, gpu)) = list.pop() {
+                *total = total.saturating_sub(1);
+                if crate::host::references(&buf) == 1 {
+                    return Some((buf, data as *mut u8, gpu));
+                }
+            }
+        }
+    }
+    let (buffer, data) = host()?.shared_buffer(aligned)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    Some((buffer, data, gpu))
+}
+
+/// Pure validity check for an exact aligned copy request `[address, address + len)`.
+/// Allows arbitrary byte alignment (e.g. 2-byte aligned `offset=6 element=4` views)
+/// because `Shadow` copies and lands byte ranges cleanly while the host buffer
+/// itself starts at offset 0 on a 64 KiB boundary.
+fn exact_range_valid(address: u64, len: u64) -> bool {
+    const MOST: u64 = 64 << 20;
+    address != 0 && len > 0 && len <= MOST && address.checked_add(len).is_some()
+}
+
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
-/// element of the copy its buffer has (`descriptor/host.rs` `view_home`).
+/// element (or 16-byte raw boundary) of the copy its buffer has
+/// (`descriptor/host.rs` `view_home`).
 /// A host view counts its first element from its buffer's start; a console
-/// view starts at any address, and the title places views at ring
-/// positions inside its big GPU heap. Such a view was refused and its slot
-/// read zeros ("buffer view not on an element of its host copy", in every
-/// run; upstream Oathkeep 86a5ed6 found its meshlet culling constants and
-/// colour-bake parameter blocks among them and gives each a copy of its
-/// own bytes, as here).
+/// view starts at any address (including 2-byte aligned offsets such as
+/// `offset=6` for 4-byte elements), and the title places views at ring
+/// positions inside its big GPU heap.
 ///
 /// The copy is brought up to date and written back like any other (a list
 /// refreshes the copy its view's slot shows, `buffer_copy`). Kept by
 /// (start, bytes) for as long as a list or a slot holds it; of the others,
 /// those not asked for lately go once there are many (ring positions
-/// change every frame).
+/// change every frame) and their backing buffers are recycled.
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for, and the askings an
     /// idle one stays for.
-    const MANY: usize = 256;
-    const LATELY: u64 = 512;
-    /// The largest, and no view the title made on purpose: off its dwords.
-    const MOST: u64 = 64 << 20;
-    if len == 0 || len > MOST || !address.is_multiple_of(4) {
+    const MANY: usize = 1024;
+    const LATELY: u64 = 1024;
+    if !exact_range_valid(address, len) {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
+    let now = EXACT_TICK.fetch_add(1, Ordering::Relaxed) + 1;
+    {
+        let map = EXACT.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get(&(address, len)) {
+            entry.used.store(now, Ordering::Relaxed);
+            entry.shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(entry.shadow.clone());
+        }
+    }
+    let aligned = len.checked_next_multiple_of(256)?;
+    let mut map = EXACT.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = map.get(&(address, len)) {
+        entry.used.store(now, Ordering::Relaxed);
+        entry.shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        return Some(entry.shadow.clone());
     }
     if map.len() >= MANY {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
+        let mut stale = Vec::new();
+        for (&key, entry) in map.iter() {
+            if Arc::strong_count(&entry.shadow) == 1
+                && crate::host::references(&entry.shadow.buffer) == 1
+                && entry.used.load(Ordering::Relaxed) + LATELY <= now
+            {
+                stale.push(key);
+            }
+        }
+        for key in stale {
+            if let Some(entry) = map.remove(&key) {
+                recycle_exact_buffer(&entry.shadow);
+            }
+        }
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let (buffer, data, gpu) = take_exact_buffer(aligned)?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    seed_mapped_bytes(data, aligned, address, len);
+    let shadow = Shadow::new(buffer, data, gpu, address, len);
+    let _ = shadow.width.set(aligned);
+    let shadow = Arc::new(shadow);
+    map.insert(
+        (address, len),
+        ExactEntry {
+            shadow: shadow.clone(),
+            used: AtomicU64::new(now),
+        },
+    );
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
@@ -5413,7 +5832,7 @@ pub(crate) fn exact_line(frames: f64) {
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let kept = EXACT.read().unwrap_or_else(|e| e.into_inner()).len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; OATHKEEP_VIEW_BYTES=0 refuses them again): \
          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
@@ -5558,6 +5977,96 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    #[test]
+    fn cbv_slab_sizing_clamps_and_aligns() {
+        use super::{CBV_SLAB_MAX_SLOT, cbv_slab_sizes};
+        assert_eq!(cbv_slab_sizes(0, 256), None);
+        assert_eq!(cbv_slab_sizes(0x1000, 0), None);
+        assert_eq!(cbv_slab_sizes(u64::MAX - 8, 64), None);
+        assert_eq!(cbv_slab_sizes(0x1010, 1), Some((1, 256)));
+        assert_eq!(cbv_slab_sizes(0x1090, 320), Some((320, 512)));
+        assert_eq!(cbv_slab_sizes(0x1090, CBV_SLAB_MAX_SLOT), Some((CBV_SLAB_MAX_SLOT, CBV_SLAB_MAX_SLOT)));
+        // Oversized CBVs clamp to the 64 KiB D3D12 CBV maximum.
+        assert_eq!(cbv_slab_sizes(0x1090, 969_472), Some((CBV_SLAB_MAX_SLOT, CBV_SLAB_MAX_SLOT)));
+    }
+
+    #[test]
+    fn exact_range_allows_arbitrary_byte_alignment() {
+        use super::exact_range_valid;
+        assert!(!exact_range_valid(0, 16));
+        assert!(!exact_range_valid(0x1000, 0));
+        assert!(!exact_range_valid(0x1000, (64 << 20) + 1));
+        assert!(!exact_range_valid(u64::MAX - 4, 16));
+        // 2-byte aligned offset=6 (e.g. R32/R16G16 view on unaligned base) is accepted.
+        assert!(exact_range_valid(0x10006, 40));
+        assert!(exact_range_valid(0x10002, 16));
+        assert!(exact_range_valid(0x10008, 128));
+    }
+
+    #[test]
+    fn aligned_cbv_slab_suballocates_seeds_and_reuses_safely() {
+        use super::{find_aligned_cbv, find_aligned_cbv_existing};
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let mut backing = vec![0u8; 8192];
+        for (i, b) in backing.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(13).wrapping_add(7);
+        }
+        let page = (backing.as_ptr() as u64).next_multiple_of(4096);
+        let addr_a = page + 0x90;
+        let addr_b = page + 0x110;
+        let sa = find_aligned_cbv(addr_a, 300).expect("aligned CBV shadow A");
+        let sb = find_aligned_cbv(addr_b, 200).expect("aligned CBV shadow B");
+        assert!(sa.can_bind_cbv(addr_a, 300));
+        assert!(sb.can_bind_cbv(addr_b, 200));
+        assert_eq!(sa.gpu(addr_a) % 256, 0);
+        assert_eq!(sb.gpu(addr_b) % 256, 0);
+        assert_eq!(sa.width(), 512);
+        assert_eq!(sb.width(), 256);
+        // Existing lookup returns the exact same Arc<Shadow>.
+        let sa2 = find_aligned_cbv_existing(addr_a, 300).expect("cached CBV shadow A");
+        assert!(std::sync::Arc::ptr_eq(&sa, &sa2));
+        // Initial bytes are seeded from guest memory and padded tail is zeroed.
+        // SAFETY: `sa.data` maps 512 bytes owned by `sa`.
+        let seeded = unsafe { std::slice::from_raw_parts(sa.data, 512) };
+        let src_off = (addr_a - backing.as_ptr() as u64) as usize;
+        assert_eq!(&seeded[..300], &backing[src_off..src_off + 300]);
+        assert!(seeded[300..].iter().all(|&b| b == 0));
+        // Growing the CBV at the same address replaces with a larger slot cleanly.
+        let sa_big = find_aligned_cbv(addr_a, 1024).expect("grown CBV shadow A");
+        assert!(sa_big.can_bind_cbv(addr_a, 1024));
+        assert_eq!(sa_big.width(), 1024);
+        assert!(!std::sync::Arc::ptr_eq(&sa, &sa_big));
+    }
+
+    #[test]
+    fn exact_shadow_supports_two_byte_aligned_offsets() {
+        use super::exact;
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let mut backing = vec![0u8; 8192];
+        for (i, b) in backing.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(3);
+        }
+        let page = (backing.as_ptr() as u64).next_multiple_of(4096);
+        let unaligned = page + 6;
+        let len = 64u64;
+        let s = exact(unaligned, len).expect("2-byte aligned exact shadow");
+        assert_eq!(s.span(), (unaligned, len));
+        assert_eq!(s.offset(unaligned), 0);
+        assert_eq!(s.gpu(unaligned) % 16, 0);
+        assert_eq!(s.width(), 256);
+        // SAFETY: `s.data` maps 256 bytes owned by `s`.
+        let seeded = unsafe { std::slice::from_raw_parts(s.data, 256) };
+        let src_off = (unaligned - backing.as_ptr() as u64) as usize;
+        assert_eq!(&seeded[..len as usize], &backing[src_off..src_off + len as usize]);
+        assert!(seeded[len as usize..].iter().all(|&b| b == 0));
+        let s2 = exact(unaligned, len).expect("cached exact shadow");
+        assert!(std::sync::Arc::ptr_eq(&s, &s2));
     }
 }
 
