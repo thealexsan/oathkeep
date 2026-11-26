@@ -8423,68 +8423,13 @@ impl Batch {
         if refreshes.is_empty() {
             return;
         }
-        const PAGE: usize = 64 << 10;
-        const SPLIT_SPAN_MIN: usize = 1 << 20;
-        const SPLIT_CHUNK: usize = 512 << 10;
-        // Split page-disjoint span groups (and multi-MiB contiguous spans on 64 KiB page
-        // boundaries) into independent work units so giant shadows fan out across workers.
-        let mut all: Vec<(
-            usize,
-            std::sync::Arc<crate::shadow::Shadow>,
-            Vec<(usize, usize)>,
-        )> = Vec::with_capacity(refreshes.len());
-        for (shadow, spans) in refreshes {
-            let total_bytes: usize = spans.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
-            if spans.len() <= 1 && total_bytes < SPLIT_SPAN_MIN {
-                all.push((total_bytes, shadow, spans));
-                continue;
-            }
-            // Group spans whose 64 KiB page ranges touch or overlap so split units are
-            // strictly page-disjoint (safe to run concurrently after `copied` is unlocked).
-            let mut page_groups: Vec<Vec<(usize, usize)>> = Vec::new();
-            let mut cur_end_page = 0usize;
-            for (a, b) in spans {
-                if a >= b {
-                    continue;
-                }
-                let p_lo = a / PAGE;
-                let p_hi = b.div_ceil(PAGE);
-                if let Some(last) = page_groups.last_mut()
-                    && p_lo < cur_end_page
-                {
-                    last.push((a, b));
-                    cur_end_page = cur_end_page.max(p_hi);
-                } else {
-                    page_groups.push(vec![(a, b)]);
-                    cur_end_page = p_hi;
-                }
-            }
-            for group in page_groups {
-                if group.len() == 1 {
-                    let (a, b) = group[0];
-                    if b.saturating_sub(a) >= SPLIT_SPAN_MIN {
-                        let mut at = a;
-                        while at < b {
-                            let next = if b - at <= SPLIT_CHUNK {
-                                b
-                            } else {
-                                let aligned = (at + SPLIT_CHUNK) & !(PAGE - 1);
-                                if aligned <= at || aligned >= b {
-                                    b
-                                } else {
-                                    aligned
-                                }
-                            };
-                            all.push((next - at, shadow.clone(), vec![(at, next)]));
-                            at = next;
-                        }
-                        continue;
-                    }
-                }
-                let bytes: usize = group.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
-                all.push((bytes, shadow.clone(), group));
-            }
-        }
+        let mut all: Vec<_> = refreshes
+            .into_iter()
+            .map(|(shadow, spans)| {
+                let bytes: usize = spans.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
+                (bytes, shadow, spans)
+            })
+            .collect();
         all.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.2.len().cmp(&a.2.len())));
         let chunks = all.len().min(24);
         let mut buckets: Vec<(
