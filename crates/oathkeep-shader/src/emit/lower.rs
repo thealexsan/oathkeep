@@ -337,6 +337,10 @@ struct Lower<'a> {
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
+    /// Multi-wave (`group > 64`) widened execution: widened and guarded scalar
+    /// branches synchronize across every host wave in the thread group via LDS
+    /// so every wave reaches barriers in lockstep.
+    group_wide: bool,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -677,6 +681,17 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
             Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)),
             _ => None,
         };
+        let ds_atomic_op = |n: &str| match n {
+            "ds_add_rtn_u32" | "ds_add_u32" => Some(Op::AddU),
+            "ds_min_rtn_u32" | "ds_min_u32" => Some(Op::MinU),
+            "ds_max_rtn_u32" | "ds_max_u32" => Some(Op::MaxU),
+            "ds_min_rtn_i32" | "ds_min_i32" => Some(Op::MinI),
+            "ds_max_rtn_i32" | "ds_max_i32" => Some(Op::MaxI),
+            "ds_or_rtn_b32" | "ds_or_b32" => Some(Op::Or),
+            "ds_and_rtn_b32" | "ds_and_b32" => Some(Op::And),
+            "ds_xor_rtn_b32" | "ds_xor_b32" => Some(Op::Xor),
+            _ => None,
+        };
         let ops: Vec<Operand> = match &inst.fields {
             Fields::Valu(v) => v.src.clone(),
             Fields::Sop { dst, src, .. } => {
@@ -688,6 +703,9 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
             }
             Fields::Buffer { data, .. } if name.contains("_atomic_") || name.contains("_store_") => {
                 data.iter().copied().collect()
+            }
+            Fields::Ds { data, .. } if ds_atomic_op(name).is_some() => {
+                data.first().copied().into_iter().collect()
             }
             _ => Vec::new(),
         };
@@ -777,7 +795,8 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 if *c == Wave::Base { Wave::Base } else { Wave::Prefix }
             }
             // the reservation: the first lane adds its wave's total to a shared counter
-            (_, [Wave::Total(op)]) if name.contains("_atomic_") => {
+            // (either in a buffer or in LDS)
+            (_, [Wave::Total(op)]) if name.contains("_atomic_") || ds_atomic_op(name).is_some() => {
                 let want = match op {
                     Op::AddU => "buffer_atomic_add",
                     Op::MinU => "buffer_atomic_umin",
@@ -789,7 +808,8 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                     Op::Xor => "buffer_atomic_xor",
                     _ => "",
                 };
-                if name != want || !first_mask(firsts, inst.read(Reg::S(EXEC))) {
+                let ok = name == want || ds_atomic_op(name) == Some(*op);
+                if !ok || !first_mask(firsts, inst.read(Reg::S(EXEC))) {
                     return Err(TOTAL);
                 }
                 reserved = true;
@@ -927,6 +947,555 @@ fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
 
+/// Lightweight expression of a thread's in-group coordinates (`SV_GroupThreadID`),
+/// evaluated across concrete threads in a 32-lane half or 64-lane console wave to
+/// prove that a region or branch can only be active in a single half or single wave.
+#[derive(Clone)]
+enum TidExpr {
+    Const(u32),
+    Comp(u8),
+    Add(Box<TidExpr>, Box<TidExpr>),
+    Sub(Box<TidExpr>, Box<TidExpr>),
+    And(Box<TidExpr>, Box<TidExpr>),
+    Or(Box<TidExpr>, Box<TidExpr>),
+    Xor(Box<TidExpr>, Box<TidExpr>),
+    Shl(Box<TidExpr>, Box<TidExpr>),
+    LShr(Box<TidExpr>, Box<TidExpr>),
+    Mul(Box<TidExpr>, Box<TidExpr>),
+}
+
+impl TidExpr {
+    fn eval(&self, x: u32, y: u32, z: u32) -> u32 {
+        match self {
+            TidExpr::Const(k) => *k,
+            TidExpr::Comp(0) => x,
+            TidExpr::Comp(1) => y,
+            TidExpr::Comp(_) => z,
+            TidExpr::Add(a, b) => a.eval(x, y, z).wrapping_add(b.eval(x, y, z)),
+            TidExpr::Sub(a, b) => a.eval(x, y, z).wrapping_sub(b.eval(x, y, z)),
+            TidExpr::And(a, b) => a.eval(x, y, z) & b.eval(x, y, z),
+            TidExpr::Or(a, b) => a.eval(x, y, z) | b.eval(x, y, z),
+            TidExpr::Xor(a, b) => a.eval(x, y, z) ^ b.eval(x, y, z),
+            TidExpr::Shl(a, b) => a.eval(x, y, z).wrapping_shl(b.eval(x, y, z) & 31),
+            TidExpr::LShr(a, b) => a.eval(x, y, z).wrapping_shr(b.eval(x, y, z) & 31),
+            TidExpr::Mul(a, b) => a.eval(x, y, z).wrapping_mul(b.eval(x, y, z)),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TidCmp {
+    Eq,
+    Ne,
+    LtU,
+    LeU,
+    GtU,
+    GeU,
+    LtI,
+    LeI,
+    GtI,
+    GeI,
+}
+
+impl TidCmp {
+    fn parse(name: &str) -> Option<Self> {
+        let rest = name
+            .strip_prefix("v_cmpx_")
+            .or_else(|| name.strip_prefix("v_cmp_"))?;
+        Some(match rest {
+            "eq_u32" | "eq_i32" => TidCmp::Eq,
+            "ne_u32" | "ne_i32" | "lg_u32" | "lg_i32" => TidCmp::Ne,
+            "lt_u32" => TidCmp::LtU,
+            "le_u32" => TidCmp::LeU,
+            "gt_u32" => TidCmp::GtU,
+            "ge_u32" => TidCmp::GeU,
+            "lt_i32" => TidCmp::LtI,
+            "le_i32" => TidCmp::LeI,
+            "gt_i32" => TidCmp::GtI,
+            "ge_i32" => TidCmp::GeI,
+            _ => return None,
+        })
+    }
+
+    fn eval(self, a: u32, b: u32) -> bool {
+        match self {
+            TidCmp::Eq => a == b,
+            TidCmp::Ne => a != b,
+            TidCmp::LtU => a < b,
+            TidCmp::LeU => a <= b,
+            TidCmp::GtU => a > b,
+            TidCmp::GeU => a >= b,
+            TidCmp::LtI => (a as i32) < (b as i32),
+            TidCmp::LeI => (a as i32) <= (b as i32),
+            TidCmp::GtI => (a as i32) > (b as i32),
+            TidCmp::GeI => (a as i32) >= (b as i32),
+        }
+    }
+}
+
+/// Abstract evaluator of lane BDD conditions over thread chunks of a compute
+/// thread group (`SV_GroupThreadID` comparisons only; unknown atoms are `(true, true)`).
+struct ThreadModel {
+    threads: [u32; 3],
+    group: u32,
+    cmps: HashMap<Value, (TidCmp, TidExpr, TidExpr)>,
+}
+
+impl ThreadModel {
+    fn new(p: &crate::ir::Program, io: &Io, threads: [u32; 3]) -> Self {
+        let group = threads.iter().product::<u32>();
+        let mut exprs: HashMap<Value, TidExpr> = HashMap::new();
+        for &(v, inp) in &io.inputs {
+            if let Input::ThreadIdInGroup(c) = inp {
+                exprs.insert(v, TidExpr::Comp(c));
+            }
+        }
+        let mut cmps = HashMap::new();
+        if group == 0 || group > 1024 {
+            return ThreadModel { threads, group, cmps };
+        }
+        let op_expr = |inst: &Inst, op: &Operand, exprs: &HashMap<Value, TidExpr>| -> Option<TidExpr> {
+            match *op {
+                Operand::Vector { reg, .. } => exprs.get(&inst.read(Reg::V(reg))?).cloned(),
+                Operand::Scalar { code, .. } if code != NULL => {
+                    exprs.get(&inst.read(Reg::S(code))?).cloned()
+                }
+                Operand::Const(c) => crate::resource::inline(c).map(TidExpr::Const),
+                Operand::Literal(k) => Some(TidExpr::Const(k)),
+                _ => None,
+            }
+        };
+        for &b in &crate::ir::reverse_postorder(&p.blocks) {
+            for inst in &p.blocks[b].insts {
+                let name = inst.name();
+                if let Some(cmp) = TidCmp::parse(name)
+                    && let Fields::Valu(v) = &inst.fields
+                    && v.src.len() >= 2
+                    && let (Some(a), Some(b_ex)) = (
+                        op_expr(inst, &v.src[0], &exprs),
+                        op_expr(inst, &v.src[1], &exprs),
+                    )
+                {
+                    let mask = if name.starts_with("v_cmpx") {
+                        inst.write(Reg::S(EXEC))
+                    } else if let Some(Operand::Scalar { code, .. }) = v.dst {
+                        inst.write(Reg::S(code))
+                    } else {
+                        None
+                    };
+                    if let Some(m) = mask {
+                        cmps.insert(m, (cmp, a, b_ex));
+                    }
+                    continue;
+                }
+                let src: &[Operand] = match &inst.fields {
+                    Fields::Valu(v) => &v.src,
+                    Fields::Sop { src, .. } => src,
+                    _ => continue,
+                };
+                let dst = match &inst.fields {
+                    Fields::Valu(v) => match v.dst {
+                        Some(Operand::Vector { reg, .. }) => inst.write(Reg::V(reg)),
+                        _ => None,
+                    },
+                    Fields::Sop { dst, .. } => match dst {
+                        Some(Operand::Scalar { code, .. }) => inst.write(Reg::S(*code)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(dst) = dst else { continue };
+                let out = (|| -> Option<TidExpr> {
+                    match (name, src) {
+                        ("v_mov_b32" | "s_mov_b32", [a]) => op_expr(inst, a, &exprs),
+                        ("v_add_nc_u32" | "s_add_u32" | "s_add_i32", [a, b_op]) => Some(TidExpr::Add(
+                            Box::new(op_expr(inst, a, &exprs)?),
+                            Box::new(op_expr(inst, b_op, &exprs)?),
+                        )),
+                        ("v_sub_nc_u32" | "s_sub_u32" | "s_sub_i32", [a, b_op]) => Some(TidExpr::Sub(
+                            Box::new(op_expr(inst, a, &exprs)?),
+                            Box::new(op_expr(inst, b_op, &exprs)?),
+                        )),
+                        ("v_subrev_nc_u32", [a, b_op]) => Some(TidExpr::Sub(
+                            Box::new(op_expr(inst, b_op, &exprs)?),
+                            Box::new(op_expr(inst, a, &exprs)?),
+                        )),
+                        ("v_and_b32" | "s_and_b32", [a, b_op]) => Some(TidExpr::And(
+                            Box::new(op_expr(inst, a, &exprs)?),
+                            Box::new(op_expr(inst, b_op, &exprs)?),
+                        )),
+                        ("v_or_b32" | "s_or_b32", [a, b_op]) => Some(TidExpr::Or(
+                            Box::new(op_expr(inst, a, &exprs)?),
+                            Box::new(op_expr(inst, b_op, &exprs)?),
+                        )),
+                        ("v_xor_b32" | "s_xor_b32", [a, b_op]) => Some(TidExpr::Xor(
+                            Box::new(op_expr(inst, a, &exprs)?),
+                            Box::new(op_expr(inst, b_op, &exprs)?),
+                        )),
+                        ("v_lshrrev_b32", [a, b_op]) => Some(TidExpr::LShr(
+                            Box::new(op_expr(inst, b_op, &exprs)?),
+                            Box::new(op_expr(inst, a, &exprs)?),
+                        )),
+                        ("s_lshr_b32", [a, b_op]) => Some(TidExpr::LShr(
+                            Box::new(op_expr(inst, a, &exprs)?),
+                            Box::new(op_expr(inst, b_op, &exprs)?),
+                        )),
+                        ("v_lshlrev_b32", [a, b_op]) => Some(TidExpr::Shl(
+                            Box::new(op_expr(inst, b_op, &exprs)?),
+                            Box::new(op_expr(inst, a, &exprs)?),
+                        )),
+                        ("s_lshl_b32", [a, b_op]) => Some(TidExpr::Shl(
+                            Box::new(op_expr(inst, a, &exprs)?),
+                            Box::new(op_expr(inst, b_op, &exprs)?),
+                        )),
+                        ("v_mul_lo_u32" | "v_mul_u32_u24" | "s_mul_i32", [a, b_op]) => {
+                            Some(TidExpr::Mul(
+                                Box::new(op_expr(inst, a, &exprs)?),
+                                Box::new(op_expr(inst, b_op, &exprs)?),
+                            ))
+                        }
+                        _ => None,
+                    }
+                })();
+                if let Some(ex) = out {
+                    exprs.insert(dst, ex);
+                }
+            }
+        }
+        ThreadModel { threads, group, cmps }
+    }
+
+    /// Evaluates BDD `cond` over flat threads `start..end` (`end <= group`):
+    /// returns `(can_be_false, can_be_true)` in the 4-point bilattice.
+    fn eval_chunk(&self, st: &Structured, cond: Bool, start: u32, end: u32) -> (bool, bool) {
+        let tx = self.threads[0].max(1);
+        let ty = self.threads[1].max(1);
+        let end = end.min(self.group);
+        if start >= end {
+            return (true, false);
+        }
+        let eval_lane = |v: Value| -> (bool, bool) {
+            let Some((cmp, a, b)) = self.cmps.get(&v) else {
+                return (true, true);
+            };
+            let (mut f, mut t) = (false, false);
+            for flat in start..end {
+                let x = flat % tx;
+                let y = (flat / tx) % ty;
+                let z = flat / (tx * ty);
+                if cmp.eval(a.eval(x, y, z), b.eval(x, y, z)) {
+                    t = true;
+                } else {
+                    f = true;
+                }
+                if f && t {
+                    break;
+                }
+            }
+            (f, t)
+        };
+        let mut phi_vals: HashMap<Value, (bool, bool)> = st
+            .phi_masks
+            .keys()
+            .map(|&id| (id, (false, false)))
+            .collect();
+        fn eval_bdd(
+            st: &Structured,
+            b: Bool,
+            eval_lane: &impl Fn(Value) -> (bool, bool),
+            phi_vals: &HashMap<Value, (bool, bool)>,
+            memo: &mut HashMap<Bool, (bool, bool)>,
+        ) -> (bool, bool) {
+            if b == Bool::FALSE {
+                return (true, false);
+            }
+            if b == Bool::TRUE {
+                return (false, true);
+            }
+            if let Some(&r) = memo.get(&b) {
+                return r;
+            }
+            let Some((atom, lo, hi)) = st.bools.node(b) else {
+                return (true, true);
+            };
+            let av = match atom {
+                Atom::Lane(v) => eval_lane(v),
+                Atom::Phi(id) => phi_vals.get(&id).copied().unwrap_or((true, true)),
+                _ => (true, true),
+            };
+            let mut r = (false, false);
+            if av.0 {
+                let l = eval_bdd(st, lo, eval_lane, phi_vals, memo);
+                r = (r.0 || l.0, r.1 || l.1);
+            }
+            if av.1 {
+                let h = eval_bdd(st, hi, eval_lane, phi_vals, memo);
+                r = (r.0 || h.0, r.1 || h.1);
+            }
+            memo.insert(b, r);
+            r
+        }
+        if !phi_vals.is_empty() {
+            let max_rounds = 2 * phi_vals.len() + 2;
+            let mut settled = false;
+            for _ in 0..max_rounds {
+                let mut changed = false;
+                let mut memo = HashMap::new();
+                let mut next = phi_vals.clone();
+                for (&id, args) in &st.phi_masks {
+                    let mut r = (false, false);
+                    for &arg in args {
+                        let v = eval_bdd(st, arg, &eval_lane, &phi_vals, &mut memo);
+                        r = (r.0 || v.0, r.1 || v.1);
+                    }
+                    if next.get(&id).copied() != Some(r) {
+                        next.insert(id, r);
+                        changed = true;
+                    }
+                }
+                phi_vals = next;
+                if !changed {
+                    settled = true;
+                    break;
+                }
+            }
+            if !settled {
+                for v in phi_vals.values_mut() {
+                    *v = (true, true);
+                }
+            }
+        }
+        let mut memo = HashMap::new();
+        eval_bdd(st, cond, &eval_lane, &phi_vals, &mut memo)
+    }
+
+    /// True if within every 64-lane console wave, at most one 32-lane half can
+    /// have `cond` true (so the two halves of a console wave never contend).
+    fn single_half_per_wave(&self, st: &Structured, cond: Bool) -> bool {
+        if self.group == 0 || self.group > 1024 {
+            return false;
+        }
+        let waves = self.group.div_ceil(64);
+        for w in 0..waves {
+            let base = w * 64;
+            let lo = self.eval_chunk(st, cond, base, base + 32).1;
+            let hi = self.eval_chunk(st, cond, base + 32, base + 64).1;
+            if lo && hi {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// True if at most one 64-lane console wave in the entire thread group can
+    /// have `cond` true.
+    fn single_console_wave(&self, st: &Structured, cond: Bool) -> bool {
+        if self.group == 0 || self.group > 1024 {
+            return false;
+        }
+        let waves = self.group.div_ceil(64);
+        let mut active = 0u32;
+        for w in 0..waves {
+            let base = w * 64;
+            if self.eval_chunk(st, cond, base, base + 64).1 {
+                active += 1;
+                if active > 1 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Static LDS byte-range summary for proving disjointness between LDS reads
+/// and LDS atomics within a divergent region.
+#[derive(Clone, Copy)]
+enum LdsRange {
+    Exact(u32, u32),
+    Min(u32),
+    Any,
+}
+
+impl LdsRange {
+    fn disjoint(self, other: Self) -> bool {
+        match (self, other) {
+            (LdsRange::Exact(a, la), LdsRange::Exact(b, lb)) => {
+                a.saturating_add(la) <= b || b.saturating_add(lb) <= a
+            }
+            (LdsRange::Exact(a, la), LdsRange::Min(mb)) => a.saturating_add(la) <= mb,
+            (LdsRange::Min(ma), LdsRange::Exact(b, lb)) => b.saturating_add(lb) <= ma,
+            _ => false,
+        }
+    }
+}
+
+/// Checks whether multi-wave (`group > 64`) widened execution is provably exact
+/// and deadlock-free: every widened branch and every guarded scalar branch in an
+/// all-lane block must have at most one active console wave (`exit_exec`), and
+/// no non-mask SGPR written inside a widened branch's region may be read outside
+/// that region.
+pub(super) fn multi_wave_wide_safe(
+    p: &crate::ir::Program,
+    st: &Structured,
+    io: &Io,
+    threads: [u32; 3],
+) -> bool {
+    let group = threads.iter().product::<u32>();
+    if group <= 64 || group % 64 != 0 || group > 1024 || st.wide.is_empty() {
+        return false;
+    }
+    let Some(all) = all_lane_blocks(st) else {
+        return false;
+    };
+    let model = ThreadModel::new(p, io, threads);
+    for (b, exit) in st.exits.iter().enumerate() {
+        let LaneExit::Branch { when, .. } = *exit else {
+            continue;
+        };
+        let wide = st.wide.contains(&b);
+        let guarded_scalar = !wide
+            && all[b]
+            && st.exit_exec[b] != Bool::TRUE
+            && st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)));
+        if (wide || guarded_scalar) && !model.single_console_wave(st, st.exit_exec[b]) {
+            return false;
+        }
+    }
+    // Check that no non-mask SGPR written inside any widened branch's CFG region
+    // is read outside that region (dragging an inactive console wave through a
+    // widened branch could otherwise clobber a live scalar).
+    let n = st.exits.len();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, e) in st.exits.iter().enumerate() {
+        match *e {
+            LaneExit::Jump(t) => succ[b].push(t),
+            LaneExit::Branch { taken, not_taken, .. } => {
+                succ[b].push(taken);
+                succ[b].push(not_taken);
+            }
+            LaneExit::End => {}
+            LaneExit::Indirect => return false,
+        }
+    }
+    let words = n.div_ceil(64);
+    let full = vec![u64::MAX; words];
+    let mut pdom: Vec<Vec<u64>> = (0..n)
+        .map(|b| {
+            if succ[b].is_empty() {
+                let mut v = vec![0; words];
+                v[b / 64] |= 1 << (b % 64);
+                v
+            } else {
+                full.clone()
+            }
+        })
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..n).rev() {
+            if succ[b].is_empty() {
+                continue;
+            }
+            let mut v = full.clone();
+            for &t in &succ[b] {
+                for w in 0..words {
+                    v[w] &= pdom[t][w];
+                }
+            }
+            v[b / 64] |= 1 << (b % 64);
+            if v != pdom[b] {
+                pdom[b] = v;
+                changed = true;
+            }
+        }
+    }
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    for &d in &st.wide {
+        // Compute blocks in `d`'s region (reachable from `d`, not post-dominating `d`).
+        let mut inside = vec![false; n];
+        let mut stack = succ[d].clone();
+        while let Some(b) = stack.pop() {
+            if inside[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
+                continue;
+            }
+            inside[b] = true;
+            stack.extend(succ[b].iter().copied());
+        }
+        // Only check outermost widened regions whose own entry may have another
+        // console wave live after exit: nested widened branches inside a single-
+        // wave region already share the outer region's live-out check.
+        let mut written_sgprs: HashSet<Value> = HashSet::new();
+        for (b, block) in p.blocks.iter().enumerate() {
+            if !inside[b] {
+                continue;
+            }
+            for phi in &block.phis {
+                if matches!(phi.reg, Reg::S(c) if c != EXEC && c != EXEC + 1) && !is_mask(phi.value) {
+                    written_sgprs.insert(phi.value);
+                }
+            }
+            for inst in &block.insts {
+                for &(r, v) in &inst.writes {
+                    if matches!(r, Reg::S(c) if c != EXEC && c != EXEC + 1) && !is_mask(v) {
+                        written_sgprs.insert(v);
+                    }
+                }
+            }
+        }
+        if written_sgprs.is_empty() {
+            continue;
+        }
+        // If `d` itself is nested inside another widened branch `outer` with the
+        // same single active wave, only check reads outside `outer`; checking
+        // directly outside `d` is still sound whenever no scalar escapes `d`,
+        // unless `d` is an inner branch whose scalar feeds the same wave's code.
+        // Skip inner branches that already sit strictly inside an enclosing widened
+        // branch's region (their enclosing region checks everything that leaves).
+        let enclosed = st.wide.iter().any(|&o| {
+            if o == d {
+                return false;
+            }
+            let mut seen = vec![false; n];
+            let mut st_o = succ[o].clone();
+            while let Some(b) = st_o.pop() {
+                if seen[b] || pdom[o][b / 64] >> (b % 64) & 1 == 1 {
+                    continue;
+                }
+                seen[b] = true;
+                if b == d {
+                    return true;
+                }
+                st_o.extend(succ[b].iter().copied());
+            }
+            false
+        });
+        if enclosed {
+            continue;
+        }
+        for (b, block) in p.blocks.iter().enumerate() {
+            if inside[b] {
+                continue;
+            }
+            for phi in &block.phis {
+                if matches!(phi.reg, Reg::S(c) if c != EXEC && c != EXEC + 1)
+                    && !is_mask(phi.value)
+                    && phi.args.iter().any(|a| written_sgprs.contains(a))
+                {
+                    return false;
+                }
+            }
+            for inst in &block.insts {
+                if inst.reads.iter().any(|&(_, v)| written_sgprs.contains(&v)) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
 /// some lanes run (`all` is [`all_lane_blocks`]): per IR block, whether the host waves meet (a
 /// group barrier) at its start and before its exit. `None` if barriers cannot keep the
@@ -939,9 +1508,20 @@ fn meeting_mode() -> u32 {
 /// there: before the exit of an all-lane block into a region with LDS accesses, and at the
 /// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
-/// joined without an all-lane block between them): refused.
+/// joined without an all-lane block between them): refused, unless:
+/// - every block with LDS accesses in that region runs in at most one 32-lane half of each
+///   console wave (e.g. a single-thread guard `tid == 0` or `tid == 63`), or
+/// - there are no non-atomic `ds_write` instructions in the region, every non-CAS atomic is
+///   provably byte-disjoint from all reads in the region, and every `ds_cmpst_rtn_b32` takes
+///   its expected operand from an LDS read in the region (lock-free CAS retry loop).
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
-fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
+fn lds_meetings(
+    p: &crate::ir::Program,
+    st: &Structured,
+    io: &Io,
+    threads: [u32; 3],
+    all: &[bool],
+) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
         match st.exits[b] {
@@ -967,38 +1547,222 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    // per region: LDS reads, LDS writes
-    let mut reads = vec![false; n];
-    let mut writes = vec![false; n];
+    // Lightweight constant / minimum byte-offset tracking for LDS addresses.
+    let mut const_val: HashMap<Value, u32> = HashMap::new();
+    let mut min_val: HashMap<Value, u32> = HashMap::new();
+    let op_const = |inst: &Inst, op: &Operand, cv: &HashMap<Value, u32>| -> Option<u32> {
+        match *op {
+            Operand::Vector { reg, .. } => cv.get(&inst.read(Reg::V(reg))?).copied(),
+            Operand::Scalar { code, .. } if code != NULL => {
+                cv.get(&inst.read(Reg::S(code))?).copied()
+            }
+            Operand::Const(c) => crate::resource::inline(c),
+            Operand::Literal(k) => Some(k),
+            _ => None,
+        }
+    };
+    let op_min = |inst: &Inst, op: &Operand, mv: &HashMap<Value, u32>| -> Option<u32> {
+        match *op {
+            Operand::Vector { reg, .. } => mv.get(&inst.read(Reg::V(reg))?).copied(),
+            Operand::Scalar { code, .. } if code != NULL => {
+                mv.get(&inst.read(Reg::S(code))?).copied()
+            }
+            Operand::Const(c) => crate::resource::inline(c),
+            Operand::Literal(k) => Some(k),
+            _ => None,
+        }
+    };
+    for &b in &crate::ir::reverse_postorder(&p.blocks) {
+        for inst in &p.blocks[b].insts {
+            let name = inst.name();
+            let (dst, src): (Option<Value>, &[Operand]) = match &inst.fields {
+                Fields::Valu(v) => (
+                    match v.dst {
+                        Some(Operand::Vector { reg, .. }) => inst.write(Reg::V(reg)),
+                        _ => None,
+                    },
+                    &v.src,
+                ),
+                Fields::Sop { dst, src, .. } => (
+                    match dst {
+                        Some(Operand::Scalar { code, .. }) => inst.write(Reg::S(*code)),
+                        _ => None,
+                    },
+                    src,
+                ),
+                _ => continue,
+            };
+            let Some(dst) = dst else { continue };
+            match (name, src) {
+                ("v_mov_b32" | "s_mov_b32", [a]) => {
+                    if let Some(k) = op_const(inst, a, &const_val) {
+                        const_val.insert(dst, k);
+                        min_val.insert(dst, k);
+                    } else if let Some(m) = op_min(inst, a, &min_val) {
+                        min_val.insert(dst, m);
+                    }
+                }
+                ("v_add_nc_u32" | "s_add_u32" | "s_add_i32", [a, b_op]) => {
+                    match (op_const(inst, a, &const_val), op_const(inst, b_op, &const_val)) {
+                        (Some(x), Some(y)) => {
+                            let s = x.wrapping_add(y);
+                            const_val.insert(dst, s);
+                            min_val.insert(dst, s);
+                        }
+                        (Some(k), None) if k <= 0x10000 => {
+                            let m = op_min(inst, b_op, &min_val).unwrap_or(0);
+                            if let Some(s) = m.checked_add(k) {
+                                min_val.insert(dst, s);
+                            }
+                        }
+                        (None, Some(k)) if k <= 0x10000 => {
+                            let m = op_min(inst, a, &min_val).unwrap_or(0);
+                            if let Some(s) = m.checked_add(k) {
+                                min_val.insert(dst, s);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                ("v_and_b32" | "s_and_b32", [a, b_op]) => {
+                    match (op_const(inst, a, &const_val), op_const(inst, b_op, &const_val)) {
+                        (Some(x), Some(y)) => {
+                            const_val.insert(dst, x & y);
+                            min_val.insert(dst, x & y);
+                        }
+                        (Some(m), None) | (None, Some(m)) if m <= 0x7FFF_FFFF => {
+                            min_val.insert(dst, 0);
+                        }
+                        _ => {}
+                    }
+                }
+                ("v_lshlrev_b32" | "s_lshl_b32", _) => {
+                    min_val.insert(dst, 0);
+                }
+                _ => {}
+            }
+        }
+    }
+    let ds_ranges = |inst: &Inst| -> Vec<LdsRange> {
+        let Fields::Ds { addr, offset0, offset1, .. } = &inst.fields else {
+            return Vec::new();
+        };
+        let name = inst.name();
+        let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
+        let width = match name.rsplit('_').next() {
+            Some("b64") => 2u32,
+            Some("b96") => 3,
+            Some("b128") => 4,
+            _ => 1,
+        };
+        let elems: Vec<(u32, u32)> = if name.starts_with("ds_read2") || name.starts_with("ds_write2") {
+            let scale = 4 * width * if name.contains("st64") { 64 } else { 1 };
+            vec![
+                (u32::from(*offset0) * scale, 4 * width),
+                (u32::from(*offset1) * scale, 4 * width),
+            ]
+        } else {
+            vec![(offset, 4 * width)]
+        };
+        let addr_const = addr.as_ref().and_then(|o| op_const(inst, o, &const_val));
+        let addr_min = addr.as_ref().and_then(|o| op_min(inst, o, &min_val));
+        elems
+            .into_iter()
+            .map(|(off, len)| {
+                if let Some(base) = addr_const {
+                    LdsRange::Exact(base.wrapping_add(off), len)
+                } else if let Some(m) = addr_min.and_then(|m| m.checked_add(off)) {
+                    LdsRange::Min(m)
+                } else if off > 0 {
+                    LdsRange::Min(off)
+                } else {
+                    LdsRange::Any
+                }
+            })
+            .collect()
+    };
+    // Per region: LDS reads, LDS writes, blocks touching LDS, and ds_read result values.
+    let mut reads: Vec<Vec<LdsRange>> = vec![Vec::new(); n];
+    let mut read_vals: Vec<HashSet<Value>> = vec![HashSet::new(); n];
+    // Writes: (is_non_atomic, is_cas, cas_expected_val, ranges)
+    let mut writes: Vec<Vec<(bool, bool, Option<Value>, Vec<LdsRange>)>> = vec![Vec::new(); n];
+    let mut blocks_in: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, block) in p.blocks.iter().enumerate().take(n) {
         if all[b] {
             continue;
         }
         let r = find(&mut region, b);
+        let mut touches = false;
         for i in &block.insts {
             let name = i.name();
             if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
                 continue;
             }
+            touches = true;
+            let ranges = ds_ranges(i);
             if name.starts_with("ds_read") {
-                reads[r] = true;
+                reads[r].extend(ranges);
+                for &(_, w) in &i.writes {
+                    read_vals[r].insert(w);
+                }
             } else {
-                writes[r] = true;
+                let non_atomic = name.starts_with("ds_write");
+                let is_cas = name.starts_with("ds_cmpst");
+                let expected = if is_cas
+                    && let Fields::Ds { data, .. } = &i.fields
+                    && let Some(Operand::Vector { reg, .. }) = data.first()
+                {
+                    i.read(Reg::V(*reg))
+                } else {
+                    None
+                };
+                writes[r].push((non_atomic, is_cas, expected, ranges));
             }
         }
+        if touches {
+            blocks_in[r].push(b);
+        }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
-        return None;
+    let model = ThreadModel::new(p, io, threads);
+    for r in 0..n {
+        if reads[r].is_empty() || writes[r].is_empty() {
+            continue;
+        }
+        // Single-half-per-console-wave blocks never run concurrently in both halves
+        // of the same console wave.
+        if blocks_in[r]
+            .iter()
+            .all(|&b| model.single_half_per_wave(st, st.reach[b]))
+        {
+            continue;
+        }
+        // Atomic-only regions where every non-CAS atomic is byte-disjoint from all
+        // reads and every CAS (`ds_cmpst_rtn_b32`) compares against an LDS read
+        // from this region (lock-free CAS retry loop).
+        let atomic_safe = writes[r].iter().all(|(non_atomic, is_cas, expected, wranges)| {
+            if *non_atomic {
+                return false;
+            }
+            if *is_cas {
+                return expected.is_some_and(|v| read_vals[r].contains(&v));
+            }
+            wranges
+                .iter()
+                .all(|&wr| reads[r].iter().all(|&rr| wr.disjoint(rr)))
+        });
+        if !atomic_safe {
+            return None;
+        }
     }
     let mut meet = vec![(false, false); n];
     for b in 0..n {
         for t in succ(b) {
             if all[b] && !all[t] {
                 let r = find(&mut region, t);
-                meet[b].1 |= reads[r] || writes[r];
+                meet[b].1 |= !reads[r].is_empty() || !writes[r].is_empty();
             } else if !all[b] && all[t] {
                 let r = find(&mut region, b);
-                meet[t].0 |= reads[r] || writes[r];
+                meet[t].0 |= !reads[r].is_empty() || !writes[r].is_empty();
             }
         }
     }
@@ -1412,26 +2176,28 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        // multi-wave widened execution (`group > 64` with `st.wide`)
+        let mut group_wide = false;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        let local_waves = LOCAL_WAVES.get();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
+            let lane_ordered = insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
                     || n.starts_with("v_permlane")
-                    || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
             }) || lane_constant_masks(x.st)
-                // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
+            console_lanes = lane_ordered
+                || insts().any(|i| i.name().starts_with("v_mbcnt") || reads_mask_as_data(x.st, i));
             let mut wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
@@ -1473,7 +2239,7 @@ impl<'a> Lower<'a> {
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
+                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, x.io, cs.threads, &all) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
                         }
@@ -1492,8 +2258,12 @@ impl<'a> Lower<'a> {
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
+                                // (local wave-independent lowering touches no exchange LDS)
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                if !local_waves {
+                                    s.lds_dwords += 2 * group.div_ceil(64);
+                                }
+                                group_wide = group > 64 && !x.st.wide.is_empty() && !local_waves;
                             }
                         }
                     }
@@ -1527,7 +2297,7 @@ impl<'a> Lower<'a> {
                         why.push("LDS in a group over 32");
                         match all_lane_blocks(x.st) {
                             None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all).is_none() => {
+                            Some(all) if lds_meetings(p, x.st, x.io, cs.threads, &all).is_none() => {
                                 why.push("an LDS read and write in one lane-branch region")
                             }
                             Some(_) => {}
@@ -1537,7 +2307,7 @@ impl<'a> Lower<'a> {
                     eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
                 }
             }
-            if wave == 32 && x.native.wave64 {
+            if wave == 32 && x.native.wave64 && (!local_waves || lane_ordered) {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
@@ -1708,6 +2478,7 @@ impl<'a> Lower<'a> {
                 _ => Default::default(),
             },
             exchange,
+            group_wide,
             clane: None,
             pair: None,
             halves,
@@ -4256,6 +5027,45 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.cmp(at, pred::NE, both, z))
     }
 
+    /// Thread-group-wide OR of `mine` (an i1) across every host wave in the
+    /// thread group, using the per-host-wave exchange slots (`slot + hw`) with
+    /// two group barriers and no basic-block splits.
+    fn group_any(&mut self, at: usize, mine: V) -> V {
+        let slot = self.exchange.as_ref().expect("exchange slots").0;
+        let hosts = self
+            .s
+            .threads
+            .expect("compute threads")
+            .iter()
+            .product::<u32>()
+            .div_ceil(32);
+        let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
+        let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[mine]);
+        self.s.flags |= flags::WAVE_OPS;
+        let some = self.s.m.cast(at, Cast::ZExt, some, i32t);
+        let ct = self.console_thread();
+        let five = self.s.m.i32(5);
+        let hw = self.s.m.bin(at, Bin::LShr, ct, five);
+        let base = self.s.m.i32(slot);
+        let idx = self.s.m.bin(at, Bin::Add, base, hw);
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(at, lds, idx);
+        self.s.m.store(at, ptr, some);
+        self.group_sync(at);
+        let mut acc = {
+            let p0 = self.s.m.element(at, lds, base);
+            self.s.m.load(at, p0)
+        };
+        for h in 1..hosts {
+            let kh = self.s.m.i32(slot + h);
+            let ph = self.s.m.element(at, lds, kh);
+            let v = self.s.m.load(at, ph);
+            acc = self.s.m.bin(at, Bin::Or, acc, v);
+        }
+        self.group_sync(at);
+        acc
+    }
+
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
         const WHY: Why = "a wave-wide branch where not every lane runs";
         let any = self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar condition")?;
@@ -4288,13 +5098,18 @@ impl<'a> Lower<'a> {
             let t = self.s.m.bool(true);
             self.s.m.bin(c, Bin::Xor, mine, t)
         };
-        let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
-        let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
-        self.s.flags |= flags::WAVE_OPS;
-        let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
-        let (lo, hi) = self.exchange_halves(c, some);
+        let both = if self.group_wide {
+            self.group_any(c, set)
+        } else {
+            let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
+            let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
+            self.s.flags |= flags::WAVE_OPS;
+            let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
+            let (lo, hi) = self.exchange_halves(c, some);
+            let c = self.cur;
+            self.s.m.bin(c, Bin::Or, lo, hi)
+        };
         let c = self.cur;
-        let both = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
     }
@@ -5009,6 +5824,13 @@ impl<'a> Lower<'a> {
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let index = match guard {
+                Some(g) => {
+                    let zero = l.s.m.i32(0);
+                    l.s.m.select(c, g, index, zero)
+                }
+                None => index,
+            };
             let lds = l.s.lds();
             l.s.m.element(c, lds, index)
         };
@@ -12445,6 +13267,29 @@ impl<'a> Lower<'a> {
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
                     _ if self.x.st.wide.contains(&b) => {
                         let c = self.wave_wide(b, when).map_err(|w| unsupported(offset, w))?;
+                        (c, taken, not_taken)
+                    }
+                    _ if self.group_wide
+                        && self.all_lanes(b)
+                        && self.x.st.exit_exec[b] != Bool::TRUE
+                        && self
+                            .x
+                            .st
+                            .bools
+                            .support(when)
+                            .iter()
+                            .all(|a| matches!(a, Atom::Uniform(_))) =>
+                    {
+                        let active = self
+                            .boolean(self.x.st.exit_exec[b], self.cur)
+                            .map_err(|w| unsupported(offset, w))?;
+                        let raw = self
+                            .boolean(when, self.cur)
+                            .map_err(|w| unsupported(offset, w))?;
+                        let vote = self.s.m.bin(self.cur, Bin::And, active, raw);
+                        let any = self.group_any(self.cur, vote);
+                        let z = self.s.m.i32(0);
+                        let c = self.s.m.cmp(self.cur, pred::NE, any, z);
                         (c, taken, not_taken)
                     }
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
