@@ -3,12 +3,12 @@ updated = "2026-11-26"
 commit = "perf/commit-reduction"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "10.9-15.1 fps heavy 3D steady / 17.9 fps peak (diag-run92: Fix AA1-AA4 clean 130s at default 512 KiB; drw=5788 batch_flush -39%, stale -57%, make_at -45%, stage_cache 62% 1-shot bypass)"
-current_frame_ms = "66.2-93.5 ms heavy 3D (55.8 ms peak, 0 refused dynamic slots, 0 crashes/TDRs, 0.0 ms GPU wait)"
-current_gpu_ms = "0.0 ms wait (100% CPU-bound across 5 recording threads + submit preparing)"
-current_preparing_ms = "35.0-51.8 ms (batch_flush 18.2-27.6 ms, stale 4.8-6.0 ms, pre_prep sweep 1.7-5.2 ms exposed)"
+current_fps = "11.3-17.2 fps heavy 3D steady / 18.8 fps NEW PEAK (diag-run93: Fix AB1-AB4 clean 135.6s at default 512 KiB; pre_prep sweep 0.43-1.72 ms, make_at cbv -50% to 4.0-7.9 ms, 0 hangs/TDRs/refusals)"
+current_frame_ms = "58.2-88.7 ms heavy 3D (53.2 ms NEW PEAK, 0 refused dynamic slots, 0 crashes/TDRs, 0.0-1.7 ms GPU wait)"
+current_gpu_ms = "0.0-1.7 ms wait (100% CPU-bound across 5 recording threads + submit preparing)"
+current_preparing_ms = "30.0-54.0 ms (batch_flush 14.5-27.1 ms, guards 10.9-26.4 ms, stale 4.2-7.6 ms, sweep 0.43-1.72 ms)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~10-15 min (Fix AB: remove periodic WHY_SYNC sweep stall, cut watch read_fast/alias_apply + recording tables/bind overhead -> 20-30+ FPS)"
+eta = "~10-15 min (Fix AC: parallelize/cut batch_flush+alias_apply, cut indirect 45-132 ms + make_at miss/post + throttle !behind sweep -> 20-30+ FPS)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -307,3 +307,12 @@ frame_ms = 55.8
 gpu_ms = "0.0 ms wait (0 hangs/TDRs in 130s at default 512 KiB)"
 preparing_ms = "35.0-51.8 ms (batch_flush 18.2-27.6 ms, stale 4.8-6.0 ms, pre_prep sweep 1.7-5.2 ms)"
 status = "Fix AA1-AA4 verified clean (isolated MIN_KB=128 hang from run91): 17.9 fps peak, drw=5788 batch_flush -39% (30->18.2 ms), stale -57% (11.4->4.9 ms), make_at -45% (77.2->42.3 ms), stage_cache 62% 1-shot bypass, pre_prep exposed WHY_SYNC sweep stall (1.7-5.2 ms/f, lock_wait 0.00 ms) -> next: Fix AB"
+
+[[runs]]
+label = "diag-run93"
+commit = "perf/commit-reduction"
+fps = 18.8
+frame_ms = 53.2
+gpu_ms = "0.0-1.7 ms wait (0 hangs/TDRs/refusals in 135.6s at default 512 KiB)"
+preparing_ms = "30.0-54.0 ms (batch_flush 14.5-27.1 ms, guards 10.9-26.4 ms, stale 4.2-7.6 ms, sweep 0.43-1.72 ms)"
+status = "Fix AB1-AB4 verified clean: NEW ALL-TIME PEAK 18.8 fps (53.2 ms/f, drw=994), steady 11.3-17.2 fps (17.2 fps drw=1135, 16.9 fps drw=1510, 14.3 fps drw=3140), pre_prep sweep cut to 0.43-1.72 ms, make_at cbv -50% (4.0-7.9 ms), tables non-make_at cut; next: Fix AC (throttle !behind sweep, cut batch_flush/alias_apply + indirect 45-132 ms + make_at miss/post -> 20-30+ FPS)"
