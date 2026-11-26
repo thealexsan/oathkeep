@@ -372,8 +372,33 @@ impl StageEntry {
     }
 }
 
+#[derive(Default)]
+struct StageKeyHasher(u64);
+
+impl std::hash::Hasher for StageKeyHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (i ^ (i >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    }
+}
+
+type StageKeyMap =
+    std::collections::HashMap<u64, usize, std::hash::BuildHasherDefault<StageKeyHasher>>;
+
 struct StageStripe {
-    map: std::collections::HashMap<u64, usize>,
+    map: StageKeyMap,
     entries: Vec<Option<StageEntry>>,
     cursor: usize,
 }
@@ -383,7 +408,7 @@ impl StageStripe {
         let mut entries = Vec::with_capacity(SLOTS_PER_STRIPE);
         entries.resize_with(SLOTS_PER_STRIPE, || None);
         Self {
-            map: std::collections::HashMap::new(),
+            map: StageKeyMap::default(),
             entries,
             cursor: 0,
         }

@@ -1718,13 +1718,45 @@ enum Step {
 }
 
 #[derive(Default)]
+struct FastHasher(u64);
+
+impl std::hash::Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (self.0 ^ (i as u64)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0 ^ i).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+type FastHashMap<K, V> =
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
+type FastHashSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<FastHasher>>;
+
+#[derive(Default)]
 struct Deferred {
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
     upload_bytes: u64,
     kept: Vec<windows::core::IUnknown>,
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
-    textures: std::collections::HashSet<usize>,
+    refreshed: FastHashSet<(usize, usize, usize)>,
+    gpu_written: FastHashSet<(usize, usize, usize)>,
+    textures: FastHashSet<usize>,
     writes: Vec<(usize, crate::queue::Written, usize)>,
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     prelude_gpu_copies: Vec<(ID3D12Resource, u64, ID3D12Resource, u64, u64)>,
@@ -2560,10 +2592,13 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
             return any_stale.load(Ordering::Relaxed);
         }
         let mut runs_left = 256;
+        let allow_wide = wide_refresh();
         return spans.iter().any(|(shadow, ranges)| {
             ranges
                 .iter()
-                .any(|&(from, to)| shadow.merge_under_writes(from, to - from, &mut runs_left))
+                .any(|&(from, to)| {
+                    shadow.merge_under_writes_wide(from, to - from, &mut runs_left, allow_wide)
+                })
         });
     }
     spans.iter().any(|(shadow, ranges)| {
@@ -7438,6 +7473,9 @@ impl HostList {
         deferred
             .refreshed
             .retain(|&(_, a, n)| a >= end || a.saturating_add(n) <= dst as usize);
+        deferred
+            .gpu_written
+            .retain(|&(_, a, n)| a >= end || a.saturating_add(n) <= dst as usize);
         if let Some(Step::Copy(d, s, n)) = deferred.copies.last_mut()
             && continues((*d, *s, *n), (dst as usize, src as usize, len))
         {
@@ -7465,8 +7503,15 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+        let key = (ptr, address, len);
         if deferred.refreshed.insert(key) {
+            if !deferred.gpu_written.is_empty() {
+                let end = address.saturating_add(len);
+                deferred.gpu_written.retain(|&(p, a, n)| {
+                    p != ptr || a >= end || a.saturating_add(n) <= address
+                });
+            }
             if !shadow.unwatched() && !shadow.guarded() {
                 deferred.has_kernel_watch = true;
             }
@@ -7482,9 +7527,13 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     pub(crate) fn defer_read_back(
@@ -7687,8 +7736,10 @@ impl HostList {
 
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         self.copy_seq.fetch_add(1, Ordering::Relaxed);
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.gpu_written.clear();
     }
 
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
@@ -7846,10 +7897,12 @@ fn wide_refresh() -> bool {
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
-    index: std::collections::HashMap<usize, usize>,
+    index: FastHashMap<usize, usize>,
+    last_refresh_key: usize,
+    last_refresh_at: usize,
     refresh_min: usize,
     refresh_max: usize,
-    textures: std::collections::HashMap<usize, (usize, usize)>,
+    textures: FastHashMap<usize, (usize, usize)>,
     textures_min: usize,
     textures_max: usize,
     pending_textures: Vec<(usize, usize, std::sync::Arc<crate::texture::Staging>)>,
@@ -7896,13 +7949,26 @@ impl Batch {
             self.refresh_max = self.refresh_max.max(end);
         }
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if self.last_refresh_key == key && self.last_refresh_at < self.refreshes.len() {
+            crate::shadow::merge_refresh_ranges(
+                &mut self.refreshes[self.last_refresh_at].1,
+                address,
+                end,
+            );
+            return;
+        }
         match self.index.get(&key) {
             Some(&at) => {
+                self.last_refresh_key = key;
+                self.last_refresh_at = at;
                 crate::shadow::merge_refresh_ranges(&mut self.refreshes[at].1, address, end);
             }
             None => {
-                self.index.insert(key, self.refreshes.len());
+                let at = self.refreshes.len();
+                self.index.insert(key, at);
                 self.refreshes.push((shadow.clone(), vec![(address, end)]));
+                self.last_refresh_key = key;
+                self.last_refresh_at = at;
             }
         }
     }
@@ -7913,7 +7979,11 @@ impl Batch {
         from: usize,
         to: usize,
     ) {
-        if from >= to {
+        if from >= to
+            || self.refreshes.is_empty()
+            || to <= self.refresh_min
+            || from >= self.refresh_max
+        {
             return;
         }
         let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -7926,6 +7996,7 @@ impl Batch {
         }
         let shadow = if self.refreshes[at].1.is_empty() {
             self.index.remove(&key);
+            self.last_refresh_key = 0;
             let (shadow, _) = self.refreshes.swap_remove(at);
             if let Some(moved) = self.refreshes.get(at) {
                 self.index
@@ -8075,6 +8146,7 @@ impl Batch {
 
     fn flush(&mut self) {
         self.index.clear();
+        self.last_refresh_key = 0;
         self.refresh_min = 0;
         self.refresh_max = 0;
         self.pending_tex_min = 0;

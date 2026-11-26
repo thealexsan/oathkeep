@@ -182,6 +182,48 @@ struct FreshTable {
 }
 
 #[derive(Default)]
+struct DrawFastHasher(u64);
+
+impl std::hash::Hasher for DrawFastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (self.0 ^ (i as u64)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0 ^ u64::from(i)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0 ^ i).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    #[inline]
+    fn write_u128(&mut self, i: u128) {
+        self.0 = (self.0 ^ (i as u64)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        self.0 = (self.0 ^ ((i >> 64) as u64)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+type DrawFastMap<K, V> =
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<DrawFastHasher>>;
+type DrawFastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<DrawFastHasher>>;
+
+#[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
     heaps: [usize; 2],
@@ -206,13 +248,13 @@ pub(crate) struct State {
     host_pipeline: usize,
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    fresh_tables: std::collections::HashMap<(usize, u32, u128), FreshTable>,
-    cbv_scratch_cache: std::collections::HashMap<(u64, u64, u64), (u64, u64, ID3D12Resource, u64)>,
-    kept_ptrs: std::collections::HashSet<usize>,
+    fresh_tables: DrawFastMap<(usize, u32, u128), FreshTable>,
+    cbv_scratch_cache: DrawFastMap<(u64, u64, u64), (u64, u64, ID3D12Resource, u64)>,
+    kept_ptrs: DrawFastSet<usize>,
     kept_list_gen: u64,
     dynamic: Vec<(usize, u32, u32)>,
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: DrawFastMap<(usize, u64), RootSlot>,
+    root_uav_slots: DrawFastMap<(usize, u64), RootSlot>,
     tables_gone: bool,
     shadow_cache: Vec<(u64, u64, u8, u64, std::sync::Arc<crate::shadow::Shadow>)>,
     constants_pool: Vec<Vec<u32>>,
@@ -3570,54 +3612,47 @@ impl State {
                 }
                 (heap_id, span, finalize_table_hash(h1, h2))
             };
-            let cached_hit = self.fresh_tables.get(&key).and_then(|entry| {
-                if entry.deps.is_empty()
+            if let Some(entry) = self.fresh_tables.get(&key)
+                && (entry.deps.is_empty()
                     || (list.bindless_write_seq() == entry.bindless_seq
                         && entry
                             .deps
                             .iter()
-                            .all(|&(sid, seq)| list.shadow_write_seq(sid) == seq))
-                {
-                    Some((entry.offset, entry.copy_seq, entry.has_gpu_active_cbv))
-                } else {
-                    None
-                }
-            });
-            if let Some((offset, entry_copy_seq, has_gpu_active_cbv)) = cached_hit {
+                            .all(|&(sid, seq)| list.shadow_write_seq(sid) == seq)))
+            {
+                let offset = entry.offset;
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TablesFreshHit, 1);
-                if has_gpu_active_cbv {
+                if entry.has_gpu_active_cbv {
                     list.uav_barrier_if_dirty();
                 }
-                if let Some(entry) = self.fresh_tables.get(&key) {
-                    if entry_copy_seq != list.copy_seq() {
-                        for (shadow, address, len) in &entry.refresh_buffers {
-                            shadow.refresh(list, *address, *len);
-                        }
+                if entry.copy_seq != list.copy_seq() {
+                    for (shadow, address, len) in &entry.refresh_buffers {
+                        shadow.refresh(list, *address, *len);
                     }
-                    if !entry.uav_buffers.is_empty() {
-                        let record_writes = STORES.get() || !write_skip();
-                        for (shadow, address, len) in &entry.uav_buffers {
-                            if record_writes {
-                                shadow.gpu_writes(list, *address, *len);
-                            } else {
-                                #[cfg(feature = "diagnostics")]
-                                {
-                                    crate::copystat::add(
-                                        crate::copystat::C::GpuWritesLeftOut,
-                                        1,
-                                    );
-                                    crate::copystat::add(
-                                        crate::copystat::C::GpuWritesLeftOutBytes,
-                                        *len,
-                                    );
-                                }
+                }
+                if !entry.uav_buffers.is_empty() {
+                    let record_writes = STORES.get() || !write_skip();
+                    for (shadow, address, len) in &entry.uav_buffers {
+                        if record_writes {
+                            shadow.gpu_writes(list, *address, *len);
+                        } else {
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                crate::copystat::add(
+                                    crate::copystat::C::GpuWritesLeftOut,
+                                    1,
+                                );
+                                crate::copystat::add(
+                                    crate::copystat::C::GpuWritesLeftOutBytes,
+                                    *len,
+                                );
                             }
                         }
                     }
-                    for &(resource, kind) in &entry.textures {
-                        readable_texture(list, resource, kind);
-                    }
+                }
+                for &(resource, kind) in &entry.textures {
+                    readable_texture(list, resource, kind);
                 }
                 self.scratch_made.push((slot, offset));
                 continue;
@@ -3643,17 +3678,25 @@ impl State {
             let mut textures: Vec<(usize, ResourceType)> = Vec::new();
             self.dynamic.push((heap_id, first, span));
             let title_first = heap.index(table);
+            self.scratch_entries
+                .sort_unstable_by_key(|&idx| used[idx].table_offset_dwords / 8);
+            let mut entry_cursor = 0usize;
             #[cfg(feature = "diagnostics")]
             let t_make = std::time::Instant::now();
             for used_i in 0..self.scratch_used_k.len() {
                 let k = self.scratch_used_k[used_i];
                 let words = self.scratch_words[used_i];
                 let index = first + (k - trim);
+                while entry_cursor < self.scratch_entries.len()
+                    && used[self.scratch_entries[entry_cursor]].table_offset_dwords / 8 < k
+                {
+                    entry_cursor += 1;
+                }
                 let used_entry = self
                     .scratch_entries
-                    .iter()
+                    .get(entry_cursor)
                     .map(|&idx| &used[idx])
-                    .find(|u| u.table_offset_dwords / 8 == k);
+                    .filter(|u| u.table_offset_dwords / 8 == k);
                 if let Some((address, size)) = crate::descriptor::constant_from_words(words) {
                     let size_u64 = u64::from(size);
                     let existing = self.find_shadow_existing(address, size_u64);
@@ -3724,9 +3767,8 @@ impl State {
                             len,
                         } => {
                             shadow.refresh(list, address, len);
-                            refresh_buffers.push((shadow.clone(), address, len));
                             if kind == ResourceType::Uav {
-                                uav_buffers.push((shadow.clone(), address, len));
+                                refresh_buffers.push((shadow.clone(), address, len));
                                 if STORES.get() || !write_skip() {
                                     shadow.gpu_writes(list, address, len);
                                 } else {
@@ -3742,6 +3784,9 @@ impl State {
                                         );
                                     }
                                 }
+                                uav_buffers.push((shadow, address, len));
+                            } else {
+                                refresh_buffers.push((shadow, address, len));
                             }
                         }
                         crate::descriptor::host::StageAction::Texture { resource } => {

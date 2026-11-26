@@ -2879,6 +2879,70 @@ enum MergeDiff {
     },
 }
 
+#[inline(always)]
+fn load_u64_le(bytes: &[u8], offset: usize) -> u64 {
+    // SAFETY: callers always guarantee `offset + 8 <= bytes.len()`.
+    unsafe { (bytes.as_ptr().add(offset) as *const u64).read_unaligned() }.to_le()
+}
+
+/// Returns a bitmask with bit 7 set in every byte lane of `x` that is zero (SWAR).
+#[inline(always)]
+fn zero_byte_mask(x: u64) -> u64 {
+    x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080
+}
+
+/// Advances `i` past equal bytes in `a[i..n]` vs `b[i..n]` using 64-bit XOR scanning.
+#[inline(always)]
+fn skip_equal_bytes(a: &[u8], b: &[u8], mut i: usize, n: usize) -> usize {
+    while i + 32 <= n {
+        let d0 = load_u64_le(a, i) ^ load_u64_le(b, i);
+        let d1 = load_u64_le(a, i + 8) ^ load_u64_le(b, i + 8);
+        let d2 = load_u64_le(a, i + 16) ^ load_u64_le(b, i + 16);
+        let d3 = load_u64_le(a, i + 24) ^ load_u64_le(b, i + 24);
+        if (d0 | d1 | d2 | d3) != 0 {
+            if d0 != 0 {
+                return i + (d0.trailing_zeros() >> 3) as usize;
+            }
+            if d1 != 0 {
+                return i + 8 + (d1.trailing_zeros() >> 3) as usize;
+            }
+            if d2 != 0 {
+                return i + 16 + (d2.trailing_zeros() >> 3) as usize;
+            }
+            return i + 24 + (d3.trailing_zeros() >> 3) as usize;
+        }
+        i += 32;
+    }
+    while i + 8 <= n {
+        let d = load_u64_le(a, i) ^ load_u64_le(b, i);
+        if d != 0 {
+            return i + (d.trailing_zeros() >> 3) as usize;
+        }
+        i += 8;
+    }
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+/// Advances `i` past differing bytes in `a[i..n]` vs `b[i..n]` using 64-bit XOR + SWAR.
+#[inline(always)]
+fn skip_diff_bytes(a: &[u8], b: &[u8], mut i: usize, n: usize) -> usize {
+    while i + 8 <= n {
+        let d = load_u64_le(a, i) ^ load_u64_le(b, i);
+        let eq = zero_byte_mask(d);
+        if eq != 0 {
+            return i + (eq.trailing_zeros() >> 3) as usize;
+        }
+        i += 8;
+    }
+    while i < n && a[i] != b[i] {
+        i += 1;
+    }
+    i
+}
+
 /// Compares `title` against `held` (at buffer-relative offset `at` inside a card buffer of
 /// 4-byte aligned `buf_len` bytes) and updates `held` in place for all changed bytes.
 /// When at most `max_runs` contiguous byte runs differ, returns `MergeDiff::Runs`; otherwise
@@ -2892,30 +2956,17 @@ fn diff_runs_or_masked(
     max_runs: usize,
 ) -> MergeDiff {
     let n = title.len().min(held.len());
-    if title[..n] == held[..n] {
+    let mut i = skip_equal_bytes(title, held, 0, n);
+    if i >= n {
         return MergeDiff::Empty;
     }
     let mut runs: Vec<(usize, usize)> = Vec::new();
-    let mut i = 0usize;
     while i < n {
-        while i + 64 <= n && title[i..i + 64] == held[i..i + 64] {
-            i += 64;
-        }
-        while i + 8 <= n && title[i..i + 8] == held[i..i + 8] {
-            i += 8;
-        }
-        while i < n && title[i] == held[i] {
-            i += 1;
-        }
-        if i >= n {
-            break;
-        }
         let first = i;
-        while i < n && title[i] != held[i] {
-            i += 1;
-        }
+        i = skip_diff_bytes(title, held, first + 1, n);
         if runs.len() < max_runs {
             runs.push((first, i - first));
+            i = skip_equal_bytes(title, held, i, n);
             continue;
         }
         // Dense diff (> max_runs): switch to a single 4-byte aligned GPU masked merge.
@@ -2929,24 +2980,11 @@ fn diff_runs_or_masked(
         let mut mask = vec![0u8; payload_len];
         let mut changed_runs = 0usize;
         let mut changed_bytes = 0usize;
-        let mut cur = first_diff;
-        while cur <= last_diff {
-            while cur + 64 <= last_diff + 1 && title[cur..cur + 64] == held[cur..cur + 64] {
-                cur += 64;
-            }
-            while cur + 8 <= last_diff + 1 && title[cur..cur + 8] == held[cur..cur + 8] {
-                cur += 8;
-            }
-            while cur <= last_diff && title[cur] == held[cur] {
-                cur += 1;
-            }
-            if cur > last_diff {
-                break;
-            }
+        let end_excl = last_diff + 1;
+        let mut cur = skip_equal_bytes(title, held, first_diff, end_excl);
+        while cur < end_excl {
             let r_start = cur;
-            while cur <= last_diff && title[cur] != held[cur] {
-                cur += 1;
-            }
+            cur = skip_diff_bytes(title, held, r_start + 1, end_excl);
             let r_len = cur - r_start;
             held[r_start..cur].copy_from_slice(&title[r_start..cur]);
             let dst_off = (at + r_start) - abs_lo;
@@ -2954,6 +2992,7 @@ fn diff_runs_or_masked(
             mask[dst_off..dst_off + r_len].fill(0xFF);
             changed_runs += 1;
             changed_bytes += r_len;
+            cur = skip_equal_bytes(title, held, cur, end_excl);
         }
         return MergeDiff::Masked {
             offset: abs_lo,
@@ -2977,28 +3016,12 @@ fn diff_runs_or_masked(
 #[inline]
 fn for_each_changed_run(now: &[u8], was: &[u8], mut f: impl FnMut(usize, usize)) {
     let n = now.len().min(was.len());
-    if now[..n] == was[..n] {
-        return;
-    }
-    let mut i = 0;
+    let mut i = skip_equal_bytes(now, was, 0, n);
     while i < n {
-        while i + 64 <= n && now[i..i + 64] == was[i..i + 64] {
-            i += 64;
-        }
-        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
-            i += 8;
-        }
-        while i < n && now[i] == was[i] {
-            i += 1;
-        }
-        if i >= n {
-            break;
-        }
         let first = i;
-        while i < n && now[i] != was[i] {
-            i += 1;
-        }
+        i = skip_diff_bytes(now, was, first + 1, n);
         f(first, i - first);
+        i = skip_equal_bytes(now, was, i, n);
     }
 }
 
@@ -4078,6 +4101,16 @@ impl Shadow {
         len: usize,
         runs_left: &mut usize,
     ) -> bool {
+        self.merge_under_writes_wide(address, len, runs_left, false)
+    }
+
+    pub(crate) fn merge_under_writes_wide(
+        &self,
+        address: usize,
+        len: usize,
+        runs_left: &mut usize,
+        allow_wide: bool,
+    ) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4215,6 +4248,176 @@ impl Shadow {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 copied.stale_pages_in(base, global_synced, a, e, &written)
             };
+            if stale.is_empty() {
+                continue;
+            }
+            if self.card.is_none() {
+                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(snapshot) = before.as_mut() else {
+                    #[cfg(feature = "diagnostics")]
+                    Self::log_why_stale("no_before", self, 0, a, e);
+                    return true;
+                };
+                let mut mark_pages: Vec<usize> = Vec::with_capacity(stale.len());
+                if allow_wide && stale.len() >= 4 {
+                    let snap_ptr = snapshot.as_mut_ptr() as usize;
+                    let data_ptr = self.data as usize;
+                    let chunk_n = stale.len().div_ceil(4).max(2);
+                    let pages_out =
+                        std::sync::Arc::new(Mutex::new(Vec::<usize>::with_capacity(stale.len())));
+                    let jobs: Vec<Job> = stale
+                        .chunks(chunk_n)
+                        .map(|chunk| {
+                            let pages = chunk.to_vec();
+                            let pages_out = pages_out.clone();
+                            Box::new(move || {
+                                let mut local_title = vec![0u8; PAGE];
+                                let mut local_done = Vec::with_capacity(pages.len());
+                                let mut local_pages = 0u64;
+                                let mut local_runs = 0u64;
+                                let mut local_bytes = 0u64;
+                                for page in pages {
+                                    let (lo, hi) =
+                                        ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                                    if lo >= hi {
+                                        continue;
+                                    }
+                                    let n = hi - lo;
+                                    let t = &mut local_title[..n];
+                                    if !crate::host::read_into(lo as *const u8, t) {
+                                        continue;
+                                    }
+                                    local_pages += 1;
+                                    let at = lo - start;
+                                    // SAFETY: `stale` pages are unique so every worker operates
+                                    // on disjoint `[at, at + n)` slices of `snapshot` and `self.data`,
+                                    // while `self.before` is locked on the calling thread.
+                                    let held = unsafe {
+                                        std::slice::from_raw_parts_mut(
+                                            (snap_ptr as *mut u8).add(at),
+                                            n,
+                                        )
+                                    };
+                                    let mut runs_n = 0u64;
+                                    let mut bytes_n = 0u64;
+                                    for_each_changed_run(t, held, |r, m| {
+                                        // SAFETY: disjoint bytes inside the copy's mapping.
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(
+                                                t.as_ptr().add(r),
+                                                (data_ptr as *mut u8).add(at + r),
+                                                m,
+                                            );
+                                        }
+                                        runs_n += 1;
+                                        bytes_n += m as u64;
+                                    });
+                                    if runs_n > 0 {
+                                        held.copy_from_slice(t);
+                                        local_runs += runs_n;
+                                        local_bytes += bytes_n;
+                                    }
+                                    if (page * PAGE).max(start) >= a
+                                        && ((page + 1) * PAGE).min(end) <= e
+                                    {
+                                        local_done.push(page);
+                                    }
+                                }
+                                if local_pages > 0 {
+                                    MERGED[0].fetch_add(local_pages, Ordering::Relaxed);
+                                }
+                                if local_runs > 0 {
+                                    MERGED[1].fetch_add(local_runs, Ordering::Relaxed);
+                                    MERGED[2].fetch_add(local_bytes, Ordering::Relaxed);
+                                }
+                                if !local_done.is_empty() {
+                                    pages_out
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .extend_from_slice(&local_done);
+                                }
+                            }) as Job
+                        })
+                        .collect();
+                    wide_stale_run(jobs);
+                    mark_pages = std::mem::take(
+                        &mut *pages_out.lock().unwrap_or_else(|e| e.into_inner()),
+                    );
+                } else {
+                    let mut total_pages = 0u64;
+                    let mut total_runs = 0u64;
+                    let mut total_bytes = 0u64;
+                    for page in stale {
+                        let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                        if lo >= hi {
+                            continue;
+                        }
+                        let n = hi - lo;
+                        let title = &mut title[..n];
+                        if !crate::host::read_into(lo as *const u8, title) {
+                            continue;
+                        }
+                        total_pages += 1;
+                        let at = lo - start;
+                        // SAFETY: the snapshot's allocation holds the copy's
+                        // bytes at the copy's offsets (`writing`), and these
+                        // are in a declared range.
+                        let held = unsafe {
+                            std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n)
+                        };
+                        let mut runs_n = 0u64;
+                        let mut bytes_n = 0u64;
+                        for_each_changed_run(title, held, |r, m| {
+                            // SAFETY: inside the copy's mapping. The card may be
+                            // writing the copy beside these bytes; they are
+                            // written here and nothing around them.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    title.as_ptr().add(r),
+                                    self.data.add(at + r),
+                                    m,
+                                )
+                            };
+                            runs_n += 1;
+                            bytes_n += m as u64;
+                        });
+                        if runs_n > 0 {
+                            held.copy_from_slice(title);
+                            total_runs += runs_n;
+                            total_bytes += bytes_n;
+                        }
+                        if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                            mark_pages.push(page);
+                        }
+                    }
+                    if total_pages > 0 {
+                        MERGED[0].fetch_add(total_pages, Ordering::Relaxed);
+                    }
+                    if total_runs > 0 {
+                        MERGED[1].fetch_add(total_runs, Ordering::Relaxed);
+                        MERGED[2].fetch_add(total_bytes, Ordering::Relaxed);
+                    }
+                }
+                drop(before);
+                if !mark_pages.is_empty() {
+                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut newly_copied = 0u64;
+                    for page in mark_pages {
+                        if page >= base
+                            && page - base < copied.len()
+                            && copied.set_page(page - base, now)
+                        {
+                            newly_copied += 1;
+                        }
+                    }
+                    if newly_copied > 0 {
+                        self.uncopied.fetch_sub(newly_copied, Ordering::Release);
+                    }
+                }
+                continue;
+            }
+            let card = self.card.as_ref().unwrap();
+            let mut mark_pages: Vec<usize> = Vec::with_capacity(stale.len());
             for page in stale {
                 let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
                 if lo >= hi {
@@ -4222,92 +4425,70 @@ impl Shadow {
                 }
                 let n = hi - lo;
                 let title = &mut title[..n];
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
                 if !crate::host::read_into(lo as *const u8, title) {
                     continue;
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
                 let at = lo - start;
-                if let Some(card) = &self.card {
-                    let p = self.pieces(at, at + n).start;
-                    let (p_lo, _) = self.piece(p);
-                    let max_runs = (*runs_left).min(16);
-                    let diff = {
-                        let mut old = card.old.lock().unwrap_or_else(|e| e.into_inner());
-                        let Some(piece_buf) = old.get_mut(&p) else {
-                            #[cfg(feature = "diagnostics")]
-                            Self::log_why_stale("no_card_old", self, p, lo, hi);
-                            return true;
-                        };
-                        let held = &mut piece_buf[at - p_lo..at - p_lo + n];
-                        diff_runs_or_masked(at, card.size as usize, title, held, max_runs)
-                    };
-                    match diff {
-                        MergeDiff::Empty => {}
-                        MergeDiff::Runs(runs) => {
-                            *runs_left = runs_left.saturating_sub(runs.len());
-                            for (r, m) in runs {
-                                MERGED[1].fetch_add(1, Ordering::Relaxed);
-                                MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
-                                let (c_from, c_to) = (at + r, at + r + m);
-                                card.clear_hot_hashes(c_from, c_to);
-                                self.card_changed(c_from, c_to);
-                            }
-                        }
-                        MergeDiff::Masked {
-                            offset,
-                            data,
-                            mask,
-                            changed_runs,
-                            changed_bytes,
-                            first_off,
-                            last_end,
-                        } => {
-                            MERGED[1].fetch_add(changed_runs as u64, Ordering::Relaxed);
-                            MERGED[2].fetch_add(changed_bytes as u64, Ordering::Relaxed);
-                            card.clear_hot_hashes(first_off, last_end);
-                            self.card_masked_push(offset, data, mask);
-                        }
-                    }
-                } else {
-                    let Some(snapshot) = before.as_mut() else {
+                let p = self.pieces(at, at + n).start;
+                let (p_lo, _) = self.piece(p);
+                let max_runs = (*runs_left).min(16);
+                let diff = {
+                    let mut old = card.old.lock().unwrap_or_else(|e| e.into_inner());
+                    let Some(piece_buf) = old.get_mut(&p) else {
                         #[cfg(feature = "diagnostics")]
-                        Self::log_why_stale("no_before", self, 0, lo, hi);
+                        Self::log_why_stale("no_card_old", self, p, lo, hi);
                         return true;
                     };
-                    // SAFETY: the snapshot's allocation holds the copy's
-                    // bytes at the copy's offsets (`writing`), and these
-                    // are in a declared range.
-                    let held =
-                        unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    let mut runs_n = 0u64;
-                    let mut bytes_n = 0u64;
-                    for_each_changed_run(title, held, |r, m| {
-                        // SAFETY: inside the copy's mapping. The card may be
-                        // writing the copy beside these bytes; they are
-                        // written here and nothing around them.
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                title.as_ptr().add(r),
-                                self.data.add(at + r),
-                                m,
-                            )
-                        };
-                        runs_n += 1;
-                        bytes_n += m as u64;
-                    });
-                    if runs_n > 0 {
-                        held.copy_from_slice(title);
-                        MERGED[1].fetch_add(runs_n, Ordering::Relaxed);
-                        MERGED[2].fetch_add(bytes_n, Ordering::Relaxed);
+                    let held = &mut piece_buf[at - p_lo..at - p_lo + n];
+                    diff_runs_or_masked(at, card.size as usize, title, held, max_runs)
+                };
+                match diff {
+                    MergeDiff::Empty => {}
+                    MergeDiff::Runs(runs) => {
+                        *runs_left = runs_left.saturating_sub(runs.len());
+                        for (r, m) in runs {
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                            let (c_from, c_to) = (at + r, at + r + m);
+                            card.clear_hot_hashes(c_from, c_to);
+                            self.card_changed(c_from, c_to);
+                        }
+                    }
+                    MergeDiff::Masked {
+                        offset,
+                        data,
+                        mask,
+                        changed_runs,
+                        changed_bytes,
+                        first_off,
+                        last_end,
+                    } => {
+                        MERGED[1].fetch_add(changed_runs as u64, Ordering::Relaxed);
+                        MERGED[2].fetch_add(changed_bytes as u64, Ordering::Relaxed);
+                        card.clear_hot_hashes(first_off, last_end);
+                        self.card_masked_push(offset, data, mask);
                     }
                 }
                 drop(before);
                 if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
-                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    if page >= base && page - base < copied.len() && copied.set_page(page - base, now) {
-                        self.uncopied.fetch_sub(1, Ordering::Release);
+                    mark_pages.push(page);
+                }
+            }
+            if !mark_pages.is_empty() {
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let mut newly_copied = 0u64;
+                for page in mark_pages {
+                    if page >= base
+                        && page - base < copied.len()
+                        && copied.set_page(page - base, now)
+                    {
+                        newly_copied += 1;
                     }
+                }
+                if newly_copied > 0 {
+                    self.uncopied.fetch_sub(newly_copied, Ordering::Release);
                 }
             }
         }

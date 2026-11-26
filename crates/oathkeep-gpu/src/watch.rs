@@ -838,6 +838,9 @@ struct Guards {
     /// Exact union `clean ∪ hot ∪ absent ∪ partly` (pairwise disjoint) for O(log n) fast-path checks.
     accounted: IntervalSet,
     aliased: BTreeSet<usize>,
+    /// Protected alias blocks whose sibling view was unlocked (`dirty_alias_block_spans`)
+    /// and therefore need alias re-arming before returning to `clean`/`accounted`.
+    alias_dirty: IntervalSet,
     /// `(frame, faults_in_frame)` for intra-frame hot-page promotion.
     recent_fault: BTreeMap<usize, (u64, u16)>,
     hot: BTreeMap<usize, u64>,
@@ -845,6 +848,10 @@ struct Guards {
     /// backoff (`hot_frames() << cool_count.min(MAX_COOL_BACKOFF)`) when it re-faults into hot.
     cool_count: BTreeMap<usize, u8>,
 }
+
+/// Monotonic counter bumped whenever an aliased block is opened/unlocked so coalesced
+/// alias re-arming only clears `alias_dirty` if no concurrent alias fault raced with it.
+static ALIAS_FAULT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Guards {
     const fn new() -> Self {
@@ -855,6 +862,7 @@ impl Guards {
             partly: IntervalSet::new(),
             accounted: IntervalSet::new(),
             aliased: BTreeSet::new(),
+            alias_dirty: IntervalSet::new(),
             recent_fault: BTreeMap::new(),
             hot: BTreeMap::new(),
             cool_count: BTreeMap::new(),
@@ -1277,7 +1285,16 @@ fn guard_with_hot_fast(
                 known = true;
             }
             if view_guard() {
-                pre_gaps.extend(g.accounted.gaps_in(a, b));
+                for (ga, gb) in g.accounted.gaps_in(a, b) {
+                    if !g.protected.overlaps(ga, gb) {
+                        pre_gaps.push((ga, gb));
+                    } else {
+                        pre_gaps.extend(g.protected.gaps_in(ga, gb));
+                        g.alias_dirty.for_each_overlap(ga, gb, |da, db| {
+                            pre_gaps.push((da, db));
+                        });
+                    }
+                }
                 if !g.hot.is_empty() {
                     for (&block, &until) in g.hot.range(a..b) {
                         if until <= frame {
@@ -1495,7 +1512,7 @@ fn guard_with_hot_fast(
                     protect_here(&mut g, pa, pb, &mut protected_runs);
                 }
                 for (pa, pb) in already {
-                    if view_guard() && g.aliased.range(pa..pb).next().is_some() {
+                    if view_guard() && g.alias_dirty.overlaps(pa, pb) {
                         protected_runs.push((pa, pb));
                         already_aliased.push((pa, pb));
                     } else {
@@ -1533,6 +1550,7 @@ fn guard_with_hot_fast(
     if span_count > 1 && hot_pages.len() > 1 {
         hot_pages.sort_unstable();
     }
+    let alias_ep_before = ALIAS_FAULT_EPOCH.load(std::sync::atomic::Ordering::Acquire);
     if !protected_runs.is_empty() {
         if protected_runs.len() > 1 {
             protected_runs.sort_unstable();
@@ -1571,9 +1589,14 @@ fn guard_with_hot_fast(
         );
     }
     if !already_aliased.is_empty() {
+        let can_clear_dirty =
+            ALIAS_FAULT_EPOCH.load(std::sync::atomic::Ordering::Acquire) == alias_ep_before;
         for (aa, ab) in already_aliased {
             for_each_shard_span(aa, ab, |shard, sa, sb| {
                 let mut g = guards_write_shard(shard);
+                if can_clear_dirty {
+                    g.alias_dirty.remove_range(sa, sb);
+                }
                 let mut still_prot = Vec::new();
                 g.protected.for_each_overlap(sa, sb, |pa, pb| {
                     still_prot.push((pa, pb));
@@ -2019,20 +2042,22 @@ fn open_and_aliases_block_spans_sharded(
             }
         });
     }
+    ALIAS_FAULT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
     (opened, all)
 }
 
-/// Marks alias blocks dirty (`clean` and `accounted` removed, sub-clean epochs bumped)
-/// while leaving their `PAGE_READONLY` hardware protection (`g.protected`) intact.
-/// Because the write occurred through a different virtual alias, untouched aliases stay
-/// read-only so neither the fault nor the next `apply_alias_protection_sharded` needs
-/// `VirtualProtect` TLB shootdowns on them.
+/// Marks alias blocks dirty (`clean` and `accounted` removed, sub-clean epochs bumped,
+/// `alias_dirty` recorded) while leaving their `PAGE_READONLY` hardware protection
+/// (`g.protected`) intact. Because the write occurred through a different virtual alias,
+/// untouched aliases stay read-only so neither the fault nor the next
+/// `apply_alias_protection_sharded` needs `VirtualProtect` TLB shootdowns on them.
 fn dirty_alias_block_spans(
     shard: usize,
     g: &mut Guards,
     first: usize,
     last: usize,
 ) -> Vec<(usize, usize)> {
+    g.alias_dirty.insert_range(first, last);
     let clean_removed = g.clean.remove_range(first, last);
     if !clean_removed.is_empty() {
         for &(a, b) in &clean_removed {
@@ -2141,6 +2166,7 @@ fn open_here_block_spans(
     if spans.is_empty() {
         return spans;
     }
+    g.alias_dirty.remove_range(first, last);
     let clean_removed = g.clean.remove_range(first, last);
     if !clean_removed.is_empty() {
         for &(a, b) in &clean_removed {
@@ -2508,6 +2534,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             let g = guards_read_shard(shard);
             g.accounted.overlaps(a, b)
                 || g.protected.overlaps(a, b)
+                || g.alias_dirty.overlaps(a, b)
                 || g.aliased.range(a..b).next().is_some()
                 || g.recent_fault.range(a..b).next().is_some()
                 || g.cool_count.range(a..b).next().is_some()
@@ -2523,6 +2550,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.protected.remove_range(a, b);
         g.clean.remove_range(a, b);
         g.accounted.remove_range(a, b);
+        g.alias_dirty.remove_range(a, b);
         let aliased: Vec<usize> = g.aliased.range(a..b).copied().collect();
         for block in aliased {
             g.aliased.remove(&block);
