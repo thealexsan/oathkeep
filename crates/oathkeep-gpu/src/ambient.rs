@@ -24,7 +24,8 @@
 //! at once). No occlusion but the creases'.
 //!
 //! `OATHKEEP_AMBIENT`:
-//! - unset or `0`/`off`: the title's own output.
+//! - unset: defaults to `0.8` (directional estimate) when `builder_runs()` is false.
+//! - `0` or `off`: the title's own output.
 //! - a number: that share of the estimate (1: all of it).
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
@@ -32,7 +33,8 @@
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `OATHKEEP_AMBIENT_AIR`
-//! bounds what the air scatters by a multiple of the light around.
+//! (default `1.5`, `0`/`off` disables) bounds what the air scatters by a
+//! multiple of the light around.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -92,9 +94,38 @@ fn parse(set: &str) -> Set {
     }
 }
 
+const DEFAULT_AMBIENT: f32 = 0.8;
+const DEFAULT_AIR: f32 = 1.5;
+/// Subtle warm-neutral indirect floor for dark interiors (breaks the zero-light
+/// feedback loop without washing out shadows or outdoor contrast).
+#[cfg(test)]
+const INTERIOR_FLOOR: [f32; 3] = [0.015, 0.0145, 0.0135];
+/// Minimum crease openness so deep corners and character facial creases keep
+/// crisp shading without crushing to pitch-black soot.
+#[cfg(test)]
+const CREASE_FLOOR: f32 = 0.12;
+
+fn resolve_setting(raw: Option<&str>) -> Set {
+    match raw {
+        Some(value) => parse(value),
+        None => Set::Estimate(DEFAULT_AMBIENT),
+    }
+}
+
+fn parse_air(raw: &str) -> f32 {
+    raw.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+}
+
+fn resolve_air(raw: Option<&str>) -> f32 {
+    match raw {
+        Some(value) => parse_air(value),
+        None => DEFAULT_AIR,
+    }
+}
+
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(|| parse(&std::env::var("OATHKEEP_AMBIENT").unwrap_or_default()))
+    *SET.get_or_init(|| resolve_setting(std::env::var("OATHKEEP_AMBIENT").ok().as_deref()))
 }
 
 /// Whether the stand-in is on: set, and the title's rays find nothing.
@@ -103,13 +134,10 @@ pub(crate) fn on() -> bool {
 }
 
 /// The most the air scatters, as a multiple of the light around
-/// (`OATHKEEP_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
+/// (`OATHKEEP_AMBIENT_AIR=<multiple>`; default `1.5`, `0`/`off`: what the title has).
 fn air() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("OATHKEEP_AMBIENT_AIR").unwrap_or_default();
-        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
-    })
+    *SET.get_or_init(|| resolve_air(std::env::var("OATHKEEP_AMBIENT_AIR").ok().as_deref()))
 }
 
 /// Strength and radius of the creases' shade.
@@ -162,11 +190,15 @@ RWTexture2D<float3> radiance : register(u0);
 void keep(uint3 at : SV_DispatchThreadID) {
     uint w, h;
     radiance.GetDimensions(w, h);
+    if (w == 0 || h == 0) return;
     float3 sum = 0;
     for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
-        uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
-        float3 c = max(radiance[p], 0.0);
-        c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
+        uint2 p = min(
+            uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY)),
+            uint2(w - 1, h - 1)
+        );
+        float3 raw = radiance[p];
+        float3 c = (any(isnan(raw)) || any(isinf(raw))) ? 0.0 : max(raw, 0.0);
         // Lamps and glints count, but not for everything.
         sum += c / max(1.0, dot(c, LUMA) / 20.0);
     }
@@ -179,7 +211,8 @@ void mean() {
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    bool valid_was = was.a > 0.0 && !any(isnan(was.rgb)) && !any(isinf(was.rgb));
+    cells[CELLS] = float4(valid_was ? lerp(was.rgb, now, follow) : now, 1.0);
 }
 #endif
 
@@ -239,12 +272,12 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     if (at.x >= w || at.y >= h || at.z >= d) return;
     uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
     uint at0 = (q.y * PX + q.x) * 3;
-    float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    float3 seen_there = max(float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w), 0.0);
     float far = float(at.z) / float(d);
-    float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
+    float cap = max(air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far), 0.0);
     float3 c = scattered[at];
     float has = dot(c, LUMA);
-    if (has > cap) scattered[at] = c * (cap / has);
+    if (has > cap && has > 1e-6) scattered[at] = c * (cap / has);
 }
 #endif
 
@@ -290,7 +323,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
             float over = dot(v, n) - 0.004 * c.z - 0.005;
             sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
         }
-        open = saturate(1.0 - strength * 2.0 * sum / N);
+        open = lerp(0.12, 1.0, saturate(1.0 - strength * 2.0 * sum / N));
     }
     float3 found;
     if (constant > 0.0) {
@@ -320,6 +353,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    if (c.z < 400.0) {
+        found = max(found, float3(0.015, 0.0145, 0.0135) * level * open);
+    }
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
@@ -501,6 +537,83 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
 mod tests {
     use super::*;
 
+    const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
+
+    fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    fn pack_r9g9b9e5(c: [f32; 3]) -> u32 {
+        let c = c.map(|v| v.clamp(0.0, 65408.0));
+        let top = c[0].max(c[1]).max(c[2]);
+        let mut e = (top.max(1e-9).log2().floor() as i32 + 16).clamp(0, 31);
+        let mut scale = (24 - e) as f32;
+        scale = scale.exp2();
+        if top * scale >= 511.5 {
+            e = (e + 1).min(31);
+            scale = ((24 - e) as f32).exp2();
+        }
+        let m = c.map(|v| ((v * scale + 0.5) as u32).min(511));
+        m[0] | (m[1] << 9) | (m[2] << 18) | ((e as u32) << 27)
+    }
+
+    fn unpack_r9g9b9e5(v: u32) -> [f32; 3] {
+        let scale = (((v >> 27) as f32) - 24.0).exp2();
+        [
+            (v & 511) as f32 * scale,
+            ((v >> 9) & 511) as f32 * scale,
+            ((v >> 18) & 511) as f32 * scale,
+        ]
+    }
+
+    fn crease_openness(strength: f32, occlusion_mean: f32) -> f32 {
+        let raw = (1.0 - strength * 2.0 * occlusion_mean).clamp(0.0, 1.0);
+        CREASE_FLOOR + (1.0 - CREASE_FLOOR) * raw
+    }
+
+    fn evaluate_raise(
+        all: [f32; 3],
+        dir_dot_n: [f32; 3],
+        slow_mean: [f32; 3],
+        was: [f32; 3],
+        level: f32,
+        open: f32,
+        most: f32,
+        depth_m: f32,
+    ) -> [f32; 3] {
+        let mut found = [0.0f32; 3];
+        for i in 0..3 {
+            let directional = (all[i] + 1.2 * dir_dot_n[i]).clamp(0.2 * all[i], 2.5 * all[i]);
+            let blended = (directional * 0.8 + slow_mean[i] * 0.2) * level * open;
+            found[i] = if depth_m < 400.0 {
+                blended.max(INTERIOR_FLOOR[i] * level * open)
+            } else {
+                blended
+            };
+        }
+        let top = (dot3(found, LUMA) * most).max(1e-6);
+        let has = dot3(was, LUMA);
+        let scale = (top / has.max(1e-6)).min(1.0);
+        [
+            (was[0] * scale).max(found[0]),
+            (was[1] * scale).max(found[1]),
+            (was[2] * scale).max(found[2]),
+        ]
+    }
+
+    fn clamp_air_haze(scattered: [f32; 3], slow_mean: [f32; 3], seen_there: [f32; 3], far: f32, air: f32) -> [f32; 3] {
+        let room_luma = dot3(slow_mean, LUMA);
+        let seen_luma = dot3(seen_there.map(|v| v.max(0.0)), LUMA);
+        let cap = (air * (room_luma + (seen_luma - room_luma) * far)).max(0.0);
+        let has = dot3(scattered, LUMA);
+        if has > cap && has > 1e-6 {
+            let k = cap / has;
+            scattered.map(|v| v * k)
+        } else {
+            scattered
+        }
+    }
+
     #[test]
     fn settings() {
         assert_eq!(parse(""), Set::Off);
@@ -509,6 +622,47 @@ mod tests {
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+    }
+
+    #[test]
+    fn defaults_enable_estimate_and_air_clamp_when_unset() {
+        assert_eq!(resolve_setting(None), Set::Estimate(DEFAULT_AMBIENT));
+        assert_eq!(resolve_setting(Some("0")), Set::Off);
+        assert_eq!(resolve_setting(Some("off")), Set::Off);
+        assert_eq!(resolve_setting(Some("1.0")), Set::Estimate(1.0));
+        assert_eq!(resolve_air(None), DEFAULT_AIR);
+        assert_eq!(resolve_air(Some("0")), 0.0);
+        assert_eq!(resolve_air(Some("off")), 0.0);
+        assert_eq!(resolve_air(Some("2.0")), 2.0);
+    }
+
+    #[test]
+    fn ambient_stand_in_math_preserves_contrast_and_clamps_indoor_haze() {
+        // R9G9B9E5 pack/unpack preserves indoor lighting values accurately.
+        let sample = [0.24f32, 0.21, 0.18];
+        let rt = unpack_r9g9b9e5(pack_r9g9b9e5(sample));
+        for i in 0..3 {
+            assert!((rt[i] - sample[i]).abs() < 0.002, "channel {i}: {rt:?}");
+        }
+
+        // Pitch-black room (zero radiance, zero probe output) gets the subtle
+        // AO-shaded interior floor rather than staying at literal 0.0.
+        let dark_open = evaluate_raise([0.0; 3], [0.0; 3], [0.0; 3], [0.0; 3], 0.8, 1.0, 4.0, 3.0);
+        let dark_crease = evaluate_raise([0.0; 3], [0.0; 3], [0.0; 3], [0.0; 3], 0.8, crease_openness(1.0, 0.6), 4.0, 3.0);
+        assert!(dark_open[0] > 0.01 && dark_open[0] < 0.03);
+        // Crease retains visible shading contrast without crushing to literal zero.
+        assert!(dark_crease[0] > 0.0 && dark_crease[0] < dark_open[0] * 0.25);
+
+        // Corrupt stale probe memory (`was` = 100.0) is bounded to `most` * estimate.
+        let bounded = evaluate_raise([0.2; 3], [0.0; 3], [0.2; 3], [100.0; 3], 0.8, 1.0, 4.0, 5.0);
+        assert!(dot3(bounded, LUMA) <= dot3([0.2 * 0.8; 3], LUMA) * 4.0 + 1e-4);
+
+        // Bright sunset sky fog bleeding into a dim room is clamped cleanly,
+        // and zero scattering never produces NaN.
+        let clamped = clamp_air_haze([2.0, 1.0, 0.5], [0.1, 0.1, 0.1], [0.1, 0.1, 0.1], 0.2, DEFAULT_AIR);
+        assert!(dot3(clamped, LUMA) <= 0.15 + 1e-5);
+        let zero = clamp_air_haze([0.0; 3], [0.0; 3], [0.0; 3], 0.5, DEFAULT_AIR);
+        assert!(zero.iter().all(|v| v.is_finite() && *v == 0.0));
     }
 
     #[test]

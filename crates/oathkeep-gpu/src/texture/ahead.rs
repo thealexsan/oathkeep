@@ -35,6 +35,58 @@ pub(crate) const LISTED: u8 = 3;
 const MOST: u64 = 96 << 20;
 /// Bytes and textures of one submission at most.
 const BATCH: (u64, usize) = (16 << 20, 64);
+/// Compact / mip-tail uploads prioritized ahead of multi-megabyte speculative
+/// textures so visible surfaces receive initial texels immediately.
+const SMALL_PRIORITY_BYTES: u64 = 256 << 10;
+
+/// Two-tier upload queue: draw-demanded (promoted by [`listed`]) and compact
+/// mip-tail uploads drain ahead of large speculative background textures.
+struct PriorityQueue<T> {
+    urgent: VecDeque<(u64, T)>,
+    background: VecDeque<(u64, T)>,
+}
+
+impl<T> PriorityQueue<T> {
+    const fn new() -> Self {
+        Self { urgent: VecDeque::new(), background: VecDeque::new() }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.urgent.is_empty() && self.background.is_empty()
+    }
+
+    fn push(&mut self, serial: u64, item: T, urgent: bool) {
+        if urgent {
+            self.urgent.push_back((serial, item));
+        } else {
+            self.background.push_back((serial, item));
+        }
+    }
+
+    /// Moves a queued background job to the front of the urgent tier when a
+    /// command list actively demands it.
+    fn promote(&mut self, serial: u64) -> bool {
+        if let Some(pos) = self.background.iter().position(|(s, _)| *s == serial)
+            && let Some(entry) = self.background.remove(pos)
+        {
+            self.urgent.push_front(entry);
+            return true;
+        }
+        false
+    }
+
+    fn pop_batch(&mut self, max_bytes: u64, max_count: usize, size_of: impl Fn(&T) -> u64) -> Vec<T> {
+        let mut out = Vec::new();
+        let mut bytes = 0u64;
+        while bytes < max_bytes && out.len() < max_count {
+            let next = self.urgent.pop_front().or_else(|| self.background.pop_front());
+            let Some((_, item)) = next else { break };
+            bytes += size_of(&item);
+            out.push(item);
+        }
+        out
+    }
+}
 
 /// Whether it is on (`OATHKEEP_UPLOAD_AHEAD`; off).
 pub(crate) fn on() -> bool {
@@ -77,7 +129,8 @@ pub(crate) enum Taken {
     Known(Arc<Job>),
 }
 
-static QUEUE: (Mutex<VecDeque<Arc<Job>>>, Condvar) = (Mutex::new(VecDeque::new()), Condvar::new());
+static QUEUE: (Mutex<PriorityQueue<Arc<Job>>>, Condvar) =
+    (Mutex::new(PriorityQueue::new()), Condvar::new());
 /// Those on their way, by host copy ([`HostTexture::serial`]).
 static ON_THEIR_WAY: Mutex<Vec<(u64, Arc<Job>)>> = Mutex::new(Vec::new());
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
@@ -105,8 +158,15 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
     }
     let most = if crate::residency::limited_host_ram() { 32 << 20 } else { MOST };
-    if !crate::residency::allow_staging_growth(false)
-        || BYTES.load(Relaxed) >= most
+    let est_bytes = super::title_span(resource, first).map_or(0, |(_, len)| len);
+    if !crate::residency::admit_ahead(
+        crate::residency::vram_level(),
+        BYTES.load(Relaxed),
+        est_bytes,
+        most,
+        super::draw_active_recently(),
+        crate::residency::allow_staging_growth(false),
+    )
         || copy.flags() & 0x7 != 0
         || copy.state.load(Relaxed) != 0
         || copy.grown.load(Relaxed)
@@ -124,12 +184,17 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     super::PICKING.set(Some(there));
     let staging = super::staging(resource, &copy, first);
     super::PICKING.set(None);
-    let Some(staging) = staging.filter(|s| {
-        !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
-    }) else {
-        copy.ahead.store(LISTED, Relaxed);
+    let Some(staging) = staging else {
+        // Staging was deferred or unavailable; leave the texture eligible for
+        // retry instead of permanently marking it LISTED.
+        copy.ahead.store(NONE, Relaxed);
         return turned_down();
     };
+    if staging.on_demand || staging.first != staging.level0 || staging.uploaded.load(Relaxed) || !staging.once.load(Relaxed) {
+        copy.ahead.store(LISTED, Relaxed);
+        return turned_down();
+    }
+    super::note_picked_upload(resource, &copy, &staging);
     if super::no_wait() && super::fill_unlocked() {
         staging.expected.store(if there == u64::MAX { super::mapped_bytes(staging.memory, staging.read) } else { there }, Relaxed);
     }
@@ -145,7 +210,12 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
 
 /// Sends a job of [`take`] on its way.
 pub(crate) fn send(job: &Arc<Job>) {
-    QUEUE.0.lock().unwrap_or_else(|e| e.into_inner()).push_back(job.clone());
+    let urgent = job.staging.read as u64 <= SMALL_PRIORITY_BYTES || job.staging.first > 0;
+    QUEUE
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(job.copy.serial, job.clone(), urgent);
     QUEUE.1.notify_one();
 }
 
@@ -175,6 +245,11 @@ pub(crate) fn listed(copy: &HostTexture) {
         return;
     }
     STATS[5].fetch_add(1, Relaxed);
+    // Promote a draw-demanded job straight to the front of the urgent queue so
+    // the recording thread does not wait behind speculative background uploads.
+    if QUEUE.0.lock().unwrap_or_else(|e| e.into_inner()).promote(copy.serial) {
+        QUEUE.1.notify_all();
+    }
     let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
     let started = std::time::Instant::now();
     while way.iter().any(|(serial, _)| *serial == copy.serial) && started.elapsed().as_millis() < 1000 {
@@ -238,39 +313,45 @@ impl Worker {
     fn work(self) {
         let mut value = 0;
         loop {
-            let mut jobs = Vec::new();
-            {
+            let jobs = {
                 let mut queue = QUEUE.0.lock().unwrap_or_else(|e| e.into_inner());
                 while queue.is_empty() {
                     queue = QUEUE.1.wait(queue).unwrap_or_else(|e| e.into_inner());
                 }
-                let mut bytes = 0;
-                while bytes < BATCH.0 && jobs.len() < BATCH.1
-                    && let Some(job) = queue.pop_front()
-                {
-                    bytes += job.staging.read as u64;
-                    jobs.push(job);
+                queue.pop_batch(BATCH.0, BATCH.1, |job| job.staging.read as u64)
+            };
+            value += 1;
+            match self.copy(&jobs, value) {
+                Ok(copied) => finish(jobs, Some(&copied)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "uploads ahead did not run");
+                    finish(jobs, None);
                 }
             }
-            value += 1;
-            if let Err(e) = self.copy(&jobs, value) {
-                tracing::warn!(error = %e, "uploads ahead did not run");
-            }
-            finish(jobs);
         }
     }
 
-    fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
+    fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<Vec<bool>> {
+        let mut ready = Vec::with_capacity(jobs.len());
+        let mut any = false;
         for job in jobs {
             job.staging.refresh();
+            let has_data = job.staging.has_data();
+            ready.push(has_data);
+            any |= has_data;
+        }
+        if !any {
+            return Ok(ready);
         }
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.
         unsafe {
             self.allocator.Reset()?;
             self.list.Reset(&self.allocator, None)?;
-            for job in jobs {
-                job.record(&self.list);
+            for (job, &has_data) in jobs.iter().zip(&ready) {
+                if has_data {
+                    job.record(&self.list);
+                }
             }
             self.list.Close()?;
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
@@ -278,7 +359,7 @@ impl Worker {
             // (Without an event: this waits.)
             self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
         }
-        Ok(())
+        Ok(ready)
     }
 }
 
@@ -308,16 +389,31 @@ impl Job {
     }
 }
 
-/// The jobs' copies have run.
-fn finish(jobs: Vec<Arc<Job>>) {
-    for job in &jobs {
-        job.staging.uploaded.store(true, Relaxed);
-        job.staging.dirty.store(false, Relaxed);
-        job.staging.note_held();
-        job.copy.ahead.store(DONE, Relaxed);
+/// The jobs' copies have run (or failed/skipped when `copied` is `None` or
+/// `false` for a job, in which case slots stay on `neutral()` and retry).
+fn finish(jobs: Vec<Arc<Job>>, copied: Option<&[bool]>) {
+    let mut any_flipped = false;
+    for (i, job) in jobs.iter().enumerate() {
         BYTES.fetch_sub(job.staging.read as u64, Relaxed);
+        let ok = copied.is_some_and(|flags| flags.get(i).copied().unwrap_or(false));
+        if ok {
+            job.staging.uploaded.store(true, Relaxed);
+            job.staging.dirty.store(false, Relaxed);
+            job.staging.note_held();
+            job.copy.ahead.store(DONE, Relaxed);
+        } else {
+            // Do not flip the descriptor slot to an un-uploaded texture; reset
+            // `ahead` so a retry or list upload can fill it cleanly.
+            job.copy.ahead.store(NONE, Relaxed);
+            let _ = job.then.lock().unwrap_or_else(|e| e.into_inner()).take();
+            crate::descriptor::host::read_short(job.staging.memory as u64);
+        }
     }
-    for job in &jobs {
+    for (i, job) in jobs.iter().enumerate() {
+        if !copied.is_some_and(|flags| flags.get(i).copied().unwrap_or(false)) {
+            continue;
+        }
+        any_flipped = true;
         let us = job.asked.elapsed().as_micros() as u64;
         let n = STATS[0].fetch_add(1, Relaxed) + 1;
         let bytes = STATS[1].fetch_add(job.staging.read as u64, Relaxed) + job.staging.read as u64;
@@ -346,7 +442,9 @@ fn finish(jobs: Vec<Arc<Job>>) {
         IN_FLIGHT.store(way.len(), std::sync::atomic::Ordering::Release);
         LANDED.notify_all();
     }
-    crate::descriptor::host::flip_now();
+    if any_flipped {
+        crate::descriptor::host::flip_now();
+    }
 }
 
 /// Whether `resource`'s host copy was filled here: no list still brings what
@@ -469,5 +567,26 @@ mod tests {
         assert!(drain() >= 1);
         assert!(ran.load(std::sync::atomic::Ordering::Acquire), "job.then callback must run before drain() returns");
         assert_eq!(drain(), 0);
+    }
+
+    #[test]
+    fn priority_queue_promotes_draw_demanded_jobs_ahead_of_background() {
+        let mut q = PriorityQueue::new();
+        q.push(1, (1u64, 4u64 << 20), false);
+        q.push(2, (2u64, 4u64 << 20), false);
+        q.push(3, (3u64, 64u64 << 10), true);
+        q.push(4, (4u64, 4u64 << 20), false);
+
+        // Draw demands serial 4: it jumps ahead of both background jobs AND
+        // queued compact urgent jobs.
+        assert!(q.promote(4));
+        assert!(!q.promote(999));
+
+        let first = q.pop_batch(16 << 20, 2, |&(_, bytes)| bytes);
+        assert_eq!(first.iter().map(|&(id, _)| id).collect::<Vec<_>>(), vec![4, 3]);
+
+        let rest = q.pop_batch(16 << 20, 8, |&(_, bytes)| bytes);
+        assert_eq!(rest.iter().map(|&(id, _)| id).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(q.is_empty());
     }
 }
