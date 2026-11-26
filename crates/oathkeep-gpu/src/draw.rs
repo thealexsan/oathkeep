@@ -173,7 +173,11 @@ fn windows() -> bool {
 struct FreshTable {
     offset: u32,
     bindless_seq: u64,
+    copy_seq: u64,
     deps: Vec<(u64, u64)>,
+    has_gpu_active_cbv: bool,
+    uav_buffers: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+    textures: Vec<(usize, ResourceType)>,
 }
 
 #[derive(Default)]
@@ -203,6 +207,8 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     fresh_tables: std::collections::HashMap<(usize, u32, u128), FreshTable>,
     cbv_scratch_cache: std::collections::HashMap<(u64, u64, u64), (u64, u64, ID3D12Resource, u64)>,
+    kept_ptrs: std::collections::HashSet<usize>,
+    kept_list_gen: u64,
     dynamic: Vec<(usize, u32, u32)>,
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
@@ -243,9 +249,23 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.kept_ptrs.clear();
+        self.kept_list_gen = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
+    }
+
+    #[inline]
+    fn keep_dynamic(&mut self, list: &HostList, resource: &ID3D12Resource) {
+        let list_gen = list.reset_gen();
+        if self.kept_list_gen != list_gen {
+            self.kept_ptrs.clear();
+            self.kept_list_gen = list_gen;
+        }
+        if self.kept_ptrs.insert(resource.as_raw() as usize) {
+            list.keep(resource);
+        }
     }
 }
 
@@ -3357,7 +3377,6 @@ impl State {
                 }
             }
         }
-        let mut retired = Vec::new();
         for fresh_i in 0..self.scratch_fresh.len() {
             let slot = self.scratch_fresh[fresh_i];
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
@@ -3429,7 +3448,7 @@ impl State {
                 }
                 (heap_id, span, finalize_table_hash(h1, h2))
             };
-            let cached_offset = self.fresh_tables.get(&key).and_then(|entry| {
+            let cached_hit = self.fresh_tables.get(&key).and_then(|entry| {
                 if entry.deps.is_empty()
                     || (list.bindless_write_seq() == entry.bindless_seq
                         && entry
@@ -3437,57 +3456,89 @@ impl State {
                             .iter()
                             .all(|&(sid, seq)| list.shadow_write_seq(sid) == seq))
                 {
-                    Some(entry.offset)
+                    Some((entry.offset, entry.copy_seq, entry.has_gpu_active_cbv))
                 } else {
                     None
                 }
             });
-            if let Some(offset) = cached_offset {
+            if let Some((offset, entry_copy_seq, has_gpu_active_cbv)) = cached_hit {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TablesFreshHit, 1);
-                for entry_i in 0..self.scratch_entries.len() {
-                    let idx = self.scratch_entries[entry_i];
-                    let u = &used[idx];
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if u.kind == ResourceType::Cbv {
-                        if let Some(View::Constant(address, size)) = crate::descriptor::view(handle)
-                        {
-                            let size_u64 = u64::from(size);
-                            let existing = self.find_shadow_existing(address, size_u64);
-                            let gpu_active = existing
-                                .as_ref()
-                                .is_some_and(|s| s.is_gpu_active(list, address, size_u64));
-                            if (direct_cbv() || gpu_active)
-                                && let Some(shadow) =
-                                    existing.or_else(|| self.find_shadow(address, size_u64))
-                                && shadow.can_bind_cbv(address, size)
-                            {
-                                shadow.refresh(list, address, size_u64);
-                                if gpu_active {
-                                    list.uav_barrier_if_dirty();
+                if entry_copy_seq == list.copy_seq() {
+                    if has_gpu_active_cbv {
+                        list.uav_barrier_if_dirty();
+                    }
+                    if let Some(entry) = self.fresh_tables.get(&key) {
+                        if !entry.uav_buffers.is_empty() {
+                            let record_writes = STORES.get() || !write_skip();
+                            for (shadow, address, len) in &entry.uav_buffers {
+                                if record_writes {
+                                    shadow.gpu_writes(list, *address, *len);
+                                } else {
+                                    #[cfg(feature = "diagnostics")]
+                                    {
+                                        crate::copystat::add(
+                                            crate::copystat::C::GpuWritesLeftOut,
+                                            1,
+                                        );
+                                        crate::copystat::add(
+                                            crate::copystat::C::GpuWritesLeftOutBytes,
+                                            *len,
+                                        );
+                                    }
                                 }
                             }
                         }
-                        continue;
+                        for &(resource, kind) in &entry.textures {
+                            readable_texture(list, resource, kind);
+                        }
                     }
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                } else {
+                    for entry_i in 0..self.scratch_entries.len() {
+                        let idx = self.scratch_entries[entry_i];
+                        let u = &used[idx];
+                        let handle = table + u64::from(u.table_offset_dwords) * 4;
+                        if u.kind == ResourceType::Cbv {
+                            if let Some(View::Constant(address, size)) =
+                                crate::descriptor::view(handle)
+                            {
+                                let size_u64 = u64::from(size);
+                                let existing = self.find_shadow_existing(address, size_u64);
+                                let gpu_active = existing
+                                    .as_ref()
+                                    .is_some_and(|s| s.is_gpu_active(list, address, size_u64));
+                                if (direct_cbv() || gpu_active)
+                                    && let Some(shadow) =
+                                        existing.or_else(|| self.find_shadow(address, size_u64))
+                                    && shadow.can_bind_cbv(address, size)
+                                {
+                                    shadow.refresh(list, address, size_u64);
+                                    if gpu_active {
+                                        list.uav_barrier_if_dirty();
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        if let Some(view) = crate::descriptor::view(handle) {
+                            readable(list, u.kind, &view);
+                        }
                     }
-                }
-                for sel_i in 0..self.scratch_selected.len() {
-                    let k = self.scratch_selected[sel_i];
-                    if self
-                        .scratch_entries
-                        .iter()
-                        .any(|&idx| used[idx].table_offset_dwords / 8 == k)
-                    {
-                        continue;
-                    }
-                    let handle = table + u64::from(k) * 32;
-                    if let Some(view) = crate::descriptor::view(handle)
-                        && let Some(kind) = view_kind(&view)
-                    {
-                        readable(list, kind, &view);
+                    for sel_i in 0..self.scratch_selected.len() {
+                        let k = self.scratch_selected[sel_i];
+                        if self
+                            .scratch_entries
+                            .iter()
+                            .any(|&idx| used[idx].table_offset_dwords / 8 == k)
+                        {
+                            continue;
+                        }
+                        let handle = table + u64::from(k) * 32;
+                        if let Some(view) = crate::descriptor::view(handle)
+                            && let Some(kind) = view_kind(&view)
+                        {
+                            readable(list, kind, &view);
+                        }
                     }
                 }
                 self.scratch_made.push((slot, offset));
@@ -3506,6 +3557,10 @@ impl State {
                 );
             }
             let mut deps: Vec<(u64, u64)> = Vec::new();
+            let mut has_gpu_active_cbv = false;
+            let mut uav_buffers: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+                Vec::new();
+            let mut textures: Vec<(usize, ResourceType)> = Vec::new();
             self.dynamic.push((heap_id, first, span));
             let title_first = heap.index(table);
             #[cfg(feature = "diagnostics")]
@@ -3533,15 +3588,11 @@ impl State {
                                 let gpu = shadow.gpu(address);
                                 shadow.refresh(list, address, size_u64);
                                 if gpu_active {
+                                    has_gpu_active_cbv = true;
                                     list.uav_barrier_if_dirty();
                                 }
-                                host.constant_at_kept_into(
-                                    index,
-                                    gpu,
-                                    size,
-                                    shadow.buffer.clone(),
-                                    &mut retired,
-                                );
+                                self.keep_dynamic(list, &shadow.buffer);
+                                host.constant_at_dynamic(index, gpu, size);
                                 continue;
                             }
                             if gpu_active
@@ -3553,25 +3604,24 @@ impl State {
                                 if !deps.iter().any(|&(id, _)| id == sid) {
                                     deps.push((sid, write_seq));
                                 }
-                                host.constant_at_kept_into(
-                                    index,
-                                    scratch_gpu,
-                                    size,
-                                    scratch,
-                                    &mut retired,
-                                );
+                                self.keep_dynamic(list, &scratch);
+                                host.constant_at_dynamic(index, scratch_gpu, size);
                                 continue;
                             }
                         }
                         let Some((gpu, to)) = list.scratch(size_u64) else {
-                            host.make_null_into(index, &mut retired);
+                            host.make_null_dynamic(index);
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at_into(index, gpu, size, &mut retired);
+                        host.constant_at_dynamic(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at_into(index, &view, &mut retired);
+                        let (kept_res, made_shadow, made_placed) =
+                            host.make_at_dynamic(index, &view);
+                        if let Some(res) = kept_res {
+                            self.keep_dynamic(list, &res);
+                        }
                         let kind = used_entry.map(|u| u.kind).or_else(|| {
                             self.scratch_selected
                                 .binary_search(&k)
@@ -3579,7 +3629,15 @@ impl State {
                                 .and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            readable_with_hint(
+                                list,
+                                kind,
+                                &view,
+                                made_shadow,
+                                made_placed,
+                                Some(&mut uav_buffers),
+                                Some(&mut textures),
+                            );
                         }
                         if let Some(title) = title_first
                             && title.saturating_add(k) < host.count()
@@ -3592,7 +3650,7 @@ impl State {
                         }
                     }
                     None => {
-                        host.make_null_into(index, &mut retired);
+                        host.make_null_dynamic(index);
                         if used_entry.is_some() {
                             once!(slot, "a table entry without a view");
                         }
@@ -3610,13 +3668,14 @@ impl State {
                 FreshTable {
                     offset,
                     bindless_seq: list.bindless_write_seq(),
+                    copy_seq: list.copy_seq(),
                     deps,
+                    has_gpu_active_cbv,
+                    uav_buffers,
+                    textures,
                 },
             );
             self.scratch_made.push((slot, offset));
-        }
-        if !retired.is_empty() {
-            crate::host::retire_batch(retired);
         }
     }
 
@@ -4228,12 +4287,81 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    readable_with_hint(list, kind, view, None, None, None, None);
+}
+
+fn readable_texture(list: &HostList, resource: usize, kind: ResourceType) {
     const UNORDERED_ACCESS: u32 = 0x8;
-    let placed = crate::descriptor::host::placed_texture(view);
+    match kind {
+        ResourceType::Srv => {
+            let aliased = crate::resource::alias_of(resource as This)
+                .is_some_and(|source| crate::texture::alias(list, resource as This, source));
+            if !aliased
+                && let Some(t) = crate::resource::host_resource(resource as This)
+                && crate::texture::title_written(t)
+            {
+                crate::texture::upload(list, resource as This, t);
+            }
+            list.twin_use(resource as This, false, false);
+            let (tested, _) = TESTED_DEPTH.get();
+            let state = if tested != 0 && tested == resource {
+                TESTED_DEPTH.set((tested, true));
+                DEPTH_READ | SHADER_RESOURCE
+            } else {
+                SHADER_RESOURCE
+            };
+            crate::list::ensure_state(list, resource as This, state);
+            #[cfg(feature = "diagnostics")]
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && let Some(t) = crate::resource::host_resource(resource as This)
+            {
+                // SAFETY: a live resource.
+                let d = unsafe { t.GetDesc() };
+                if d.Flags.0 & 7 == 0 {
+                    tracing::debug!(
+                        resource = format_args!("{resource:#x}"),
+                        ?d,
+                        "a shader reads a texture the title fills"
+                    );
+                }
+            }
+        }
+        ResourceType::Uav => {
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_target(resource as This);
+            if !list.twin_use(resource as This, true, true) {
+                crate::list::ensure_state(list, resource as This, UNORDERED_ACCESS);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn readable_with_hint(
+    list: &HostList,
+    kind: ResourceType,
+    view: &View,
+    shadow_hint: Option<std::sync::Arc<crate::shadow::Shadow>>,
+    placed_hint: Option<View>,
+    uav_buffers: Option<&mut Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>>,
+    textures: Option<&mut Vec<(usize, ResourceType)>>,
+) {
+    let placed = placed_hint.or_else(|| {
+        if shadow_hint.is_some() {
+            None
+        } else {
+            crate::descriptor::host::placed_texture(view)
+        }
+    });
     let view = placed.as_ref().unwrap_or(view);
-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+    if let Some((shadow, address, len)) =
+        crate::descriptor::host::buffer_copy_with_hint(view, shadow_hint)
+    {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
+            if let Some(sink) = uav_buffers {
+                sink.push((shadow.clone(), address, len));
+            }
             if STORES.get() || !write_skip() {
                 shadow.gpu_writes(list, address, len);
             } else {
@@ -4248,44 +4376,16 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     }
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
-            let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
-            if !aliased
-                && let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
-            {
-                crate::texture::upload(list, *resource as This, t);
+            if let Some(sink) = textures {
+                sink.push((*resource, ResourceType::Srv));
             }
-            list.twin_use(*resource as This, false, false);
-            let (tested, _) = TESTED_DEPTH.get();
-            let state = if tested != 0 && tested == *resource {
-                TESTED_DEPTH.set((tested, true));
-                DEPTH_READ | SHADER_RESOURCE
-            } else {
-                SHADER_RESOURCE
-            };
-            crate::list::ensure_state(list, *resource as This, state);
-            #[cfg(feature = "diagnostics")]
-            if tracing::enabled!(tracing::Level::DEBUG)
-                && let Some(t) = crate::resource::host_resource(*resource as This)
-            {
-                // SAFETY: a live resource.
-                let d = unsafe { t.GetDesc() };
-                if d.Flags.0 & 7 == 0 {
-                    tracing::debug!(
-                        resource = format_args!("{resource:#x}"),
-                        ?d,
-                        "a shader reads a texture the title fills"
-                    );
-                }
-            }
+            readable_texture(list, *resource, ResourceType::Srv);
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
-            #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(*resource as This);
-            if !list.twin_use(*resource as This, true, true) {
-                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            if let Some(sink) = textures {
+                sink.push((*resource, ResourceType::Uav));
             }
+            readable_texture(list, *resource, ResourceType::Uav);
         }
         _ => {}
     }

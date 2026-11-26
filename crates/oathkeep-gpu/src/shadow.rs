@@ -2262,8 +2262,8 @@ fn workers() -> &'static Workers {
     });
     STARTED.call_once(|| {
         let n = std::thread::available_parallelism()
-            .map_or(4, |n| n.get() / 2)
-            .clamp(2, 6);
+            .map_or(4, |n| n.get().saturating_sub(2))
+            .clamp(2, 8);
         for i in 0..n {
             let _ = std::thread::Builder::new()
                 .name(format!("oathkeep-wide-{i}"))
@@ -3974,7 +3974,28 @@ impl Shadow {
             return self.merge_unwatched(start, &busy, runs_left);
         }
         let base = start / PAGE;
-        let mut title = vec![0u8; PAGE];
+        thread_local! {
+            static MERGE_TITLE_BUF: std::cell::RefCell<Vec<u8>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let title = MERGE_TITLE_BUF.with(|cell| {
+            let mut v = cell.take();
+            if v.len() < PAGE {
+                v.resize(PAGE, 0);
+            }
+            v
+        });
+        struct ReturnBuf(Vec<u8>);
+        impl Drop for ReturnBuf {
+            fn drop(&mut self) {
+                let v = std::mem::take(&mut self.0);
+                MERGE_TITLE_BUF.with(|cell| {
+                    *cell.borrow_mut() = v;
+                });
+            }
+        }
+        let mut title_guard = ReturnBuf(title);
+        let title = &mut title_guard.0;
         for (a, e) in busy {
             let full = a <= start && e >= end;
             let uncopied_zero = self.uncopied.load(Ordering::Acquire) == 0;
@@ -4347,6 +4368,22 @@ impl Shadow {
             }
             return bytes;
         }
+        // When no GPU writes are pending on this shadow and some 64 KiB pages have never been
+        // copied yet (`uncopied > 0`), align `(from, to)` outward to 64 KiB page boundaries
+        // (clamped to `[start, end)`). Otherwise unaligned edge refreshes leave `copied[page] == 0`
+        // forever, preventing `all_copied` / `clean_guard_epochs` from ever engaging and causing
+        // repeated re-copies on every subsequent submission.
+        let (from, to) = if self.uncopied.load(Ordering::Acquire) > 0
+            && !self.writes_pending()
+            && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
+        {
+            (
+                (from & !(PAGE - 1)).max(start),
+                to.next_multiple_of(PAGE).min(end),
+            )
+        } else {
+            (from, to)
+        };
         self.update_free(from, to)
     }
 
@@ -5003,9 +5040,28 @@ impl Shadow {
             self.card_changed(off_from, off_to);
             return to - from;
         }
-        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(off_from) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if self.watched.load(Ordering::Relaxed) == WATCHED_GUARDED {
+            crate::watch::split_absent_spans(
+                from,
+                to,
+                |a, b| {
+                    // SAFETY: inside the mapping (`[a, b)` lies within `[from, to)` <= `[start, end)`).
+                    let at = unsafe { self.data.add(a - start) };
+                    crate::host::copy_mapped(at, a as *const u8, b - a, false);
+                },
+                |a, b| {
+                    let n = b - a;
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                    // SAFETY: inside the writable host shadow mapping.
+                    unsafe { self.data.add(a - start).write_bytes(0, n) };
+                },
+            );
+        } else {
+            // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+            let at = unsafe { self.data.add(off_from) };
+            crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        }
         self.changed(off_from, off_to);
         self.card_changed(off_from, off_to);
         to - from

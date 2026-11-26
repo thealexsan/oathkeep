@@ -2212,6 +2212,47 @@ impl HostHeap {
         self.keep_into(index, kept.flatten(), Some(retired));
     }
 
+    /// Writes a descriptor directly into a dynamic slot owned by the caller's command list,
+    /// bypassing `self.kept` locking/retirement. Returns `(kept_resource, made_shadow, made_placed)`
+    /// so the caller can keep the resource on the command list (deduplicated) and reuse
+    /// `made_shadow` / `made_placed` without a second global lookup.
+    pub(crate) fn make_at_dynamic(
+        &self,
+        index: u32,
+        view: &View,
+    ) -> (
+        Option<ID3D12Resource>,
+        Option<std::sync::Arc<crate::shadow::Shadow>>,
+        Option<View>,
+    ) {
+        let (kept, shadow, placed) = make_detailed(view, self.cpu(index));
+        if kept.is_none() {
+            null_for(view, self.cpu(index));
+        }
+        (kept.flatten(), shadow, placed)
+    }
+
+    pub(crate) fn make_null_dynamic(&self, index: u32) {
+        if self.sampler {
+            self.null_sampler(index);
+        } else {
+            null_view(self.cpu(index));
+        }
+    }
+
+    pub(crate) fn constant_at_dynamic(&self, index: u32, gpu: u64, size: u32) {
+        let Some(host) = host() else { return };
+        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: gpu,
+            SizeInBytes: size.next_multiple_of(256),
+        };
+        // SAFETY: dynamic slot owned by the caller's command list; backing buffer is kept on the list.
+        unsafe {
+            host.device
+                .CreateConstantBufferView(Some(&desc), self.cpu(index))
+        };
+    }
+
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
             self.null_sampler(index);
@@ -2772,7 +2813,7 @@ pub(crate) fn buffer_copy(
     buffer_copy_with_hint(view, None)
 }
 
-fn buffer_copy_with_hint(
+pub(crate) fn buffer_copy_with_hint(
     view: &View,
     hint: Option<std::sync::Arc<crate::shadow::Shadow>>,
 ) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
@@ -2780,14 +2821,14 @@ fn buffer_copy_with_hint(
     if len == 0 {
         return None;
     }
+    if let Some(shadow) = hint {
+        return Some((shadow, address, len));
+    }
     if view_extent()
         && let Some((base, width)) = buffer_extent(view)
         && address >= base
         && address - base < width.max(1)
     {
-        if let Some(shadow) = hint {
-            return Some((shadow, address, len));
-        }
         if let Some(shadow) = crate::shadow::find(base, width) {
             return Some((shadow, address, len));
         }

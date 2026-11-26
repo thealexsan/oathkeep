@@ -873,6 +873,8 @@ pub(crate) struct HostList {
     prelude_scratch_pool: Mutex<GpuScratchPool>,
     shadow_writes: Mutex<ShadowWrites>,
     bindless_write_seq: std::sync::atomic::AtomicU64,
+    copy_seq: std::sync::atomic::AtomicU64,
+    reset_gen: std::sync::atomic::AtomicU64,
     uav_dirty: std::sync::atomic::AtomicBool,
     indirect_uav_dirty: std::sync::atomic::AtomicBool,
     indirect_epoch: std::sync::atomic::AtomicU64,
@@ -2507,15 +2509,20 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 fn stale_under_flights(runs: &[&HostList]) -> bool {
     use std::sync::Arc;
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+    let mut index: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
             {
                 let range = (*address, *address + *len);
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => s.1.push(range),
-                    None => spans.push((shadow.clone(), vec![range])),
+                let key = Arc::as_ptr(shadow) as usize;
+                match index.get(&key) {
+                    Some(&at) => spans[at].1.push(range),
+                    None => {
+                        index.insert(key, spans.len());
+                        spans.push((shadow.clone(), vec![range]));
+                    }
                 }
             }
         }
@@ -3619,6 +3626,8 @@ impl Host {
                 prelude_scratch_pool: Mutex::default(),
                 shadow_writes: Mutex::default(),
                 bindless_write_seq: std::sync::atomic::AtomicU64::new(0),
+                copy_seq: std::sync::atomic::AtomicU64::new(0),
+                reset_gen: std::sync::atomic::AtomicU64::new(1),
                 uav_dirty: std::sync::atomic::AtomicBool::new(true),
                 indirect_uav_dirty: std::sync::atomic::AtomicBool::new(true),
                 indirect_epoch: std::sync::atomic::AtomicU64::new(1),
@@ -6703,6 +6712,14 @@ impl HostList {
         self.bindless_write_seq.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn copy_seq(&self) -> u64 {
+        self.copy_seq.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reset_gen(&self) -> u64 {
+        self.reset_gen.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn indirect_epoch(&self) -> u64 {
         self.indirect_epoch.load(Ordering::Relaxed)
     }
@@ -6908,6 +6925,8 @@ impl HostList {
             writes.pending.clear();
         }
         self.bindless_write_seq.store(0, Ordering::Relaxed);
+        self.copy_seq.store(0, Ordering::Relaxed);
+        self.reset_gen.fetch_add(1, Ordering::Relaxed);
         let old_deferred = std::mem::take(&mut *self.deferred());
         let old_states =
             std::mem::take(&mut *self.states.lock().unwrap_or_else(|e| e.into_inner()));
@@ -7143,14 +7162,8 @@ impl HostList {
     fn prelude(&self, host: &Host) -> Option<(ID3D12CommandList, PooledPrelude)> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
-        let prelude_copies = {
-            let deferred = self.deferred();
-            if deferred.prelude_gpu_copies.is_empty() {
-                Vec::new()
-            } else {
-                deferred.prelude_gpu_copies.clone()
-            }
-        };
+        let deferred = self.deferred();
+        let prelude_copies = &deferred.prelude_gpu_copies;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let mut syncs = Vec::new();
@@ -7237,12 +7250,35 @@ impl HostList {
                         },
                     }]);
                     let mut dsts: Vec<&ID3D12Resource> = Vec::new();
-                    for (src, src_off, dst, dst_off, len) in &prelude_copies {
-                        list.CopyBufferRegion(dst, *dst_off, src, *src_off, *len);
-                        let raw = dst.as_raw();
-                        if !dsts.iter().any(|d| d.as_raw() == raw) {
+                    let mut i = 0;
+                    while i < prelude_copies.len() {
+                        let (src, src_off, dst, dst_off, len_ref) = &prelude_copies[i];
+                        let mut len = *len_ref;
+                        let src_raw = src.as_raw();
+                        let dst_raw = dst.as_raw();
+                        let mut cur_src_end = *src_off + len;
+                        let mut cur_dst_end = *dst_off + len;
+                        let mut j = i + 1;
+                        while j < prelude_copies.len() {
+                            let (nsrc, nsrc_off, ndst, ndst_off, nlen) = &prelude_copies[j];
+                            if nsrc.as_raw() == src_raw
+                                && ndst.as_raw() == dst_raw
+                                && *nsrc_off == cur_src_end
+                                && *ndst_off == cur_dst_end
+                            {
+                                len += *nlen;
+                                cur_src_end += *nlen;
+                                cur_dst_end += *nlen;
+                                j += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        list.CopyBufferRegion(dst, *dst_off, src, *src_off, len);
+                        if !dsts.iter().any(|d| d.as_raw() == dst_raw) {
                             dsts.push(dst);
                         }
+                        i = j;
                     }
                     for dst in dsts {
                         barriers.push(transition(
@@ -7345,6 +7381,7 @@ impl HostList {
     }
 
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        self.copy_seq.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         let end = (dst as usize).saturating_add(len);
@@ -7593,6 +7630,7 @@ impl HostList {
     }
 
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
+        self.copy_seq.fetch_add(1, Ordering::Relaxed);
         self.deferred().copies.push(Step::Run(Box::new(work)));
         self.deferred().refreshed.clear();
     }
@@ -8196,7 +8234,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 
 fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
     let mut offset = 0;
     while offset < len {
@@ -8214,13 +8252,31 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             read_pieces(at, to, remaining);
             break;
         }
-        if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
+        if info.State != MEM_COMMIT
+            || info.Protect == 0
+            || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0
+        {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !read(at, to, n) {
-            read_pieces(at, to, n);
+        } else {
+            let mut sub = 0;
+            while sub < n {
+                let done = read_partial(at.wrapping_add(sub), to.wrapping_add(sub), n - sub);
+                sub += done;
+                if sub < n {
+                    // Faulted mid-committed region (e.g. sparse MEM_MAPPED / IN_PAGE_ERROR):
+                    // zero only the faulting 4 KiB page and continue with read_partial.
+                    let cur = (at as usize).wrapping_add(sub);
+                    let page_rem = (4096 - (cur & 4095)).min(n - sub);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::Unmapped, page_rem as u64);
+                    // SAFETY: inside the writable host destination.
+                    unsafe { to.wrapping_add(sub).write_bytes(0, page_rem) };
+                    sub += page_rem;
+                }
+            }
         }
         offset += n;
     }

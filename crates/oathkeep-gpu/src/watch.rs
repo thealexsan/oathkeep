@@ -936,6 +936,58 @@ pub(crate) fn guarded_single_shard_epoch_matches(shard: usize, epoch: u64, since
         && SHARD_GUARDED_ASKED[shard].load(Acquire) <= since
 }
 
+/// Splits `[start, end)` into contiguous subranges that are NOT known to be uncommitted
+/// (`on_present`) vs. subranges whose 64 KiB blocks are recorded in `g.absent` (`on_absent`).
+/// Only active when HLE demand-commit hooks (`COMMIT_TITLE_MEMORY`) are installed so `g.absent`
+/// is guaranteed exact; otherwise invokes `on_present(start, end)` directly.
+pub(crate) fn split_absent_spans(
+    start: usize,
+    end: usize,
+    mut on_present: impl FnMut(usize, usize),
+    mut on_absent: impl FnMut(usize, usize),
+) {
+    if start >= end {
+        return;
+    }
+    if COMMIT_TITLE_MEMORY.get().is_none() {
+        on_present(start, end);
+        return;
+    }
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let mut absent_blocks: Vec<(usize, usize)> = Vec::new();
+    for_each_shard_span(first, last, |shard, a, b| {
+        let g = guards_read_shard(shard);
+        if !g.absent.overlaps(a, b) {
+            return;
+        }
+        g.absent.for_each_overlap(a, b, |oa, ob| {
+            match absent_blocks.last_mut() {
+                Some(prev) if prev.1 == oa => prev.1 = ob,
+                _ => absent_blocks.push((oa, ob)),
+            }
+        });
+    });
+    if absent_blocks.is_empty() {
+        on_present(start, end);
+        return;
+    }
+    let mut cur = start;
+    for (ab_a, ab_b) in absent_blocks {
+        let lo = ab_a.saturating_mul(BLOCK).max(start);
+        let hi = ab_b.saturating_mul(BLOCK).min(end);
+        if lo > cur {
+            on_present(cur, lo);
+        }
+        if hi > lo {
+            on_absent(lo, hi);
+        }
+        cur = cur.max(hi);
+    }
+    if cur < end {
+        on_present(cur, end);
+    }
+}
+
 #[inline]
 fn guards_read_shard(shard: usize) -> std::sync::RwLockReadGuard<'static, Guards> {
     GUARDS[shard].read().unwrap_or_else(|e| e.into_inner())
@@ -1032,13 +1084,22 @@ fn guard_with_hot_fast(
             if g.accounted.contains_range(a, b) && (!probe_absent || !g.absent.overlaps(a, b)) {
                 known = true;
                 let has_partly = g.partly.overlaps(a, b);
-                if g.hot.is_empty() && !has_partly {
-                    clean_ok = false;
+                let has_hot = !g.hot.is_empty() && g.hot.range(a..b).next().is_some();
+                if !has_hot && !has_partly {
+                    if !probe_absent && clean_ok {
+                        // When HLE demand-commit hooks are installed, every commit to an
+                        // `absent` block bumps `SHARD_CLEAN_EPOCH[shard]`, so a span that is
+                        // purely `clean ∪ absent` is valid for lock-free clean-epoch caching.
+                        clean_epochs[slot] =
+                            SHARD_CLEAN_EPOCH[shard].load(std::sync::atomic::Ordering::Acquire);
+                    } else {
+                        clean_ok = false;
+                    }
                     return;
                 }
                 let start_len = fast_hot_pairs.len();
                 let mut all_active = true;
-                if !g.hot.is_empty() {
+                if has_hot {
                     for (&block, &until) in g.hot.range(a..b) {
                         if until > frame {
                             fast_hot_pairs.push((block, HOT_WRITE));
@@ -1294,6 +1355,17 @@ fn guard_with_hot_fast(
         hot_pages.sort_unstable();
     }
     if !protected_runs.is_empty() {
+        if protected_runs.len() > 1 {
+            protected_runs.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(protected_runs.len());
+            for (pa, pb) in protected_runs {
+                match merged.last_mut() {
+                    Some(last) if pa <= last.1 => last.1 = last.1.max(pb),
+                    _ => merged.push((pa, pb)),
+                }
+            }
+            protected_runs = merged;
+        }
         #[cfg(feature = "diagnostics")]
         let t_alias = std::time::Instant::now();
         let reused = if let Some((seq, ref covered, all_blocks, other_runs, total_count)) =
