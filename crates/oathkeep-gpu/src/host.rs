@@ -465,10 +465,42 @@ fn sweep() {
             .compare_exchange(last_idle, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     {
-        crate::pipeline::trim_library();
-        crate::shadow::let_go_idle();
-        crate::texture::let_go_idle();
-        crate::resource::let_go_idle();
+        spawn_idle_sweep();
+    }
+}
+
+fn run_idle_sweep() {
+    crate::pipeline::trim_library();
+    crate::shadow::let_go_idle();
+    crate::texture::let_go_idle();
+    crate::resource::let_go_idle();
+}
+
+/// Runs idle cache/resource trimming on a persistent background thread so the
+/// submitting thread never stalls for tens of milliseconds on `sweep()`.
+fn spawn_idle_sweep() {
+    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static TX: OnceLock<std::sync::mpsc::SyncSender<()>> = OnceLock::new();
+    if upcheck::on() {
+        run_idle_sweep();
+        return;
+    }
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let _ = std::thread::Builder::new().name("oathkeep-sweep".into()).spawn(move || {
+            while rx.recv().is_ok() {
+                run_idle_sweep();
+                BUSY.store(false, Ordering::Release);
+            }
+        });
+        tx
+    });
+    if BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+        && tx.try_send(()).is_err()
+    {
+        BUSY.store(false, Ordering::Release);
     }
 }
 
@@ -8213,22 +8245,39 @@ fn wide_textures() -> bool {
 }
 
 impl Batch {
+    fn mark_ahead(&mut self, key: usize, from: usize, to: usize) {
+        self.ahead
+            .entry(key)
+            .and_modify(|span| {
+                span.0 = span.0.min(from);
+                span.1 = span.1.max(to);
+            })
+            .or_insert((from, to));
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
             return;
         }
-        match self.index.get(&key) {
-            Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
+        if let Some(&at) = self.index.get(&key) {
+            let r = &mut self.refreshes[at];
+            if r.1 <= address && end <= r.2 {
+                return;
             }
-            None => {
-                self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+            if crate::watch::light() && shadow.nothing_new(address, len) {
+                return;
             }
+            (r.1, r.2) = (r.1.min(address), r.2.max(end));
+            return;
         }
+        if crate::watch::light() && shadow.nothing_new(address, len) {
+            self.mark_ahead(key, address, end);
+            return;
+        }
+        self.index.insert(key, self.refreshes.len());
+        self.refreshes.push((shadow.clone(), address, end));
     }
 
     /// Before shaders are given a range of `shadow`'s copy: its pending
@@ -8481,18 +8530,17 @@ impl Batch {
     }
 
     fn flush_all(&mut self) {
-        // Most of a flush's copies are as they were: filter them out BEFORE
-        // `ask_ahead` and worker dispatch, using chunked parallel checks when
-        // the batch is large.
         let light = crate::watch::light();
-        if light {
-            let started = std::time::Instant::now();
-            let _skipped = filter_active_refreshes(&mut self.refreshes);
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add(_skipped as u64, Ordering::Relaxed);
-            if self.refreshes.is_empty() {
-                return;
+        if !self.front {
+            for (shadow, from, to) in &self.refreshes {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                self.ahead
+                    .entry(key)
+                    .and_modify(|span| {
+                        span.0 = span.0.min(*from);
+                        span.1 = span.1.max(*to);
+                    })
+                    .or_insert((*from, *to));
             }
         }
         // One write-watch asking for the copies that lie close together,

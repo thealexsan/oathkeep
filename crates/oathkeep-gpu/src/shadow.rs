@@ -53,6 +53,8 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Fast lock-free mirror of `!self.pending.is_empty()`.
+    has_pending: std::sync::atomic::AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -202,7 +204,7 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     if budget_mb < SIX_GIB_MB {
         (16, 512)
     } else if budget_mb <= TWELVE_GIB_MB {
-        (1, 512)
+        (1, 640)
     } else if budget_mb < TWENTY_GIB_MB {
         (1, 2048)
     } else {
@@ -211,10 +213,10 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
 }
 
 /// Effective `CARD_BYTES[0]` ceiling for a candidate allocation of `size` bytes
-/// within `most`. On `<= 1 GiB` card-buffer caps (such as 512 MiB on 8–12 GB
+/// within `most`. On `<= 1 GiB` card-buffer caps (such as 640 MiB on 8–12 GB
 /// cards), sub-1-MiB buffers (e.g. from `OATHKEEP_CARD_BUFFERS_MIN_KB=64`) may
-/// use only the first half of `most`, and `1..8 MiB` buffers up to `3/4` of
-/// `most`, reserving the top quarter (128 MiB of 512 MiB) for `>= 8 MiB`
+/// use only the first half of `most`, and `1..8 MiB` buffers up to `7/8` of
+/// `most`, reserving the top eighth (80 MiB of 640 MiB) for `>= 8 MiB`
 /// buffers so hundreds of tiny early buffers do not push 8–50 MiB UAV buffers
 /// onto CPU snapshots.
 fn card_tier_most(size: u64, most: u64, all: bool) -> u64 {
@@ -225,7 +227,7 @@ fn card_tier_most(size: u64, most: u64, all: bool) -> u64 {
     if size < MIB {
         most / 2
     } else if size < 8 * MIB {
-        most / 4 * 3
+        most / 8 * 7
     } else {
         most
     }
@@ -946,11 +948,11 @@ mod card_tests {
     fn card_tier_reserves_top_headroom_for_large_buffers_under_tight_caps() {
         use super::card_tier_most;
         const MIB: u64 = 1 << 20;
-        let cap = 512 * MIB;
-        assert_eq!(card_tier_most(64 << 10, cap, false), 256 * MIB);
-        assert_eq!(card_tier_most(512 << 10, cap, false), 256 * MIB);
-        assert_eq!(card_tier_most(MIB, cap, false), 384 * MIB);
-        assert_eq!(card_tier_most(4 * MIB, cap, false), 384 * MIB);
+        let cap = 640 * MIB;
+        assert_eq!(card_tier_most(64 << 10, cap, false), 320 * MIB);
+        assert_eq!(card_tier_most(512 << 10, cap, false), 320 * MIB);
+        assert_eq!(card_tier_most(MIB, cap, false), 560 * MIB);
+        assert_eq!(card_tier_most(4 * MIB, cap, false), 560 * MIB);
         assert_eq!(card_tier_most(8 * MIB, cap, false), cap);
         assert_eq!(card_tier_most(24 * MIB, cap, false), cap);
         // `card_all` or >1 GiB caps use the full limit.
@@ -3459,6 +3461,7 @@ impl Shadow {
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            has_pending: std::sync::atomic::AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3538,6 +3541,7 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.has_pending.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3546,6 +3550,7 @@ impl Shadow {
         let initial = self.inside(address, len);
         if initial.0 >= initial.1 {
             pending.push(range);
+            self.has_pending.store(true, Ordering::Release);
             return;
         }
         let mut parts = Vec::with_capacity(4);
@@ -3575,6 +3580,7 @@ impl Shadow {
             }
         }
         pending.push(range);
+        self.has_pending.store(true, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         if taken == 0 {
             return;
@@ -3866,7 +3872,9 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
-        if !pending.is_empty() || self.card.is_some() {
+        let non_empty = !pending.is_empty();
+        self.has_pending.store(non_empty, Ordering::Release);
+        if non_empty || self.card.is_some() {
             return;
         }
         if keeps() {
@@ -3923,13 +3931,15 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.has_pending.load(Ordering::Acquire)
+            && !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        self.has_pending.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -4186,14 +4196,17 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        let mut busy: Vec<(usize, usize)> = if self.has_pending.load(Ordering::Acquire) {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect()
+        } else {
+            Vec::new()
+        };
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -4230,7 +4243,9 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        if self.has_pending.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -5199,6 +5214,7 @@ mod land_tests {
             return; // no host GPU
         };
         shadow.pending.lock().unwrap().push((title, title + LEN));
+        shadow.has_pending.store(true, Ordering::Release);
         // SAFETY: committed, aligned; touched as atomics or by the landing's
         // stores of whole dwords.
         let dword = |i: usize| unsafe { &*((title + i * 4) as *const AtomicU32) };
@@ -5564,9 +5580,10 @@ fn window() -> u64 {
 }
 
 /// Default sized-window grid in bytes when `OATHKEEP_WINDOW_KB` is unset or
-/// invalid: 512 KiB on `<= 32 GiB` hosts, 1 MiB otherwise.
-fn default_grid(limited_host_ram: bool) -> u64 {
-    if limited_host_ram { 512 << 10 } else { 1 << 20 }
+/// invalid: 2 MiB (`2048 KiB`) across host RAM tiers so sized window count
+/// stays ~4x lower than 512 KiB while unsized asks keep `tails()` + VAD clamping.
+fn default_grid(_limited_host_ram: bool) -> u64 {
+    2 << 20
 }
 
 /// The window grid in bytes for a setting in KiB: a power of two from
@@ -6440,13 +6457,13 @@ mod window_tests {
         const MIB: u64 = 1 << 20;
 
         // Unknown (WARP / query failure) and < 6 GiB keep the 16 MiB floor;
-        // 6..=12 GiB (8–12 GB cards) use 1 MiB min while strictly keeping the 512 MiB cap.
+        // 6..=12 GiB (8–12 GB cards) use 1 MiB min and 640 MiB cap.
         assert_eq!(default_card_limits_mb(None), (16, 512));
         assert_eq!(default_card_limits_mb(Some(4 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(7 * GIB)), (1, 512));
-        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (1, 512));
-        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (1, 512));
-        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (1, 512));
+        assert_eq!(default_card_limits_mb(Some(7 * GIB)), (1, 640));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (1, 640));
+        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (1, 640));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (1, 640));
 
         // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
         assert_eq!(default_card_limits_mb(Some(13 * GIB)), (1, 2048));
@@ -6537,22 +6554,21 @@ mod window_tests {
     }
 
     /// The setting takes powers of two from 64 KiB to 4 MiB; anything else
-    /// falls back to the host RAM tier default (512 KiB on `<= 32 GiB`, 1 MiB
-    /// on larger hosts).
+    /// falls back to the 2 MiB (`2048 KiB`) default grid.
     #[test]
     fn the_grid_is_a_power_of_two_or_the_default() {
         use super::{grid_for, longest_tail_to, superseded_window_flags, tail_bounds};
-        assert_eq!(grid(None), 512 << 10);
-        assert_eq!(grid_for(None, true), 512 << 10);
-        assert_eq!(grid_for(None, false), 1 << 20);
+        assert_eq!(grid(None), 2 << 20);
+        assert_eq!(grid_for(None, true), 2 << 20);
+        assert_eq!(grid_for(None, false), 2 << 20);
         assert_eq!(grid_for(Some(4096), true), WINDOW);
         assert_eq!(grid_for(Some(1024), true), 1 << 20);
         assert_eq!(grid_for(Some(512), false), 512 << 10);
         assert_eq!(grid_for(Some(256), true), 256 << 10);
         assert_eq!(grid_for(Some(64), true), 64 << 10);
         for bad in [0, 32, 100, 1000, 8192] {
-            assert_eq!(grid_for(Some(bad), true), 512 << 10, "{bad}");
-            assert_eq!(grid_for(Some(bad), false), 1 << 20, "{bad}");
+            assert_eq!(grid_for(Some(bad), true), 2 << 20, "{bad}");
+            assert_eq!(grid_for(Some(bad), false), 2 << 20, "{bad}");
         }
 
         // Private VAD bounds clamp tail start/end to 64 KiB pages within the
