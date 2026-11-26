@@ -2337,48 +2337,53 @@ fn workers() -> &'static Workers {
 }
 
 fn wide(jobs: Vec<Job>) {
-    if jobs.len() < 2 {
-        for job in jobs {
-            job();
-        }
-        return;
-    }
-    let workers = workers();
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
-    {
-        let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        for job in jobs {
-            let left = left.clone();
-            queue.push_back(Box::new(move || {
-                job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
-                }
-            }));
-        }
-    }
-    workers.more.notify_all();
-    loop {
-        let job = workers
-            .jobs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop_front();
-        match job {
-            Some(job) => job(),
-            None => break,
-        }
-    }
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
-    }
+    wide_leaf_on(workers(), jobs);
 }
 
 pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
-    wide(jobs);
+    wide_leaf_on(workers(), jobs);
+}
+
+fn relay_workers() -> &'static Workers {
+    static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let workers = WORKERS.get_or_init(|| Workers {
+        jobs: Mutex::new(std::collections::VecDeque::new()),
+        more: std::sync::Condvar::new(),
+    });
+    STARTED.call_once(|| {
+        let count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .clamp(2, 4);
+        for i in 0..count {
+            let _ = std::thread::Builder::new()
+                .name(format!("oathkeep-relay-w-{i}"))
+                .spawn(move || {
+                    let workers = relay_workers();
+                    loop {
+                        let job = {
+                            let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if let Some(job) = jobs.pop_front() {
+                                    break job;
+                                }
+                                jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                            }
+                        };
+                        job();
+                    }
+                });
+        }
+    });
+    workers
+}
+
+/// Runs relay background diff/merge/writeback jobs on a dedicated non-stealing pool
+/// isolated from `workers()`, so `Batch::flush`, `record_prelude`, and `take_snapshots`
+/// never queue behind or steal relay background work.
+pub(crate) fn wide_relay_run(jobs: Vec<Job>) {
+    wide_leaf_on(relay_workers(), jobs);
 }
 
 fn heap_workers() -> &'static Workers {
@@ -2618,7 +2623,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         }
         let found = found.clone();
         jobs.push(Box::new(move || {
-            let mut mine: Found = Vec::with_capacity(group.len());
+            let mut mine: Found = Vec::new();
             for (data, before, start, from, to, which, place) in group {
                 let mut pieces = Vec::new();
                 let mut at = from;
@@ -2639,9 +2644,13 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     }
                     at += n;
                 }
-                mine.push((which, place, pieces));
+                if !pieces.is_empty() {
+                    mine.push((which, place, pieces));
+                }
             }
-            found.lock().unwrap_or_else(|e| e.into_inner()).extend(mine);
+            if !mine.is_empty() {
+                found.lock().unwrap_or_else(|e| e.into_inner()).extend(mine);
+            }
         }));
     };
     let count = scans.len();
@@ -2667,12 +2676,14 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         }
     }
     flush(&mut group, &mut jobs);
-    wide(jobs);
+    wide_relay_run(jobs);
     let mut found = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
-    found.sort_unstable_by_key(|f| (f.0, f.1));
     let mut out = vec![Vec::new(); count];
-    for (which, _, pieces) in found {
-        out[which].extend(pieces);
+    if !found.is_empty() {
+        found.sort_unstable_by_key(|f| (f.0, f.1));
+        for (which, _, pieces) in found {
+            out[which].extend(pieces);
+        }
     }
     out
 }
@@ -4423,63 +4434,94 @@ impl Shadow {
             }
             let card = self.card.as_ref().unwrap();
             let mut mark_pages: Vec<usize> = Vec::with_capacity(stale.len());
-            for page in stale {
-                let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
-                if lo >= hi {
-                    continue;
-                }
-                let n = hi - lo;
-                let title = &mut title[..n];
-                let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-                if !crate::host::read_into(lo as *const u8, title) {
-                    continue;
-                }
-                MERGED[0].fetch_add(1, Ordering::Relaxed);
-                let at = lo - start;
-                let p = self.pieces(at, at + n).start;
-                let (p_lo, _) = self.piece(p);
-                let max_runs = (*runs_left).min(16);
-                let diff = {
-                    let mut old = card.old.lock().unwrap_or_else(|e| e.into_inner());
+            let mut clear_spans: Vec<(usize, usize)> = Vec::new();
+            let mut dirty_spans: Vec<(usize, usize)> = Vec::new();
+            let mut masked_pushes: Vec<(usize, Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut total_pages = 0u64;
+            let mut total_runs = 0u64;
+            let mut total_bytes = 0u64;
+            {
+                let _before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                let mut old = card.old.lock().unwrap_or_else(|e| e.into_inner());
+                for page in stale {
+                    let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                    if lo >= hi {
+                        continue;
+                    }
+                    let n = hi - lo;
+                    let title = &mut title[..n];
+                    if !crate::host::read_into(lo as *const u8, title) {
+                        continue;
+                    }
+                    total_pages += 1;
+                    let at = lo - start;
+                    let p = self.pieces(at, at + n).start;
+                    let (p_lo, _) = self.piece(p);
+                    let max_runs = (*runs_left).min(16);
                     let Some(piece_buf) = old.get_mut(&p) else {
                         #[cfg(feature = "diagnostics")]
                         Self::log_why_stale("no_card_old", self, p, lo, hi);
                         return true;
                     };
                     let held = &mut piece_buf[at - p_lo..at - p_lo + n];
-                    diff_runs_or_masked(at, card.size as usize, title, held, max_runs)
-                };
-                match diff {
-                    MergeDiff::Empty => {}
-                    MergeDiff::Runs(runs) => {
-                        *runs_left = runs_left.saturating_sub(runs.len());
-                        for (r, m) in runs {
-                            MERGED[1].fetch_add(1, Ordering::Relaxed);
-                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
-                            let (c_from, c_to) = (at + r, at + r + m);
-                            card.clear_hot_hashes(c_from, c_to);
-                            self.card_changed(c_from, c_to);
+                    let diff = diff_runs_or_masked(at, card.size as usize, title, held, max_runs);
+                    match diff {
+                        MergeDiff::Empty => {}
+                        MergeDiff::Runs(runs) => {
+                            *runs_left = runs_left.saturating_sub(runs.len());
+                            for (r, m) in runs {
+                                total_runs += 1;
+                                total_bytes += m as u64;
+                                let (c_from, c_to) = (at + r, at + r + m);
+                                clear_spans.push((c_from, c_to));
+                                dirty_spans.push((c_from, c_to));
+                            }
+                        }
+                        MergeDiff::Masked {
+                            offset,
+                            data,
+                            mask,
+                            changed_runs,
+                            changed_bytes,
+                            first_off,
+                            last_end,
+                        } => {
+                            total_runs += changed_runs as u64;
+                            total_bytes += changed_bytes as u64;
+                            clear_spans.push((first_off, last_end));
+                            masked_pushes.push((offset, data, mask));
                         }
                     }
-                    MergeDiff::Masked {
-                        offset,
-                        data,
-                        mask,
-                        changed_runs,
-                        changed_bytes,
-                        first_off,
-                        last_end,
-                    } => {
-                        MERGED[1].fetch_add(changed_runs as u64, Ordering::Relaxed);
-                        MERGED[2].fetch_add(changed_bytes as u64, Ordering::Relaxed);
-                        card.clear_hot_hashes(first_off, last_end);
-                        self.card_masked_push(offset, data, mask);
+                    if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                        mark_pages.push(page);
                     }
                 }
-                drop(before);
-                if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
-                    mark_pages.push(page);
+            }
+            if total_pages > 0 {
+                MERGED[0].fetch_add(total_pages, Ordering::Relaxed);
+            }
+            if total_runs > 0 {
+                MERGED[1].fetch_add(total_runs, Ordering::Relaxed);
+                MERGED[2].fetch_add(total_bytes, Ordering::Relaxed);
+            }
+            if !clear_spans.is_empty() && card.has_hot_hashes.load(Ordering::Acquire) {
+                for (ca, cb) in coalesce_hash_spans(&clear_spans) {
+                    card.clear_hot_hashes(ca, cb);
                 }
+            }
+            if !dirty_spans.is_empty() {
+                let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+                for (c_from, c_to) in dirty_spans {
+                    match dirty.last_mut() {
+                        Some(last) if c_from <= last.1 && c_to >= last.0 => {
+                            *last = (last.0.min(c_from), last.1.max(c_to))
+                        }
+                        _ => dirty.push((c_from, c_to)),
+                    }
+                }
+            }
+            for (offset, data, mask) in masked_pushes {
+                self.card_masked_push(offset, data, mask);
             }
             if !mark_pages.is_empty() {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -5944,7 +5986,7 @@ impl Shadow {
                     *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
                 }));
             }
-            wide_run(jobs);
+            wide_relay_run(jobs);
             results
                 .into_iter()
                 .filter_map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).take())
@@ -6060,7 +6102,7 @@ impl Shadow {
                     }) as Box<dyn FnOnce() + Send>
                 })
                 .collect();
-            wide_run(jobs);
+            wide_relay_run(jobs);
         } else {
             for bucket in &buckets {
                 for w in &bucket.writes {
@@ -7022,30 +7064,6 @@ fn bump_shadow_epochs(start: u64, len: u64) {
     for i in 0..count {
         SHADOW_EPOCHS[(b0 + i) & (SHADOW_EPOCH_BUCKETS - 1)].fetch_add(1, Ordering::Release);
     }
-}
-
-#[inline]
-pub(crate) fn snapshot_epochs() -> [u64; SHADOW_EPOCH_BUCKETS] {
-    std::array::from_fn(|b| SHADOW_EPOCHS[b].load(Ordering::Acquire))
-}
-
-#[inline]
-pub(crate) fn epoch_for_range_from(
-    snap: &[u64; SHADOW_EPOCH_BUCKETS],
-    start: u64,
-    len: u64,
-) -> u64 {
-    let b0 = (start >> 20) as usize;
-    let b1 = (start.saturating_add(len.max(1) - 1) >> 20) as usize;
-    if b0 == b1 {
-        return snap[b0 & (SHADOW_EPOCH_BUCKETS - 1)];
-    }
-    let count = (b1 - b0 + 1).min(SHADOW_EPOCH_BUCKETS);
-    let mut sum = 0u64;
-    for i in 0..count {
-        sum = sum.wrapping_add(snap[(b0 + i) & (SHADOW_EPOCH_BUCKETS - 1)]);
-    }
-    sum
 }
 
 #[inline]

@@ -3321,7 +3321,7 @@ fn relay_hand_back(back: &[Declared]) {
                 }) as Box<dyn FnOnce() + Send>
             })
             .collect();
-        crate::shadow::wide_run(jobs);
+        crate::shadow::wide_relay_run(jobs);
         for (dst, src) in written_per_work.iter_mut().zip(counts.iter()) {
             *dst = src.load(Ordering::Relaxed);
         }
@@ -4877,7 +4877,7 @@ impl Host {
                     }) as Box<dyn FnOnce() + Send>
                 })
                 .collect();
-            crate::shadow::wide_run(jobs);
+            crate::shadow::wide_relay_run(jobs);
             total_written += written_atomic.load(Ordering::Relaxed);
         } else {
             for (shadow, items, fetched) in small {

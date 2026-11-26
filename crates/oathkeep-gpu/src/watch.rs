@@ -1726,11 +1726,18 @@ fn apply_alias_protection_sharded(
         }
         all_other_runs = merged;
     }
+    let skip_absent = COMMIT_TITLE_MEMORY.get().is_some();
     for (a, b) in all_other_runs {
         for_each_shard_span(a, b, |shard, sa, sb| {
             let already_protected = {
                 let g = guards_read_shard(shard);
                 g.protected.contains_range(sa, sb)
+                    || (skip_absent
+                        && g.absent.overlaps(sa, sb)
+                        && g.protected
+                            .gaps_in(sa, sb)
+                            .into_iter()
+                            .all(|(ga, gb)| g.absent.contains_range(ga, gb)))
             };
             if !already_protected {
                 let mut g = guards_write_shard(shard);
@@ -1753,33 +1760,42 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] =
 
 fn protect_alias_range(g: &mut Guards, from: usize, to: usize) {
     let frame = crate::frame::current();
+    let skip_absent = COMMIT_TITLE_MEMORY.get().is_some();
     for (a, b) in g.protected.gaps_in(from, to) {
-        let has_hot = g
-            .hot
-            .range(a..b)
-            .any(|(_, &until)| until > frame);
-        if has_hot {
-            let mut run_start = a;
-            for block in a..b {
-                if g.hot.get(&block).is_some_and(|&until| until > frame) {
-                    if run_start < block {
-                        protect_alias_span(g, run_start, block);
+        let sub_ranges = if skip_absent && g.absent.overlaps(a, b) {
+            g.absent.gaps_in(a, b)
+        } else {
+            vec![(a, b)]
+        };
+        for (sa, sb) in sub_ranges {
+            let has_hot = g
+                .hot
+                .range(sa..sb)
+                .any(|(_, &until)| until > frame);
+            if has_hot {
+                let mut run_start = sa;
+                for block in sa..sb {
+                    if g.hot.get(&block).is_some_and(|&until| until > frame) {
+                        if run_start < block {
+                            protect_alias_span(g, run_start, block);
+                        }
+                        run_start = block + 1;
                     }
-                    run_start = block + 1;
                 }
+                if run_start < sb {
+                    protect_alias_span(g, run_start, sb);
+                }
+                continue;
             }
-            if run_start < b {
-                protect_alias_span(g, run_start, b);
-            }
-            continue;
+            protect_alias_span(g, sa, sb);
         }
-        protect_alias_span(g, a, b);
     }
 }
 
 fn protect_alias_span(g: &mut Guards, a: usize, b: usize) {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect, VirtualQuery,
+        MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY,
+        VirtualProtect, VirtualQuery,
     };
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
@@ -1810,7 +1826,15 @@ fn protect_alias_span(g: &mut Guards, a: usize, b: usize) {
             continue;
         }
         let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
-        let next = (region_end / BLOCK).max(block + 1).min(b);
+        let raw_end = (region_end / BLOCK).min(b);
+        let next = raw_end.max(block + 1);
+        if matches!(info.State, MEM_RESERVE | MEM_FREE) {
+            if raw_end > block {
+                g.absent.insert_range(block, raw_end);
+            }
+            block = next;
+            continue;
+        }
         if info.State == MEM_COMMIT {
             // SAFETY: committed contiguous region within `[block, next)`.
             if unsafe {
@@ -2232,29 +2256,51 @@ pub fn title_memory_committed(at: usize, len: usize) {
     }
     record_written_range(at, at.saturating_add(len));
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    for_each_shard_span(first, last, |shard, a, b| {
-        {
-            let g = guards_read_shard(shard);
-            if !g.absent.overlaps(a, b) && !g.partly.overlaps(a, b) {
-                return;
+    let clear_absent = |a_first: usize, a_last: usize, mark_alias_dirty: bool| {
+        for_each_shard_span(a_first, a_last, |shard, a, b| {
+            {
+                let g = guards_read_shard(shard);
+                if !g.absent.overlaps(a, b)
+                    && !g.partly.overlaps(a, b)
+                    && (!mark_alias_dirty || !g.protected.overlaps(a, b))
+                {
+                    return;
+                }
             }
-        }
-        let mut g = guards_write_shard(shard);
-        let removed_absent = g.absent.remove_range(a, b);
-        for (ra, rb) in &removed_absent {
-            g.accounted.remove_range(*ra, *rb);
-        }
-        let removed_partly = g.partly.remove_range(a, b);
-        for (ra, rb) in &removed_partly {
-            g.accounted.remove_range(*ra, *rb);
-        }
-        if !removed_absent.is_empty() || !removed_partly.is_empty() {
-            for &(ra, rb) in removed_absent.iter().chain(removed_partly.iter()) {
-                bump_sub_clean_range(ra, rb);
+            let mut g = guards_write_shard(shard);
+            let removed_absent = g.absent.remove_range(a, b);
+            for (ra, rb) in &removed_absent {
+                g.accounted.remove_range(*ra, *rb);
             }
-            bump_shard_clean_epoch(shard);
+            let removed_partly = g.partly.remove_range(a, b);
+            for (ra, rb) in &removed_partly {
+                g.accounted.remove_range(*ra, *rb);
+            }
+            if mark_alias_dirty && (!removed_absent.is_empty() || g.protected.overlaps(a, b)) {
+                g.alias_dirty.insert_range(a, b);
+            }
+            if !removed_absent.is_empty() || !removed_partly.is_empty() {
+                for &(ra, rb) in removed_absent.iter().chain(removed_partly.iter()) {
+                    bump_sub_clean_range(ra, rb);
+                }
+                bump_shard_clean_epoch(shard);
+            }
+        });
+    };
+    clear_absent(first, last, false);
+    if view_guard() {
+        let (_, other_runs, count) = crate::inplace::alias_blocks_between(
+            first.saturating_mul(BLOCK),
+            last.saturating_mul(BLOCK),
+            MANY_VIEWS,
+        );
+        if count > 0 {
+            for (oa, ob) in other_runs {
+                clear_absent(oa, ob, true);
+            }
+            ALIAS_FAULT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
-    });
+    }
 }
 
 fn promote_opened_hot_sharded(opened_spans: &[(usize, usize)]) {

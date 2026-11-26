@@ -334,8 +334,8 @@ impl DynamicMade {
     }
 }
 
-const STAGE_STRIPES: usize = 64;
-const SLOTS_PER_STRIPE: usize = 4096;
+const STAGE_STRIPES: usize = 256;
+const SLOTS_PER_STRIPE: usize = 1024;
 
 struct StageEntry {
     key: u64,
@@ -2619,6 +2619,64 @@ impl HostHeap {
         };
         let is_texture = is_texture_view(&view);
         let view_kind = stage_view_kind(&view);
+        enum PreStageEpoch {
+            Buf(u64),
+            Tex(u8, u64),
+        }
+        let pre_epoch = match &view {
+            View::Shader(resource, _) | View::Unordered(resource, _, _) if is_texture => {
+                let addr = crate::resource::texture_memory(*resource as crate::object::This)
+                    .map_or(0, |(ptr, _)| ptr as u64);
+                let b = tex_epoch_bucket(addr);
+                PreStageEpoch::Tex(
+                    b as u8,
+                    STAGE_TEX_EPOCHS[b].load(std::sync::atomic::Ordering::Acquire),
+                )
+            }
+            View::Placed(..) => {
+                if let Some(resolved) = placed_texture(&view) {
+                    if let View::Shader(resource, _) | View::Unordered(resource, _, _) = &resolved {
+                        let addr =
+                            crate::resource::texture_memory(*resource as crate::object::This)
+                                .map_or(0, |(ptr, _)| ptr as u64);
+                        let b = tex_epoch_bucket(addr);
+                        PreStageEpoch::Tex(
+                            b as u8,
+                            STAGE_TEX_EPOCHS[b].load(std::sync::atomic::Ordering::Acquire),
+                        )
+                    } else {
+                        let b = tex_epoch_bucket(0);
+                        PreStageEpoch::Tex(
+                            b as u8,
+                            STAGE_TEX_EPOCHS[b].load(std::sync::atomic::Ordering::Acquire),
+                        )
+                    }
+                } else if let Some((address, len)) = buffer_range(&view)
+                    && len > 0
+                {
+                    PreStageEpoch::Buf(crate::shadow::epoch_for_range(address, len))
+                } else {
+                    let b = tex_epoch_bucket(0);
+                    PreStageEpoch::Tex(
+                        b as u8,
+                        STAGE_TEX_EPOCHS[b].load(std::sync::atomic::Ordering::Acquire),
+                    )
+                }
+            }
+            _ => {
+                if let Some((address, len)) = buffer_range(&view)
+                    && len > 0
+                {
+                    PreStageEpoch::Buf(crate::shadow::epoch_for_range(address, len))
+                } else {
+                    let b = tex_epoch_bucket(0);
+                    PreStageEpoch::Tex(
+                        b as u8,
+                        STAGE_TEX_EPOCHS[b].load(std::sync::atomic::Ordering::Acquire),
+                    )
+                }
+            }
+        };
         let mut guard = stage.stripes[stripe_idx]
             .write()
             .unwrap_or_else(|e| e.into_inner());
@@ -2657,10 +2715,6 @@ impl HostHeap {
             at
         };
         let slot = (stripe_idx * SLOTS_PER_STRIPE + local) as u32;
-        let pre_shadow_epochs = crate::shadow::snapshot_epochs();
-        let pre_tex_epochs: [u64; STAGE_TEX_BUCKETS] = std::array::from_fn(|b| {
-            STAGE_TEX_EPOCHS[b].load(std::sync::atomic::Ordering::Acquire)
-        });
         let (kept, made_shadow, made_placed) = make_detailed(&view, stage.cpu(slot));
         let Some(kept_res) = kept else {
             drop(guard);
@@ -2686,7 +2740,10 @@ impl HostHeap {
         let (action, is_buffer, tex_bucket, epoch) = if let Some((shadow, address, len)) =
             buffer_copy_with_hint(resolved, made_shadow)
         {
-            let ep = crate::shadow::epoch_for_range_from(&pre_shadow_epochs, address, len);
+            let ep = match pre_epoch {
+                PreStageEpoch::Buf(ep) => ep,
+                PreStageEpoch::Tex(..) => 0,
+            };
             (
                 StageAction::Buffer {
                     shadow,
@@ -2698,20 +2755,28 @@ impl HostHeap {
                 ep,
             )
         } else if let View::Shader(resource, _) | View::Unordered(resource, _, _) = resolved {
-            let addr = crate::resource::texture_memory(*resource as crate::object::This)
-                .map_or(0, |(ptr, _)| ptr as u64);
-            let b = tex_epoch_bucket(addr);
+            let (b, ep) = match pre_epoch {
+                PreStageEpoch::Tex(b, ep) => (b, ep),
+                PreStageEpoch::Buf(_) => {
+                    let addr = crate::resource::texture_memory(*resource as crate::object::This)
+                        .map_or(0, |(ptr, _)| ptr as u64);
+                    (tex_epoch_bucket(addr) as u8, 0)
+                }
+            };
             (
                 StageAction::Texture {
                     resource: *resource,
                 },
                 false,
-                b as u8,
-                pre_tex_epochs[b],
+                b,
+                ep,
             )
         } else {
-            let b = tex_epoch_bucket(0);
-            (StageAction::None, false, b as u8, pre_tex_epochs[b])
+            let (b, ep) = match pre_epoch {
+                PreStageEpoch::Tex(b, ep) => (b, ep),
+                PreStageEpoch::Buf(_) => (tex_epoch_bucket(0) as u8, 0),
+            };
+            (StageAction::None, false, b, ep)
         };
         if let Some(old) = guard.entries[local].take()
             && old.key != key
