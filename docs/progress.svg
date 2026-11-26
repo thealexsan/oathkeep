@@ -1,201 +1,738 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="412" viewBox="0 0 880 412" role="img" aria-label="Oathkeep Compatibility and Performance Progress">
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="1015" viewBox="0 0 1120 1015" role="img" aria-label="Oathkeep Codebase Coverage Dashboard">
   <defs>
-    <style>text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; } .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }</style>
+    <style>text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; } .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; } .lbl { fill: #f0f3f6; font-size: 11px; font-weight: 500; paint-order: stroke; stroke: #0d0f12; stroke-width: 2.5px; stroke-linejoin: round; }</style>
   </defs>
-  <rect x="0.5" y="0.5" width="879" height="411" rx="8" fill="#0d1117" stroke="#30363d"/>
-  <text x="24" y="32" fill="#f0f6fc" font-size="16" font-weight="600">Oathkeep Progress Matrix</text>
-  <text x="24" y="52" fill="#8b949e" font-size="12">Clean-room Xbox Series X|S (GDK) compatibility &amp; RDNA 2-to-DXIL layer</text>
-  <text x="856" y="32" text-anchor="end" fill="#39d353" font-size="16" font-weight="700" class="mono">95%</text>
-  <text x="856" y="52" text-anchor="end" fill="#8b949e" font-size="11" class="mono">main (main) • 2026-11-26</text>
-  <line x1="24" y1="66" x2="856" y2="66" stroke="#21262d"/>
-  <text x="24" y="80" fill="#c9d1d9" font-size="11" font-weight="600">SUBSYSTEM CAPABILITY MATRIX</text>
-  <text x="24" y="106" fill="#c9d1d9" font-size="12">PE32+ Loader &amp; CPU</text>
-  <rect x="200" y="96" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="217" y="96" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="234" y="96" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="251" y="96" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="268" y="96" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="285" y="96" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="302" y="96" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="319" y="96" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="336" y="96" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="353" y="96" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <text x="382" y="106" fill="#8b949e" font-size="11" class="mono"> 98%</text>
-  <text x="24" y="128" fill="#c9d1d9" font-size="12">Win32 / GDK HLE</text>
-  <rect x="200" y="118" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="217" y="118" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="234" y="118" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="251" y="118" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="268" y="118" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="285" y="118" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="302" y="118" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="319" y="118" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="336" y="118" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="353" y="118" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <text x="382" y="128" fill="#8b949e" font-size="11" class="mono"> 93%</text>
-  <text x="24" y="150" fill="#c9d1d9" font-size="12">DirectStorage &amp; VFS</text>
-  <rect x="200" y="140" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="217" y="140" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="234" y="140" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="251" y="140" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="268" y="140" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="285" y="140" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="302" y="140" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="319" y="140" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="336" y="140" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="353" y="140" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <text x="382" y="150" fill="#8b949e" font-size="11" class="mono"> 95%</text>
-  <text x="24" y="172" fill="#c9d1d9" font-size="12">Audio (XMA / Opus)</text>
-  <rect x="200" y="162" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="217" y="162" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="234" y="162" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="251" y="162" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="268" y="162" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="285" y="162" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="302" y="162" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="319" y="162" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="336" y="162" width="13" height="13" rx="2.5" fill="#006d32" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="353" y="162" width="13" height="13" rx="2.5" fill="#006d32" stroke="#21262d" stroke-width="0.75"/>
-  <text x="382" y="172" fill="#8b949e" font-size="11" class="mono"> 83%</text>
-  <text x="24" y="194" fill="#c9d1d9" font-size="12">D3D12.x Command Host</text>
-  <rect x="200" y="184" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="217" y="184" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="234" y="184" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="251" y="184" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="268" y="184" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="285" y="184" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="302" y="184" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="319" y="184" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="336" y="184" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="353" y="184" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <text x="382" y="194" fill="#8b949e" font-size="11" class="mono"> 95%</text>
-  <text x="24" y="216" fill="#c9d1d9" font-size="12">RDNA 2 -&gt; DXIL Core</text>
-  <rect x="200" y="206" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="217" y="206" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="234" y="206" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="251" y="206" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="268" y="206" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="285" y="206" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="302" y="206" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="319" y="206" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="336" y="206" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="353" y="206" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <text x="382" y="216" fill="#8b949e" font-size="11" class="mono"> 98%</text>
-  <text x="24" y="238" fill="#c9d1d9" font-size="12">Wave64 -&gt; Wave32</text>
-  <rect x="200" y="228" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="217" y="228" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="234" y="228" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="251" y="228" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="268" y="228" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="285" y="228" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="302" y="228" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="319" y="228" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="336" y="228" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="353" y="228" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <text x="382" y="238" fill="#8b949e" font-size="11" class="mono"> 98%</text>
-  <text x="24" y="260" fill="#c9d1d9" font-size="12">DP4A / ML Compute</text>
-  <rect x="200" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="217" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="234" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="251" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="268" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="285" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="302" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="319" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="336" y="250" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="353" y="250" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <text x="382" y="260" fill="#8b949e" font-size="11" class="mono"> 98%</text>
-  <text x="24" y="282" fill="#c9d1d9" font-size="12">Pipeline Cache &amp; Queue</text>
-  <rect x="200" y="272" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="217" y="272" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="234" y="272" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="251" y="272" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="268" y="272" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="285" y="272" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="302" y="272" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="319" y="272" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="336" y="272" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="353" y="272" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <text x="382" y="282" fill="#8b949e" font-size="11" class="mono"> 98%</text>
-  <text x="24" y="304" fill="#c9d1d9" font-size="12">Shadow &amp; Page Sync</text>
-  <rect x="200" y="294" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="217" y="294" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="234" y="294" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="251" y="294" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="268" y="294" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="285" y="294" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="302" y="294" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="319" y="294" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="336" y="294" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="353" y="294" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <text x="382" y="304" fill="#8b949e" font-size="11" class="mono"> 98%</text>
-  <text x="24" y="326" fill="#c9d1d9" font-size="12">Texture Streaming</text>
-  <rect x="200" y="316" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="217" y="316" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="234" y="316" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="251" y="316" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="268" y="316" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="285" y="316" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="302" y="316" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="319" y="316" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="336" y="316" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="353" y="316" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <text x="382" y="326" fill="#8b949e" font-size="11" class="mono"> 95%</text>
-  <text x="24" y="348" fill="#c9d1d9" font-size="12">Display &amp; Input</text>
-  <rect x="200" y="338" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="217" y="338" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="234" y="338" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="251" y="338" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="268" y="338" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="285" y="338" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="302" y="338" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="319" y="338" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="336" y="338" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="353" y="338" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <text x="382" y="348" fill="#8b949e" font-size="11" class="mono"> 95%</text>
-  <line x1="452" y1="72" x2="452" y2="370" stroke="#21262d"/>
-  <text x="474" y="80" fill="#c9d1d9" font-size="11" font-weight="600">PLAYABILITY MILESTONES</text>
-  <rect x="474" y="96" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="1"/>
-  <text x="495" y="106" fill="#f0f6fc" font-size="12" font-weight="500">Executable boot &amp; HLE init</text>
-  <text x="856" y="106" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">verified</text>
-  <rect x="474" y="120" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="1"/>
-  <text x="495" y="130" fill="#f0f6fc" font-size="12" font-weight="500">Intro &amp; menus interactive</text>
-  <text x="856" y="130" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">30-35 fps</text>
-  <rect x="474" y="144" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="1"/>
-  <text x="495" y="154" fill="#f0f6fc" font-size="12" font-weight="500">World entry &amp; full 3D render</text>
-  <text x="856" y="154" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">verified</text>
-  <rect x="474" y="168" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="1"/>
-  <text x="495" y="178" fill="#f0f6fc" font-size="12" font-weight="500">Zero-TDR lighting (2561af95)</text>
-  <text x="856" y="178" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">0.36 ms/frame</text>
-  <rect x="474" y="192" width="13" height="13" rx="2.5" fill="#26a641" stroke="#39d353" stroke-width="1"/>
-  <text x="495" y="202" fill="#39d353" font-size="12" font-weight="500">CPU preparing &lt;15 ms</text>
-  <text x="856" y="202" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">59.7 ms -&gt; &lt;15 ms</text>
-  <rect x="474" y="216" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="1"/>
-  <text x="495" y="226" fill="#f0f6fc" font-size="12" font-weight="500">All 9 ML DP4A shaders fast</text>
-  <text x="856" y="226" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">0.15-0.63 ms (VRAM verified)</text>
-  <rect x="474" y="240" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="1"/>
-  <text x="495" y="250" fill="#f0f6fc" font-size="12" font-weight="500">1:1 console visuals verified</text>
-  <text x="856" y="250" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">verified (all NPC faces &amp; interior walls textured/lit)</text>
-  <rect x="474" y="264" width="13" height="13" rx="2.5" fill="#161b22" stroke="#21262d" stroke-width="1"/>
-  <text x="495" y="274" fill="#8b949e" font-size="12" font-weight="500">Playable first mission (20-30+ FPS)</text>
-  <text x="856" y="274" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">target</text>
-  <rect x="474" y="296" width="382" height="62" rx="6" fill="#161b22" stroke="#30363d"/>
-  <text x="486" y="314" fill="#8b949e" font-size="10.5" font-weight="600">LATEST WORLD TELEMETRY (RTX 3070 8 GB, 1080P)</text>
-  <text x="486" y="330" fill="#8b949e" font-size="10" class="mono">FPS</text>
-  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">5.4 fps peak in-world (184.0 ms/f; 1.5-5.4 fps across diag-fps-swarm2b, 145.7s TIMEOUT_CLEAN; 0 refused dynamic tables, 0 exploding tris, intact ceiling/interiors)</text>
-  <text x="575" y="330" fill="#8b949e" font-size="10" class="mono">FRAME</text>
-  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">184.0-655.0 ms in diag-fps-swarm2b (planning 1.1-5.5 ms, waiting for flights 0.1-0.2 ms, sweep 0.1-0.6 ms, lists' steps 122-137 ms)</text>
-  <text x="664" y="330" fill="#8b949e" font-size="10" class="mono">GPU</text>
-  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">0.0-33.8 ms (145.7s TIMEOUT_CLEAN; 0 crashes/TDRs/OOMs, 0 failed Wave64 shaders, 0 refused PSOs)</text>
-  <text x="753" y="330" fill="#8b949e" font-size="10" class="mono">PREP</text>
-  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">116.9-239.4 ms in diag-fps-swarm2b (refreshes 62-80 ms, heap views 67-98 ms slots + 68-86 ms textures)</text>
-  <line x1="24" y1="374" x2="856" y2="374" stroke="#21262d"/>
-  <text x="24" y="390" fill="#8b949e" font-size="11">Target: 20-30+ FPS (1:1 visuals) • Clean-room Xbox Series X|S (GDK) layer</text>
-  <text x="704" y="390" text-anchor="end" fill="#8b949e" font-size="11">Less</text>
-  <rect x="712" y="380" width="12" height="12" rx="2.5" fill="#161b22" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="728" y="380" width="12" height="12" rx="2.5" fill="#0e4429" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="744" y="380" width="12" height="12" rx="2.5" fill="#006d32" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="760" y="380" width="12" height="12" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="776" y="380" width="12" height="12" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <text x="796" y="390" fill="#8b949e" font-size="11">More</text>
+  <rect width="1120" height="1015" fill="#0d0f12"/>
+  <text x="16" y="26" fill="#f0f3f6" font-size="15.5" font-weight="600">System &amp; Console Libraries*: 52.36% (688/1314)</text>
+  <text x="1104" y="26" text-anchor="end" fill="#8b949e" font-size="11" class="mono">World: 5.4 fps (184.0 ms/f) · 2026-11-26</text>
+  <text x="16" y="50" fill="#f0f3f6" font-size="13.5" font-weight="600">Large libraries: 48.61% (403/829)</text>
+  <text x="568" y="50" fill="#f0f3f6" font-size="13.5" font-weight="600">Medium libraries: 51.52% (203/394)</text>
+  <g>
+    <title>ID3D12CommandList: 70/160 (43.8%)</title>
+    <rect x="17.0" y="59.0" width="204.9" height="112.0" fill="#5a6068"/>
+    <path d="M17.0 59.0h56.9v12.4h-56.9zM85.3 59.0h56.9v12.4h-56.9zM153.6 59.0h68.3v12.4h-68.3zM28.4 71.4h91.1v12.4h-91.1zM130.8 71.4h34.1v12.4h-34.1zM176.4 71.4h45.5v12.4h-45.5zM17.0 83.9h148.0v12.4h-148.0zM176.4 83.9h45.5v12.4h-45.5zM17.0 96.3h11.4v12.4h-11.4zM73.9 96.3h22.8v12.4h-22.8zM176.4 96.3h45.5v12.4h-45.5zM17.0 108.8h22.8v12.4h-22.8zM85.3 108.8h11.4v12.4h-11.4zM142.2 108.8h22.8v12.4h-22.8zM108.1 121.2h22.8v12.4h-22.8zM199.1 133.7h11.4v12.4h-11.4zM28.4 146.1h11.4v12.4h-11.4zM51.1 146.1h22.8v12.4h-22.8zM142.2 146.1h11.4v12.4h-11.4zM199.1 146.1h11.4v12.4h-11.4zM39.8 158.6h11.4v12.4h-11.4zM62.5 158.6h11.4v12.4h-11.4z" fill="#2fa343"/>
+    <rect x="199.1" y="158.6" width="22.8" height="12.4" fill="#0d0f12" opacity="0.55"/>
+    <path d="M28.4 59.0v112.0M39.8 59.0v112.0M51.1 59.0v112.0M62.5 59.0v112.0M73.9 59.0v112.0M85.3 59.0v112.0M96.7 59.0v112.0M108.1 59.0v112.0M119.4 59.0v112.0M130.8 59.0v112.0M142.2 59.0v112.0M153.6 59.0v112.0M165.0 59.0v112.0M176.4 59.0v112.0M187.7 59.0v112.0M199.1 59.0v112.0M210.5 59.0v112.0M17.0 71.4h204.9M17.0 83.9h204.9M17.0 96.3h204.9M17.0 108.8h204.9M17.0 121.2h204.9M17.0 133.7h204.9M17.0 146.1h204.9M17.0 158.6h204.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="17.0" y="59.0" width="204.9" height="112.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="21.0" y="71.5" class="lbl">ID3D12CommandList</text>
+  </g>
+  <g>
+    <title>ID3D12Device: 54/160 (33.8%)</title>
+    <rect x="17.0" y="173.0" width="204.9" height="112.0" fill="#5a6068"/>
+    <path d="M17.0 173.0h56.9v12.4h-56.9zM85.3 173.0h136.6v12.4h-136.6zM17.0 185.4h136.6v12.4h-136.6zM17.0 197.9h45.5v12.4h-45.5zM73.9 197.9h11.4v12.4h-11.4zM153.6 197.9h11.4v12.4h-11.4zM51.1 210.3h11.4v12.4h-11.4zM96.7 210.3h22.8v12.4h-22.8zM165.0 210.3h11.4v12.4h-11.4zM187.7 210.3h34.1v12.4h-34.1zM28.4 222.8h45.5v12.4h-45.5zM85.3 222.8h45.5v12.4h-45.5zM176.4 222.8h11.4v12.4h-11.4zM17.0 247.7h11.4v12.4h-11.4zM28.4 260.1h11.4v12.4h-11.4zM96.7 260.1h11.4v12.4h-11.4z" fill="#2fa343"/>
+    <rect x="199.1" y="272.6" width="22.8" height="12.4" fill="#0d0f12" opacity="0.55"/>
+    <path d="M28.4 173.0v112.0M39.8 173.0v112.0M51.1 173.0v112.0M62.5 173.0v112.0M73.9 173.0v112.0M85.3 173.0v112.0M96.7 173.0v112.0M108.1 173.0v112.0M119.4 173.0v112.0M130.8 173.0v112.0M142.2 173.0v112.0M153.6 173.0v112.0M165.0 173.0v112.0M176.4 173.0v112.0M187.7 173.0v112.0M199.1 173.0v112.0M210.5 173.0v112.0M17.0 185.4h204.9M17.0 197.9h204.9M17.0 210.3h204.9M17.0 222.8h204.9M17.0 235.2h204.9M17.0 247.7h204.9M17.0 260.1h204.9M17.0 272.6h204.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="17.0" y="173.0" width="204.9" height="112.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="21.0" y="185.5" class="lbl">ID3D12Device</text>
+  </g>
+  <g>
+    <title>XStore: 50/77 (64.9%)</title>
+    <rect x="223.9" y="59.0" width="93.0" height="117.4" fill="#5a6068"/>
+    <path d="M235.5 59.0h69.8v11.7h-69.8zM235.5 70.7h23.3v11.7h-23.3zM305.3 70.7h11.6v11.7h-11.6zM223.9 82.5h93.0v11.7h-93.0zM270.4 94.2h23.3v11.7h-23.3zM235.5 106.0h81.4v11.7h-81.4zM223.9 117.7h34.9v11.7h-34.9zM235.5 129.5h23.3v11.7h-23.3zM282.1 129.5h34.9v11.7h-34.9zM223.9 141.2h23.3v11.7h-23.3zM270.4 141.2h46.5v11.7h-46.5zM223.9 152.9h69.8v11.7h-69.8zM305.3 152.9h11.6v11.7h-11.6zM223.9 164.7h11.6v11.7h-11.6zM258.8 164.7h23.3v11.7h-23.3z" fill="#2fa343"/>
+    <rect x="282.1" y="164.7" width="34.9" height="11.7" fill="#0d0f12" opacity="0.55"/>
+    <path d="M235.5 59.0v117.4M247.2 59.0v117.4M258.8 59.0v117.4M270.4 59.0v117.4M282.1 59.0v117.4M293.7 59.0v117.4M305.3 59.0v117.4M223.9 70.7h93.0M223.9 82.5h93.0M223.9 94.2h93.0M223.9 106.0h93.0M223.9 117.7h93.0M223.9 129.5h93.0M223.9 141.2h93.0M223.9 152.9h93.0M223.9 164.7h93.0" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="223.9" y="59.0" width="93.0" height="117.4" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="227.9" y="71.5" class="lbl">XStore</text>
+  </g>
+  <g>
+    <title>GameInput: 41/70 (58.6%)</title>
+    <rect x="223.9" y="178.4" width="93.0" height="106.6" fill="#5a6068"/>
+    <path d="M223.9 178.4h93.0v11.8h-93.0zM223.9 190.3h93.0v11.8h-93.0zM223.9 202.1h93.0v11.8h-93.0zM223.9 214.0h34.9v11.8h-34.9zM223.9 225.8h11.6v11.8h-11.6zM258.8 237.6h58.2v11.8h-58.2zM223.9 249.5h23.3v11.8h-23.3zM270.4 249.5h23.3v11.8h-23.3zM247.2 261.3h23.3v11.8h-23.3zM247.2 273.2h11.6v11.8h-11.6zM282.1 273.2h11.6v11.8h-11.6z" fill="#2fa343"/>
+    <rect x="293.7" y="273.2" width="23.3" height="11.8" fill="#0d0f12" opacity="0.55"/>
+    <path d="M235.5 178.4v106.6M247.2 178.4v106.6M258.8 178.4v106.6M270.4 178.4v106.6M282.1 178.4v106.6M293.7 178.4v106.6M305.3 178.4v106.6M223.9 190.3h93.0M223.9 202.1h93.0M223.9 214.0h93.0M223.9 225.8h93.0M223.9 237.6h93.0M223.9 249.5h93.0M223.9 261.3h93.0M223.9 273.2h93.0" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="223.9" y="178.4" width="93.0" height="106.6" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="227.9" y="190.9" class="lbl">GameInput</text>
+  </g>
+  <g>
+    <title>XUser: 31/45 (68.9%)</title>
+    <rect x="318.9" y="59.0" width="80.1" height="78.8" fill="#5a6068"/>
+    <path d="M330.4 59.0h57.2v11.3h-57.2zM318.9 70.3h80.1v11.3h-80.1zM318.9 81.5h22.9v11.3h-22.9zM376.2 81.5h22.9v11.3h-22.9zM318.9 92.8h57.2v11.3h-57.2zM376.2 104.0h22.9v11.3h-22.9zM330.4 115.3h34.3v11.3h-34.3zM376.2 115.3h22.9v11.3h-22.9zM318.9 126.5h34.3v11.3h-34.3z" fill="#2fa343"/>
+    <rect x="353.3" y="126.5" width="45.8" height="11.3" fill="#0d0f12" opacity="0.55"/>
+    <path d="M330.4 59.0v78.8M341.8 59.0v78.8M353.3 59.0v78.8M364.7 59.0v78.8M376.2 59.0v78.8M387.6 59.0v78.8M318.9 70.3h80.1M318.9 81.5h80.1M318.9 92.8h80.1M318.9 104.0h80.1M318.9 115.3h80.1M318.9 126.5h80.1" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="318.9" y="59.0" width="80.1" height="78.8" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="322.9" y="71.5" class="lbl">XUser</text>
+  </g>
+  <g>
+    <title>DirectStorage: 19/42 (45.2%)</title>
+    <rect x="318.9" y="139.8" width="80.1" height="73.4" fill="#5a6068"/>
+    <path d="M330.4 139.8h22.9v12.2h-22.9zM364.7 139.8h22.9v12.2h-22.9zM330.4 152.0h11.4v12.2h-11.4zM353.3 152.0h11.4v12.2h-11.4zM353.3 164.3h22.9v12.2h-22.9zM364.7 176.5h34.3v12.2h-34.3zM318.9 188.7h11.4v12.2h-11.4zM341.8 188.7h45.8v12.2h-45.8zM318.9 201.0h11.4v12.2h-11.4zM341.8 201.0h11.4v12.2h-11.4zM387.6 201.0h11.4v12.2h-11.4z" fill="#2fa343"/>
+    <path d="M330.4 139.8v73.4M341.8 139.8v73.4M353.3 139.8v73.4M364.7 139.8v73.4M376.2 139.8v73.4M387.6 139.8v73.4M318.9 152.0h80.1M318.9 164.3h80.1M318.9 176.5h80.1M318.9 188.7h80.1M318.9 201.0h80.1" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="318.9" y="139.8" width="80.1" height="73.4" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="322.9" y="152.3" class="lbl">DirectStora</text>
+  </g>
+  <g>
+    <title>XPackage: 21/40 (52.5%)</title>
+    <rect x="318.9" y="215.2" width="80.1" height="69.8" fill="#5a6068"/>
+    <path d="M330.4 215.2h68.7v11.6h-68.7zM318.9 226.8h11.4v11.6h-11.4zM341.8 226.8h22.9v11.6h-22.9zM376.2 226.8h11.4v11.6h-11.4zM318.9 238.5h11.4v11.6h-11.4zM341.8 238.5h45.8v11.6h-45.8zM364.7 250.1h22.9v11.6h-22.9zM387.6 261.7h11.4v11.6h-11.4zM341.8 273.4h34.3v11.6h-34.3z" fill="#2fa343"/>
+    <rect x="376.2" y="273.4" width="22.9" height="11.6" fill="#0d0f12" opacity="0.55"/>
+    <path d="M330.4 215.2v69.8M341.8 215.2v69.8M353.3 215.2v69.8M364.7 215.2v69.8M376.2 215.2v69.8M387.6 215.2v69.8M318.9 226.8h80.1M318.9 238.5h80.1M318.9 250.1h80.1M318.9 261.7h80.1M318.9 273.4h80.1" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="318.9" y="215.2" width="80.1" height="69.8" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="322.9" y="227.7" class="lbl">XPackage</text>
+  </g>
+  <g>
+    <title>WinSockNet: 38/38 (100.0%)</title>
+    <rect x="401.1" y="59.0" width="76.0" height="69.8" fill="#2fa343"/>
+    <rect x="433.6" y="117.2" width="43.4" height="11.6" fill="#0d0f12" opacity="0.55"/>
+    <path d="M411.9 59.0v69.8M422.8 59.0v69.8M433.6 59.0v69.8M444.5 59.0v69.8M455.4 59.0v69.8M466.2 59.0v69.8M401.1 70.6h76.0M401.1 82.3h76.0M401.1 93.9h76.0M401.1 105.5h76.0M401.1 117.2h76.0" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="401.1" y="59.0" width="76.0" height="69.8" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="405.1" y="71.5" class="lbl">WinSockNet</text>
+  </g>
+  <g>
+    <title>ID3D12CommandQueue: 19/36 (52.8%)</title>
+    <rect x="479.1" y="59.0" width="71.9" height="69.8" fill="#5a6068"/>
+    <path d="M479.1 59.0h59.9v11.6h-59.9zM479.1 70.6h24.0v11.6h-24.0zM527.0 70.6h24.0v11.6h-24.0zM479.1 82.3h59.9v11.6h-59.9zM503.1 105.5h12.0v11.6h-12.0zM539.0 105.5h12.0v11.6h-12.0zM479.1 117.2h12.0v11.6h-12.0zM503.1 117.2h24.0v11.6h-24.0z" fill="#2fa343"/>
+    <path d="M491.1 59.0v69.8M503.1 59.0v69.8M515.0 59.0v69.8M527.0 59.0v69.8M539.0 59.0v69.8M479.1 70.6h71.9M479.1 82.3h71.9M479.1 93.9h71.9M479.1 105.5h71.9M479.1 117.2h71.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="479.1" y="59.0" width="71.9" height="69.8" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="483.1" y="71.5" class="lbl">ID3D12Comm</text>
+  </g>
+  <g>
+    <title>Win32Files: 33/33 (100.0%)</title>
+    <rect x="401.1" y="130.8" width="75.1" height="61.1" fill="#2fa343"/>
+    <rect x="454.7" y="179.6" width="21.5" height="12.2" fill="#0d0f12" opacity="0.55"/>
+    <path d="M411.8 130.8v61.1M422.5 130.8v61.1M433.3 130.8v61.1M444.0 130.8v61.1M454.7 130.8v61.1M465.5 130.8v61.1M401.1 143.0h75.1M401.1 155.2h75.1M401.1 167.4h75.1M401.1 179.6h75.1" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="401.1" y="130.8" width="75.1" height="61.1" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="405.1" y="143.3" class="lbl">Win32Files</text>
+  </g>
+  <g>
+    <title>ID3D12Resource: 12/32 (37.5%)</title>
+    <rect x="478.2" y="130.8" width="72.8" height="61.1" fill="#5a6068"/>
+    <path d="M478.2 130.8h52.0v12.2h-52.0zM540.6 130.8h10.4v12.2h-10.4zM478.2 143.0h52.0v12.2h-52.0zM478.2 155.2h10.4v12.2h-10.4z" fill="#2fa343"/>
+    <rect x="519.8" y="179.6" width="31.2" height="12.2" fill="#0d0f12" opacity="0.55"/>
+    <path d="M488.6 130.8v61.1M499.0 130.8v61.1M509.4 130.8v61.1M519.8 130.8v61.1M530.2 130.8v61.1M540.6 130.8v61.1M478.2 143.0h72.8M478.2 155.2h72.8M478.2 167.4h72.8M478.2 179.6h72.8" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="478.2" y="130.8" width="72.8" height="61.1" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="482.2" y="143.3" class="lbl">ID3D12Reso</text>
+  </g>
+  <g>
+    <title>IDXGIDevice: 5/32 (15.6%)</title>
+    <rect x="401.1" y="193.9" width="48.6" height="91.1" fill="#5a6068"/>
+    <path d="M401.1 193.9h36.5v11.4h-36.5zM425.4 205.3h24.3v11.4h-24.3z" fill="#2fa343"/>
+    <path d="M413.2 193.9v91.1M425.4 193.9v91.1M437.5 193.9v91.1M401.1 205.3h48.6M401.1 216.6h48.6M401.1 228.0h48.6M401.1 239.4h48.6M401.1 250.8h48.6M401.1 262.2h48.6M401.1 273.6h48.6" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="401.1" y="193.9" width="48.6" height="91.1" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="405.1" y="206.4" class="lbl">IDXGID</text>
+  </g>
+  <g>
+    <title>IDXGIFactory: 5/32 (15.6%)</title>
+    <rect x="451.7" y="193.9" width="48.6" height="91.1" fill="#5a6068"/>
+    <path d="M451.7 193.9h36.5v11.4h-36.5zM488.2 205.3h12.2v11.4h-12.2zM451.7 228.0h12.2v11.4h-12.2z" fill="#2fa343"/>
+    <path d="M463.9 193.9v91.1M476.0 193.9v91.1M488.2 193.9v91.1M451.7 205.3h48.6M451.7 216.6h48.6M451.7 228.0h48.6M451.7 239.4h48.6M451.7 250.8h48.6M451.7 262.2h48.6M451.7 273.6h48.6" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="451.7" y="193.9" width="48.6" height="91.1" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="455.7" y="206.4" class="lbl">IDXGIF</text>
+  </g>
+  <g>
+    <title>IDXGIOutput: 5/32 (15.6%)</title>
+    <rect x="502.4" y="193.9" width="48.6" height="91.1" fill="#5a6068"/>
+    <path d="M502.4 193.9h36.5v11.4h-36.5zM526.7 205.3h12.2v11.4h-12.2zM514.5 250.8h12.2v11.4h-12.2z" fill="#2fa343"/>
+    <path d="M514.5 193.9v91.1M526.7 193.9v91.1M538.8 193.9v91.1M502.4 205.3h48.6M502.4 216.6h48.6M502.4 228.0h48.6M502.4 239.4h48.6M502.4 250.8h48.6M502.4 262.2h48.6M502.4 273.6h48.6" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="502.4" y="193.9" width="48.6" height="91.1" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="506.4" y="206.4" class="lbl">IDXGIO</text>
+  </g>
+  <g>
+    <title>XAsync: 24/31 (77.4%)</title>
+    <rect x="569.0" y="59.0" width="81.0" height="113.9" fill="#5a6068"/>
+    <path d="M585.2 59.0h64.8v16.3h-64.8zM569.0 75.3h48.6v16.3h-48.6zM633.8 75.3h16.2v16.3h-16.2zM569.0 91.5h81.0v16.3h-81.0zM569.0 107.8h81.0v16.3h-81.0zM601.4 124.1h48.6v16.3h-48.6zM569.0 140.3h32.4v16.3h-32.4zM633.8 140.3h16.2v16.3h-16.2z" fill="#2fa343"/>
+    <rect x="585.2" y="156.6" width="64.8" height="16.3" fill="#0d0f12" opacity="0.55"/>
+    <path d="M585.2 59.0v113.9M601.4 59.0v113.9M617.6 59.0v113.9M633.8 59.0v113.9M569.0 75.3h81.0M569.0 91.5h81.0M569.0 107.8h81.0M569.0 124.1h81.0M569.0 140.3h81.0M569.0 156.6h81.0" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="569.0" y="59.0" width="81.0" height="113.9" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="573.0" y="71.5" class="lbl">XAsync</text>
+  </g>
+  <g>
+    <title>XGameSave: 23/30 (76.7%)</title>
+    <rect x="569.0" y="174.9" width="81.0" height="110.1" fill="#5a6068"/>
+    <path d="M585.2 174.9h32.4v18.4h-32.4zM633.8 174.9h16.2v18.4h-16.2zM569.0 193.2h32.4v18.4h-32.4zM617.6 193.2h32.4v18.4h-32.4zM585.2 211.6h64.8v18.4h-64.8zM585.2 229.9h32.4v18.4h-32.4zM633.8 229.9h16.2v18.4h-16.2zM569.0 248.3h81.0v18.4h-81.0zM569.0 266.6h32.4v18.4h-32.4zM617.6 266.6h32.4v18.4h-32.4z" fill="#2fa343"/>
+    <path d="M585.2 174.9v110.1M601.4 174.9v110.1M617.6 174.9v110.1M633.8 174.9v110.1M569.0 193.2h81.0M569.0 211.6h81.0M569.0 229.9h81.0M569.0 248.3h81.0M569.0 266.6h81.0" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="569.0" y="174.9" width="81.0" height="110.1" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="573.0" y="187.4" class="lbl">XGameSave</text>
+  </g>
+  <g>
+    <title>ID3D12Allocator: 9/24 (37.5%)</title>
+    <rect x="652.0" y="59.0" width="95.9" height="74.0" fill="#5a6068"/>
+    <path d="M652.0 59.0h80.0v18.5h-80.0zM652.0 77.5h64.0v18.5h-64.0z" fill="#2fa343"/>
+    <path d="M668.0 59.0v74.0M684.0 59.0v74.0M700.0 59.0v74.0M716.0 59.0v74.0M731.9 59.0v74.0M652.0 77.5h95.9M652.0 96.0h95.9M652.0 114.5h95.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="652.0" y="59.0" width="95.9" height="74.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="656.0" y="71.5" class="lbl">ID3D12Allocat</text>
+  </g>
+  <g>
+    <title>ID3D12CmdSig: 7/24 (29.2%)</title>
+    <rect x="652.0" y="135.0" width="95.9" height="74.0" fill="#5a6068"/>
+    <path d="M652.0 135.0h80.0v18.5h-80.0zM652.0 153.5h32.0v18.5h-32.0z" fill="#2fa343"/>
+    <path d="M668.0 135.0v74.0M684.0 135.0v74.0M700.0 135.0v74.0M716.0 135.0v74.0M731.9 135.0v74.0M652.0 153.5h95.9M652.0 172.0h95.9M652.0 190.5h95.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="652.0" y="135.0" width="95.9" height="74.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="656.0" y="147.5" class="lbl">ID3D12CmdSig</text>
+  </g>
+  <g>
+    <title>ID3D12DescHeap: 10/24 (41.7%)</title>
+    <rect x="652.0" y="211.0" width="95.9" height="74.0" fill="#5a6068"/>
+    <path d="M652.0 211.0h80.0v18.5h-80.0zM652.0 229.5h80.0v18.5h-80.0z" fill="#2fa343"/>
+    <path d="M668.0 211.0v74.0M684.0 211.0v74.0M700.0 211.0v74.0M716.0 211.0v74.0M731.9 211.0v74.0M652.0 229.5h95.9M652.0 248.0h95.9M652.0 266.5h95.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="652.0" y="211.0" width="95.9" height="74.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="656.0" y="223.5" class="lbl">ID3D12DescHea</text>
+  </g>
+  <g>
+    <title>ID3D12Fence: 12/24 (50.0%)</title>
+    <rect x="749.9" y="59.0" width="95.9" height="74.0" fill="#5a6068"/>
+    <path d="M749.9 59.0h80.0v18.5h-80.0zM749.9 77.5h95.9v18.5h-95.9zM749.9 96.0h16.0v18.5h-16.0z" fill="#2fa343"/>
+    <path d="M765.9 59.0v74.0M781.9 59.0v74.0M797.9 59.0v74.0M813.9 59.0v74.0M829.9 59.0v74.0M749.9 77.5h95.9M749.9 96.0h95.9M749.9 114.5h95.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="749.9" y="59.0" width="95.9" height="74.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="753.9" y="71.5" class="lbl">ID3D12Fence</text>
+  </g>
+  <g>
+    <title>ID3D12Heap: 8/24 (33.3%)</title>
+    <rect x="749.9" y="135.0" width="95.9" height="74.0" fill="#5a6068"/>
+    <path d="M749.9 135.0h80.0v18.5h-80.0zM749.9 153.5h48.0v18.5h-48.0z" fill="#2fa343"/>
+    <path d="M765.9 135.0v74.0M781.9 135.0v74.0M797.9 135.0v74.0M813.9 135.0v74.0M829.9 135.0v74.0M749.9 153.5h95.9M749.9 172.0h95.9M749.9 190.5h95.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="749.9" y="135.0" width="95.9" height="74.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="753.9" y="147.5" class="lbl">ID3D12Heap</text>
+  </g>
+  <g>
+    <title>ID3D12Pipeline: 7/24 (29.2%)</title>
+    <rect x="749.9" y="211.0" width="95.9" height="74.0" fill="#5a6068"/>
+    <path d="M749.9 211.0h80.0v18.5h-80.0zM749.9 229.5h32.0v18.5h-32.0z" fill="#2fa343"/>
+    <path d="M765.9 211.0v74.0M781.9 211.0v74.0M797.9 211.0v74.0M813.9 211.0v74.0M829.9 211.0v74.0M749.9 229.5h95.9M749.9 248.0h95.9M749.9 266.5h95.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="749.9" y="211.0" width="95.9" height="74.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="753.9" y="223.5" class="lbl">ID3D12Pipelin</text>
+  </g>
+  <g>
+    <title>ID3D12QueryHeap: 7/24 (29.2%)</title>
+    <rect x="847.9" y="59.0" width="95.9" height="74.0" fill="#5a6068"/>
+    <path d="M847.9 59.0h80.0v18.5h-80.0zM847.9 77.5h32.0v18.5h-32.0z" fill="#2fa343"/>
+    <path d="M863.9 59.0v74.0M879.9 59.0v74.0M895.9 59.0v74.0M911.8 59.0v74.0M927.8 59.0v74.0M847.9 77.5h95.9M847.9 96.0h95.9M847.9 114.5h95.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="847.9" y="59.0" width="95.9" height="74.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="851.9" y="71.5" class="lbl">ID3D12QueryHe</text>
+  </g>
+  <g>
+    <title>ID3D12RootSig: 7/24 (29.2%)</title>
+    <rect x="847.9" y="135.0" width="95.9" height="74.0" fill="#5a6068"/>
+    <path d="M847.9 135.0h80.0v18.5h-80.0zM847.9 153.5h32.0v18.5h-32.0z" fill="#2fa343"/>
+    <path d="M863.9 135.0v74.0M879.9 135.0v74.0M895.9 135.0v74.0M911.8 135.0v74.0M927.8 135.0v74.0M847.9 153.5h95.9M847.9 172.0h95.9M847.9 190.5h95.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="847.9" y="135.0" width="95.9" height="74.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="851.9" y="147.5" class="lbl">ID3D12RootSig</text>
+  </g>
+  <g>
+    <title>IDXGIAdapter: 6/24 (25.0%)</title>
+    <rect x="847.9" y="211.0" width="95.9" height="74.0" fill="#5a6068"/>
+    <path d="M847.9 211.0h48.0v18.5h-48.0zM847.9 229.5h48.0v18.5h-48.0z" fill="#2fa343"/>
+    <path d="M863.9 211.0v74.0M879.9 211.0v74.0M895.9 211.0v74.0M911.8 211.0v74.0M927.8 211.0v74.0M847.9 229.5h95.9M847.9 248.0h95.9M847.9 266.5h95.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="847.9" y="211.0" width="95.9" height="74.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="851.9" y="223.5" class="lbl">IDXGIAdapter</text>
+  </g>
+  <g>
+    <title>Kernel32: 22/22 (100.0%)</title>
+    <rect x="945.8" y="59.0" width="77.6" height="83.7" fill="#2fa343"/>
+    <rect x="976.9" y="126.0" width="46.6" height="16.7" fill="#0d0f12" opacity="0.55"/>
+    <path d="M961.3 59.0v83.7M976.9 59.0v83.7M992.4 59.0v83.7M1007.9 59.0v83.7M945.8 75.7h77.6M945.8 92.5h77.6M945.8 109.2h77.6M945.8 126.0h77.6" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="945.8" y="59.0" width="77.6" height="83.7" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="949.8" y="71.5" class="lbl">Kernel32</text>
+  </g>
+  <g>
+    <title>XSpeech: 12/22 (54.5%)</title>
+    <rect x="1025.4" y="59.0" width="77.6" height="83.7" fill="#5a6068"/>
+    <path d="M1040.9 59.0h31.0v16.7h-31.0zM1072.0 75.7h31.0v16.7h-31.0zM1025.4 92.5h77.6v16.7h-77.6zM1025.4 109.2h31.0v16.7h-31.0zM1040.9 126.0h15.5v16.7h-15.5z" fill="#2fa343"/>
+    <rect x="1056.4" y="126.0" width="46.6" height="16.7" fill="#0d0f12" opacity="0.55"/>
+    <path d="M1040.9 59.0v83.7M1056.4 59.0v83.7M1072.0 59.0v83.7M1087.5 59.0v83.7M1025.4 75.7h77.6M1025.4 92.5h77.6M1025.4 109.2h77.6M1025.4 126.0h77.6" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="1025.4" y="59.0" width="77.6" height="83.7" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="1029.4" y="71.5" class="lbl">XSpeech</text>
+  </g>
+  <g>
+    <title>XGameUI: 7/20 (35.0%)</title>
+    <rect x="945.8" y="144.7" width="80.9" height="72.9" fill="#5a6068"/>
+    <path d="M962.0 144.7h32.3v18.2h-32.3zM978.2 163.0h32.3v18.2h-32.3zM978.2 199.4h48.5v18.2h-48.5z" fill="#2fa343"/>
+    <path d="M962.0 144.7v72.9M978.2 144.7v72.9M994.3 144.7v72.9M1010.5 144.7v72.9M945.8 163.0h80.9M945.8 181.2h80.9M945.8 199.4h80.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="945.8" y="144.7" width="80.9" height="72.9" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="949.8" y="157.2" class="lbl">XGameUI</text>
+  </g>
+  <g>
+    <title>XGame: 14/18 (77.8%)</title>
+    <rect x="945.8" y="219.6" width="80.9" height="65.4" fill="#5a6068"/>
+    <path d="M962.0 219.6h64.7v16.3h-64.7zM962.0 236.0h48.5v16.3h-48.5zM945.8 252.3h64.7v16.3h-64.7zM945.8 268.7h48.5v16.3h-48.5z" fill="#2fa343"/>
+    <rect x="994.3" y="268.7" width="32.3" height="16.3" fill="#0d0f12" opacity="0.55"/>
+    <path d="M962.0 219.6v65.4M978.2 219.6v65.4M994.3 219.6v65.4M1010.5 219.6v65.4M945.8 236.0h80.9M945.8 252.3h80.9M945.8 268.7h80.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="945.8" y="219.6" width="80.9" height="65.4" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="949.8" y="232.1" class="lbl">XGame</text>
+  </g>
+  <g>
+    <title>XNetworking: 17/18 (94.4%)</title>
+    <rect x="1028.7" y="144.7" width="74.3" height="71.2" fill="#5a6068"/>
+    <path d="M1043.5 144.7h59.5v17.8h-59.5zM1028.7 162.5h74.3v17.8h-74.3zM1028.7 180.3h74.3v17.8h-74.3zM1028.7 198.1h44.6v17.8h-44.6z" fill="#2fa343"/>
+    <rect x="1073.3" y="198.1" width="29.7" height="17.8" fill="#0d0f12" opacity="0.55"/>
+    <path d="M1043.5 144.7v71.2M1058.4 144.7v71.2M1073.3 144.7v71.2M1088.1 144.7v71.2M1028.7 162.5h74.3M1028.7 180.3h74.3M1028.7 198.1h74.3" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="1028.7" y="144.7" width="74.3" height="71.2" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="1032.7" y="157.2" class="lbl">XNetworkin</text>
+  </g>
+  <g>
+    <title>XDisplay: 11/17 (64.7%)</title>
+    <rect x="1028.7" y="217.9" width="74.3" height="67.1" fill="#5a6068"/>
+    <path d="M1043.5 217.9h29.7v16.8h-29.7zM1088.1 217.9h14.9v16.8h-14.9zM1043.5 234.7h59.5v16.8h-59.5zM1028.7 251.5h14.9v16.8h-14.9zM1058.4 251.5h29.7v16.8h-29.7zM1043.5 268.2h14.9v16.8h-14.9z" fill="#2fa343"/>
+    <rect x="1058.4" y="268.2" width="44.6" height="16.8" fill="#0d0f12" opacity="0.55"/>
+    <path d="M1043.5 217.9v67.1M1058.4 217.9v67.1M1073.3 217.9v67.1M1088.1 217.9v67.1M1028.7 234.7h74.3M1028.7 251.5h74.3M1028.7 268.2h74.3" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="1028.7" y="217.9" width="74.3" height="67.1" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="1032.7" y="230.4" class="lbl">XDisplay</text>
+  </g>
+  <text x="16" y="312" fill="#f0f3f6" font-size="13.5" font-weight="600">Small libraries: 90.11% (82/91)</text>
+  <g>
+    <title>XGTexture: 9/15 (60.0%)</title>
+    <rect x="17.0" y="321.0" width="130.5" height="26.0" fill="#5a6068"/>
+    <path d="M17.0 321.0h39.2v13.0h-39.2zM95.3 321.0h13.1v13.0h-13.1zM121.4 321.0h26.1v13.0h-26.1zM17.0 334.0h13.1v13.0h-13.1zM56.2 334.0h26.1v13.0h-26.1z" fill="#2fa343"/>
+    <rect x="82.2" y="334.0" width="65.2" height="13.0" fill="#0d0f12" opacity="0.55"/>
+    <path d="M30.1 321.0v26.0M43.1 321.0v26.0M56.2 321.0v26.0M69.2 321.0v26.0M82.2 321.0v26.0M95.3 321.0v26.0M108.4 321.0v26.0M121.4 321.0v26.0M134.4 321.0v26.0M17.0 334.0h130.5" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="17.0" y="321.0" width="130.5" height="26.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="21.0" y="333.5" class="lbl">XGTexture</text>
+  </g>
+  <g>
+    <title>XMem: 14/14 (100.0%)</title>
+    <rect x="153.5" y="321.0" width="130.5" height="26.0" fill="#2fa343"/>
+    <rect x="205.7" y="334.0" width="78.3" height="13.0" fill="#0d0f12" opacity="0.55"/>
+    <path d="M166.6 321.0v26.0M179.6 321.0v26.0M192.7 321.0v26.0M205.7 321.0v26.0M218.8 321.0v26.0M231.8 321.0v26.0M244.9 321.0v26.0M257.9 321.0v26.0M270.9 321.0v26.0M153.5 334.0h130.5" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="153.5" y="321.0" width="130.5" height="26.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="157.5" y="333.5" class="lbl">XMem</text>
+  </g>
+  <g>
+    <title>XSystem: 12/14 (85.7%)</title>
+    <rect x="290.0" y="321.0" width="130.5" height="26.0" fill="#5a6068"/>
+    <path d="M303.1 321.0h65.2v13.0h-65.2zM381.4 321.0h39.2v13.0h-39.2zM290.0 334.0h52.2v13.0h-52.2z" fill="#2fa343"/>
+    <rect x="342.2" y="334.0" width="78.3" height="13.0" fill="#0d0f12" opacity="0.55"/>
+    <path d="M303.1 321.0v26.0M316.1 321.0v26.0M329.1 321.0v26.0M342.2 321.0v26.0M355.2 321.0v26.0M368.3 321.0v26.0M381.4 321.0v26.0M394.4 321.0v26.0M407.4 321.0v26.0M290.0 334.0h130.5" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="290.0" y="321.0" width="130.5" height="26.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="294.0" y="333.5" class="lbl">XSystem</text>
+  </g>
+  <g>
+    <title>AcpHal: 9/9 (100.0%)</title>
+    <rect x="426.5" y="321.0" width="130.5" height="26.0" fill="#2fa343"/>
+    <rect x="442.8" y="334.0" width="114.2" height="13.0" fill="#0d0f12" opacity="0.55"/>
+    <path d="M442.8 321.0v26.0M459.1 321.0v26.0M475.4 321.0v26.0M491.8 321.0v26.0M508.1 321.0v26.0M524.4 321.0v26.0M540.7 321.0v26.0M426.5 334.0h130.5" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="426.5" y="321.0" width="130.5" height="26.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="430.5" y="333.5" class="lbl">AcpHal</text>
+  </g>
+  <g>
+    <title>LocalStorage: 7/8 (87.5%)</title>
+    <rect x="563.0" y="321.0" width="130.5" height="26.0" fill="#5a6068"/>
+    <path d="M579.3 321.0h114.2v26.0h-114.2z" fill="#2fa343"/>
+    <path d="M579.3 321.0v26.0M595.6 321.0v26.0M611.9 321.0v26.0M628.2 321.0v26.0M644.6 321.0v26.0M660.9 321.0v26.0M677.2 321.0v26.0" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="563.0" y="321.0" width="130.5" height="26.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="567.0" y="333.5" class="lbl">LocalStorage</text>
+  </g>
+  <g>
+    <title>XGameRuntime: 8/8 (100.0%)</title>
+    <rect x="699.5" y="321.0" width="130.5" height="26.0" fill="#2fa343"/>
+    <path d="M715.8 321.0v26.0M732.1 321.0v26.0M748.4 321.0v26.0M764.8 321.0v26.0M781.1 321.0v26.0M797.4 321.0v26.0M813.7 321.0v26.0" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="699.5" y="321.0" width="130.5" height="26.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="703.5" y="333.5" class="lbl">XGameRuntime</text>
+  </g>
+  <g>
+    <title>D3D12X: 6/6 (100.0%)</title>
+    <rect x="836.0" y="321.0" width="130.5" height="26.0" fill="#2fa343"/>
+    <path d="M857.8 321.0v26.0M879.5 321.0v26.0M901.2 321.0v26.0M923.0 321.0v26.0M944.8 321.0v26.0" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="836.0" y="321.0" width="130.5" height="26.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="840.0" y="333.5" class="lbl">D3D12X</text>
+  </g>
+  <g>
+    <title>Lifecycle: 6/6 (100.0%)</title>
+    <rect x="972.5" y="321.0" width="130.5" height="26.0" fill="#2fa343"/>
+    <path d="M994.2 321.0v26.0M1016.0 321.0v26.0M1037.8 321.0v26.0M1059.5 321.0v26.0M1081.2 321.0v26.0" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="972.5" y="321.0" width="130.5" height="26.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="976.5" y="333.5" class="lbl">Lifecycle</text>
+  </g>
+  <g>
+    <title>XApu: 5/5 (100.0%)</title>
+    <rect x="17.0" y="353.0" width="130.5" height="26.0" fill="#2fa343"/>
+    <path d="M43.1 353.0v26.0M69.2 353.0v26.0M95.3 353.0v26.0M121.4 353.0v26.0" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="17.0" y="353.0" width="130.5" height="26.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="21.0" y="365.5" class="lbl">XApu</text>
+  </g>
+  <g>
+    <title>XDsp: 5/5 (100.0%)</title>
+    <rect x="153.5" y="353.0" width="130.5" height="26.0" fill="#2fa343"/>
+    <path d="M179.6 353.0v26.0M205.7 353.0v26.0M231.8 353.0v26.0M257.9 353.0v26.0" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="153.5" y="353.0" width="130.5" height="26.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="157.5" y="365.5" class="lbl">XDsp</text>
+  </g>
+  <g>
+    <title>MFPlat: 1/1 (100.0%)</title>
+    <rect x="290.0" y="353.0" width="130.5" height="26.0" fill="#2fa343"/>
+    <rect x="290.0" y="353.0" width="130.5" height="26.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="294.0" y="365.5" class="lbl">MFPlat</text>
+  </g>
+  <text x="16" y="408" fill="#f0f3f6" font-size="13.5" font-weight="600">RDNA2 (GFX10.3) opcodes decoded: 100.00% (1233/1233)</text>
+  <text x="568" y="408" fill="#f0f3f6" font-size="13.5" font-weight="600">RDNA2 → DXIL lowered: 52.07% (642/1233)</text>
+  <g>
+    <title>VOPC: 190/190 (100.0%)</title>
+    <rect x="17.0" y="417.0" width="147.5" height="137.2" fill="#2fa343"/>
+    <rect x="115.4" y="543.6" width="49.2" height="10.6" fill="#0d0f12" opacity="0.55"/>
+    <path d="M26.8 417.0v137.2M36.7 417.0v137.2M46.5 417.0v137.2M56.3 417.0v137.2M66.2 417.0v137.2M76.0 417.0v137.2M85.9 417.0v137.2M95.7 417.0v137.2M105.5 417.0v137.2M115.4 417.0v137.2M125.2 417.0v137.2M135.0 417.0v137.2M144.9 417.0v137.2M154.7 417.0v137.2M17.0 427.6h147.5M17.0 438.1h147.5M17.0 448.7h147.5M17.0 459.2h147.5M17.0 469.8h147.5M17.0 480.3h147.5M17.0 490.9h147.5M17.0 501.4h147.5M17.0 512.0h147.5M17.0 522.5h147.5M17.0 533.1h147.5M17.0 543.6h147.5" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="17.0" y="417.0" width="147.5" height="137.2" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="21.0" y="429.5" class="lbl">VOPC</text>
+  </g>
+  <g>
+    <title>DS: 154/154 (100.0%)</title>
+    <rect x="17.0" y="556.2" width="147.5" height="110.8" fill="#2fa343"/>
+    <path d="M27.5 556.2v110.8M38.1 556.2v110.8M48.6 556.2v110.8M59.2 556.2v110.8M69.7 556.2v110.8M80.2 556.2v110.8M90.8 556.2v110.8M101.3 556.2v110.8M111.8 556.2v110.8M122.4 556.2v110.8M132.9 556.2v110.8M143.5 556.2v110.8M154.0 556.2v110.8M17.0 566.3h147.5M17.0 576.3h147.5M17.0 586.4h147.5M17.0 596.5h147.5M17.0 606.6h147.5M17.0 616.6h147.5M17.0 626.7h147.5M17.0 636.8h147.5M17.0 646.9h147.5M17.0 656.9h147.5" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="17.0" y="556.2" width="147.5" height="110.8" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="21.0" y="568.7" class="lbl">DS</text>
+  </g>
+  <g>
+    <title>VOP3: 116/116 (100.0%)</title>
+    <rect x="166.5" y="417.0" width="93.2" height="131.5" fill="#2fa343"/>
+    <rect x="249.4" y="538.4" width="10.4" height="10.1" fill="#0d0f12" opacity="0.55"/>
+    <path d="M176.9 417.0v131.5M187.3 417.0v131.5M197.6 417.0v131.5M208.0 417.0v131.5M218.3 417.0v131.5M228.7 417.0v131.5M239.0 417.0v131.5M249.4 417.0v131.5M166.5 427.1h93.2M166.5 437.2h93.2M166.5 447.3h93.2M166.5 457.5h93.2M166.5 467.6h93.2M166.5 477.7h93.2M166.5 487.8h93.2M166.5 497.9h93.2M166.5 508.0h93.2M166.5 518.1h93.2M166.5 528.3h93.2M166.5 538.4h93.2" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="166.5" y="417.0" width="93.2" height="131.5" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="170.5" y="429.5" class="lbl">VOP3</text>
+  </g>
+  <g>
+    <title>MIMG: 103/103 (100.0%)</title>
+    <rect x="166.5" y="550.5" width="93.2" height="116.5" fill="#2fa343"/>
+    <rect x="208.0" y="657.3" width="51.8" height="9.7" fill="#0d0f12" opacity="0.55"/>
+    <path d="M176.9 550.5v116.5M187.3 550.5v116.5M197.6 550.5v116.5M208.0 550.5v116.5M218.3 550.5v116.5M228.7 550.5v116.5M239.0 550.5v116.5M249.4 550.5v116.5M166.5 560.2h93.2M166.5 569.9h93.2M166.5 579.6h93.2M166.5 589.3h93.2M166.5 599.0h93.2M166.5 608.7h93.2M166.5 618.4h93.2M166.5 628.2h93.2M166.5 637.9h93.2M166.5 647.6h93.2M166.5 657.3h93.2" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="166.5" y="550.5" width="93.2" height="116.5" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="170.5" y="563.0" class="lbl">MIMG</text>
+  </g>
+  <g>
+    <title>SMEM: 84/84 (100.0%)</title>
+    <rect x="261.7" y="417.0" width="102.3" height="86.2" fill="#2fa343"/>
+    <rect x="302.7" y="493.6" width="61.4" height="9.6" fill="#0d0f12" opacity="0.55"/>
+    <path d="M272.0 417.0v86.2M282.2 417.0v86.2M292.4 417.0v86.2M302.7 417.0v86.2M312.9 417.0v86.2M323.1 417.0v86.2M333.4 417.0v86.2M343.6 417.0v86.2M353.8 417.0v86.2M261.7 426.6h102.3M261.7 436.2h102.3M261.7 445.7h102.3M261.7 455.3h102.3M261.7 464.9h102.3M261.7 474.5h102.3M261.7 484.0h102.3M261.7 493.6h102.3" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="261.7" y="417.0" width="102.3" height="86.2" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="265.7" y="429.5" class="lbl">SMEM</text>
+  </g>
+  <g>
+    <title>VOP1: 81/81 (100.0%)</title>
+    <rect x="261.7" y="505.2" width="102.3" height="83.0" fill="#2fa343"/>
+    <rect x="299.0" y="577.9" width="65.1" height="10.4" fill="#0d0f12" opacity="0.55"/>
+    <path d="M271.0 505.2v83.0M280.3 505.2v83.0M289.7 505.2v83.0M299.0 505.2v83.0M308.3 505.2v83.0M317.6 505.2v83.0M326.9 505.2v83.0M336.2 505.2v83.0M345.5 505.2v83.0M354.8 505.2v83.0M261.7 515.6h102.3M261.7 526.0h102.3M261.7 536.3h102.3M261.7 546.7h102.3M261.7 557.1h102.3M261.7 567.5h102.3M261.7 577.9h102.3" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="261.7" y="505.2" width="102.3" height="83.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="265.7" y="517.7" class="lbl">VOP1</text>
+  </g>
+  <g>
+    <title>MUBUF: 75/75 (100.0%)</title>
+    <rect x="261.7" y="590.2" width="102.3" height="76.8" fill="#2fa343"/>
+    <rect x="312.9" y="657.4" width="51.2" height="9.6" fill="#0d0f12" opacity="0.55"/>
+    <path d="M272.0 590.2v76.8M282.2 590.2v76.8M292.4 590.2v76.8M302.7 590.2v76.8M312.9 590.2v76.8M323.1 590.2v76.8M333.4 590.2v76.8M343.6 590.2v76.8M353.8 590.2v76.8M261.7 599.8h102.3M261.7 609.4h102.3M261.7 619.0h102.3M261.7 628.6h102.3M261.7 638.2h102.3M261.7 647.8h102.3M261.7 657.4h102.3" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="261.7" y="590.2" width="102.3" height="76.8" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="265.7" y="602.8" class="lbl">MUBUF</text>
+  </g>
+  <g>
+    <title>SOP1: 66/66 (100.0%)</title>
+    <rect x="366.1" y="417.0" width="98.3" height="70.1" fill="#2fa343"/>
+    <rect x="425.1" y="477.1" width="39.3" height="10.0" fill="#0d0f12" opacity="0.55"/>
+    <path d="M375.9 417.0v70.1M385.7 417.0v70.1M395.6 417.0v70.1M405.4 417.0v70.1M415.2 417.0v70.1M425.1 417.0v70.1M434.9 417.0v70.1M444.7 417.0v70.1M454.5 417.0v70.1M366.1 427.0h98.3M366.1 437.0h98.3M366.1 447.0h98.3M366.1 457.0h98.3M366.1 467.1h98.3M366.1 477.1h98.3" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="366.1" y="417.0" width="98.3" height="70.1" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="370.1" y="429.5" class="lbl">SOP1</text>
+  </g>
+  <g>
+    <title>GLOBAL: 57/57 (100.0%)</title>
+    <rect x="466.4" y="417.0" width="84.6" height="70.1" fill="#2fa343"/>
+    <rect x="494.6" y="477.1" width="56.4" height="10.0" fill="#0d0f12" opacity="0.55"/>
+    <path d="M475.8 417.0v70.1M485.2 417.0v70.1M494.6 417.0v70.1M504.0 417.0v70.1M513.4 417.0v70.1M522.8 417.0v70.1M532.2 417.0v70.1M541.6 417.0v70.1M466.4 427.0h84.6M466.4 437.0h84.6M466.4 447.0h84.6M466.4 457.0h84.6M466.4 467.1h84.6M466.4 477.1h84.6" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="466.4" y="417.0" width="84.6" height="70.1" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="470.4" y="429.5" class="lbl">GLOBAL</text>
+  </g>
+  <g>
+    <title>FLAT: 54/54 (100.0%)</title>
+    <rect x="366.1" y="489.1" width="61.9" height="90.5" fill="#2fa343"/>
+    <path d="M376.4 489.1v90.5M386.7 489.1v90.5M397.0 489.1v90.5M407.4 489.1v90.5M417.7 489.1v90.5M366.1 499.1h61.9M366.1 509.2h61.9M366.1 519.3h61.9M366.1 529.3h61.9M366.1 539.4h61.9M366.1 549.4h61.9M366.1 559.5h61.9M366.1 569.6h61.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="366.1" y="489.1" width="61.9" height="90.5" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="370.1" y="501.6" class="lbl">FLAT</text>
+  </g>
+  <g>
+    <title>SOP2: 51/51 (100.0%)</title>
+    <rect x="366.1" y="581.6" width="61.9" height="85.4" fill="#2fa343"/>
+    <rect x="397.0" y="657.5" width="31.0" height="9.5" fill="#0d0f12" opacity="0.55"/>
+    <path d="M376.4 581.6v85.4M386.7 581.6v85.4M397.0 581.6v85.4M407.4 581.6v85.4M417.7 581.6v85.4M366.1 591.1h61.9M366.1 600.6h61.9M366.1 610.1h61.9M366.1 619.6h61.9M366.1 629.0h61.9M366.1 638.5h61.9M366.1 648.0h61.9M366.1 657.5h61.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="366.1" y="581.6" width="61.9" height="85.4" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="370.1" y="594.1" class="lbl">SOP2</text>
+  </g>
+  <g>
+    <title>VOP2: 50/50 (100.0%)</title>
+    <rect x="430.0" y="489.1" width="68.7" height="75.5" fill="#2fa343"/>
+    <rect x="439.8" y="555.1" width="58.9" height="9.4" fill="#0d0f12" opacity="0.55"/>
+    <path d="M439.8 489.1v75.5M449.6 489.1v75.5M459.4 489.1v75.5M469.3 489.1v75.5M479.1 489.1v75.5M488.9 489.1v75.5M430.0 498.5h68.7M430.0 508.0h68.7M430.0 517.4h68.7M430.0 526.8h68.7M430.0 536.3h68.7M430.0 545.7h68.7M430.0 555.1h68.7" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="430.0" y="489.1" width="68.7" height="75.5" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="434.0" y="501.6" class="lbl">VOP2</text>
+  </g>
+  <g>
+    <title>SOPP: 37/37 (100.0%)</title>
+    <rect x="500.7" y="489.1" width="50.3" height="75.5" fill="#2fa343"/>
+    <rect x="520.8" y="555.1" width="30.2" height="9.4" fill="#0d0f12" opacity="0.55"/>
+    <path d="M510.8 489.1v75.5M520.8 489.1v75.5M530.9 489.1v75.5M540.9 489.1v75.5M500.7 498.5h50.3M500.7 508.0h50.3M500.7 517.4h50.3M500.7 526.8h50.3M500.7 536.3h50.3M500.7 545.7h50.3M500.7 555.1h50.3" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="500.7" y="489.1" width="50.3" height="75.5" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="504.7" y="501.6" class="lbl">SOPP</text>
+  </g>
+  <g>
+    <title>VOP3P: 28/28 (100.0%)</title>
+    <rect x="430.0" y="566.6" width="56.8" height="50.1" fill="#2fa343"/>
+    <rect x="467.9" y="606.7" width="18.9" height="10.0" fill="#0d0f12" opacity="0.55"/>
+    <path d="M439.5 566.6v50.1M448.9 566.6v50.1M458.4 566.6v50.1M467.9 566.6v50.1M477.4 566.6v50.1M430.0 576.6h56.8M430.0 586.6h56.8M430.0 596.7h56.8M430.0 606.7h56.8" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="430.0" y="566.6" width="56.8" height="50.1" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="434.0" y="579.1" class="lbl">VOP3P</text>
+  </g>
+  <g>
+    <title>SOPK: 27/27 (100.0%)</title>
+    <rect x="430.0" y="618.7" width="56.8" height="48.3" fill="#2fa343"/>
+    <rect x="458.4" y="657.3" width="28.4" height="9.7" fill="#0d0f12" opacity="0.55"/>
+    <path d="M439.5 618.7v48.3M448.9 618.7v48.3M458.4 618.7v48.3M467.9 618.7v48.3M477.4 618.7v48.3M430.0 628.4h56.8M430.0 638.0h56.8M430.0 647.7h56.8M430.0 657.3h56.8" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="430.0" y="618.7" width="56.8" height="48.3" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="434.0" y="631.2" class="lbl">SOPK</text>
+  </g>
+  <g>
+    <title>SCRATCH: 22/22 (100.0%)</title>
+    <rect x="488.8" y="566.6" width="62.2" height="35.6" fill="#2fa343"/>
+    <rect x="497.7" y="593.2" width="53.3" height="8.9" fill="#0d0f12" opacity="0.55"/>
+    <path d="M497.7 566.6v35.6M506.6 566.6v35.6M515.5 566.6v35.6M524.4 566.6v35.6M533.2 566.6v35.6M542.1 566.6v35.6M488.8 575.5h62.2M488.8 584.4h62.2M488.8 593.2h62.2" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="488.8" y="566.6" width="62.2" height="35.6" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="492.8" y="579.1" class="lbl">SCRATCH</text>
+  </g>
+  <g>
+    <title>SOPC: 18/18 (100.0%)</title>
+    <rect x="488.8" y="604.1" width="32.0" height="56.0" fill="#2fa343"/>
+    <path d="M499.5 604.1v56.0M510.1 604.1v56.0M488.8 613.5h32.0M488.8 622.8h32.0M488.8 632.2h32.0M488.8 641.5h32.0M488.8 650.8h32.0" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="488.8" y="604.1" width="32.0" height="56.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="492.8" y="616.6" class="lbl">SOP</text>
+  </g>
+  <g>
+    <title>MTBUF: 16/16 (100.0%)</title>
+    <rect x="522.8" y="604.1" width="28.2" height="56.0" fill="#2fa343"/>
+    <rect x="532.2" y="650.8" width="18.8" height="9.3" fill="#0d0f12" opacity="0.55"/>
+    <path d="M532.2 604.1v56.0M541.6 604.1v56.0M522.8 613.5h28.2M522.8 622.8h28.2M522.8 632.2h28.2M522.8 641.5h28.2M522.8 650.8h28.2" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="522.8" y="604.1" width="28.2" height="56.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="526.8" y="616.6" class="lbl">MTB</text>
+  </g>
+  <g>
+    <title>VINTRP: 3/3 (100.0%)</title>
+    <rect x="488.8" y="662.2" width="46.1" height="4.8" fill="#2fa343"/>
+    <path d="M504.2 662.2v4.8M519.6 662.2v4.8" stroke="#14181d" stroke-width="0.55" fill="none"/>
+    <rect x="488.8" y="662.2" width="46.1" height="4.8" fill="none" stroke="#0d0f12" stroke-width="1"/>
+  </g>
+  <g>
+    <title>EXP: 1/1 (100.0%)</title>
+    <rect x="537.0" y="662.2" width="14.0" height="4.8" fill="#2fa343"/>
+    <rect x="537.0" y="662.2" width="14.0" height="4.8" fill="none" stroke="#0d0f12" stroke-width="1"/>
+  </g>
+  <g>
+    <title>VOPC: 148/190 (77.9%)</title>
+    <rect x="569.0" y="417.0" width="147.5" height="137.2" fill="#5a6068"/>
+    <path d="M569.0 417.0h147.5v10.6h-147.5zM569.0 427.6h147.5v10.6h-147.5zM569.0 438.1h19.7v10.6h-19.7zM608.3 459.2h108.2v10.6h-108.2zM569.0 469.8h147.5v10.6h-147.5zM569.0 480.3h59.0v10.6h-59.0zM637.9 480.3h59.0v10.6h-59.0zM569.0 490.9h59.0v10.6h-59.0zM637.9 490.9h59.0v10.6h-59.0zM569.0 501.4h147.5v10.6h-147.5zM569.0 512.0h147.5v10.6h-147.5zM569.0 522.5h78.7v10.6h-78.7zM657.5 522.5h59.0v10.6h-59.0zM578.8 533.1h78.7v10.6h-78.7zM667.4 533.1h49.2v10.6h-49.2zM569.0 543.6h9.8v10.6h-9.8zM588.7 543.6h78.7v10.6h-78.7z" fill="#2fa343"/>
+    <rect x="667.4" y="543.6" width="49.2" height="10.6" fill="#0d0f12" opacity="0.55"/>
+    <path d="M578.8 417.0v137.2M588.7 417.0v137.2M598.5 417.0v137.2M608.3 417.0v137.2M618.2 417.0v137.2M628.0 417.0v137.2M637.9 417.0v137.2M647.7 417.0v137.2M657.5 417.0v137.2M667.4 417.0v137.2M677.2 417.0v137.2M687.0 417.0v137.2M696.9 417.0v137.2M706.7 417.0v137.2M569.0 427.6h147.5M569.0 438.1h147.5M569.0 448.7h147.5M569.0 459.2h147.5M569.0 469.8h147.5M569.0 480.3h147.5M569.0 490.9h147.5M569.0 501.4h147.5M569.0 512.0h147.5M569.0 522.5h147.5M569.0 533.1h147.5M569.0 543.6h147.5" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="569.0" y="417.0" width="147.5" height="137.2" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="573.0" y="429.5" class="lbl">VOPC</text>
+  </g>
+  <g>
+    <title>DS: 57/154 (37.0%)</title>
+    <rect x="569.0" y="556.2" width="147.5" height="110.8" fill="#5a6068"/>
+    <path d="M569.0 556.2h21.1v10.1h-21.1zM621.7 556.2h73.8v10.1h-73.8zM706.0 556.2h10.5v10.1h-10.5zM569.0 566.3h31.6v10.1h-31.6zM611.2 566.3h21.1v10.1h-21.1zM569.0 576.3h42.2v10.1h-42.2zM642.8 576.3h73.8v10.1h-73.8zM579.5 586.4h10.5v10.1h-10.5zM611.2 586.4h10.5v10.1h-10.5zM632.2 586.4h21.1v10.1h-21.1zM663.8 586.4h52.7v10.1h-52.7zM569.0 596.5h31.6v10.1h-31.6zM621.7 606.6h31.6v10.1h-31.6zM621.7 626.7h31.6v10.1h-31.6zM684.9 636.8h31.6v10.1h-31.6zM569.0 646.9h52.7v10.1h-52.7zM653.3 646.9h10.5v10.1h-10.5zM674.4 656.9h42.2v10.1h-42.2z" fill="#2fa343"/>
+    <path d="M579.5 556.2v110.8M590.1 556.2v110.8M600.6 556.2v110.8M611.2 556.2v110.8M621.7 556.2v110.8M632.2 556.2v110.8M642.8 556.2v110.8M653.3 556.2v110.8M663.8 556.2v110.8M674.4 556.2v110.8M684.9 556.2v110.8M695.5 556.2v110.8M706.0 556.2v110.8M569.0 566.3h147.5M569.0 576.3h147.5M569.0 586.4h147.5M569.0 596.5h147.5M569.0 606.6h147.5M569.0 616.6h147.5M569.0 626.7h147.5M569.0 636.8h147.5M569.0 646.9h147.5M569.0 656.9h147.5" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="569.0" y="556.2" width="147.5" height="110.8" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="573.0" y="568.7" class="lbl">DS</text>
+  </g>
+  <g>
+    <title>VOP3: 77/116 (66.4%)</title>
+    <rect x="718.5" y="417.0" width="93.2" height="131.5" fill="#5a6068"/>
+    <path d="M718.5 417.0h93.2v10.1h-93.2zM718.5 427.1h31.1v10.1h-31.1zM770.3 427.1h20.7v10.1h-20.7zM801.4 427.1h10.4v10.1h-10.4zM718.5 437.2h93.2v10.1h-93.2zM718.5 447.3h51.8v10.1h-51.8zM739.3 457.5h20.7v10.1h-20.7zM770.3 457.5h20.7v10.1h-20.7zM801.4 457.5h10.4v10.1h-10.4zM728.9 467.6h10.4v10.1h-10.4zM780.7 467.6h10.4v10.1h-10.4zM801.4 467.6h10.4v10.1h-10.4zM718.5 477.7h93.2v10.1h-93.2zM718.5 487.8h31.1v10.1h-31.1zM770.3 487.8h31.1v10.1h-31.1zM728.9 497.9h20.7v10.1h-20.7zM760.0 497.9h51.8v10.1h-51.8zM718.5 508.0h31.1v10.1h-31.1zM770.3 508.0h10.4v10.1h-10.4zM801.4 508.0h10.4v10.1h-10.4zM739.3 518.1h10.4v10.1h-10.4zM770.3 518.1h20.7v10.1h-20.7zM801.4 518.1h10.4v10.1h-10.4zM718.5 528.3h31.1v10.1h-31.1zM791.0 528.3h20.7v10.1h-20.7zM718.5 538.4h20.7v10.1h-20.7zM770.3 538.4h20.7v10.1h-20.7z" fill="#2fa343"/>
+    <rect x="801.4" y="538.4" width="10.4" height="10.1" fill="#0d0f12" opacity="0.55"/>
+    <path d="M728.9 417.0v131.5M739.3 417.0v131.5M749.6 417.0v131.5M760.0 417.0v131.5M770.3 417.0v131.5M780.7 417.0v131.5M791.0 417.0v131.5M801.4 417.0v131.5M718.5 427.1h93.2M718.5 437.2h93.2M718.5 447.3h93.2M718.5 457.5h93.2M718.5 467.6h93.2M718.5 477.7h93.2M718.5 487.8h93.2M718.5 497.9h93.2M718.5 508.0h93.2M718.5 518.1h93.2M718.5 528.3h93.2M718.5 538.4h93.2" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="718.5" y="417.0" width="93.2" height="131.5" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="722.5" y="429.5" class="lbl">VOP3</text>
+  </g>
+  <g>
+    <title>MIMG: 36/103 (35.0%)</title>
+    <rect x="718.5" y="550.5" width="93.2" height="116.5" fill="#5a6068"/>
+    <path d="M718.5 550.5h20.7v9.7h-20.7zM780.7 550.5h10.4v9.7h-10.4zM728.9 560.2h82.8v9.7h-82.8zM718.5 569.9h41.4v9.7h-41.4zM718.5 579.6h93.2v9.7h-93.2zM718.5 589.3h10.4v9.7h-10.4zM780.7 589.3h20.7v9.7h-20.7zM770.3 599.0h10.4v9.7h-10.4zM770.3 608.7h10.4v9.7h-10.4zM791.0 608.7h10.4v9.7h-10.4zM728.9 618.4h10.4v9.7h-10.4zM728.9 628.2h10.4v9.7h-10.4zM760.0 628.2h10.4v9.7h-10.4zM739.3 637.9h10.4v9.7h-10.4zM739.3 657.3h20.7v9.7h-20.7z" fill="#2fa343"/>
+    <rect x="760.0" y="657.3" width="51.8" height="9.7" fill="#0d0f12" opacity="0.55"/>
+    <path d="M728.9 550.5v116.5M739.3 550.5v116.5M749.6 550.5v116.5M760.0 550.5v116.5M770.3 550.5v116.5M780.7 550.5v116.5M791.0 550.5v116.5M801.4 550.5v116.5M718.5 560.2h93.2M718.5 569.9h93.2M718.5 579.6h93.2M718.5 589.3h93.2M718.5 599.0h93.2M718.5 608.7h93.2M718.5 618.4h93.2M718.5 628.2h93.2M718.5 637.9h93.2M718.5 647.6h93.2M718.5 657.3h93.2" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="718.5" y="550.5" width="93.2" height="116.5" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="722.5" y="563.0" class="lbl">MIMG</text>
+  </g>
+  <g>
+    <title>SMEM: 10/84 (11.9%)</title>
+    <rect x="813.7" y="417.0" width="102.3" height="86.2" fill="#5a6068"/>
+    <path d="M813.7 417.0h51.2v9.6h-51.2zM895.6 417.0h20.5v9.6h-20.5zM813.7 426.6h30.7v9.6h-30.7z" fill="#2fa343"/>
+    <rect x="854.7" y="493.6" width="61.4" height="9.6" fill="#0d0f12" opacity="0.55"/>
+    <path d="M824.0 417.0v86.2M834.2 417.0v86.2M844.4 417.0v86.2M854.7 417.0v86.2M864.9 417.0v86.2M875.1 417.0v86.2M885.4 417.0v86.2M895.6 417.0v86.2M905.8 417.0v86.2M813.7 426.6h102.3M813.7 436.2h102.3M813.7 445.7h102.3M813.7 455.3h102.3M813.7 464.9h102.3M813.7 474.5h102.3M813.7 484.0h102.3M813.7 493.6h102.3" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="813.7" y="417.0" width="102.3" height="86.2" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="817.7" y="429.5" class="lbl">SMEM</text>
+  </g>
+  <g>
+    <title>VOP1: 56/81 (69.1%)</title>
+    <rect x="813.7" y="505.2" width="102.3" height="83.0" fill="#5a6068"/>
+    <path d="M823.0 505.2h18.6v10.4h-18.6zM860.3 505.2h55.8v10.4h-55.8zM813.7 515.6h37.2v10.4h-37.2zM860.3 515.6h37.2v10.4h-37.2zM860.3 526.0h55.8v10.4h-55.8zM813.7 536.3h37.2v10.4h-37.2zM869.6 536.3h9.3v10.4h-9.3zM888.2 536.3h27.9v10.4h-27.9zM813.7 546.7h37.2v10.4h-37.2zM906.8 546.7h9.3v10.4h-9.3zM813.7 557.1h18.6v10.4h-18.6zM841.7 557.1h74.4v10.4h-74.4zM813.7 567.5h9.3v10.4h-9.3zM841.7 567.5h65.1v10.4h-65.1zM813.7 577.9h27.9v10.4h-27.9z" fill="#2fa343"/>
+    <rect x="851.0" y="577.9" width="65.1" height="10.4" fill="#0d0f12" opacity="0.55"/>
+    <path d="M823.0 505.2v83.0M832.3 505.2v83.0M841.7 505.2v83.0M851.0 505.2v83.0M860.3 505.2v83.0M869.6 505.2v83.0M878.9 505.2v83.0M888.2 505.2v83.0M897.5 505.2v83.0M906.8 505.2v83.0M813.7 515.6h102.3M813.7 526.0h102.3M813.7 536.3h102.3M813.7 546.7h102.3M813.7 557.1h102.3M813.7 567.5h102.3M813.7 577.9h102.3" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="813.7" y="505.2" width="102.3" height="83.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="817.7" y="517.7" class="lbl">VOP1</text>
+  </g>
+  <g>
+    <title>MUBUF: 42/75 (56.0%)</title>
+    <rect x="813.7" y="590.2" width="102.3" height="76.8" fill="#5a6068"/>
+    <path d="M813.7 590.2h102.3v9.6h-102.3zM813.7 599.8h71.6v9.6h-71.6zM895.6 599.8h10.2v9.6h-10.2zM813.7 609.4h40.9v9.6h-40.9zM834.2 619.0h30.7v9.6h-30.7zM885.4 619.0h30.7v9.6h-30.7zM813.7 628.6h40.9v9.6h-40.9zM864.9 647.8h51.2v9.6h-51.2zM813.7 657.4h51.2v9.6h-51.2z" fill="#2fa343"/>
+    <rect x="864.9" y="657.4" width="51.2" height="9.6" fill="#0d0f12" opacity="0.55"/>
+    <path d="M824.0 590.2v76.8M834.2 590.2v76.8M844.4 590.2v76.8M854.7 590.2v76.8M864.9 590.2v76.8M875.1 590.2v76.8M885.4 590.2v76.8M895.6 590.2v76.8M905.8 590.2v76.8M813.7 599.8h102.3M813.7 609.4h102.3M813.7 619.0h102.3M813.7 628.6h102.3M813.7 638.2h102.3M813.7 647.8h102.3M813.7 657.4h102.3" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="813.7" y="590.2" width="102.3" height="76.8" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="817.7" y="602.8" class="lbl">MUBUF</text>
+  </g>
+  <g>
+    <title>SOP1: 17/66 (25.8%)</title>
+    <rect x="918.1" y="417.0" width="98.3" height="70.1" fill="#5a6068"/>
+    <path d="M918.1 417.0h19.7v10.0h-19.7zM957.4 417.0h19.7v10.0h-19.7zM996.7 417.0h9.8v10.0h-9.8zM937.7 427.0h19.7v10.0h-19.7zM977.1 427.0h29.5v10.0h-29.5zM918.1 437.0h9.8v10.0h-9.8zM957.4 437.0h9.8v10.0h-9.8zM977.1 437.0h9.8v10.0h-9.8zM996.7 437.0h9.8v10.0h-9.8zM918.1 457.0h19.7v10.0h-19.7zM977.1 457.0h9.8v10.0h-9.8z" fill="#2fa343"/>
+    <rect x="977.1" y="477.1" width="39.3" height="10.0" fill="#0d0f12" opacity="0.55"/>
+    <path d="M927.9 417.0v70.1M937.7 417.0v70.1M947.6 417.0v70.1M957.4 417.0v70.1M967.2 417.0v70.1M977.1 417.0v70.1M986.9 417.0v70.1M996.7 417.0v70.1M1006.5 417.0v70.1M918.1 427.0h98.3M918.1 437.0h98.3M918.1 447.0h98.3M918.1 457.0h98.3M918.1 467.1h98.3M918.1 477.1h98.3" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="918.1" y="417.0" width="98.3" height="70.1" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="922.1" y="429.5" class="lbl">SOP1</text>
+  </g>
+  <g>
+    <title>GLOBAL: 24/57 (42.1%)</title>
+    <rect x="1018.4" y="417.0" width="84.6" height="70.1" fill="#5a6068"/>
+    <path d="M1018.4 417.0h75.2v10.0h-75.2zM1065.4 427.0h37.6v10.0h-37.6zM1074.8 437.0h9.4v10.0h-9.4zM1093.6 437.0h9.4v10.0h-9.4zM1018.4 447.0h9.4v10.0h-9.4zM1037.2 447.0h65.8v10.0h-65.8zM1046.6 457.0h18.8v10.0h-18.8z" fill="#2fa343"/>
+    <rect x="1046.6" y="477.1" width="56.4" height="10.0" fill="#0d0f12" opacity="0.55"/>
+    <path d="M1027.8 417.0v70.1M1037.2 417.0v70.1M1046.6 417.0v70.1M1056.0 417.0v70.1M1065.4 417.0v70.1M1074.8 417.0v70.1M1084.2 417.0v70.1M1093.6 417.0v70.1M1018.4 427.0h84.6M1018.4 437.0h84.6M1018.4 447.0h84.6M1018.4 457.0h84.6M1018.4 467.1h84.6M1018.4 477.1h84.6" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="1018.4" y="417.0" width="84.6" height="70.1" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="1022.4" y="429.5" class="lbl">GLOBAL</text>
+  </g>
+  <g>
+    <title>FLAT: 0/54 (0.0%)</title>
+    <rect x="918.1" y="489.1" width="61.9" height="90.5" fill="#5a6068"/>
+    <path d="M928.4 489.1v90.5M938.7 489.1v90.5M949.0 489.1v90.5M959.4 489.1v90.5M969.7 489.1v90.5M918.1 499.1h61.9M918.1 509.2h61.9M918.1 519.3h61.9M918.1 529.3h61.9M918.1 539.4h61.9M918.1 549.4h61.9M918.1 559.5h61.9M918.1 569.6h61.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="918.1" y="489.1" width="61.9" height="90.5" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="922.1" y="501.6" class="lbl">FLAT</text>
+  </g>
+  <g>
+    <title>SOP2: 44/51 (86.3%)</title>
+    <rect x="918.1" y="581.6" width="61.9" height="85.4" fill="#5a6068"/>
+    <path d="M918.1 581.6h61.9v9.5h-61.9zM918.1 591.1h61.9v9.5h-61.9zM918.1 600.6h61.9v9.5h-61.9zM918.1 610.1h61.9v9.5h-61.9zM918.1 619.6h61.9v9.5h-61.9zM918.1 629.0h51.6v9.5h-51.6zM918.1 638.5h31.0v9.5h-31.0zM918.1 648.0h41.3v9.5h-41.3zM928.4 657.5h20.6v9.5h-20.6z" fill="#2fa343"/>
+    <rect x="949.0" y="657.5" width="31.0" height="9.5" fill="#0d0f12" opacity="0.55"/>
+    <path d="M928.4 581.6v85.4M938.7 581.6v85.4M949.0 581.6v85.4M959.4 581.6v85.4M969.7 581.6v85.4M918.1 591.1h61.9M918.1 600.6h61.9M918.1 610.1h61.9M918.1 619.6h61.9M918.1 629.0h61.9M918.1 638.5h61.9M918.1 648.0h61.9M918.1 657.5h61.9" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="918.1" y="581.6" width="61.9" height="85.4" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="922.1" y="594.1" class="lbl">SOP2</text>
+  </g>
+  <g>
+    <title>VOP2: 45/50 (90.0%)</title>
+    <rect x="982.0" y="489.1" width="68.7" height="75.5" fill="#5a6068"/>
+    <path d="M982.0 489.1h9.8v9.4h-9.8zM1001.6 489.1h49.1v9.4h-49.1zM982.0 498.5h68.7v9.4h-68.7zM982.0 508.0h68.7v9.4h-68.7zM982.0 517.4h68.7v9.4h-68.7zM982.0 526.8h68.7v9.4h-68.7zM982.0 536.3h68.7v9.4h-68.7zM982.0 545.7h19.6v9.4h-19.6zM1021.3 545.7h19.6v9.4h-19.6z" fill="#2fa343"/>
+    <rect x="991.8" y="555.1" width="58.9" height="9.4" fill="#0d0f12" opacity="0.55"/>
+    <path d="M991.8 489.1v75.5M1001.6 489.1v75.5M1011.4 489.1v75.5M1021.3 489.1v75.5M1031.1 489.1v75.5M1040.9 489.1v75.5M982.0 498.5h68.7M982.0 508.0h68.7M982.0 517.4h68.7M982.0 526.8h68.7M982.0 536.3h68.7M982.0 545.7h68.7M982.0 555.1h68.7" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="982.0" y="489.1" width="68.7" height="75.5" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="986.0" y="501.6" class="lbl">VOP2</text>
+  </g>
+  <g>
+    <title>SOPP: 18/37 (48.6%)</title>
+    <rect x="1052.7" y="489.1" width="50.3" height="75.5" fill="#5a6068"/>
+    <path d="M1062.8 489.1h40.2v9.4h-40.2zM1052.7 498.5h50.3v9.4h-50.3zM1052.7 508.0h10.1v9.4h-10.1zM1062.8 517.4h20.1v9.4h-20.1zM1092.9 517.4h10.1v9.4h-10.1zM1072.8 536.3h30.2v9.4h-30.2zM1092.9 545.7h10.1v9.4h-10.1zM1052.7 555.1h10.1v9.4h-10.1z" fill="#2fa343"/>
+    <rect x="1072.8" y="555.1" width="30.2" height="9.4" fill="#0d0f12" opacity="0.55"/>
+    <path d="M1062.8 489.1v75.5M1072.8 489.1v75.5M1082.9 489.1v75.5M1092.9 489.1v75.5M1052.7 498.5h50.3M1052.7 508.0h50.3M1052.7 517.4h50.3M1052.7 526.8h50.3M1052.7 536.3h50.3M1052.7 545.7h50.3M1052.7 555.1h50.3" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="1052.7" y="489.1" width="50.3" height="75.5" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="1056.7" y="501.6" class="lbl">SOPP</text>
+  </g>
+  <g>
+    <title>VOP3P: 23/28 (82.1%)</title>
+    <rect x="982.0" y="566.6" width="56.8" height="50.1" fill="#5a6068"/>
+    <path d="M982.0 566.6h56.8v10.0h-56.8zM982.0 576.6h56.8v10.0h-56.8zM982.0 586.6h56.8v10.0h-56.8zM982.0 596.7h9.5v10.0h-9.5zM1019.9 596.7h9.5v10.0h-9.5zM991.5 606.7h28.4v10.0h-28.4z" fill="#2fa343"/>
+    <rect x="1019.9" y="606.7" width="18.9" height="10.0" fill="#0d0f12" opacity="0.55"/>
+    <path d="M991.5 566.6v50.1M1000.9 566.6v50.1M1010.4 566.6v50.1M1019.9 566.6v50.1M1029.4 566.6v50.1M982.0 576.6h56.8M982.0 586.6h56.8M982.0 596.7h56.8M982.0 606.7h56.8" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="982.0" y="566.6" width="56.8" height="50.1" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="986.0" y="579.1" class="lbl">VOP3P</text>
+  </g>
+  <g>
+    <title>SOPK: 15/27 (55.6%)</title>
+    <rect x="982.0" y="618.7" width="56.8" height="48.3" fill="#5a6068"/>
+    <path d="M982.0 618.7h9.5v9.7h-9.5zM1010.4 618.7h28.4v9.7h-28.4zM982.0 628.4h56.8v9.7h-56.8zM982.0 638.0h47.4v9.7h-47.4z" fill="#2fa343"/>
+    <rect x="1010.4" y="657.3" width="28.4" height="9.7" fill="#0d0f12" opacity="0.55"/>
+    <path d="M991.5 618.7v48.3M1000.9 618.7v48.3M1010.4 618.7v48.3M1019.9 618.7v48.3M1029.4 618.7v48.3M982.0 628.4h56.8M982.0 638.0h56.8M982.0 647.7h56.8M982.0 657.3h56.8" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="982.0" y="618.7" width="56.8" height="48.3" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="986.0" y="631.2" class="lbl">SOPK</text>
+  </g>
+  <g>
+    <title>SCRATCH: 0/22 (0.0%)</title>
+    <rect x="1040.8" y="566.6" width="62.2" height="35.6" fill="#5a6068"/>
+    <rect x="1049.7" y="593.2" width="53.3" height="8.9" fill="#0d0f12" opacity="0.55"/>
+    <path d="M1049.7 566.6v35.6M1058.6 566.6v35.6M1067.5 566.6v35.6M1076.4 566.6v35.6M1085.2 566.6v35.6M1094.1 566.6v35.6M1040.8 575.5h62.2M1040.8 584.4h62.2M1040.8 593.2h62.2" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="1040.8" y="566.6" width="62.2" height="35.6" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="1044.8" y="579.1" class="lbl">SCRATCH</text>
+  </g>
+  <g>
+    <title>SOPC: 18/18 (100.0%)</title>
+    <rect x="1040.8" y="604.1" width="32.0" height="56.0" fill="#2fa343"/>
+    <path d="M1051.5 604.1v56.0M1062.1 604.1v56.0M1040.8 613.5h32.0M1040.8 622.8h32.0M1040.8 632.2h32.0M1040.8 641.5h32.0M1040.8 650.8h32.0" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="1040.8" y="604.1" width="32.0" height="56.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="1044.8" y="616.6" class="lbl">SOP</text>
+  </g>
+  <g>
+    <title>MTBUF: 8/16 (50.0%)</title>
+    <rect x="1074.8" y="604.1" width="28.2" height="56.0" fill="#5a6068"/>
+    <path d="M1074.8 604.1h28.2v9.3h-28.2zM1074.8 613.5h9.4v9.3h-9.4zM1093.6 622.8h9.4v9.3h-9.4zM1074.8 632.2h28.2v9.3h-28.2z" fill="#2fa343"/>
+    <rect x="1084.2" y="650.8" width="18.8" height="9.3" fill="#0d0f12" opacity="0.55"/>
+    <path d="M1084.2 604.1v56.0M1093.6 604.1v56.0M1074.8 613.5h28.2M1074.8 622.8h28.2M1074.8 632.2h28.2M1074.8 641.5h28.2M1074.8 650.8h28.2" stroke="#14181d" stroke-width="0.8" fill="none"/>
+    <rect x="1074.8" y="604.1" width="28.2" height="56.0" fill="none" stroke="#0d0f12" stroke-width="1"/>
+    <text x="1078.8" y="616.6" class="lbl">MTB</text>
+  </g>
+  <g>
+    <title>VINTRP: 3/3 (100.0%)</title>
+    <rect x="1040.8" y="662.2" width="46.1" height="4.8" fill="#2fa343"/>
+    <path d="M1056.2 662.2v4.8M1071.6 662.2v4.8" stroke="#14181d" stroke-width="0.55" fill="none"/>
+    <rect x="1040.8" y="662.2" width="46.1" height="4.8" fill="none" stroke="#0d0f12" stroke-width="1"/>
+  </g>
+  <g>
+    <title>EXP: 1/1 (100.0%)</title>
+    <rect x="1089.0" y="662.2" width="14.0" height="4.8" fill="#2fa343"/>
+    <rect x="1089.0" y="662.2" width="14.0" height="4.8" fill="none" stroke="#0d0f12" stroke-width="1"/>
+  </g>
+  <text x="16" y="694" fill="#f0f3f6" font-size="13.5" font-weight="600">Unsupported / stub sites by area (230)</text>
+  <text x="16" y="719.0" fill="#c8ced6" font-size="11.5">HLE / Runtime Stubs</text>
+  <rect x="182.0" y="708.0" width="316.0" height="13" fill="#4a5058"/>
+  <rect x="182.0" y="708.0" width="316.0" height="13" fill="#c98f24"/>
+  <text x="552.0" y="719.0" text-anchor="end" fill="#f0f3f6" font-size="11.5" class="mono">161</text>
+  <text x="16" y="741.0" fill="#c8ced6" font-size="11.5">Shader / Resource &amp; IR</text>
+  <rect x="182.0" y="730.0" width="316.0" height="13" fill="#4a5058"/>
+  <rect x="182.0" y="730.0" width="56.9" height="13" fill="#c98f24"/>
+  <text x="552.0" y="741.0" text-anchor="end" fill="#f0f3f6" font-size="11.5" class="mono">29</text>
+  <text x="16" y="763.0" fill="#c8ced6" font-size="11.5">Shader / Emit &amp; Lower</text>
+  <rect x="182.0" y="752.0" width="316.0" height="13" fill="#4a5058"/>
+  <rect x="182.0" y="752.0" width="45.1" height="13" fill="#c98f24"/>
+  <text x="552.0" y="763.0" text-anchor="end" fill="#f0f3f6" font-size="11.5" class="mono">23</text>
+  <text x="16" y="785.0" fill="#c8ced6" font-size="11.5">GPU / D3D12.x Host</text>
+  <rect x="182.0" y="774.0" width="316.0" height="13" fill="#4a5058"/>
+  <rect x="182.0" y="774.0" width="29.4" height="13" fill="#c98f24"/>
+  <text x="552.0" y="785.0" text-anchor="end" fill="#f0f3f6" font-size="11.5" class="mono">15</text>
+  <text x="16" y="807.0" fill="#c8ced6" font-size="11.5">Formats / Tiling &amp; Audio</text>
+  <rect x="182.0" y="796.0" width="316.0" height="13" fill="#4a5058"/>
+  <rect x="182.0" y="796.0" width="3.9" height="13" fill="#c98f24"/>
+  <text x="552.0" y="807.0" text-anchor="end" fill="#f0f3f6" font-size="11.5" class="mono">2</text>
+  <text x="16" y="838" fill="#f0f3f6" font-size="13.5" font-weight="600">DXGI / Image formats (of 123)</text>
+  <text x="16" y="863.0" fill="#c8ced6" font-size="11.5">Sampled &amp; Element</text>
+  <rect x="182.0" y="852.0" width="316.0" height="13" fill="#4a5058"/>
+  <rect x="182.0" y="852.0" width="274.9" height="13" fill="#2fa343"/>
+  <text x="552.0" y="863.0" text-anchor="end" fill="#f0f3f6" font-size="11.5" class="mono">107/123</text>
+  <text x="16" y="885.0" fill="#c8ced6" font-size="11.5">Console Tiling</text>
+  <rect x="182.0" y="874.0" width="316.0" height="13" fill="#4a5058"/>
+  <rect x="182.0" y="874.0" width="251.8" height="13" fill="#2fa343"/>
+  <text x="552.0" y="885.0" text-anchor="end" fill="#f0f3f6" font-size="11.5" class="mono">98/123</text>
+  <text x="16" y="907.0" fill="#c8ced6" font-size="11.5">Typed Buffer</text>
+  <rect x="182.0" y="896.0" width="316.0" height="13" fill="#4a5058"/>
+  <rect x="182.0" y="896.0" width="220.9" height="13" fill="#2fa343"/>
+  <text x="552.0" y="907.0" text-anchor="end" fill="#f0f3f6" font-size="11.5" class="mono">86/123</text>
+  <text x="16" y="929.0" fill="#c8ced6" font-size="11.5">Swapchain Present</text>
+  <rect x="182.0" y="918.0" width="316.0" height="13" fill="#4a5058"/>
+  <rect x="182.0" y="918.0" width="46.2" height="13" fill="#2fa343"/>
+  <text x="552.0" y="929.0" text-anchor="end" fill="#f0f3f6" font-size="11.5" class="mono">18/123</text>
+  <text x="568" y="694" fill="#f0f3f6" font-size="13.5" font-weight="600">Instruction forms still needed</text>
+  <text x="568" y="711" fill="#c8ced6" font-size="11.5">Instruction forms not lowered to DXIL (591)</text>
+  <text x="568" y="729.0" fill="#f0f3f6" font-size="10" font-weight="600" class="mono">DS (97)</text>
+  <text x="638.0" y="729.0" fill="#c8ced6" font-size="9.2" class="mono">DS_RSUB_U32, DS_INC_U32, DS_DEC_U32, DS_MSKOR_B32, DS_CMPST_F32, DS_NOP,</text>
+  <text x="638.0" y="742.5" fill="#c8ced6" font-size="9.2" class="mono">DS_ADD_F32, DS_GWS_SEMA_RELEASE_ALL, DS_GWS_INIT, ... (+88 more)</text>
+  <text x="568" y="762.0" fill="#f0f3f6" font-size="10" font-weight="600" class="mono">SMEM (74)</text>
+  <text x="638.0" y="762.0" fill="#c8ced6" font-size="9.2" class="mono">S_SCRATCH_LOAD_DWORD, S_SCRATCH_LOAD_DWORDX2, S_SCRATCH_LOAD_DWORDX4,</text>
+  <text x="638.0" y="775.5" fill="#c8ced6" font-size="9.2" class="mono">S_STORE_DWORD, S_STORE_DWORDX2, S_STORE_DWORDX4, S_SCRATCH_STORE_DWORD,</text>
+  <text x="638.0" y="789.0" fill="#c8ced6" font-size="9.2" class="mono">S_SCRATCH_STORE_DWORDX2, S_SCRATCH_STORE_DWORDX4, ... (+65 more)</text>
+  <text x="568" y="808.5" fill="#f0f3f6" font-size="10" font-weight="600" class="mono">MIMG (67)</text>
+  <text x="638.0" y="808.5" fill="#c8ced6" font-size="9.2" class="mono">IMAGE_LOAD_PCK, IMAGE_LOAD_PCK_SGN, IMAGE_LOAD_MIP_PCK,</text>
+  <text x="638.0" y="822.0" fill="#c8ced6" font-size="9.2" class="mono">IMAGE_LOAD_MIP_PCK_SGN, IMAGE_STORE_MIP, IMAGE_STORE_PCK,</text>
+  <text x="638.0" y="835.5" fill="#c8ced6" font-size="9.2" class="mono">IMAGE_STORE_MIP_PCK, IMAGE_ATOMIC_INC, IMAGE_ATOMIC_DEC, ... (+58 more)</text>
+  <text x="568" y="855.0" fill="#f0f3f6" font-size="10" font-weight="600" class="mono">FLAT (54)</text>
+  <text x="638.0" y="855.0" fill="#c8ced6" font-size="9.2" class="mono">FLAT_LOAD_UBYTE, FLAT_LOAD_SBYTE, FLAT_LOAD_USHORT, FLAT_LOAD_SSHORT,</text>
+  <text x="638.0" y="868.5" fill="#c8ced6" font-size="9.2" class="mono">FLAT_LOAD_DWORD, FLAT_LOAD_DWORDX2, FLAT_LOAD_DWORDX4, FLAT_LOAD_DWORDX3,</text>
+  <text x="638.0" y="882.0" fill="#c8ced6" font-size="9.2" class="mono">FLAT_STORE_BYTE, ... (+45 more)</text>
+  <text x="568" y="901.5" fill="#f0f3f6" font-size="10" font-weight="600" class="mono">SOP1 (49)</text>
+  <text x="638.0" y="901.5" fill="#c8ced6" font-size="9.2" class="mono">S_CMOV_B32, S_CMOV_B64, S_WQM_B32, S_WQM_B64, S_BREV_B64, S_BCNT0_I32_B32,</text>
+  <text x="638.0" y="915.0" fill="#c8ced6" font-size="9.2" class="mono">S_BCNT0_I32_B64, S_FF0_I32_B32, S_FF0_I32_B64, ... (+40 more)</text>
+  <text x="568" y="934.5" fill="#f0f3f6" font-size="10" font-weight="600" class="mono">VOPC (42)</text>
+  <text x="638.0" y="934.5" fill="#c8ced6" font-size="9.2" class="mono">V_CMP_F_F64, V_CMP_LT_F64, V_CMP_EQ_F64, V_CMP_LE_F64, V_CMP_GT_F64,</text>
+  <text x="638.0" y="948.0" fill="#c8ced6" font-size="9.2" class="mono">V_CMP_LG_F64, V_CMP_GE_F64, V_CMP_O_F64, V_CMP_U_F64, ... (+33 more)</text>
+  <text x="16" y="998.5" fill="#8b949e" font-size="10.5">*HLE exports, runtime vtables, and D3D12.x/DXGI COM slots. Counted directly from the codebase — not from playing games.</text>
+  <text x="1104" y="998.5" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">cargo xtask progress</text>
 </svg>

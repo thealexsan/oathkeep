@@ -1,0 +1,36 @@
+{
+  "updated": "2026-11-26",
+  "branch": "main",
+  "commit": "main",
+  "pages_url": "https://thealexsan.github.io/oathkeep/",
+  "libraries": {
+    "implemented": 688,
+    "total": 1314,
+    "pct": 52.36
+  },
+  "rdna2_decoded": {
+    "implemented": 1233,
+    "total": 1233,
+    "pct": 100.00
+  },
+  "rdna2_lowered": {
+    "implemented": 642,
+    "total": 1233,
+    "pct": 52.07
+  },
+  "dxgi_formats": {
+    "element": 107,
+    "tiling": 98,
+    "total": 123,
+    "pct": 86.99
+  },
+  "unsupported_sites": 230,
+  "performance": {
+    "latest_run": "diag-fps-swarm2b",
+    "commit": "3a0890d",
+    "fps": 5.4,
+    "target_fps": 30.0,
+    "playable_pct": 18.0,
+    "frame_ms": 184.0
+  }
+}
