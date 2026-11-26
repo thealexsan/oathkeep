@@ -521,6 +521,7 @@ static MADE_LATE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new(
 
 #[cfg(windows)]
 pub(crate) fn texture_made(resource: usize) {
+    crate::descriptor::host::bump_stage_texture_epoch();
     MADE_LATE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -613,16 +614,38 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     }
 }
 
-pub(crate) fn view(handle: u64) -> Option<View> {
+#[inline]
+pub(crate) fn view_words(handle: u64) -> Option<[u32; 3]> {
     if handle == 0 {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    if tag != VIEW_TAG {
+    let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    (words[0] == VIEW_TAG).then_some(words)
+}
+
+#[inline]
+pub(crate) fn constant_from_words(words: [u32; 3]) -> Option<(u64, u32)> {
+    if words[0] != VIEW_TAG || (words[2] >> KIND_SHIFT) != CONSTANT {
         return None;
     }
-    view_at(i, generation)
+    match constant_of(words[1], words[2]) {
+        View::Constant(address, size) => Some((address, size)),
+        _ => None,
+    }
+}
+
+#[inline]
+pub(crate) fn view_from_words(words: [u32; 3]) -> Option<View> {
+    if words[0] != VIEW_TAG {
+        return None;
+    }
+    view_at(words[1], words[2])
+}
+
+pub(crate) fn view(handle: u64) -> Option<View> {
+    let words = view_words(handle)?;
+    view_at(words[1], words[2])
 }
 
 fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {

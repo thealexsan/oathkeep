@@ -163,7 +163,7 @@ struct Window {
 
 const WINDOW_MOST: u64 = 1024;
 const WINDOW_STEP_MAX: u64 = 4096;
-const MAX_WINDOWS: usize = 16;
+const MAX_WINDOWS: usize = 64;
 
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -176,6 +176,7 @@ struct FreshTable {
     copy_seq: u64,
     deps: Vec<(u64, u64)>,
     has_gpu_active_cbv: bool,
+    refresh_buffers: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
     uav_buffers: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
     textures: Vec<(usize, ResourceType)>,
 }
@@ -221,6 +222,7 @@ pub(crate) struct State {
     scratch_entries: Vec<usize>,
     scratch_selected: Vec<u32>,
     scratch_used_k: Vec<u32>,
+    scratch_words: Vec<[u32; 3]>,
     scratch_addresses: Vec<u64>,
     scratch_constants: Vec<u32>,
 }
@@ -3186,49 +3188,57 @@ impl State {
         }
     }
 
+    fn can_direct_cbv_addr(&mut self, address: u64, size: u32) -> bool {
+        let size_u64 = u64::from(size);
+        let Some(shadow) = self.find_shadow(address, size_u64) else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TablesCbvNoShadow, 1);
+            return false;
+        };
+        if shadow.can_bind_cbv(address, size) {
+            return true;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            let gpu = shadow.gpu(address);
+            if !gpu.is_multiple_of(256) {
+                crate::copystat::add(crate::copystat::C::TablesCbvUnaligned, 1);
+            } else {
+                crate::copystat::add(crate::copystat::C::TablesCbvShort, 1);
+            }
+            static LOGGED: AtomicU64 = AtomicU64::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
+                let aligned = u64::from(size.next_multiple_of(256));
+                let left = shadow.left(address);
+                let host_left = shadow.host_width().saturating_sub(shadow.offset(address));
+                tracing::info!(
+                    addr_mod256 = address % 256,
+                    gpu_mod256 = gpu % 256,
+                    size,
+                    aligned,
+                    left,
+                    host_left,
+                    ever_written = shadow.ever_written(),
+                    in_place = shadow.is_in_place(),
+                    "cbv_fail sample"
+                );
+            }
+        }
+        false
+    }
+
     fn can_direct_cbv(&mut self, handle: u64) -> bool {
         if !direct_cbv() {
             return false;
         }
-        match crate::descriptor::view(handle) {
-            Some(View::Constant(address, size)) => {
-                let size_u64 = u64::from(size);
-                let Some(shadow) = self.find_shadow(address, size_u64) else {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::TablesCbvNoShadow, 1);
-                    return false;
-                };
-                if shadow.can_bind_cbv(address, size) {
-                    return true;
-                }
-                #[cfg(feature = "diagnostics")]
-                {
-                    let gpu = shadow.gpu(address);
-                    if !gpu.is_multiple_of(256) {
-                        crate::copystat::add(crate::copystat::C::TablesCbvUnaligned, 1);
-                    } else {
-                        crate::copystat::add(crate::copystat::C::TablesCbvShort, 1);
-                    }
-                    static LOGGED: AtomicU64 = AtomicU64::new(0);
-                    if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
-                        let aligned = u64::from(size.next_multiple_of(256));
-                        let left = shadow.left(address);
-                        let host_left = shadow.host_width().saturating_sub(shadow.offset(address));
-                        tracing::info!(
-                            addr_mod256 = address % 256,
-                            gpu_mod256 = gpu % 256,
-                            size,
-                            aligned,
-                            left,
-                            host_left,
-                            ever_written = shadow.ever_written(),
-                            in_place = shadow.is_in_place(),
-                            "cbv_fail sample"
-                        );
-                    }
-                }
-                false
-            }
+        let Some(words) = crate::descriptor::view_words(handle) else {
+            return true;
+        };
+        if let Some((address, size)) = crate::descriptor::constant_from_words(words) {
+            return self.can_direct_cbv_addr(address, size);
+        }
+        match crate::descriptor::view_from_words(words) {
+            Some(View::Constant(address, size)) => self.can_direct_cbv_addr(address, size),
             _ => true,
         }
     }
@@ -3242,11 +3252,30 @@ impl State {
     ) {
         self.scratch_fresh.clear();
         self.scratch_made.clear();
+        let mut fresh_mask = 0u64;
+        let mark_fresh = |slot: u8, mask: &mut u64, fresh: &mut Vec<u8>| {
+            if slot < 64 {
+                let bit = 1u64 << slot;
+                if *mask & bit == 0 {
+                    *mask |= bit;
+                    fresh.push(slot);
+                }
+            } else if !fresh.contains(&slot) {
+                fresh.push(slot);
+            }
+        };
+        let is_fresh = |slot: u8, mask: u64, fresh: &[u8]| -> bool {
+            if slot < 64 {
+                (mask & (1u64 << slot)) != 0
+            } else {
+                fresh.contains(&slot)
+            }
+        };
         for u in used {
             if u.root != RootType::Table {
                 continue;
             }
-            if self.scratch_fresh.contains(&u.slot) {
+            if is_fresh(u.slot, fresh_mask, &self.scratch_fresh) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -3271,17 +3300,17 @@ impl State {
                         crate::copystat::add(crate::copystat::C::TablesOverGe1M, 1);
                     }
                 }
-                self.scratch_fresh.push(u.slot);
+                mark_fresh(u.slot, &mut fresh_mask, &mut self.scratch_fresh);
                 continue;
             }
             if u.kind == ResourceType::Cbv && !self.can_direct_cbv(end) {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TablesFreshCbv, 1);
-                self.scratch_fresh.push(u.slot);
+                mark_fresh(u.slot, &mut fresh_mask, &mut self.scratch_fresh);
             }
         }
         for ix in indexed {
-            if self.scratch_fresh.contains(&ix.table_slot) {
+            if is_fresh(ix.table_slot, fresh_mask, &self.scratch_fresh) {
                 continue;
             }
             let Some(&Root::Table(table)) =
@@ -3318,24 +3347,23 @@ impl State {
                         crate::copystat::add(crate::copystat::C::TablesOverGe1M, 1);
                     }
                 }
-                self.scratch_fresh.push(ix.table_slot);
-            } else if matches!(crate::descriptor::view(handle), Some(View::Constant(..)))
-                && !self.can_direct_cbv(handle)
+                mark_fresh(ix.table_slot, &mut fresh_mask, &mut self.scratch_fresh);
+            } else if let Some(words) = crate::descriptor::view_words(handle)
+                && let Some((address, size)) = crate::descriptor::constant_from_words(words)
+                && (!direct_cbv() || !self.can_direct_cbv_addr(address, size))
             {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TablesFreshCbv, 1);
-                self.scratch_fresh.push(ix.table_slot);
+                mark_fresh(ix.table_slot, &mut fresh_mask, &mut self.scratch_fresh);
             }
         }
-        self.scratch_fresh.sort_unstable();
-        self.scratch_fresh.dedup();
         for u in used {
-            if u.root == RootType::Table && !self.scratch_fresh.contains(&u.slot) {
+            if u.root == RootType::Table && !is_fresh(u.slot, fresh_mask, &self.scratch_fresh) {
                 self.table_entry(list, u, compute);
             }
         }
         for ix in indexed {
-            if self.scratch_fresh.contains(&ix.table_slot) {
+            if is_fresh(ix.table_slot, fresh_mask, &self.scratch_fresh) {
                 continue;
             }
             let Some(&Root::Table(table)) =
@@ -3435,6 +3463,7 @@ impl State {
                 continue;
             }
             let heap_id = std::ptr::from_ref(heap) as usize;
+            self.scratch_words.clear();
             let key = {
                 let mut h1 =
                     0xcbf2_9ce4_8422_2325_u64 ^ (u64::from(span) | (u64::from(trim) << 32));
@@ -3443,6 +3472,7 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     let words = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                    self.scratch_words.push(words);
                     h1 ^= u64::from(k).wrapping_mul(0x9e37_79b9_7f4a_7c15);
                     hash_table_words(&words, &mut h1, &mut h2);
                 }
@@ -3464,81 +3494,37 @@ impl State {
             if let Some((offset, entry_copy_seq, has_gpu_active_cbv)) = cached_hit {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TablesFreshHit, 1);
-                if entry_copy_seq == list.copy_seq() {
-                    if has_gpu_active_cbv {
-                        list.uav_barrier_if_dirty();
-                    }
-                    if let Some(entry) = self.fresh_tables.get(&key) {
-                        if !entry.uav_buffers.is_empty() {
-                            let record_writes = STORES.get() || !write_skip();
-                            for (shadow, address, len) in &entry.uav_buffers {
-                                if record_writes {
-                                    shadow.gpu_writes(list, *address, *len);
-                                } else {
-                                    #[cfg(feature = "diagnostics")]
-                                    {
-                                        crate::copystat::add(
-                                            crate::copystat::C::GpuWritesLeftOut,
-                                            1,
-                                        );
-                                        crate::copystat::add(
-                                            crate::copystat::C::GpuWritesLeftOutBytes,
-                                            *len,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        for &(resource, kind) in &entry.textures {
-                            readable_texture(list, resource, kind);
+                if has_gpu_active_cbv {
+                    list.uav_barrier_if_dirty();
+                }
+                if let Some(entry) = self.fresh_tables.get(&key) {
+                    if entry_copy_seq != list.copy_seq() {
+                        for (shadow, address, len) in &entry.refresh_buffers {
+                            shadow.refresh(list, *address, *len);
                         }
                     }
-                } else {
-                    for entry_i in 0..self.scratch_entries.len() {
-                        let idx = self.scratch_entries[entry_i];
-                        let u = &used[idx];
-                        let handle = table + u64::from(u.table_offset_dwords) * 4;
-                        if u.kind == ResourceType::Cbv {
-                            if let Some(View::Constant(address, size)) =
-                                crate::descriptor::view(handle)
-                            {
-                                let size_u64 = u64::from(size);
-                                let existing = self.find_shadow_existing(address, size_u64);
-                                let gpu_active = existing
-                                    .as_ref()
-                                    .is_some_and(|s| s.is_gpu_active(list, address, size_u64));
-                                if (direct_cbv() || gpu_active)
-                                    && let Some(shadow) =
-                                        existing.or_else(|| self.find_shadow(address, size_u64))
-                                    && shadow.can_bind_cbv(address, size)
+                    if !entry.uav_buffers.is_empty() {
+                        let record_writes = STORES.get() || !write_skip();
+                        for (shadow, address, len) in &entry.uav_buffers {
+                            if record_writes {
+                                shadow.gpu_writes(list, *address, *len);
+                            } else {
+                                #[cfg(feature = "diagnostics")]
                                 {
-                                    shadow.refresh(list, address, size_u64);
-                                    if gpu_active {
-                                        list.uav_barrier_if_dirty();
-                                    }
+                                    crate::copystat::add(
+                                        crate::copystat::C::GpuWritesLeftOut,
+                                        1,
+                                    );
+                                    crate::copystat::add(
+                                        crate::copystat::C::GpuWritesLeftOutBytes,
+                                        *len,
+                                    );
                                 }
                             }
-                            continue;
-                        }
-                        if let Some(view) = crate::descriptor::view(handle) {
-                            readable(list, u.kind, &view);
                         }
                     }
-                    for sel_i in 0..self.scratch_selected.len() {
-                        let k = self.scratch_selected[sel_i];
-                        if self
-                            .scratch_entries
-                            .iter()
-                            .any(|&idx| used[idx].table_offset_dwords / 8 == k)
-                        {
-                            continue;
-                        }
-                        let handle = table + u64::from(k) * 32;
-                        if let Some(view) = crate::descriptor::view(handle)
-                            && let Some(kind) = view_kind(&view)
-                        {
-                            readable(list, kind, &view);
-                        }
+                    for &(resource, kind) in &entry.textures {
+                        readable_texture(list, resource, kind);
                     }
                 }
                 self.scratch_made.push((slot, offset));
@@ -3558,6 +3544,8 @@ impl State {
             }
             let mut deps: Vec<(u64, u64)> = Vec::new();
             let mut has_gpu_active_cbv = false;
+            let mut refresh_buffers: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+                Vec::new();
             let mut uav_buffers: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
                 Vec::new();
             let mut textures: Vec<(usize, ResourceType)> = Vec::new();
@@ -3567,93 +3555,115 @@ impl State {
             let t_make = std::time::Instant::now();
             for used_i in 0..self.scratch_used_k.len() {
                 let k = self.scratch_used_k[used_i];
+                let words = self.scratch_words[used_i];
                 let index = first + (k - trim);
                 let used_entry = self
                     .scratch_entries
                     .iter()
                     .map(|&idx| &used[idx])
                     .find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
-                        let size_u64 = u64::from(size);
-                        let existing = self.find_shadow_existing(address, size_u64);
-                        let gpu_active = existing
-                            .as_ref()
-                            .is_some_and(|s| s.is_gpu_active(list, address, size_u64));
-                        if (direct_cbv() || gpu_active)
-                            && let Some(shadow) =
-                                existing.or_else(|| self.find_shadow(address, size_u64))
-                        {
-                            if shadow.can_bind_cbv(address, size) {
-                                let gpu = shadow.gpu(address);
-                                shadow.refresh(list, address, size_u64);
-                                if gpu_active {
-                                    has_gpu_active_cbv = true;
-                                    list.uav_barrier_if_dirty();
-                                }
-                                self.keep_dynamic(list, &shadow.buffer);
-                                host.constant_at_dynamic(index, gpu, size);
-                                continue;
+                if let Some((address, size)) = crate::descriptor::constant_from_words(words) {
+                    let size_u64 = u64::from(size);
+                    let existing = self.find_shadow_existing(address, size_u64);
+                    let gpu_active = existing
+                        .as_ref()
+                        .is_some_and(|s| s.is_gpu_active(list, address, size_u64));
+                    if (direct_cbv() || gpu_active)
+                        && let Some(shadow) =
+                            existing.or_else(|| self.find_shadow(address, size_u64))
+                    {
+                        if shadow.can_bind_cbv(address, size) {
+                            let gpu = shadow.gpu(address);
+                            shadow.refresh(list, address, size_u64);
+                            refresh_buffers.push((shadow.clone(), address, size_u64));
+                            if gpu_active {
+                                has_gpu_active_cbv = true;
+                                list.uav_barrier_if_dirty();
                             }
-                            if gpu_active
-                                && shadow.left(address) >= size_u64
-                                && let Some((scratch, scratch_gpu, write_seq, _)) =
-                                    self.cbv_gpu_scratch(list, &shadow, address, size_u64)
-                            {
-                                let sid = shadow.id();
-                                if !deps.iter().any(|&(id, _)| id == sid) {
-                                    deps.push((sid, write_seq));
-                                }
-                                self.keep_dynamic(list, &scratch);
-                                host.constant_at_dynamic(index, scratch_gpu, size);
-                                continue;
-                            }
-                        }
-                        let Some((gpu, to)) = list.scratch(size_u64) else {
-                            host.make_null_dynamic(index);
+                            self.keep_dynamic(list, &shadow.buffer);
+                            host.constant_at_dynamic(index, gpu, size);
                             continue;
-                        };
-                        list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at_dynamic(index, gpu, size);
-                    }
-                    Some(view) => {
-                        let (kept_res, made_shadow, made_placed) =
-                            host.make_at_dynamic(index, &view);
-                        if let Some(res) = kept_res {
-                            self.keep_dynamic(list, &res);
                         }
-                        let kind = used_entry.map(|u| u.kind).or_else(|| {
-                            self.scratch_selected
-                                .binary_search(&k)
-                                .ok()
-                                .and_then(|_| view_kind(&view))
-                        });
-                        if let Some(kind) = kind {
-                            readable_with_hint(
-                                list,
-                                kind,
-                                &view,
-                                made_shadow,
-                                made_placed,
-                                Some(&mut uav_buffers),
-                                Some(&mut textures),
-                            );
-                        }
-                        if let Some(title) = title_first
-                            && title.saturating_add(k) < host.count()
-                            && crate::descriptor::host::is_texture_view(&view)
+                        if gpu_active
+                            && shadow.left(address) >= size_u64
+                            && let Some((scratch, scratch_gpu, write_seq, _)) =
+                                self.cbv_gpu_scratch(list, &shadow, address, size_u64)
                         {
-                            host.texture_slot_tabled(title + k, kind.is_some());
-                            if kind.is_some() {
-                                host.mirror(title + k, table + u64::from(k) * 32, true);
+                            let sid = shadow.id();
+                            if !deps.iter().any(|&(id, _)| id == sid) {
+                                deps.push((sid, write_seq));
+                            }
+                            self.keep_dynamic(list, &scratch);
+                            host.constant_at_dynamic(index, scratch_gpu, size);
+                            continue;
+                        }
+                    }
+                    let Some((gpu, to)) = list.scratch(size_u64) else {
+                        host.make_null_dynamic(index);
+                        continue;
+                    };
+                    list.defer_fill(to, address as *const u8, size as usize);
+                    host.constant_at_dynamic(index, gpu, size);
+                    continue;
+                }
+                let made = host.copy_or_make_dynamic(index, words);
+                if !made.found {
+                    if used_entry.is_some() {
+                        once!(slot, "a table entry without a view");
+                    }
+                    continue;
+                }
+                if let Some(res) = made.kept {
+                    self.keep_dynamic(list, &res);
+                }
+                let kind = used_entry.map(|u| u.kind).or_else(|| {
+                    self.scratch_selected
+                        .binary_search(&k)
+                        .ok()
+                        .and_then(|_| made.view_kind)
+                });
+                if let Some(kind) = kind {
+                    match made.action {
+                        crate::descriptor::host::StageAction::Buffer {
+                            shadow,
+                            address,
+                            len,
+                        } => {
+                            shadow.refresh(list, address, len);
+                            refresh_buffers.push((shadow.clone(), address, len));
+                            if kind == ResourceType::Uav {
+                                uav_buffers.push((shadow.clone(), address, len));
+                                if STORES.get() || !write_skip() {
+                                    shadow.gpu_writes(list, address, len);
+                                } else {
+                                    #[cfg(feature = "diagnostics")]
+                                    {
+                                        crate::copystat::add(
+                                            crate::copystat::C::GpuWritesLeftOut,
+                                            1,
+                                        );
+                                        crate::copystat::add(
+                                            crate::copystat::C::GpuWritesLeftOutBytes,
+                                            len,
+                                        );
+                                    }
+                                }
                             }
                         }
-                    }
-                    None => {
-                        host.make_null_dynamic(index);
-                        if used_entry.is_some() {
-                            once!(slot, "a table entry without a view");
+                        crate::descriptor::host::StageAction::Texture { resource } => {
+                            textures.push((resource, kind));
+                            readable_texture(list, resource, kind);
                         }
+                        crate::descriptor::host::StageAction::None => {}
+                    }
+                }
+                if let Some(title) = title_first
+                    && title.saturating_add(k) < host.count()
+                    && made.is_texture
+                {
+                    host.texture_slot_tabled(title + k, kind.is_some());
+                    if kind.is_some() {
+                        host.mirror(title + k, table + u64::from(k) * 32, true);
                     }
                 }
             }
@@ -3671,6 +3681,7 @@ impl State {
                     copy_seq: list.copy_seq(),
                     deps,
                     has_gpu_active_cbv,
+                    refresh_buffers,
                     uav_buffers,
                     textures,
                 },

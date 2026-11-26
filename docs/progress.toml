@@ -3,12 +3,12 @@ updated = "2026-11-26"
 commit = "perf/commit-reduction"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "8.7-11.9 fps steady (diag-run78 peak 11.9 fps / 83.8 ms; heavy scene +48% to 7.4 fps; 0.0 ms GPU wait)"
-current_frame_ms = "83.8-115.3 ms (0 refused dynamic slots, 0 dropped indirects, 95-98% cbv_scratch hoisted)"
-current_gpu_ms = "0.0 ms wait (GPU busy cut 93-97% -> 50-74%; now 100% CPU-bound!)"
-current_preparing_ms = "46.5-72.4 ms (batch_flush 25.3-42.7 ms, guards 23.8-45.8 ms CPU sum, moves shadow 33.2-72.2 ms)"
+current_fps = "10.4-15.7 fps steady (diag-run79 peak 15.7 fps / 63.6 ms, +32% over run78; 0-1.4 ms GPU wait)"
+current_frame_ms = "63.6-95.8 ms (0 refused dynamic slots, 0 crashes/TDRs, copies MB -60%)"
+current_gpu_ms = "0.0-1.4 ms wait (GPU busy 71-99%; now balanced/CPU-bound on recording + preparing)"
+current_preparing_ms = "36.6-60.3 ms (batch_flush 16.0-25.7 ms, moves shadow 13.6-18.6 ms, sparse reads 0.3 ms, kernel -77%)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~20-30 min (now 100% CPU-bound at 50-74% GPU; cut guards/batch_flush + recording make_at -> 20-30+ FPS)"
+eta = "~15-20 min (Fix R1-R4 built: CPU staging descriptor cache + indirect pool growth -> 20-30+ FPS)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -238,9 +238,18 @@ status = "Fix O1+O2 verified: dynamic slot refusals 576->0, dropped indirects 13
 
 [[runs]]
 label = "diag-run78"
-commit = "perf/commit-reduction"
+commit = "8e04090"
 fps = 11.9
 frame_ms = 83.8
 gpu_ms = "0.0 ms wait (50-74% busy, down from 93-97%; 95-98% cbv_scratch hoisted to prelude)"
 preparing_ms = "46.5-72.4 ms (batch_flush 25.3-42.7 ms, guards 23.8-45.8 ms, moves shadow 33.2-72.2 ms)"
 status = "New peak 11.9 fps (heavy scene +48% to 7.4 fps)! Fix P1a/P1b/P1c/P2b verified: bindless_wr -96% (1526->52-97), inline barriers -98% (2622->57-97), GPU busy 93-97%->50-74%; now 100% CPU-bound -> next: cut guards/alias_apply + batch_flush + recording make_at"
+
+[[runs]]
+label = "diag-run79"
+commit = "1b671a8"
+fps = 15.7
+frame_ms = 63.6
+gpu_ms = "0.0-1.4 ms wait (71-99% busy)"
+preparing_ms = "36.6-60.3 ms (batch_flush 16.0-25.7 ms, moves shadow 13.6-18.6 ms, sparse reads 0.3 ms)"
+status = "New peak 15.7 fps (+32%, steady 10.4-15.7 fps)! Fix Q1-Q4 verified: copies MB -60% (116->44 MB), moves shadow -60% (33-72->13.6-18.6 ms), sparse reads 0.3 ms (-99%), submit kernel -77% (20.1->4.7 ms), GUARD_HOT=0 beats GUARD_HOT=1 (15.7 vs 6.9 fps); next: Fix R1-R4 CPU staging descriptor cache + indirect scratch growth"

@@ -463,6 +463,7 @@ fn twin_texture(
         None
     };
     TWINS[0].fetch_add(1, Relaxed);
+    crate::descriptor::host::bump_stage_texture_epoch();
     Some(std::sync::Arc::new(Twin {
         colour: std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS)),
         behind: std::sync::atomic::AtomicU32::new(0),
@@ -2324,6 +2325,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    crate::descriptor::host::bump_stage_texture_epoch();
     crate::texture::placed_in_host_written(address, desc);
     resource(out)
         .host

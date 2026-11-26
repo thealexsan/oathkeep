@@ -8,7 +8,7 @@ const DEFAULT_HOT_FRAMES: u64 = 6;
 const DEFAULT_HOT_FAULTS: u16 = 4;
 const HOT_STREAK_GAP: u64 = 2;
 const MAX_COOL_BACKOFF: u8 = 1;
-pub(crate) const CLEAN_EPOCH_SHARDS: usize = 4;
+pub(crate) const CLEAN_EPOCH_SHARDS: usize = 8;
 
 static GLOBAL_WRITE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RANGED_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

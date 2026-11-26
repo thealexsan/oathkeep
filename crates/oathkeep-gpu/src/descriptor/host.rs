@@ -281,7 +281,154 @@ pub(crate) fn first_viewed(start: u64) -> Option<u32> {
 
 static RESHOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
+static STAGE_TEXTURE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn bump_stage_texture_epoch() {
+    STAGE_TEXTURE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+#[derive(Clone)]
+pub(crate) enum StageAction {
+    None,
+    Buffer {
+        shadow: std::sync::Arc<crate::shadow::Shadow>,
+        address: u64,
+        len: u64,
+    },
+    Texture {
+        resource: usize,
+    },
+}
+
+pub(crate) struct DynamicMade {
+    pub(crate) found: bool,
+    pub(crate) kept: Option<ID3D12Resource>,
+    pub(crate) action: StageAction,
+    pub(crate) view_kind: Option<oathkeep_shader::ResourceType>,
+    pub(crate) is_texture: bool,
+}
+
+impl DynamicMade {
+    fn missing() -> Self {
+        Self {
+            found: false,
+            kept: None,
+            action: StageAction::None,
+            view_kind: None,
+            is_texture: false,
+        }
+    }
+}
+
+const STAGE_STRIPES: usize = 64;
+const SLOTS_PER_STRIPE: usize = 1024;
+
+struct StageEntry {
+    key: u64,
+    slot: u32,
+    epoch: u64,
+    is_buffer: bool,
+    is_texture: bool,
+    view_kind: Option<oathkeep_shader::ResourceType>,
+    kept: Option<ID3D12Resource>,
+    action: StageAction,
+}
+
+struct StageStripe {
+    map: std::collections::HashMap<u64, usize>,
+    entries: Vec<Option<StageEntry>>,
+    cursor: usize,
+}
+
+impl StageStripe {
+    fn new() -> Self {
+        let mut entries = Vec::with_capacity(SLOTS_PER_STRIPE);
+        entries.resize_with(SLOTS_PER_STRIPE, || None);
+        Self {
+            map: std::collections::HashMap::new(),
+            entries,
+            cursor: 0,
+        }
+    }
+}
+
+struct StageHeap {
+    _heap: ID3D12DescriptorHeap,
+    cpu: usize,
+    step: u32,
+    stripes: Box<[std::sync::RwLock<StageStripe>; STAGE_STRIPES]>,
+}
+
+// SAFETY: CPU-only descriptor heap; per-stripe RwLock guards concurrent read/write
+// of every slot, and CopyDescriptorsSimple on disjoint slots is free-threaded in D3D12.
+unsafe impl Send for StageHeap {}
+unsafe impl Sync for StageHeap {}
+
+impl StageHeap {
+    fn cpu(&self, slot: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: self.cpu + slot as usize * self.step as usize,
+        }
+    }
+}
+
+fn cpu_stage_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_CPU_STAGE_CACHE").is_none_or(|v| v != "0"))
+}
+
+fn cpu_stage_heap() -> Option<&'static StageHeap> {
+    if !cpu_stage_enabled() {
+        return None;
+    }
+    static STAGE: std::sync::OnceLock<Option<StageHeap>> = std::sync::OnceLock::new();
+    STAGE
+        .get_or_init(|| {
+            let host = host()?;
+            let total = (STAGE_STRIPES * SLOTS_PER_STRIPE) as u32;
+            // SAFETY: plain CPU-only descriptor heap creation.
+            let heap: ID3D12DescriptorHeap = unsafe {
+                host.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: total,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                        NodeMask: 0,
+                    })
+                    .ok()?
+            };
+            // SAFETY: live heap.
+            let (cpu, step) = unsafe {
+                (
+                    heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                    host.device
+                        .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+                )
+            };
+            let stripes: Vec<std::sync::RwLock<StageStripe>> = (0..STAGE_STRIPES)
+                .map(|_| std::sync::RwLock::new(StageStripe::new()))
+                .collect();
+            let stripes = stripes.into_boxed_slice().try_into().ok()?;
+            Some(StageHeap {
+                _heap: heap,
+                cpu,
+                step,
+                stripes,
+            })
+        })
+        .as_ref()
+}
+
+fn stage_view_kind(view: &View) -> Option<oathkeep_shader::ResourceType> {
+    match view {
+        View::Shader(..) | View::Placed(false, ..) => Some(oathkeep_shader::ResourceType::Srv),
+        View::Unordered(..) | View::Placed(true, ..) => Some(oathkeep_shader::ResourceType::Uav),
+        _ => None,
+    }
+}
+
 pub(crate) fn levels_changed(start: u64) {
+    bump_stage_texture_epoch();
     RESHOWN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2199,19 +2346,6 @@ impl HostHeap {
         crate::host::retire_batch(retired);
     }
 
-    pub(crate) fn make_at_into(
-        &self,
-        index: u32,
-        view: &View,
-        retired: &mut Vec<ID3D12Resource>,
-    ) {
-        let kept = make(view, self.cpu(index));
-        if kept.is_none() {
-            null_for(view, self.cpu(index));
-        }
-        self.keep_into(index, kept.flatten(), Some(retired));
-    }
-
     /// Writes a descriptor directly into a dynamic slot owned by the caller's command list,
     /// bypassing `self.kept` locking/retirement. Returns `(kept_resource, made_shadow, made_placed)`
     /// so the caller can keep the resource on the command list (deduplicated) and reuse
@@ -2230,6 +2364,231 @@ impl HostHeap {
             null_for(view, self.cpu(index));
         }
         (kept.flatten(), shadow, placed)
+    }
+
+    /// Copies a cached CPU staging descriptor into dynamic slot `index` via
+    /// `CopyDescriptorsSimple`, bypassing `descriptor::view()` RwLocks, `GetDesc()`,
+    /// `shadow::find()`, and `CreateShaderResourceView` on cache hits (~99.9% steady state).
+    pub(crate) fn copy_or_make_dynamic(&self, index: u32, words: [u32; 3]) -> DynamicMade {
+        if self.sampler || words[0] != VIEW_TAG {
+            let Some(view) = crate::descriptor::view_from_words(words) else {
+                self.make_null_dynamic(index);
+                return DynamicMade::missing();
+            };
+            let is_texture = is_texture_view(&view);
+            let view_kind = stage_view_kind(&view);
+            let (kept, shadow, placed) = self.make_at_dynamic(index, &view);
+            let resolved = placed.as_ref().unwrap_or(&view);
+            let action = if let Some((shadow, address, len)) =
+                buffer_copy_with_hint(resolved, shadow)
+            {
+                StageAction::Buffer {
+                    shadow,
+                    address,
+                    len,
+                }
+            } else if let View::Shader(resource, _) | View::Unordered(resource, _, _) = resolved {
+                StageAction::Texture {
+                    resource: *resource,
+                }
+            } else {
+                StageAction::None
+            };
+            return DynamicMade {
+                found: true,
+                kept,
+                action,
+                view_kind,
+                is_texture,
+            };
+        }
+        let Some(host) = host() else {
+            return DynamicMade::missing();
+        };
+        let Some(stage) = cpu_stage_heap() else {
+            let Some(view) = crate::descriptor::view_from_words(words) else {
+                self.make_null_dynamic(index);
+                return DynamicMade::missing();
+            };
+            let is_texture = is_texture_view(&view);
+            let view_kind = stage_view_kind(&view);
+            let (kept, shadow, placed) = self.make_at_dynamic(index, &view);
+            let resolved = placed.as_ref().unwrap_or(&view);
+            let action = if let Some((shadow, address, len)) =
+                buffer_copy_with_hint(resolved, shadow)
+            {
+                StageAction::Buffer {
+                    shadow,
+                    address,
+                    len,
+                }
+            } else if let View::Shader(resource, _) | View::Unordered(resource, _, _) = resolved {
+                StageAction::Texture {
+                    resource: *resource,
+                }
+            } else {
+                StageAction::None
+            };
+            return DynamicMade {
+                found: true,
+                kept,
+                action,
+                view_kind,
+                is_texture,
+            };
+        };
+        let key = (u64::from(words[1]) << 32) | u64::from(words[2]);
+        let stripe_idx = ((key ^ (key >> 17) ^ (key >> 33)) as usize) & (STAGE_STRIPES - 1);
+        let dst = self.cpu(index);
+        {
+            let guard = stage.stripes[stripe_idx]
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(&local) = guard.map.get(&key)
+                && let Some(entry) = guard.entries[local].as_ref()
+                && entry.key == key
+            {
+                let cur_epoch = if entry.is_buffer {
+                    crate::shadow::generation()
+                } else {
+                    STAGE_TEXTURE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+                };
+                if entry.epoch == cur_epoch {
+                    // SAFETY: dst is our dynamic shader-visible slot; src is a live CPU staging
+                    // slot protected from concurrent overwrite by the stripe read lock.
+                    unsafe {
+                        host.device.CopyDescriptorsSimple(
+                            1,
+                            dst,
+                            stage.cpu(entry.slot),
+                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        );
+                    }
+                    return DynamicMade {
+                        found: true,
+                        kept: entry.kept.clone(),
+                        action: entry.action.clone(),
+                        view_kind: entry.view_kind,
+                        is_texture: entry.is_texture,
+                    };
+                }
+            }
+        }
+        let Some(view) = crate::descriptor::view_from_words(words) else {
+            self.make_null_dynamic(index);
+            return DynamicMade::missing();
+        };
+        let is_texture = is_texture_view(&view);
+        let view_kind = stage_view_kind(&view);
+        let tex_epoch = STAGE_TEXTURE_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        let buf_epoch = crate::shadow::generation();
+        let mut guard = stage.stripes[stripe_idx]
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(&local) = guard.map.get(&key)
+            && let Some(entry) = guard.entries[local].as_ref()
+            && entry.key == key
+        {
+            let cur_epoch = if entry.is_buffer {
+                crate::shadow::generation()
+            } else {
+                STAGE_TEXTURE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+            };
+            if entry.epoch == cur_epoch {
+                // SAFETY: dst is our dynamic slot; src is guarded by stripe write lock.
+                unsafe {
+                    host.device.CopyDescriptorsSimple(
+                        1,
+                        dst,
+                        stage.cpu(entry.slot),
+                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    );
+                }
+                return DynamicMade {
+                    found: true,
+                    kept: entry.kept.clone(),
+                    action: entry.action.clone(),
+                    view_kind: entry.view_kind,
+                    is_texture: entry.is_texture,
+                };
+            }
+        }
+        let local = if let Some(&existing) = guard.map.get(&key) {
+            existing
+        } else {
+            let at = guard.cursor;
+            guard.cursor = (at + 1) % SLOTS_PER_STRIPE;
+            at
+        };
+        let slot = (stripe_idx * SLOTS_PER_STRIPE + local) as u32;
+        let (kept, made_shadow, made_placed) = make_detailed(&view, stage.cpu(slot));
+        let Some(kept_res) = kept else {
+            drop(guard);
+            null_for(&view, dst);
+            return DynamicMade {
+                found: true,
+                kept: None,
+                action: StageAction::None,
+                view_kind,
+                is_texture,
+            };
+        };
+        // SAFETY: dst is our dynamic slot; src was just populated in our CPU staging heap.
+        unsafe {
+            host.device.CopyDescriptorsSimple(
+                1,
+                dst,
+                stage.cpu(slot),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+        }
+        let resolved = made_placed.as_ref().unwrap_or(&view);
+        let (action, is_buffer, epoch) = if let Some((shadow, address, len)) =
+            buffer_copy_with_hint(resolved, made_shadow)
+        {
+            (
+                StageAction::Buffer {
+                    shadow,
+                    address,
+                    len,
+                },
+                true,
+                buf_epoch,
+            )
+        } else if let View::Shader(resource, _) | View::Unordered(resource, _, _) = resolved {
+            (
+                StageAction::Texture {
+                    resource: *resource,
+                },
+                false,
+                tex_epoch,
+            )
+        } else {
+            (StageAction::None, false, tex_epoch)
+        };
+        if let Some(old) = guard.entries[local].take()
+            && old.key != key
+        {
+            guard.map.remove(&old.key);
+        }
+        guard.map.insert(key, local);
+        guard.entries[local] = Some(StageEntry {
+            key,
+            slot,
+            epoch,
+            is_buffer,
+            is_texture,
+            view_kind,
+            kept: kept_res.clone(),
+            action: action.clone(),
+        });
+        DynamicMade {
+            found: true,
+            kept: kept_res,
+            action,
+            view_kind,
+            is_texture,
+        }
     }
 
     pub(crate) fn make_null_dynamic(&self, index: u32) {
@@ -2260,15 +2619,6 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
-    }
-
-    pub(crate) fn make_null_into(&self, index: u32, retired: &mut Vec<ID3D12Resource>) {
-        if self.sampler {
-            self.null_sampler(index);
-        } else {
-            null_view(self.cpu(index));
-        }
-        self.keep_into(index, None, Some(retired));
     }
 
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
@@ -2407,47 +2757,6 @@ impl HostHeap {
         D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
-    }
-
-    pub(crate) fn constant_at_into(
-        &self,
-        index: u32,
-        gpu: u64,
-        size: u32,
-        retired: &mut Vec<ID3D12Resource>,
-    ) {
-        self.keep_into(index, None, Some(retired));
-        let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
-        };
-        // SAFETY: a slot of our heap; the memory is the caller's.
-        unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
-        };
-    }
-
-    pub(crate) fn constant_at_kept_into(
-        &self,
-        index: u32,
-        gpu: u64,
-        size: u32,
-        buffer: ID3D12Resource,
-        retired: &mut Vec<ID3D12Resource>,
-    ) {
-        self.keep_into(index, Some(buffer), Some(retired));
-        let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
-        };
-        // SAFETY: a slot of our heap; the buffer is kept in `self.kept`.
-        unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
-        };
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -2805,12 +3114,6 @@ pub(crate) fn buffer_extent(view: &View) -> Option<(u64, u64)> {
 fn view_extent() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("OATHKEEP_VIEW_EXTENT").is_none_or(|v| v != "0"))
-}
-
-pub(crate) fn buffer_copy(
-    view: &View,
-) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
-    buffer_copy_with_hint(view, None)
 }
 
 pub(crate) fn buffer_copy_with_hint(

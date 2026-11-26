@@ -1193,7 +1193,7 @@ void main() {
             (count_ptr as *mut u32).write_volatile(2);
         }
 
-        // Consecutive allocations sub-allocate 256-byte-aligned slices from the same 64 KiB buffer.
+        // Consecutive allocations sub-allocate 256-byte-aligned slices from the same 256 KiB buffer.
         let (buf0, off0, ev0) =
             bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
         assert_eq!(off0, 0);
@@ -1204,20 +1204,21 @@ void main() {
         assert_eq!(off1, 1024);
         assert!(!ev1);
 
-        // Request that exceeds remaining space (but fits in 64 KiB) wraps to offset 0 and signals eviction.
-        let (buf_wrap, off_wrap, ev_wrap) =
+        // Request that fits within the 256 KiB initial buffer sub-allocates without wrapping.
+        let (buf_fit, off_fit, ev_fit) =
             bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 3200)).unwrap();
-        assert_eq!(buf_wrap.as_raw(), buf0.as_raw());
-        assert_eq!(off_wrap, 0);
-        assert!(ev_wrap);
+        assert_eq!(buf_fit.as_raw(), buf0.as_raw());
+        assert_eq!(off_fit, 3584);
+        assert!(!ev_fit);
 
-        // Request larger than current 64 KiB capacity (5000 * 20 = 100 KiB) grows buffer and signals eviction.
+        // Request exceeding 256 KiB remaining space grows the buffer (rather than wrapping early)
+        // and signals eviction.
         let (b_grown, off_grown, ev_grown) =
-            bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
+            bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 12000)).unwrap();
         assert_ne!(
             b_grown.as_raw(),
             buf0.as_raw(),
-            "larger request must grow single scratch buffer"
+            "overflowing initial 256 KiB scratch must grow buffer"
         );
         assert_eq!(off_grown, 0);
         assert!(ev_grown);

@@ -1729,6 +1729,7 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     prelude_gpu_copies: Vec<(ID3D12Resource, u64, ID3D12Resource, u64, u64)>,
     budget_zeroed: bool,
+    has_kernel_watch: bool,
 }
 
 impl Deferred {
@@ -6003,7 +6004,11 @@ impl Host {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> =
                 std::collections::HashMap::new();
             for list in runs {
-                for step in &list.deferred().copies {
+                let deferred = list.deferred();
+                if !deferred.has_kernel_watch {
+                    continue;
+                }
+                for step in &deferred.copies {
                     match step {
                         Step::Refresh(shadow, address, len)
                             if !shadow.unwatched() && !shadow.guarded() =>
@@ -6026,7 +6031,9 @@ impl Host {
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
-            crate::watch::ask_once(&ranges);
+            if !ranges.is_empty() {
+                crate::watch::ask_once(&ranges);
+            }
             #[cfg(feature = "diagnostics")]
             {
                 prep_ask_once += t.elapsed().as_micros() as u64;
@@ -6035,12 +6042,14 @@ impl Host {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
-                #[cfg(feature = "diagnostics")]
-                let t2 = std::time::Instant::now();
-                crate::watch::ask_once(&ranges);
-                #[cfg(feature = "diagnostics")]
-                {
-                    prep_ask_once += t2.elapsed().as_micros() as u64;
+                if !ranges.is_empty() {
+                    #[cfg(feature = "diagnostics")]
+                    let t2 = std::time::Instant::now();
+                    crate::watch::ask_once(&ranges);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        prep_ask_once += t2.elapsed().as_micros() as u64;
+                    }
                 }
             }
         } else if behind && stale_under_flights(runs) {
@@ -7417,6 +7426,9 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
+            if !shadow.unwatched() && !shadow.guarded() {
+                deferred.has_kernel_watch = true;
+            }
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
@@ -7534,6 +7546,8 @@ impl HostList {
         size: u64,
     ) -> Option<(ID3D12Resource, u64, bool, bool)> {
         const ALIGN: u64 = 256;
+        const INIT_CAP: u64 = 256 << 10;
+        const MAX_GROW_CAP: u64 = 1 << 20;
         let alloc_bytes = size.max(4).next_multiple_of(ALIGN);
         let mut pool = self.indirect_pool.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(buf) = pool.buffer.clone() {
@@ -7542,7 +7556,7 @@ impl HostList {
                 pool.used += alloc_bytes;
                 return Some((buf, offset, pool.in_indirect, false));
             }
-            if alloc_bytes <= pool.cap {
+            if alloc_bytes <= pool.cap && pool.cap >= MAX_GROW_CAP {
                 pool.used = alloc_bytes;
                 return Some((buf, 0, pool.in_indirect, true));
             }
@@ -7550,6 +7564,7 @@ impl HostList {
             let new_cap = pool
                 .cap
                 .saturating_mul(2)
+                .max(pool.used.saturating_add(alloc_bytes))
                 .max(alloc_bytes)
                 .next_multiple_of(64 << 10);
             let buffer = host()?.uav_buffer(new_cap)?;
@@ -7568,7 +7583,7 @@ impl HostList {
             }
             return Some((buffer, 0, false, true));
         }
-        let cap = alloc_bytes.max(64 << 10).next_multiple_of(64 << 10);
+        let cap = alloc_bytes.max(INIT_CAP).next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(cap)?;
         name(&buffer, || format!("indirect arguments {cap:#x}"));
         pool.buffer = Some(buffer.clone());
@@ -7640,7 +7655,11 @@ impl HostList {
     }
 
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+        let mut deferred = self.deferred();
+        if staging.watch_range().is_some() {
+            deferred.has_kernel_watch = true;
+        }
+        deferred.copies.push(Step::Texture(staging));
     }
 
     pub(crate) fn defer_after_textures(&self, work: impl Fn() + Send + Sync + 'static) {
