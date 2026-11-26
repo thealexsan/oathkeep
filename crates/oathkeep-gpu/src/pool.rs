@@ -17,10 +17,32 @@
 //! goes (an object of ours the texture holds says so), a staging buffer's
 //! when the last list that recorded its copy is reset.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+thread_local! {
+    /// When set on the current thread, texture pool allocations only reuse
+    /// existing free ranges in already-committed blocks (zero new DXGI VRAM).
+    static NO_GROW: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn no_grow() -> bool {
+    NO_GROW.get()
+}
+
+pub(crate) fn with_no_grow<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NO_GROW.set(self.0);
+        }
+    }
+    let _reset = Reset(NO_GROW.replace(true));
+    f()
+}
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
@@ -222,20 +244,51 @@ impl<B: Clone> Pool<B> {
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
+    #[cfg(test)]
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
-        self.take_ripe(len, align, now, Ripe::ALL, make)
+        self.take_ripe_capped(len, align, now, Ripe::ALL, None, make)
+    }
+
+    /// Like [`Pool::take`], refusing new block creation once `blocks() >= cap`.
+    fn take_capped(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        max_blocks: Option<usize>,
+        make: impl FnMut() -> Option<B>,
+    ) -> Option<(Piece, B, bool)> {
+        self.take_ripe_capped(len, align, now, Ripe::ALL, max_blocks, make)
     }
 
     /// The same from a block that is ripe, if one has room; `make` makes one
     /// ahead too, when few are empty.
+    #[cfg(test)]
     fn take_ripe(
         &mut self,
         len: u64,
         align: u64,
         now: u64,
         ripe: Ripe,
+        make: impl FnMut() -> Option<B>,
+    ) -> Option<(Piece, B, bool)> {
+        self.take_ripe_capped(len, align, now, ripe, None, make)
+    }
+
+    /// Like [`Pool::take_ripe`], refusing new block creation once `blocks() >= cap`
+    /// without calling `make` or arming `retry_growth_at`.
+    fn take_ripe_capped(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        mut ripe: Ripe,
+        max_blocks: Option<usize>,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
+        if max_blocks == Some(0) {
+            ripe.ahead = 0;
+        }
         // With blocks made ahead, what would be an allocation of its own (and
         // new when the card first reads it) lies in one of those too.
         if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
@@ -264,6 +317,9 @@ impl<B: Clone> Pool<B> {
         let (i, start) = match found {
             Some(found) => found,
             None => {
+                if max_blocks.is_some_and(|cap| self.blocks() >= cap) {
+                    return None;
+                }
                 let memory = self.grow(now, &mut make)?;
                 let i = self.add(memory, ripe.started);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
@@ -278,6 +334,7 @@ impl<B: Clone> Pool<B> {
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
             if empty < ripe.ahead
+                && !max_blocks.is_some_and(|cap| self.blocks() >= cap)
                 && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
@@ -391,6 +448,22 @@ impl Drop for StagingPiece {
     }
 }
 
+/// Cap on 64 MiB staging blocks on limited-RAM hosts (<= 32 GiB): speculative
+/// prefetch stops growing at 5 blocks (320 MiB), bakes/draws at 6 (384 MiB),
+/// preventing multi-GB PC commit spikes while continuing to reuse free slices.
+fn staging_block_cap(limited_host_ram: bool, speculative: bool, baking: bool) -> Option<usize> {
+    if !limited_host_ram {
+        return None;
+    }
+    if speculative {
+        Some(5)
+    } else if baking {
+        Some(6)
+    } else {
+        Some(6)
+    }
+}
+
 /// `bytes` of upload memory, all zeros: the buffer it lies in, where in
 /// that buffer, and its mapping. `None`: not pooled.
 pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
@@ -399,18 +472,31 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
-        // Only gate speculative bindless prefetch on staging-pool growth
-        // headroom; table-bound textures and decoration bakes are sampled
-        // immediately and would otherwise read uninitialized/reused VRAM.
-        let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
-        if speculative && !crate::residency::allow_staging_growth(false) {
-            return None;
+    let baking = crate::texture::BAKING.get();
+    let speculative = crate::texture::PICKING.get().is_some() && !baking;
+    let cap = staging_block_cap(crate::residency::limited_host_ram(), speculative, baking);
+    let (piece, memory, again) = {
+        let mut pool = lock(&STAGING);
+        match pool.take_capped(bytes, 512, now(), cap, || {
+            // Only gate speculative bindless prefetch on staging-pool growth
+            // headroom; table-bound textures and decoration bakes are sampled
+            // immediately and would otherwise read uninitialized/reused VRAM.
+            if speculative && !crate::residency::allow_staging_growth(false) {
+                return None;
+            }
+            let (buffer, data) = host.upload_buffer(BLOCK)?;
+            crate::host::name(&buffer, || "staging of textures (a block)".into());
+            Some(Upload(buffer, data))
+        }) {
+            Some(taken) => taken,
+            None => {
+                if speculative && bytes <= BLOCK / 2 && cap.is_some_and(|c| pool.blocks() >= c) {
+                    crate::residency::note_staging_deferred();
+                }
+                return None;
+            }
         }
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
-        crate::host::name(&buffer, || "staging of textures (a block)".into());
-        Some(Upload(buffer, data))
-    })?;
+    };
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
@@ -535,8 +621,17 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
+    let no_grow = no_grow();
+    let ripe = if no_grow { Ripe::ALL } else { Ripe::now() };
+    let max_blocks = no_grow.then_some(0);
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let (piece, heap, again) = lock(&TEXTURES).take_ripe_capped(
+        info.SizeInBytes,
+        info.Alignment.max(1),
+        now(),
+        ripe,
+        max_blocks,
+        || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -769,5 +864,72 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn no_grow_reuses_free_hole_and_never_calls_make() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let calls = std::cell::Cell::new(0u32);
+        let mut make = || {
+            calls.set(calls.get() + 1);
+            Some(calls.get())
+        };
+        let (a, _, _) = pool.take(BLOCK / 4, 65536, 0, &mut make).unwrap();
+        let (b, _, _) = pool.take(BLOCK / 4, 65536, 0, &mut make).unwrap();
+        assert_eq!(calls.get(), 1);
+        pool.give(a, 10);
+        // Under NO_GROW (max_blocks = Some(0)), reuse the rested hole with 0 make() calls.
+        let (reused, heap, again) = pool
+            .take_ripe_capped(BLOCK / 4, 65536, 10 + REST, Ripe { started: 5, finished: 0, ahead: 4 }, Some(0), &mut make)
+            .unwrap();
+        assert_eq!(heap, 1);
+        assert!(again);
+        assert_eq!(reused.start, a.start);
+        assert_eq!(calls.get(), 1, "no_grow must not allocate ahead or grow");
+        // Fill remaining half, then ask for another slice under NO_GROW -> None, 0 make() calls, no backoff.
+        let _ = pool.take_capped(BLOCK / 2, 65536, 10 + REST, Some(0), &mut make).unwrap();
+        assert!(pool.take_capped(65536, 65536, 10 + REST, Some(0), &mut make).is_none());
+        assert_eq!(calls.get(), 1);
+        // Normal growth immediately afterwards is NOT blocked by backoff.
+        let (_, heap2, _) = pool.take(65536, 65536, 10 + REST, &mut make).unwrap();
+        assert_eq!(heap2, 2);
+        assert_eq!(calls.get(), 2);
+        let _ = b;
+    }
+
+    #[test]
+    fn staging_cap_limits_blocks_on_limited_ram_without_blocking_reuse() {
+        assert_eq!(staging_block_cap(false, true, false), None);
+        assert_eq!(staging_block_cap(true, true, false), Some(5));
+        assert_eq!(staging_block_cap(true, false, true), Some(6));
+        assert_eq!(staging_block_cap(true, false, false), Some(6));
+
+        let mut pool: Pool<u32> = Pool::new(STAGING_KEPT);
+        let calls = std::cell::Cell::new(0u32);
+        let mut make = || {
+            calls.set(calls.get() + 1);
+            Some(calls.get())
+        };
+        let mut pieces = Vec::new();
+        // Fill 5 blocks (2 x BLOCK/2 each = 10 pieces).
+        for _ in 0..10 {
+            let (p, _, _) = pool.take_capped(BLOCK / 2, 512, 0, Some(5), &mut make).unwrap();
+            pieces.push(p);
+        }
+        assert_eq!(pool.blocks(), 5);
+        assert_eq!(calls.get(), 5);
+        // 11th speculative piece at cap 5 fails without calling make() or arming backoff.
+        assert!(pool.take_capped(65536, 512, 0, Some(5), &mut make).is_none());
+        assert_eq!(calls.get(), 5);
+        // Baking (cap 6) can immediately allocate block 6 at the same timestamp.
+        let (_, b6, _) = pool.take_capped(BLOCK / 2, 512, 0, Some(6), &mut make).unwrap();
+        assert_eq!(b6, 6);
+        assert_eq!(pool.blocks(), 6);
+        // Releasing a piece lets speculative cap 5 reuse it once rested without growing.
+        pool.give(pieces[0], 10);
+        let (reused, _, again) = pool.take_capped(BLOCK / 2, 512, 10 + REST, Some(5), &mut make).unwrap();
+        assert!(again);
+        assert_eq!(reused.block, pieces[0].block);
+        assert_eq!(pool.blocks(), 6);
     }
 }

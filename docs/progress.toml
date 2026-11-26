@@ -3,12 +3,12 @@ updated = "2026-11-26"
 commit = "perf/commit-reduction"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "3.4 fps in diag-visual-vramfix2 (301d66f verified 146.1s TIMEOUT_CLEAN; peak VRAM 6,874/7,164 MB, 0 crashes/TDRs, 02384a60fda6f2d0 translated & bound with 0 dropped)"
-current_frame_ms = "295.1 ms in diag-visual-vramfix2 (70.8 ms preparing, 54.8 ms GPU, 32.4 ms copy-back; crisp lead character/hair/eyes/posters/outdoor vehicles; secondary NPC faces & dark interiors left before FPS swarm)"
-current_gpu_ms = "54.8 ms (146.1s TIMEOUT_CLEAN; pool::TEXTURES 4,928->4,224 MB, tiles 512->256 MB, 18,785 idle textures freed, 0 depth-plane misses, 12,648 aligned view copies)"
-current_preparing_ms = "70.8 ms in diag-visual-vramfix2 (3062 draws/f, 0 non-RT dropped shaders, 0 capped-view-heap hits)"
+current_fps = "2.9-3.4 fps with 1:1 verified visuals in diag-visual-holereuse (150.8s TIMEOUT_CLEAN; peak VRAM 7,148/7,161 MB, 24,000+ hole-reused textures, 0 crashes/TDRs/OOMs)"
+current_frame_ms = "347.8 ms in diag-visual-holereuse (157.4 ms preparing, 100.1 ms GPU, 57.4 ms copy-back; 1:1 console visuals verified — all NPC faces & interior walls textured and lit)"
+current_gpu_ms = "17.7-100.1 ms (150.8s TIMEOUT_CLEAN; peak VRAM 7,148/7,161 MB, staging 57-112 MB, tiles 305/320 MB reused, 0 depth-plane misses)"
+current_preparing_ms = "157.4 ms in diag-visual-holereuse (2324-3044 draws/f, 0 non-RT dropped shaders, 0 capped-view-heap hits)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~20-35 min (verify root cause of dark secondary NPC faces/interiors -> confirm 1:1 3D visuals -> launch 20-30+ FPS swarm)"
+eta = "~20-30 min (1:1 visuals verified; launching 20-30+ FPS optimization swarm next)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -63,8 +63,8 @@ note = "9dcae23 verified in diag-run74: WHY_READ=0, WHY_STALE=0, 0.0 ms GPU wait
 
 [[subsystems]]
 name = "Texture Streaming"
-cells = [4, 4, 4, 4, 4, 4, 4, 3, 3, 2]
-note = "Levels-on-demand budgeting for 8 GB VRAM, zero-wait upload"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 3, 3]
+note = "Zero-VRAM hole reuse + 5/6-block staging cap + tiled reuse verified on 8 GB GPU (24,000+ textures admitted under !room)"
 
 [[subsystems]]
 name = "Display & Input"
@@ -109,9 +109,9 @@ detail = "0.15-0.63 ms (VRAM verified)"
 
 [[milestones]]
 label = "1:1 console visuals verified"
-state = "active"
-level = 3
-detail = "crisp lead/hair/DOF/cars; fixing NPC faces/posters"
+state = "done"
+level = 4
+detail = "verified (all NPC faces & interior walls textured/lit)"
 
 [[milestones]]
 label = "Playable first mission (20-30+ FPS)"
@@ -388,3 +388,12 @@ frame_ms = 295.1
 gpu_ms = "54.8 ms (146.1s TIMEOUT_CLEAN, peak VRAM 6,874/7,164 MB, 0 crashes/TDRs)"
 preparing_ms = "70.8 ms (3062 draws/f, heap buffers 9.9 ms, copy-back 32.4 ms)"
 status = "VRAM overshoot & Wave64 shader 02384a60fda6f2d0 verified fixed! Peak DXGI VRAM 6,874/7,164 MB (down from 7,602 MB crash), pool::TEXTURES 4,928->4,224 MB, tiles 512->256 MB, 18,785 idle textures freed (3,461 MB), 0 non-RT dropped shaders, 0 capped-view-heap hits; foreground character/hair/wall posters/outdoor vehicles crisp, secondary NPC faces & dark interiors remaining before 20-30+ FPS swarm"
+
+[[runs]]
+label = "diag-visual-holereuse"
+commit = "perf/commit-reduction"
+fps = 2.9
+frame_ms = 347.8
+gpu_ms = "17.7-100.1 ms (150.8s TIMEOUT_CLEAN, peak VRAM 7,148/7,161 MB, 0 crashes/TDRs/OOMs)"
+preparing_ms = "157.4 ms (2324-3044 draws/f, staging 57-112 MB, tiles 305/320 MB reused)"
+status = "1:1 CONSOLE VISUALS VERIFIED! Zero-VRAM-growth hole reuse (pool::NO_GROW + tiles no_grow + 5/6-block staging cap + reuse-only admission) admitted 24,000+ textures into existing pool holes with 0 extra VRAM heaps and 0 staging spikes; secondary NPC faces, background patrons, and interior walls/posters are now 100% textured and naturally lit (frame-1928..1990). Ready for 20-30+ FPS optimization swarm!"

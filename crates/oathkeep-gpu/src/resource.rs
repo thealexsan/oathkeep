@@ -1590,7 +1590,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
+            if !crate::pool::no_grow() {
+                r.host.refused.store(true, Relaxed);
+            }
             return None;
         };
         let twin = twin_texture(&r.desc, &texture);
@@ -2541,6 +2543,9 @@ fn host_texture_as(
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
         return Some(t);
+    }
+    if !reserved && crate::pool::no_grow() {
+        return None;
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {

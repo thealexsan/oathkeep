@@ -2582,6 +2582,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         None => {
             let speculative = PICKING.get().is_some() && !BAKING.get();
             if crate::residency::upload_refused()
+                || crate::residency::is_staging_deferred()
                 || (speculative
                     && !crate::residency::allow_speculative_staging(total, draw_active_recently()))
             {

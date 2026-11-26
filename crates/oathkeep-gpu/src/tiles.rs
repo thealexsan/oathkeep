@@ -158,8 +158,8 @@ static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
 /// `count` tiles of one heap, in as many runs as it takes, the lowest free
 /// tiles first (single free tiles are used up before a long run is cut):
 /// the heap, its place in the pool and the runs (first tile, tiles). A new
-/// heap is made when no heap has that many free.
-fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
+/// heap is made when no heap has that many free, unless `no_grow` is true.
+fn take(device: &ID3D12Device, count: u32, no_grow: bool) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
     if count == 0 || count > HEAP_TILES {
         return None;
     }
@@ -167,6 +167,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
     let found = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count));
     let index = match found {
         Some(index) => index,
+        None if no_grow => return None,
         None => {
             let desc = D3D12_HEAP_DESC {
                 SizeInBytes: u64::from(HEAP_TILES) * TILE,
@@ -371,12 +372,16 @@ impl Tiled {
     /// the level would stay empty until the title writes the texture.
     pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32, room: bool) -> (bool, bool) {
         match host() {
-            Some(host) => self.uploaded_on(host.queue(), &host.device, texture, held, room),
+            Some(host) => {
+                let reuse_only = !room && free_room() >= (16 << 20);
+                self.uploaded_on_mode(host.queue(), &host.device, texture, held, room, reuse_only)
+            }
             None => (false, false),
         }
     }
 
     /// [`Tiled::uploaded`] on a queue and a device.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn uploaded_on(
         &self,
         queue: &ID3D12CommandQueue,
@@ -385,6 +390,20 @@ impl Tiled {
         held: u32,
         room: bool,
     ) -> (bool, bool) {
+        self.uploaded_on_mode(queue, device, texture, held, room, false)
+    }
+
+    /// Like [`Tiled::uploaded_on`], optionally allowing held levels to reuse
+    /// already-committed free pool tiles (`no_grow = true`) when `!room`.
+    pub(crate) fn uploaded_on_mode(
+        &self,
+        queue: &ID3D12CommandQueue,
+        device: &ID3D12Device,
+        texture: &ID3D12Resource,
+        held: u32,
+        room: bool,
+        reuse_only: bool,
+    ) -> (bool, bool) {
         let held = held & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.held.store(held, Ordering::Relaxed);
@@ -392,7 +411,16 @@ impl Tiled {
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        let changed = if room {
+            self.give_locked(&mut given, queue, device, texture, named, named, false)
+        } else {
+            let mut changed = self.give_locked(&mut given, queue, device, texture, named, card, false);
+            let held_only = held & !card;
+            if reuse_only && held_only != 0 {
+                changed |= self.give_locked(&mut given, queue, device, texture, named, held_only, true);
+            }
+            changed
+        };
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
     }
@@ -429,6 +457,7 @@ impl Tiled {
             texture,
             prev | levels | self.held.load(Ordering::Relaxed),
             levels,
+            false,
         );
         // Only levels that actually received tiles (or already had them) saw
         // the card's write; a level that got no tiles saw its zeros and write
@@ -518,7 +547,7 @@ impl Tiled {
         may: u32,
     ) -> bool {
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        self.give_locked(&mut given, queue, device, texture, named, may)
+        self.give_locked(&mut given, queue, device, texture, named, may, false)
     }
 
     fn give_locked(
@@ -529,6 +558,7 @@ impl Tiled {
         texture: &ID3D12Resource,
         named: u32,
         may: u32,
+        no_grow: bool,
     ) -> bool {
         let has = |level: u32| level < 32 && named & (1 << level) != 0;
         let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
@@ -544,7 +574,7 @@ impl Tiled {
             wanted.push((first_packed, self.packed, None));
         }
         for (subresource, tiles, level) in wanted {
-            let Some((heap, index, runs)) = take(device, tiles) else {
+            let Some((heap, index, runs)) = take(device, tiles, no_grow) else {
                 continue;
             };
             let at = D3D12_TILED_RESOURCE_COORDINATE {
@@ -1260,7 +1290,7 @@ void look() {
         rig.step = "step 4, a level on several ranges of the heap";
         // Three single tiles; the first and the last go back, the middle
         // one stays taken.
-        let singles: Vec<_> = (0..3).map(|_| take(&rig.device, 1).expect("a tile")).collect();
+        let singles: Vec<_> = (0..3).map(|_| take(&rig.device, 1, false).expect("a tile")).collect();
         give_back(singles[0].1, &singles[0].2);
         give_back(singles[2].1, &singles[2].2);
         let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
@@ -1597,5 +1627,35 @@ void look() {
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);
+    }
+
+    #[test]
+    fn no_grow_reuses_free_tiles_without_allocating_new_heap() {
+        let Some(rig) = Rig::new() else {
+            return;
+        };
+        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
+        // Seed one heap in POOL on this device and release its tiles back to POOL
+        // (the last heap stays kept with all HEAP_TILES free).
+        {
+            let (seed_tex, seed_tiled) = rig.reserved(&desc);
+            let (changed, waiting) = seed_tiled.uploaded_on(&rig.queue, &rig.device, &seed_tex, from_level(3), true);
+            assert!(changed && !waiting);
+        }
+        let heaps_before = STATS[3].load(Ordering::Relaxed);
+        assert!(free_room() >= (16 << 20), "seeded heap should leave free tiles for reuse");
+        let (tex, tiled) = rig.reserved(&desc);
+        let (changed, waiting) = tiled.uploaded_on_mode(&rig.queue, &rig.device, &tex, from_level(3), false, true);
+        rig.check("no_grow reuse of free tiles");
+        assert!(changed && !waiting, "reuse_only must map held levels from existing free tiles");
+        assert_eq!(STATS[3].load(Ordering::Relaxed), heaps_before, "no_grow must not allocate a new heap");
+        assert!(tiled.given_bytes() > 0);
+        // Asking for more tiles than any existing heap has free (while holding some) must fail without growing.
+        let (_, idx, runs) = take(&rig.device, 1, true).unwrap();
+        assert_eq!(STATS[3].load(Ordering::Relaxed), heaps_before);
+        // Requesting all HEAP_TILES cannot fit in the partially occupied heap; no_grow returns None.
+        assert!(take(&rig.device, HEAP_TILES, true).is_none());
+        assert_eq!(STATS[3].load(Ordering::Relaxed), heaps_before);
+        give_back(idx, &runs);
     }
 }

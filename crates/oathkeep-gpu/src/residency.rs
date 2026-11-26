@@ -66,6 +66,10 @@ pub(crate) fn note_staging_deferred() {
     STAGING_DEFERRED.set(true);
 }
 
+pub(crate) fn is_staging_deferred() -> bool {
+    STAGING_DEFERRED.get()
+}
+
 pub(crate) fn take_staging_deferred() -> bool {
     STAGING_DEFERRED.replace(false)
 }

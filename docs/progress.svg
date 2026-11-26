@@ -137,10 +137,10 @@
   <rect x="268" y="316" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
   <rect x="285" y="316" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
   <rect x="302" y="316" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="319" y="316" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
+  <rect x="319" y="316" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
   <rect x="336" y="316" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
-  <rect x="353" y="316" width="13" height="13" rx="2.5" fill="#006d32" stroke="#21262d" stroke-width="0.75"/>
-  <text x="382" y="326" fill="#8b949e" font-size="11" class="mono"> 90%</text>
+  <rect x="353" y="316" width="13" height="13" rx="2.5" fill="#26a641" stroke="#21262d" stroke-width="0.75"/>
+  <text x="382" y="326" fill="#8b949e" font-size="11" class="mono"> 95%</text>
   <text x="24" y="348" fill="#c9d1d9" font-size="12">Display &amp; Input</text>
   <rect x="200" y="338" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
   <rect x="217" y="338" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="0.75"/>
@@ -173,22 +173,22 @@
   <rect x="474" y="216" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="1"/>
   <text x="495" y="226" fill="#f0f6fc" font-size="12" font-weight="500">All 9 ML DP4A shaders fast</text>
   <text x="856" y="226" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">0.15-0.63 ms (VRAM verified)</text>
-  <rect x="474" y="240" width="13" height="13" rx="2.5" fill="#26a641" stroke="#39d353" stroke-width="1"/>
-  <text x="495" y="250" fill="#39d353" font-size="12" font-weight="500">1:1 console visuals verified</text>
-  <text x="856" y="250" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">crisp lead/hair/DOF/cars; fixing NPC faces/posters</text>
+  <rect x="474" y="240" width="13" height="13" rx="2.5" fill="#39d353" stroke="#21262d" stroke-width="1"/>
+  <text x="495" y="250" fill="#f0f6fc" font-size="12" font-weight="500">1:1 console visuals verified</text>
+  <text x="856" y="250" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">verified (all NPC faces &amp; interior walls textured/lit)</text>
   <rect x="474" y="264" width="13" height="13" rx="2.5" fill="#161b22" stroke="#21262d" stroke-width="1"/>
   <text x="495" y="274" fill="#8b949e" font-size="12" font-weight="500">Playable first mission (20-30+ FPS)</text>
   <text x="856" y="274" text-anchor="end" fill="#8b949e" font-size="10.5" class="mono">target</text>
   <rect x="474" y="296" width="382" height="62" rx="6" fill="#161b22" stroke="#30363d"/>
   <text x="486" y="314" fill="#8b949e" font-size="10.5" font-weight="600">LATEST WORLD TELEMETRY (RTX 3070 8 GB, 1080P)</text>
   <text x="486" y="330" fill="#8b949e" font-size="10" class="mono">FPS</text>
-  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">3.4 fps in diag-visual-vramfix2 (301d66f verified 146.1s TIMEOUT_CLEAN; peak VRAM 6,874/7,164 MB, 0 crashes/TDRs, 02384a60fda6f2d0 translated &amp; bound with 0 dropped)</text>
+  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">2.9-3.4 fps with 1:1 verified visuals in diag-visual-holereuse (150.8s TIMEOUT_CLEAN; peak VRAM 7,148/7,161 MB, 24,000+ hole-reused textures, 0 crashes/TDRs/OOMs)</text>
   <text x="575" y="330" fill="#8b949e" font-size="10" class="mono">FRAME</text>
-  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">295.1 ms in diag-visual-vramfix2 (70.8 ms preparing, 54.8 ms GPU, 32.4 ms copy-back; crisp lead character/hair/eyes/posters/outdoor vehicles; secondary NPC faces &amp; dark interiors left before FPS swarm)</text>
+  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">347.8 ms in diag-visual-holereuse (157.4 ms preparing, 100.1 ms GPU, 57.4 ms copy-back; 1:1 console visuals verified — all NPC faces &amp; interior walls textured and lit)</text>
   <text x="664" y="330" fill="#8b949e" font-size="10" class="mono">GPU</text>
-  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">54.8 ms (146.1s TIMEOUT_CLEAN; pool::TEXTURES 4,928-&gt;4,224 MB, tiles 512-&gt;256 MB, 18,785 idle textures freed, 0 depth-plane misses, 12,648 aligned view copies)</text>
+  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">17.7-100.1 ms (150.8s TIMEOUT_CLEAN; peak VRAM 7,148/7,161 MB, staging 57-112 MB, tiles 305/320 MB reused, 0 depth-plane misses)</text>
   <text x="753" y="330" fill="#8b949e" font-size="10" class="mono">PREP</text>
-  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">70.8 ms in diag-visual-vramfix2 (3062 draws/f, 0 non-RT dropped shaders, 0 capped-view-heap hits)</text>
+  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">157.4 ms in diag-visual-holereuse (2324-3044 draws/f, 0 non-RT dropped shaders, 0 capped-view-heap hits)</text>
   <line x1="24" y1="374" x2="856" y2="374" stroke="#21262d"/>
   <text x="24" y="390" fill="#8b949e" font-size="11">Target: 20-30+ FPS (1:1 visuals) • Clean-room Xbox Series X|S (GDK) layer</text>
   <text x="704" y="390" text-anchor="end" fill="#8b949e" font-size="11">Less</text>

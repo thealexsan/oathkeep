@@ -2605,9 +2605,10 @@ impl State {
         // has run are made from that.
         host.texture_views_remade();
         host.texture_slots_flip();
-        // And with room, the textures whose upload left a held level
-        // without the card's memory are uploaded again.
-        if room {
+        // And with room (or enough free tiles already committed in tiles::POOL),
+        // the textures whose upload left a held level without the card's memory
+        // are uploaded again.
+        if room || crate::tiles::free_room() >= (16 << 20) {
             host.texture_slots_waiting(frame);
         }
         let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
@@ -2663,12 +2664,18 @@ impl State {
         // drains; `OATHKEEP_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let (per_frame, span) = if catchup && on_time >= 1024 && room && !crate::residency::limited_host_ram() {
+            (per_frame * 3, span * 3)
+        } else {
+            (per_frame, span)
+        };
+        let per_frame = if !room && !required && !baking { per_frame.min(48 << 20) } else { per_frame };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
             Some((ms, bytes, _)) => {
+                let bytes = if !room && !required && !baking { bytes.min(48 << 20) } else { bytes };
                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
             }
             None => (span, per_frame),
@@ -2810,31 +2817,38 @@ impl State {
             // had its colour only in the launches that entered the world
             // under the line. `OATHKEEP_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
+            let mut reuse_only = false;
             if !room {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
-                    refused += 1;
-                    if full_card_pass() {
-                        // Held back for the frames of about four seconds
-                        // (`most`), or until the card has room; the pass
-                        // goes on, within a count that bounds one pass.
-                        host.texture_slot_held(index, write, frame + most);
-                        if refused > 1024 {
+                    let can_reuse = crate::pool::texture_room() >= (32 << 20)
+                        || crate::tiles::free_room() >= (16 << 20);
+                    if !can_reuse {
+                        refused += 1;
+                        if full_card_pass() {
+                            // Held back for the frames of about four seconds
+                            // (`most`), or until the card has room; the pass
+                            // goes on, within a count that bounds one pass.
+                            host.texture_slot_held(index, write, frame + most);
+                            if refused > 1024 {
+                                break;
+                            }
+                        } else if refused > 256 {
                             break;
                         }
-                    } else if refused > 256 {
-                        break;
+                        continue;
                     }
-                    continue;
-                }
-                let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == 1 || n.is_multiple_of(500) {
-                    tracing::info!(
-                        so_far = n,
-                        slot = index,
-                        "a texture already on the card is brought up to date although the card has no room for new ones"
-                    );
+                    reuse_only = true;
+                } else {
+                    let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_multiple_of(500) {
+                        tracing::info!(
+                            so_far = n,
+                            slot = index,
+                            "a texture already on the card is brought up to date although the card has no room for new ones"
+                        );
+                    }
                 }
             }
             // Gate new host texture creation / staging on commit reserve after
@@ -2859,6 +2873,7 @@ impl State {
                 && !sync_bake
                 && crate::descriptor::host::show_after()
                 && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
+            let defer_mirror = reuse_only && !sync_bake && !shows_other && !late;
             let (view, bake_key) = if sync_bake {
                 match heap.handle(index).and_then(|handle| host.prepare_bake_slot(index, handle)) {
                     Some((view, key)) => (Some(view), Some(key)),
@@ -2866,12 +2881,16 @@ impl State {
                 }
             } else {
                 let view = heap.handle(index).and_then(|handle| {
-                    if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
+                    if shows_other || late || defer_mirror {
+                        crate::descriptor::view(handle)
+                    } else {
+                        host.mirror(index, handle, true)
+                    }
                 });
                 (view, None)
             };
             let at_once = || {
-                if (late || bake_key.is_some()) && let Some(handle) = heap.handle(index) {
+                if (late || defer_mirror || bake_key.is_some()) && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
                 }
             };
@@ -2888,10 +2907,43 @@ impl State {
                     continue;
                 }
             };
-            let texture = crate::resource::host_resource(resource);
+            let texture = if reuse_only {
+                crate::pool::with_no_grow(|| crate::resource::host_resource(resource))
+            } else {
+                crate::resource::host_resource(resource)
+            };
             if crate::residency::upload_refused() {
                 served = false;
                 break;
+            }
+            if reuse_only && texture.is_none() {
+                refused += 1;
+                if full_card_pass() {
+                    host.texture_slot_held(index, write, frame + most);
+                    if refused > 1024 {
+                        break;
+                    }
+                } else if refused > 256 {
+                    break;
+                }
+                continue;
+            }
+            if reuse_only {
+                static REUSED: AtomicU64 = AtomicU64::new(0);
+                let n = REUSED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n.is_multiple_of(2000) {
+                    tracing::info!(
+                        so_far = n,
+                        slot = index,
+                        baking,
+                        pool_room_mb = crate::pool::texture_room() >> 20,
+                        tiles_free_mb = crate::tiles::free_room() >> 20,
+                        "new texture admitted into existing pool holes without growing VRAM"
+                    );
+                }
+            }
+            if defer_mirror && let Some(handle) = heap.handle(index) {
+                let _ = host.mirror(index, handle, true);
             }
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
