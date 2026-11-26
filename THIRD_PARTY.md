@@ -9,6 +9,7 @@ Oathkeep is licensed under the GNU General Public License v3.0 or later ([LICENS
 - **[victory-amd](https://github.com/myokex/victory-amd)** (myokex, Joshua Odom, Spexivus, joroyt, tightfall) — GPL-3.0-or-later. Multi-view page guard and kernel read-beside fixes inherited via `victory-fork`.
 - **[XCL](https://github.com/ivall/xcl)** (ivall and contributors) — GPL-2.0-only. Referenced upstream for behavioral comparison; fixes were written independently in VIctory's codebase.
 - **[ztrx](https://github.com/Zettrox/ztrx)** (Zettrox) — GPL-3.0-or-later. Inspiration for clean launcher defaults and 8 GB NVIDIA GPU tuning profiles.
+- **[VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)** (Belobug and contributors) & **[VIctory-7900XTX / cool_fox](https://github.com/avatarmanz/VIctory-7900XTX)** (avatarmanz, codec-d, and contributors) — GPL-3.0-or-later. Directional indirect-light ambient stand-in (`ambient.rs`) and GPU residency/bake-upload techniques.
 
 ## External Runtime (Downloaded Locally by Users, Never Bundled)
 

@@ -118,6 +118,8 @@ pub(crate) struct Shader {
     #[cfg(windows)]
     is_spilled: bool,
     #[cfg(windows)]
+    pub(crate) ambient: Option<crate::ambient::Role>,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
 
@@ -202,6 +204,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: Mutex::new(store),
                 #[cfg(windows)]
                 is_spilled,
+                #[cfg(windows)]
+                ambient: (stage == "compute")
+                    .then(|| crate::ambient::role(bytes))
+                    .flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
