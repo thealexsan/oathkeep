@@ -417,6 +417,18 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+/// Whether `sweep` should trim idle caches/allocations after `elapsed_ms`:
+/// every 1 s when VRAM is pressured, or every 3 s when there is headroom.
+fn should_sweep_idle(pressured: bool, elapsed_ms: u64) -> bool {
+    elapsed_ms >= if pressured { 1000 } else { 3000 }
+}
+
+/// Whether a behind-flights submission should force a GPU settle for `sweep`
+/// after `elapsed_ms`: 1.5 s under VRAM pressure, 5 s otherwise.
+fn should_settle_for_sweep(pressured: bool, elapsed_ms: u64) -> bool {
+    elapsed_ms > if pressured { 1500 } else { 5000 }
+}
+
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
@@ -429,6 +441,7 @@ fn sweep() {
         return;
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LAST_IDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
     if now < last + 1000
@@ -441,14 +454,22 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
-    if crate::residency::pressured() {
+    let pressured = crate::residency::pressured();
+    if pressured {
         trim_spare_chunks();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
-    crate::pipeline::trim_library();
-    crate::shadow::let_go_idle();
-    crate::texture::let_go_idle();
-    crate::resource::let_go_idle();
+    let last_idle = LAST_IDLE.load(Ordering::Relaxed);
+    if should_sweep_idle(pressured, now.saturating_sub(last_idle))
+        && LAST_IDLE
+            .compare_exchange(last_idle, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        crate::pipeline::trim_library();
+        crate::shadow::let_go_idle();
+        crate::texture::let_go_idle();
+        crate::resource::let_go_idle();
+    }
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -5710,7 +5731,12 @@ impl Host {
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present()
+            && should_settle_for_sweep(
+                crate::residency::pressured(),
+                now_ms().saturating_sub(SWEPT.load(Ordering::Relaxed)),
+            )
+        {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
@@ -8118,6 +8144,22 @@ mod written_spans_tests {
         found.sort_unstable();
         assert_eq!(found, [(1, 10, 40), (4, 7, 9)]);
     }
+
+    #[test]
+    fn sweep_throttles_when_unpressured_and_stays_eager_under_pressure() {
+        use super::{should_settle_for_sweep, should_sweep_idle};
+        // Under VRAM pressure: idle sweep at 1s, settle at >1.5s.
+        assert!(!should_sweep_idle(true, 999));
+        assert!(should_sweep_idle(true, 1000));
+        assert!(!should_settle_for_sweep(true, 1500));
+        assert!(should_settle_for_sweep(true, 1501));
+
+        // Without VRAM pressure: idle sweep at 3s, settle at >5s.
+        assert!(!should_sweep_idle(false, 2999));
+        assert!(should_sweep_idle(false, 3000));
+        assert!(!should_settle_for_sweep(false, 5000));
+        assert!(should_settle_for_sweep(false, 5001));
+    }
 }
 
 /// Whether the fills of a submission's upload memory are done together on
@@ -8274,17 +8316,13 @@ impl Batch {
         let _flush = crate::timeline::span("refreshes of copies");
         let started = std::time::Instant::now();
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
-        // Those known to copy nothing are said so here, unless they are very
-        // many: then beside the others.
-        const FEW: usize = 256;
+        // Filter out known-no-op refreshes BEFORE `ask_ahead` and `wide_each`
+        // so `ask_ahead` and worker dispatch only see active refreshes.
         let mut spans = spans;
-        let many = spans.len() > FEW;
-        if !many {
+        if crate::watch::light() {
+            let _skipped = filter_active_refreshes(&mut spans);
             #[cfg(feature = "diagnostics")]
-            let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
-            #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+            FLUSHES[2].fetch_add(_skipped as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1;
         if ahead {
@@ -8300,11 +8338,6 @@ impl Batch {
                 return;
             };
             let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
-            }
             Self::update(shadow, *from, *to);
         });
         if ahead {
@@ -8430,20 +8463,19 @@ impl Batch {
     }
 
     fn flush_all(&mut self) {
-        // Most of a flush's copies are as they were: they are told so here,
-        // from what the submission's asking found, before anything is asked
-        // and any thread woken. (Thousands of them, the heap's buffer views
-        // once a frame: on the threads, below.)
-        const FEW: usize = 256;
+        // Most of a flush's copies are as they were: filter them out BEFORE
+        // `ask_ahead` and worker dispatch, using chunked parallel checks when
+        // the batch is large.
         let light = crate::watch::light();
-        if light && self.refreshes.len() <= FEW {
+        if light {
             let started = std::time::Instant::now();
-            #[cfg(feature = "diagnostics")]
-            let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let _skipped = filter_active_refreshes(&mut self.refreshes);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+            FLUSHES[2].fetch_add(_skipped as u64, Ordering::Relaxed);
+            if self.refreshes.is_empty() {
+                return;
+            }
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -8472,11 +8504,6 @@ impl Batch {
                 let refreshes = std::mem::take(&mut self.refreshes);
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        #[cfg(feature = "diagnostics")]
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
                     Self::update(shadow, *from, *to);
                 });
             } else {
@@ -8498,6 +8525,43 @@ impl Batch {
             crate::watch::ask_ahead_done();
         }
     }
+}
+
+/// Drops refreshes known to copy nothing (`Shadow::nothing_new`) and returns
+/// how many were skipped. Large batches are checked in parallel chunks so
+/// neither `ask_ahead` nor worker dispatch wastes work on no-ops.
+fn filter_active_refreshes(refreshes: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) -> usize {
+    const FEW: usize = 256;
+    const CHUNK: usize = 64;
+    let total = refreshes.len();
+    if total <= FEW || !wide_refresh() {
+        refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+        return total - refreshes.len();
+    }
+    let items = std::sync::Arc::new(std::mem::take(refreshes));
+    let keep: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>> =
+        std::sync::Arc::new((0..total).map(|_| std::sync::atomic::AtomicBool::new(false)).collect());
+    let items_w = items.clone();
+    let keep_w = keep.clone();
+    crate::shadow::wide_each(total.div_ceil(CHUNK), move |chunk| {
+        let start = chunk * CHUNK;
+        let end = (start + CHUNK).min(total);
+        for i in start..end {
+            let (shadow, from, to) = &items_w[i];
+            if !shadow.nothing_new(*from, *to - *from) {
+                keep_w[i].store(true, Ordering::Relaxed);
+            }
+        }
+    });
+    let mut items = std::sync::Arc::try_unwrap(items).unwrap_or_else(|arc| (*arc).clone());
+    let mut idx = 0;
+    items.retain(|_| {
+        let k = keep[idx].load(Ordering::Relaxed);
+        idx += 1;
+        k
+    });
+    *refreshes = items;
+    total - refreshes.len()
 }
 
 /// Copies title memory at submission. The ranges were checked against their

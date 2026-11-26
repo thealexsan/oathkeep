@@ -192,7 +192,7 @@ fn sync_aside() -> bool {
 fn sync_early() -> Option<std::time::Duration> {
     static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
     *EVERY.get_or_init(|| {
-        let ms = std::env::var("OATHKEEP_HEAP_SYNC_EARLY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64);
+        let ms = std::env::var("OATHKEEP_HEAP_SYNC_EARLY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16u64);
         (ms > 0).then(|| std::time::Duration::from_millis(ms))
     })
 }
@@ -1209,6 +1209,10 @@ fn wait_for(resource: usize, handle: u64) {
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
     let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
+    if made.is_empty() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for resource in made {
         let handles = WAITING
             .lock()
@@ -1221,7 +1225,6 @@ pub(crate) fn make_waiting() {
             // (Looked up first: the handle is read only while its heap is
             // there.)
             // (The heap stays while the lock is held: `mirror`.)
-            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
             let Some(&(_, _, at)) = heaps.iter().find(|&&(start, end, _)| (start..end).contains(&handle)) else {
                 continue;
             };

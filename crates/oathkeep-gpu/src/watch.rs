@@ -739,6 +739,12 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// by their bits. `false` if something would have to be asked.
 pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
+        return false;
+    };
+    if ranged == 0 && !taken.iter().all(|&at| at != 0) {
+        return false;
+    }
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
     #[cfg(feature = "diagnostics")]
@@ -749,11 +755,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return false;
     }
-    let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
-        return false;
-    };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+    j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
 }
 
 impl Tracked {
@@ -1698,17 +1700,27 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let known = g.clean.word(word) & !BESIDE.word(word) | g.absent.word(word);
         written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
     }
+    const YIELD_RUNS: usize = 16;
+    const YIELD_BLOCKS: usize = 64;
     let mut run: Option<(usize, usize)> = None;
+    let mut runs_since_yield = 0usize;
+    let mut blocks_since_yield = 0usize;
     for &block in &written {
         if let Some((from, to)) = run
             && to != block
         {
             protect(&mut g, from, to);
+            runs_since_yield += 1;
+            blocks_since_yield += to - from;
             run = None;
-            // Faults of the title's wait for the lock: each block is done on
-            // its own, and looked at anew below.
-            drop(g);
-            g = guards_timed();
+            if runs_since_yield >= YIELD_RUNS || blocks_since_yield >= YIELD_BLOCKS {
+                runs_since_yield = 0;
+                blocks_since_yield = 0;
+                // Faults of the title's wait for the lock: yield periodically so
+                // scattered runs do not thrash `GUARDS` on every gap.
+                drop(g);
+                g = guards_timed();
+            }
         }
         // Told as written by this, and read by the caller after.
         if BESIDE.take(block) {
@@ -1920,30 +1932,48 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     };
     // Ahead of the protection (`PROTECTED`).
     (from..to).for_each(|block| PROTECTED.set(block));
+    protect_range(g, from, to, &set, &note);
+}
+
+/// Binary-splits `[from, to)` when a coalesced `VirtualProtect` fails so
+/// committed sub-ranges stay coalesced instead of falling back to one call
+/// per block.
+fn protect_range(
+    g: &mut Guards,
+    from: usize,
+    to: usize,
+    set: &impl Fn(usize, usize) -> bool,
+    note: &impl Fn(&mut Guards, usize, usize),
+) {
+    if from >= to {
+        return;
+    }
     if set(from, to) {
         note(g, from, to);
         return;
     }
-    let mut uncommitted_until = from;
-    for block in from..to {
-        // (Not one question a block of a region that is not there.)
-        if block >= uncommitted_until && set(block, block + 1) {
-            note(g, block, block + 1);
-            continue;
-        }
-        PROTECTED.clear(block);
-        if block >= uncommitted_until {
-            uncommitted_until = uncommitted_end(block);
-            #[cfg(feature = "diagnostics")]
-            tally(9, 1);
-        }
-        if block < uncommitted_until {
+    let uncommitted = uncommitted_end(from);
+    if uncommitted > from {
+        let hole_end = uncommitted.min(to);
+        #[cfg(feature = "diagnostics")]
+        tally(9, 1);
+        for block in from..hole_end {
+            PROTECTED.clear(block);
             g.absent.insert(block);
             if known_holes() && placeholder(block) {
                 g.held.insert(block);
             }
         }
+        protect_range(g, hole_end, to, set, note);
+        return;
     }
+    if to - from == 1 {
+        PROTECTED.clear(from);
+        return;
+    }
+    let mid = from + (to - from) / 2;
+    protect_range(g, from, mid, set, note);
+    protect_range(g, mid, to, set, note);
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
@@ -2001,9 +2031,30 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
     here
 }
 
+/// Groups sorted/unsorted block indices into contiguous `[from, to)` runs.
+fn coalesce_block_runs(blocks: &[usize]) -> Vec<(usize, usize)> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = blocks.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for block in sorted {
+        match runs.last_mut() {
+            Some((_, to)) if *to == block => *to = block + 1,
+            _ => runs.push((block, block + 1)),
+        }
+    }
+    runs
+}
+
 /// Gives write access back to `blocks`, guarded ones.
 fn unguard(g: &mut Guards, blocks: &[usize]) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    if blocks.is_empty() {
+        return;
+    }
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // All of them before the first can be written: a write through one is a
@@ -2013,24 +2064,37 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
         g.clean.remove(block);
         PUBLISHED.clear(block);
     }
-    for &block in blocks {
+    for (from, to) in coalesce_block_runs(blocks) {
         let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe {
-            if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
-                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
-            {
-                // Not what we left there: the address is other memory's
-                // (code's, say), which keeps its protection.
-                VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+        // SAFETY: blocks we made read-only.
+        let ok = unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READWRITE, &mut old) != 0 };
+        if ok && matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+            for block in from..to {
+                PROTECTED.clear(block);
             }
+            continue;
         }
-        PROTECTED.clear(block);
+        if ok {
+            // Mixed protections inside the coalesced range: restore and fall back per block.
+            unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
+        }
+        for block in from..to {
+            let mut old = 0;
+            // SAFETY: a block we made read-only.
+            unsafe {
+                if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
+                    && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
+                {
+                    // Not what we left there: the address is other memory's
+                    // (code's, say), which keeps its protection.
+                    VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+                }
+            }
+            PROTECTED.clear(block);
+        }
     }
     #[cfg(feature = "diagnostics")]
-    if !blocks.is_empty() {
-        tally(8, started.elapsed().as_nanos() as u64);
-    }
+    tally(8, started.elapsed().as_nanos() as u64);
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -2661,6 +2725,28 @@ fn writable(at: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+}
+
+#[cfg(test)]
+mod guard_coalesce_tests {
+    use super::{coalesce_block_runs, nothing_new};
+
+    #[test]
+    fn coalesces_contiguous_and_dedups_unsorted_blocks() {
+        assert_eq!(coalesce_block_runs(&[]), Vec::<(usize, usize)>::new());
+        assert_eq!(coalesce_block_runs(&[5]), vec![(5, 6)]);
+        assert_eq!(
+            coalesce_block_runs(&[10, 3, 4, 5, 11, 4, 20]),
+            vec![(3, 6), (10, 12), (20, 21)]
+        );
+    }
+
+    #[test]
+    fn nothing_new_fast_fails_without_copied_coverage() {
+        // Out of range of `copied` or zero asking timestamp returns false.
+        assert!(!nothing_new(0, 4096, 1, &[10, 10], 0));
+        assert!(!nothing_new(4096, 8192, 1, &[0], 0));
+    }
 }
 
 #[cfg(test)]
