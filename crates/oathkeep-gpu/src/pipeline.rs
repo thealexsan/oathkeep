@@ -594,23 +594,35 @@ fn hand_out(
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
 
-/// Device method.
+/// Device method (`ID3D12Device::CreateGraphicsPipelineState`, slot 0x50).
+/// Captures both the shader stages and the full graphics pipeline state from
+/// `D3D12_GRAPHICS_PIPELINE_STATE_DESC`.
 pub(crate) extern "system" fn create_graphics(
     _: This,
     desc: *const GraphicsHead,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
-    let Some(desc) = (unsafe { desc.as_ref() }) else {
+    // SAFETY: the title passes a full D3D12_GRAPHICS_PIPELINE_STATE_DESC (null is tolerated).
+    let Some(head) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    let stages = GRAPHICS_STAGES.iter().zip(&desc.stages);
+    let stages = GRAPHICS_STAGES.iter().zip(&head.stages);
     let shaders = stages.filter_map(|(s, c)| copy(s, c)).collect();
+    #[cfg(windows)]
+    let graphics = {
+        use windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC;
+        const _: () = assert!(
+            offset_of!(GraphicsHead, stages) == offset_of!(D3D12_GRAPHICS_PIPELINE_STATE_DESC, VS)
+        );
+        // SAFETY: `CreateGraphicsPipelineState` passes a `D3D12_GRAPHICS_PIPELINE_STATE_DESC`.
+        let full = unsafe { &*desc.cast::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>() };
+        Some(Box::new(unsafe { host::GraphicsState::from_graphics_desc(full) }))
+    };
     hand_out(
         shaders,
         #[cfg(windows)]
-        None,
+        graphics,
         iid,
         out,
     )
@@ -817,43 +829,81 @@ mod tests {
     #[test]
     fn pipelines_keep_their_shaders() {
         let (vs, ps) = ([1u8, 2, 3], [4u8; 5]);
-        let none = || Bytecode {
-            code: std::ptr::null(),
-            size: 0,
-        };
-        let desc = GraphicsHead {
-            root: std::ptr::null(),
-            stages: [
-                Bytecode {
-                    code: vs.as_ptr(),
-                    size: vs.len(),
+        #[cfg(windows)]
+        let mut full = {
+            use windows::Win32::Graphics::Direct3D12::*;
+            use windows::Win32::Graphics::Dxgi::Common::*;
+            let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                VS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: vs.as_ptr().cast(),
+                    BytecodeLength: vs.len(),
                 },
-                Bytecode {
-                    code: ps.as_ptr(),
-                    size: ps.len(),
+                PS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: ps.as_ptr().cast(),
+                    BytecodeLength: ps.len(),
                 },
-                none(),
-                none(),
-                none(),
-            ],
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                DSVFormat: DXGI_FORMAT_D32_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 0, Quality: 0 },
+                SampleMask: u32::MAX,
+                ..Default::default()
+            };
+            d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            d.RTVFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM; // trailing stale format
+            d
         };
+        #[cfg(windows)]
+        let desc_ptr = (&raw const full).cast::<GraphicsHead>();
+        #[cfg(not(windows))]
+        let desc = {
+            let none = || Bytecode {
+                code: std::ptr::null(),
+                size: 0,
+            };
+            GraphicsHead {
+                root: std::ptr::null(),
+                stages: [
+                    Bytecode { code: vs.as_ptr(), size: vs.len() },
+                    Bytecode { code: ps.as_ptr(), size: ps.len() },
+                    none(),
+                    none(),
+                    none(),
+                ],
+            }
+        };
+        #[cfg(not(windows))]
+        let desc_ptr = &raw const desc;
         let mut p = std::ptr::null();
         assert_eq!(
-            create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            create_graphics(std::ptr::null(), desc_ptr, &PIPELINE_IIDS[0], &mut p),
             S_OK
         );
         assert_eq!(
             shaders(p),
             [("vertex", vs.to_vec()), ("pixel", ps.to_vec())]
         );
+        #[cfg(windows)]
+        {
+            let g = pipeline(p).host.graphics.as_deref().expect("plain graphics state kept");
+            assert_eq!(g.topology.0, 3);
+            assert_eq!(g.targets.NumRenderTargets, 1);
+            assert_eq!(g.targets.RTFormats[0].0, 28);
+            assert_eq!(g.targets.RTFormats[1].0, 0, "trailing RTV format zeroed");
+            assert_eq!(g.depth_format.0, 40);
+            assert_eq!(g.samples.Count, 1, "SampleDesc.Count 0 normalized to 1");
+        }
         // A second pipeline with the same pixel shader shares its container.
         let mut q = std::ptr::null();
-        create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q);
+        create_graphics(std::ptr::null(), desc_ptr, &PIPELINE_IIDS[0], &mut q);
         assert!(Arc::ptr_eq(
             &pipeline(p).shaders[1],
             &pipeline(q).shaders[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+        #[cfg(windows)]
+        let _ = &mut full;
     }
 
     /// The stream layout the title builds (title+0x86f090): root

@@ -420,6 +420,9 @@ pub struct Structured {
     /// Per block: what holds in every lane that enters it (over forward
     /// edges; a loop header forgets what its loop redefines).
     pub reach: Vec<Bool>,
+    /// Per block: the lane's EXEC bit at the end of the block (intersected
+    /// with `reach`), i.e. whether the lane is active when leaving the block.
+    pub exit_exec: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
@@ -472,14 +475,14 @@ pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Struct
     let mut l = Lanes::new(program)?;
     l.wide = wide.clone();
     loop {
-        let execs = l.masks_in_order();
+        let (execs, exit_exec) = l.masks_in_order();
         let cond = l.paths()?;
         let (wrong, new_derived) = l.check_joins(&cond);
         if l.b.overflow {
             return Err(TOO_LARGE);
         }
         if wrong.is_empty() && new_derived.is_empty() {
-            return l.finish(&execs, &cond);
+            return l.finish(&execs, &exit_exec, &cond);
         }
         l.unresolved.extend(wrong);
         l.derived_phis.extend(new_derived);
@@ -637,8 +640,9 @@ impl<'a> Lanes<'a> {
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
-    /// block in reverse postorder; returns EXEC at each instruction reading it.
-    fn masks_in_order(&mut self) -> Vec<Vec<Option<Bool>>> {
+    /// block in reverse postorder; returns EXEC at each instruction reading it
+    /// and EXEC at the end of each block.
+    fn masks_in_order(&mut self) -> (Vec<Vec<Option<Bool>>>, Vec<Bool>) {
         let p = self.p;
         let input = |reg| p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1);
         if let Some(lo) = input(Reg::S(EXEC)) {
@@ -652,25 +656,39 @@ impl<'a> Lanes<'a> {
         }
         let mut execs: Vec<Vec<Option<Bool>>> =
             p.blocks.iter().map(|b| vec![None; b.insts.len()]).collect();
+        let mut exit_exec = vec![Bool::TRUE; p.blocks.len()];
         for n in 0..self.order.len() {
             let b = self.order[n];
             let mut c = if n == 0 { Bool::TRUE } else { Bool::FALSE };
+            let mut pred_exec = None;
             for k in 0..self.incoming[b].len() {
                 let (q, taken) = self.incoming[b][k];
                 if self.index[q] < n {
                     let e = self.edge(self.first[q], q, taken);
                     c = self.b.or(c, e);
+                    pred_exec.get_or_insert(exit_exec[q]);
                 }
             }
             self.first[b] = c;
             // EXEC joined at the block's entry holds the lanes that arrive.
+            let mut phi_lo = None;
+            let mut phi_hi = None;
             for phi in &p.blocks[b].phis {
                 if phi.reg == Reg::S(EXEC) {
                     self.active.insert(phi.value);
+                    phi_lo = Some(phi.value);
+                } else if p.wave64 && phi.reg == Reg::S(EXEC + 1) {
+                    phi_hi = Some(phi.value);
                 }
             }
             // EXEC where known in this block (read or written so far).
-            let mut now = None;
+            let mut now = match phi_lo {
+                Some(lo) => {
+                    let hi = if p.wave64 { phi_hi.unwrap_or(lo) } else { lo };
+                    Some(self.mask((lo, hi)).0)
+                }
+                None => pred_exec,
+            };
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
                 if inst.read(Reg::S(EXEC)).is_some() {
                     let e = self.exec(inst);
@@ -682,6 +700,7 @@ impl<'a> Lanes<'a> {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
                 }
             }
+            exit_exec[b] = now.unwrap_or(Bool::TRUE);
             if let Exit::Branch { .. } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
@@ -689,7 +708,7 @@ impl<'a> Lanes<'a> {
                 self.wave_any[b] = self.wave_kind(last);
             }
         }
-        execs
+        (execs, exit_exec)
     }
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.
@@ -768,6 +787,7 @@ impl<'a> Lanes<'a> {
     fn finish(
         mut self,
         execs: &[Vec<Option<Bool>>],
+        exit_exec: &[Bool],
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
         let phi_joins = std::mem::take(&mut self.phi_joins);
@@ -832,6 +852,11 @@ impl<'a> Lanes<'a> {
                 },
             })
             .collect();
+        let exit_exec: Vec<Bool> = exit_exec
+            .iter()
+            .enumerate()
+            .map(|(n, &e)| b.and(cond[n], e))
+            .collect();
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
@@ -872,6 +897,7 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             reach: cond.to_vec(),
+            exit_exec,
         })
     }
 

@@ -154,6 +154,9 @@ impl Pending {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(why) = p.left_out {
+        return Some(why.to_owned());
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
@@ -659,5 +662,13 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn missing_reports_left_out_reason_instead_of_being_made() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.left_out = Some("intentionally skipped in test");
+        assert_eq!(missing(&p).as_deref(), Some("intentionally skipped in test"));
     }
 }

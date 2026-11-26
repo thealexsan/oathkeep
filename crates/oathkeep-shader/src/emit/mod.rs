@@ -548,7 +548,15 @@ pub fn emit(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        let multi_wave_group = matches!(
+            native.io,
+            crate::native::StageIo::Cs(cs)
+                if cs.threads.iter().product::<u32>() > 64
+                    && cs.threads.iter().product::<u32>() % 64 == 0
+        );
+        let wide_on = wide_option
+            .as_ref()
+            .map_or(scene_kernel || multi_wave_group, |v| v == "1");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -586,7 +594,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why, driver_loop);
+                        let again = widen(c, native, base, why, !wide_on && driver_loop);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -701,10 +709,16 @@ fn widen(
         offset: 0,
         what: "wave-wide branches in a thread group of several console waves",
     };
-    match native.io {
+    let multi_wave = match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
-        crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => None,
+        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => None,
+        crate::native::StageIo::Cs(cs)
+            if cs.threads.iter().product::<u32>() > 64
+                && cs.threads.iter().product::<u32>() % 64 == 0 =>
+        {
+            Some(cs.threads)
+        }
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -712,7 +726,7 @@ fn widen(
             return Err(NOT);
         }
         _ => return Err(NOT),
-    }
+    };
     let mut wide = std::collections::HashSet::new();
     loop {
         let st = structure::structure_wide(p, &wide)?;
@@ -727,6 +741,16 @@ fn widen(
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
+            if let Some(threads) = multi_wave
+                && r.is_ok()
+                && !wide.is_empty()
+                && !lower::multi_wave_wide_safe(p, &st, &io, threads)
+            {
+                if why {
+                    eprintln!("WAVE64-WIDE rejected: multi-wave widened branches not single-wave safe");
+                }
+                return Err(NOT);
+            }
             if why {
                 let order = ir::reverse_postorder(&p.blocks);
                 let mut rpo = vec![0usize; p.blocks.len()];

@@ -141,6 +141,10 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     if !per_target {
         host.IndependentBlendEnable = true.into();
         host.RenderTarget = [blend.RenderTarget[0]; 8];
+        // D3D12 forbids IndependentBlendEnable and LogicOpEnable simultaneously.
+        for rt in &mut host.RenderTarget {
+            rt.LogicOpEnable = false.into();
+        }
     }
     for i in 0..count {
         if integer_format(targets.RTFormats[i]) {
@@ -150,7 +154,95 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     host
 }
 
+/// Sanitizes render target format arrays for D3D12 PSO creation: clamps
+/// `NumRenderTargets` to `<= 8` and zeroes trailing `RTFormats[count..8]` to
+/// `DXGI_FORMAT_UNKNOWN` (D3D12 refuses non-UNKNOWN trailing formats).
+fn sanitize_targets(targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_RT_FORMAT_ARRAY {
+    let mut out = *targets;
+    let count = (out.NumRenderTargets as usize).min(8);
+    out.NumRenderTargets = count as u32;
+    for fmt in &mut out.RTFormats[count..] {
+        *fmt = DXGI_FORMAT_UNKNOWN;
+    }
+    out
+}
+
+/// Sanitizes sample descriptions for D3D12 PSO creation: `Count == 0` is
+/// invalid in D3D12 and normalized to single-sample `(1, 0)`.
+fn sanitize_samples(samples: DXGI_SAMPLE_DESC) -> DXGI_SAMPLE_DESC {
+    if samples.Count == 0 {
+        DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        }
+    } else {
+        samples
+    }
+}
+
 impl GraphicsState {
+    /// Captures graphics pipeline state from a plain
+    /// `D3D12_GRAPHICS_PIPELINE_STATE_DESC` (`ID3D12Device::CreateGraphicsPipelineState`).
+    ///
+    /// # Safety
+    /// `desc` points at a valid `D3D12_GRAPHICS_PIPELINE_STATE_DESC`, and if
+    /// `desc.InputLayout.pInputElementDescs` is non-null it points at
+    /// `desc.InputLayout.NumElements` valid elements with NUL-terminated names.
+    pub(crate) unsafe fn from_graphics_desc(desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Self {
+        let mut state = GraphicsState {
+            blend: desc.BlendState,
+            sample_mask: desc.SampleMask,
+            rasterizer: desc.RasterizerState,
+            depth: desc.DepthStencilState,
+            depth_bounds: false,
+            inputs: Vec::new(),
+            names: Vec::new(),
+            strip_cut: desc.IBStripCutValue,
+            topology: desc.PrimitiveTopologyType,
+            targets: D3D12_RT_FORMAT_ARRAY {
+                RTFormats: desc.RTVFormats,
+                NumRenderTargets: desc.NumRenderTargets,
+            },
+            depth_format: DXGI_FORMAT(crate::resource::pc_format(desc.DSVFormat.0 as u32) as i32),
+            samples: sanitize_samples(desc.SampleDesc),
+        };
+        state.targets = sanitize_targets(&state.targets);
+        for f in &mut state.targets.RTFormats[..state.targets.NumRenderTargets as usize] {
+            f.0 = crate::resource::target_format(crate::resource::pc_format(f.0 as u32)) as i32;
+        }
+        let layout = desc.InputLayout;
+        if !layout.pInputElementDescs.is_null() && layout.NumElements > 0 {
+            // SAFETY: caller guarantees valid `NumElements` elements and semantic names.
+            unsafe {
+                let elements = std::slice::from_raw_parts(
+                    layout.pInputElementDescs,
+                    layout.NumElements as usize,
+                );
+                state.names = elements
+                    .iter()
+                    .map(|e| {
+                        if e.SemanticName.0.is_null() {
+                            CString::default()
+                        } else {
+                            CStr::from_ptr(e.SemanticName.0.cast()).to_owned()
+                        }
+                    })
+                    .collect();
+                state.inputs = elements
+                    .iter()
+                    .zip(&state.names)
+                    .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                        SemanticName: PCSTR(name.as_ptr().cast()),
+                        Format: DXGI_FORMAT(
+                            crate::resource::pc_format(e.Format.0 as u32) as i32
+                        ),
+                        ..*e
+                    })
+                    .collect();
+            }
+        }
+        state
+    }
     /// Whether the draws are a pass over the screen: no vertex input, no
     /// depth or stencil, a target. Such passes fill tables once; their shaders
     /// are few. (After Belobug/Oathkeep-Belobug-AMD 18e57db8.)
@@ -649,7 +741,9 @@ impl HostPipeline {
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
         };
-        let depth_bounds = if g.depth_bounds {
+        let targets = sanitize_targets(&g.targets);
+        let samples = sanitize_samples(g.samples);
+        let depth_bounds = if g.depth_bounds && g.depth_format != DXGI_FORMAT_UNKNOWN {
             if host.depth_bounds() {
                 true
             } else {
@@ -724,7 +818,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: host_blend(&g.blend, &g.targets),
+            BlendState: host_blend(&g.blend, &targets),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -739,10 +833,10 @@ impl HostPipeline {
                 RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
                 _ => g.topology,
             },
-            NumRenderTargets: g.targets.NumRenderTargets,
-            RTVFormats: g.targets.RTFormats,
+            NumRenderTargets: targets.NumRenderTargets,
+            RTVFormats: targets.RTFormats,
             DSVFormat: g.depth_format,
-            SampleDesc: g.samples,
+            SampleDesc: samples,
             ..Default::default()
         };
         // A pipeline with the geometry stage has a name of its own in the
@@ -966,18 +1060,20 @@ fn mesh_pipeline(
         samples: Sub<DXGI_SAMPLE_DESC>,
         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
     }
+    let targets = sanitize_targets(&g.targets);
+    let samples = sanitize_samples(g.samples);
     let build = |depth: Sub<_>| {
         let mut stream = Stream {
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(&g.blend, &g.targets)),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(&g.blend, &targets)),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
-            targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
+            targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, targets),
             dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
-            samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
+            samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, samples),
             topology: Sub(
                 D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
@@ -990,13 +1086,13 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(&g.blend, &g.targets)),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(&g.blend, &targets)),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
-            targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
+            targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, targets),
             dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
-            samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
+            samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, samples),
             topology: Sub(
                 D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
@@ -1520,5 +1616,45 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    #[test]
+    fn pso_state_sanitization_fixes_invalid_targets_samples_and_blend() {
+        let mut raw_targets = D3D12_RT_FORMAT_ARRAY {
+            RTFormats: [DXGI_FORMAT_R8G8B8A8_UNORM; 8],
+            NumRenderTargets: 2,
+        };
+        raw_targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        let targets = sanitize_targets(&raw_targets);
+        assert_eq!(targets.NumRenderTargets, 2);
+        assert_eq!(targets.RTFormats[0], DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(targets.RTFormats[1], DXGI_FORMAT_R8_UINT);
+        for i in 2..8 {
+            assert_eq!(targets.RTFormats[i], DXGI_FORMAT_UNKNOWN);
+        }
+
+        let over = D3D12_RT_FORMAT_ARRAY {
+            RTFormats: [DXGI_FORMAT_R8G8B8A8_UNORM; 8],
+            NumRenderTargets: 12,
+        };
+        assert_eq!(sanitize_targets(&over).NumRenderTargets, 8);
+
+        let zero_samples = sanitize_samples(DXGI_SAMPLE_DESC { Count: 0, Quality: 5 });
+        assert_eq!((zero_samples.Count, zero_samples.Quality), (1, 0));
+        let msaa = sanitize_samples(DXGI_SAMPLE_DESC { Count: 4, Quality: 1 });
+        assert_eq!((msaa.Count, msaa.Quality), (4, 1));
+
+        // Integer RTV with shared blend + LogicOpEnable must disable BlendEnable
+        // on the integer target and clear LogicOpEnable when IndependentBlendEnable turns on.
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].BlendEnable = true.into();
+        blend.RenderTarget[0].LogicOpEnable = true.into();
+        let fixed = host_blend(&blend, &targets);
+        assert!(fixed.IndependentBlendEnable.as_bool());
+        assert!(fixed.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!fixed.RenderTarget[1].BlendEnable.as_bool());
+        for rt in &fixed.RenderTarget {
+            assert!(!rt.LogicOpEnable.as_bool());
+        }
     }
 }
