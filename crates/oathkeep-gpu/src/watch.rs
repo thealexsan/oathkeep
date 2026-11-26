@@ -3185,6 +3185,39 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     });
 }
 
+fn handle_write_fault(at: usize) -> bool {
+    let block = at / BLOCK;
+    let shard = shard_of(block);
+    loop {
+        let tracked = {
+            let g = guards_read_shard(shard);
+            if g.protected.contains(block) || g.aliased.contains(block) {
+                true
+            } else {
+                // Keep the shard read lock across `writable(at)` so a concurrent
+                // `protect_range` / `protect_alias_span` on this shard cannot flip
+                // `block` back to `PAGE_READONLY` between `!contains` and `VirtualQuery`.
+                return writable(at);
+            }
+        };
+        if tracked && open_fault_sharded(at) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            return true;
+        }
+        // Another thread opened `block` between our read check and `open_fault_sharded`.
+        // Re-check under the shard read lock: if a third thread already re-protected
+        // `block`, retry opening it instead of letting `writable(at)` return false and
+        // turning a guarded write into an unhandled access violation.
+        let g = guards_read_shard(shard);
+        if g.protected.contains(block) {
+            drop(g);
+            continue;
+        }
+        return writable(at);
+    }
+}
+
 fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -3201,18 +3234,7 @@ fn install() {
         {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        let at = r.ExceptionInformation[1];
-        let block = at / BLOCK;
-        let tracked = {
-            let g = guards_read_shard(shard_of(block));
-            g.protected.contains(block) || g.aliased.contains(block)
-        };
-        if tracked && open_fault_sharded(at) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if writable(at) {
+        if handle_write_fault(r.ExceptionInformation[1]) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             EXCEPTION_CONTINUE_SEARCH
@@ -3226,17 +3248,7 @@ fn install() {
 }
 
 pub fn try_open_write(at: usize) -> bool {
-    let block = at / BLOCK;
-    let tracked = {
-        let g = guards_read_shard(shard_of(block));
-        g.protected.contains(block) || g.aliased.contains(block)
-    };
-    if tracked && open_fault_sharded(at) {
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-        return true;
-    }
-    writable(at)
+    handle_write_fault(at)
 }
 
 fn writable(at: usize) -> bool {
@@ -4681,5 +4693,64 @@ mod mapping_tests {
         ask_once(&[(base, base + PAGE)]);
         assert_eq!(write_stamp().global, before);
         assert!(!is_journal_kept());
+    }
+
+    #[test]
+    fn concurrent_guard_reprotect_never_drops_write_fault() {
+        use super::{BLOCK, pre_guard_batch, title_memory_remapped, writes_guarded_since_with_clean};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        let bytes = 4 * BLOCK;
+        let mapping = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                bytes as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!mapping.is_null());
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, bytes) };
+        assert!(!view.Value.is_null());
+        let base = view.Value as usize;
+
+        // Arm guard handler once on the region.
+        let _ = writes_guarded_since_with_clean(base, base + bytes, 0);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for t in 0..3usize {
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut i = 0u8;
+                while !stop.load(Ordering::Relaxed) {
+                    let off = ((t * 4096) + (i as usize * 64)) % bytes;
+                    // SAFETY: mapped writable section view guarded by `watch.rs` VEH.
+                    unsafe { ((base + off) as *mut u8).write_volatile(i) };
+                    i = i.wrapping_add(1);
+                }
+            }));
+        }
+        // Hammer `pre_guard_batch` concurrently with active writer threads to exercise the
+        // `on_write` open-vs-reprotect race window.
+        for _ in 0..400 {
+            pre_guard_batch(&[(base, base + bytes)]);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().unwrap();
+        }
+        title_memory_remapped(base, bytes);
+        unsafe {
+            UnmapViewOfFile(view);
+            CloseHandle(mapping);
+        }
     }
 }
