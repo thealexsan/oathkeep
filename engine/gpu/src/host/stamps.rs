@@ -109,7 +109,7 @@ fn times(taken: usize) -> Vec<(u64, u64)> {
 }
 
 impl Host {
-    fn make_stamps(&self) -> windows::core::Result<Stamps> {
+    pub(in crate::host) fn make_stamps(&self) -> windows::core::Result<Stamps> {
         let Some((buffer, back)) = self.shared_buffer(16 * MOST as u64) else {
             return Err(windows::core::Error::from(windows::Win32::Foundation::E_OUTOFMEMORY));
         };

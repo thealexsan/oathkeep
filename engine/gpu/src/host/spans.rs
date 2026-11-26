@@ -74,7 +74,7 @@ static SPANS_MADE: Mutex<Option<Option<Spans>>> = Mutex::new(None);
 impl Host {
     /// The lists that go in front of and behind a submission about to be
     /// sent to the drawing queue, if stamps are asked for.
-    pub(super) fn span_lists(&self) -> Option<[ID3D12CommandList; 2]> {
+    pub(in crate::host) fn span_lists(&self) -> Option<[ID3D12CommandList; 2]> {
         if !on() {
             return None;
         }
@@ -102,7 +102,7 @@ impl Host {
         Some([spans.lists[2 * i].clone(), spans.lists[2 * i + 1].clone()])
     }
 
-    fn make_spans(&self) -> windows::core::Result<Spans> {
+    pub(in crate::host) fn make_spans(&self) -> windows::core::Result<Spans> {
         let device = &self.device;
         // SAFETY: plain object creation; lists of one allocator recorded one
         // after the other.
