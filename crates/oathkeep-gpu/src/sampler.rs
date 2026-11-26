@@ -75,7 +75,7 @@ impl Fields {
             } else {
                 D3D12_COMPARISON_FUNC_NEVER
             },
-            BorderColor: self.border,
+            BorderColor: self.border.map(|c| finite_lod(c, 0.0)),
             MinLOD: min_lod,
             MaxLOD: max_lod,
         }
@@ -225,5 +225,20 @@ mod tests {
             ]
         );
         assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
+    }
+
+    #[test]
+    fn non_finite_border_colors_are_sanitized() {
+        let mut w = [0u32; 27];
+        w[6..9].copy_from_slice(&[4, 4, 4]); // BORDER
+        w[17] = f32::NAN.to_bits();
+        w[18] = f32::INFINITY.to_bits();
+        w[19] = f32::NEG_INFINITY.to_bits();
+        w[20] = 0.5f32.to_bits();
+        let d = console(&w);
+        assert_eq!(
+            d.BorderColor,
+            [0.0, D3D12_FLOAT32_MAX, -D3D12_FLOAT32_MAX, 0.5]
+        );
     }
 }
