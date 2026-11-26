@@ -896,6 +896,8 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
 });
+/// Incremented whenever [`forget`] invalidates a table entry's generation.
+static VIEWS_FORGOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
@@ -1266,6 +1268,7 @@ pub(crate) fn forget(resource: usize) {
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    let mut forgot_any = false;
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -1279,7 +1282,17 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        forgot_any = true;
     }
+    if forgot_any {
+        VIEWS_FORGOT.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Monotonic counter bumped whenever [`forget`] invalidates a `VIEWS` entry.
+#[cfg(windows)]
+pub(crate) fn views_forgot() -> u64 {
+    VIEWS_FORGOT.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// The view the record words `i` and `generation` name: the one they hold
@@ -1318,6 +1331,27 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     view_at(i, generation)
+}
+
+/// Whether the view recorded at `handle` still exists, without cloning it.
+#[cfg(windows)]
+pub(crate) fn view_exists(handle: u64) -> bool {
+    if handle == 0 {
+        return false;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag != VIEW_TAG {
+        return false;
+    }
+    match generation >> KIND_SHIFT {
+        0 => views_read()
+            .list
+            .get(i as usize)
+            .is_some_and(|(_, current)| *current == generation),
+        CONSTANT | PLACED => true,
+        _ => false,
+    }
 }
 
 /// A description of `N` words, if the title passes one.

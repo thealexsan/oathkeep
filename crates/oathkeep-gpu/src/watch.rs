@@ -79,6 +79,32 @@ impl Journal {
             None => WHOLE,
         }
     }
+
+    /// Whether `[first, last)` (in pages) is covered by an interval in `ahead`.
+    /// `ahead` is kept sorted and disjoint.
+    fn has_ahead(&self, first: usize, last: usize) -> bool {
+        let i = self.ahead.partition_point(|&(a, _)| a <= first);
+        i > 0 && self.ahead[i - 1].1 >= last
+    }
+}
+
+/// Sort and merge overlapping/adjacent `(first, last)` page intervals in place.
+fn normalize_ahead(ahead: &mut Vec<(usize, usize)>) {
+    if ahead.len() <= 1 {
+        return;
+    }
+    ahead.sort_unstable();
+    let mut write = 0;
+    for read in 1..ahead.len() {
+        let (a, b) = ahead[read];
+        if a <= ahead[write].1 {
+            ahead[write].1 = ahead[write].1.max(b);
+        } else {
+            write += 1;
+            ahead[write] = (a, b);
+        }
+    }
+    ahead.truncate(write + 1);
 }
 
 /// Of the pages of a copy that were written after it took them (page number,
@@ -149,6 +175,24 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     ahead_asked: 0,
     kept: false,
 });
+
+/// Lock-free mirror of `JOURNAL.kept`: true while a submission's `ask_once`
+/// asking stands.
+static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Lock-free mirror of `!JOURNAL.ahead.is_empty()`.
+static AHEAD_NONEMPTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a submission's `ask_once` asking is currently active.
+pub(crate) fn once_kept() -> bool {
+    KEPT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Fast lock-free pre-check for [`nothing_new`]: false if neither `published`
+/// nor any `ahead` range can answer `[start, end)`.
+pub(crate) fn can_answer_without_asking(start: usize, end: usize) -> bool {
+    published(start, end) || AHEAD_NONEMPTY.load(std::sync::atomic::Ordering::Acquire)
+}
 
 fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
     if let Ok(j) = JOURNAL.try_read() {
@@ -313,6 +357,9 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    if KEPT.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -347,9 +394,11 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         i = k;
     }
     note_hot(&written);
+    normalize_ahead(&mut asked);
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
     j.ahead = asked;
+    AHEAD_NONEMPTY.store(!j.ahead.is_empty(), std::sync::atomic::Ordering::Release);
     let now = j.ahead_asked;
     for (page, parts) in written {
         j.note(page, parts, now);
@@ -494,9 +543,13 @@ fn ask_early(every: std::time::Duration) {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
+    if KEPT.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let mut j = journal_mut();
     if !j.kept {
         j.ahead.clear();
+        AHEAD_NONEMPTY.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -542,6 +595,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     let _all = Asking::hold_all();
     let mut ahead = {
         let mut j = journal_mut();
+        AHEAD_NONEMPTY.store(false, std::sync::atomic::Ordering::Release);
         std::mem::take(&mut j.ahead)
     };
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
@@ -563,6 +617,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         }
     }
     note_hot(&written);
+    normalize_ahead(&mut ahead);
     let mut j = journal_mut();
     // A number of its own, and the one this asking stands under: between
     // the two parts another thread may have asked about a range of the
@@ -575,6 +630,8 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     }
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
+    KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
+    AHEAD_NONEMPTY.store(!j.ahead.is_empty(), std::sync::atomic::Ordering::Release);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -584,16 +641,19 @@ pub(crate) fn ask_once_end() {
     if j.kept {
         j.kept = false;
         j.ahead.clear();
+        KEPT.store(false, std::sync::atomic::Ordering::Release);
+        AHEAD_NONEMPTY.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
 /// We wrote title memory `[at, at + len)` while a submission's one asking
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
-pub(crate) fn wrote(at: usize, len: usize) {
+/// Returns `true` if any physical-page aliases were also marked.
+pub(crate) fn wrote(at: usize, len: usize) -> bool {
     let mut j = journal_mut();
     if !j.kept || len == 0 {
-        return;
+        return false;
     }
     let now = next_asking();
     // What is copied from now on counts as copied after these writes (fork
@@ -603,11 +663,19 @@ pub(crate) fn wrote(at: usize, len: usize) {
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.note(page, WHOLE, now);
     }
-    for (_, others) in elsewhere(at, len) {
+    let aliases = elsewhere(at, len);
+    let had_aliases = !aliases.is_empty();
+    for (_, others) in aliases {
         for other in others {
             j.note(other / PAGE, WHOLE, now);
         }
     }
+    had_aliases
+}
+
+/// Whether `[at, at + len)` has physical-page aliases at other virtual addresses.
+pub(crate) fn has_aliases(at: usize, len: usize) -> bool {
+    !elsewhere(at, len).is_empty()
 }
 
 /// The blocks of `[at, at + len)` whose pages the title shows at other
@@ -647,9 +715,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    j.has_ahead(first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -662,7 +728,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| j.has_ahead(first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -745,8 +811,11 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     if known {
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
+    if !known && !AHEAD_NONEMPTY.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !j.has_ahead(first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -2692,6 +2761,29 @@ mod parts_tests {
         // A page never written before: what was not named was never written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
+    }
+
+    #[test]
+    fn normalize_ahead_and_has_ahead_merge_and_binary_search() {
+        let mut ahead = vec![(30, 40), (10, 20), (20, 25), (12, 18), (50, 60)];
+        normalize_ahead(&mut ahead);
+        assert_eq!(ahead, vec![(10, 25), (30, 40), (50, 60)]);
+
+        let j = Journal {
+            written: BTreeMap::new(),
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            ahead,
+            ahead_asked: 1,
+            kept: true,
+        };
+        assert!(j.has_ahead(10, 25));
+        assert!(j.has_ahead(15, 22));
+        assert!(j.has_ahead(30, 40));
+        assert!(j.has_ahead(55, 56));
+        assert!(!j.has_ahead(10, 26));
+        assert!(!j.has_ahead(25, 30));
+        assert!(!j.has_ahead(0, 10));
+        assert!(!j.has_ahead(59, 61));
     }
 }
 

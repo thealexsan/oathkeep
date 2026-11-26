@@ -40,6 +40,14 @@ impl Slots {
         })
     }
 
+    /// Whether `slot` is in the set.
+    #[inline]
+    fn contains(&self, slot: u32) -> bool {
+        self.0.get(slot as usize / 64).is_some_and(|bits| {
+            bits.load(std::sync::atomic::Ordering::Acquire) & (1 << (slot % 64)) != 0
+        })
+    }
+
     fn of(n: usize, mut bits: u64, out: &mut Vec<u32>, which: &impl Fn(u32) -> bool) {
         while bits != 0 {
             let slot = n as u32 * 64 + bits.trailing_zeros();
@@ -54,9 +62,36 @@ impl Slots {
     fn all(&self, which: impl Fn(u32) -> bool) -> Vec<u32> {
         let mut out = Vec::new();
         for (n, bits) in self.0.iter().enumerate() {
-            Self::of(n, bits.load(std::sync::atomic::Ordering::Acquire), &mut out, &which);
+            let word = bits.load(std::sync::atomic::Ordering::Acquire);
+            if word != 0 {
+                Self::of(n, word, &mut out, &which);
+            }
         }
         out
+    }
+
+    /// Those with `slot % parts == part`, in order.
+    fn all_mod(&self, part: u32, parts: u32) -> Vec<u32> {
+        if parts != 0 && 64 % parts == 0 && part < parts {
+            let mut mask = 0u64;
+            let mut bit = part;
+            while bit < 64 {
+                mask |= 1u64 << bit;
+                bit += parts;
+            }
+            let mut out = Vec::new();
+            for (n, bits) in self.0.iter().enumerate() {
+                let mut masked = bits.load(std::sync::atomic::Ordering::Acquire) & mask;
+                while masked != 0 {
+                    let slot = n as u32 * 64 + masked.trailing_zeros();
+                    masked &= masked - 1;
+                    out.push(slot);
+                }
+            }
+            out
+        } else {
+            self.all(|slot| slot % parts == part)
+        }
     }
 
     /// All of them, and none is left.
@@ -963,8 +998,15 @@ struct Waiting {
 /// which order (no host heap needed, so it is tested without one).
 #[derive(Default)]
 pub(crate) struct TextureQueue {
-    slots: std::collections::BTreeMap<u32, Waiting>,
+    slots: std::collections::HashMap<u32, Waiting>,
+    /// Slots indexed by their `due` frame so `due` and `census` only inspect
+    /// buckets with `due <= frame` instead of scanning all waiting slots.
+    by_due: std::collections::BTreeMap<u64, std::collections::BTreeSet<u32>>,
     writes: u64,
+    /// Incremental count of slots with `mapped == 0 && looks > 0`.
+    waiting_memory: u64,
+    /// Incremental count of slots with `mapped > 0`.
+    partly_mapped: u64,
     /// Slots held back because the card had no room for the host copy
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
@@ -972,6 +1014,87 @@ pub(crate) struct TextureQueue {
 }
 
 impl TextureQueue {
+    fn account_delta(&mut self, w: &Waiting, add: bool) {
+        if w.mapped > 0 {
+            if add {
+                self.partly_mapped += 1;
+            } else {
+                self.partly_mapped -= 1;
+            }
+        } else if w.looks > 0 {
+            if add {
+                self.waiting_memory += 1;
+            } else {
+                self.waiting_memory -= 1;
+            }
+        }
+    }
+
+    fn due_insert(&mut self, due: u64, index: u32) {
+        self.by_due.entry(due).or_default().insert(index);
+    }
+
+    fn due_remove(&mut self, due: u64, index: u32) {
+        if let Some(bucket) = self.by_due.get_mut(&due) {
+            bucket.remove(&index);
+            if bucket.is_empty() {
+                self.by_due.remove(&due);
+            }
+        }
+    }
+
+    fn insert_waiting(&mut self, index: u32, w: Waiting) {
+        self.account_delta(&w, true);
+        let new_due = w.due;
+        if let Some(old) = self.slots.insert(index, w) {
+            self.account_delta(&old, false);
+            if old.due != new_due {
+                self.due_remove(old.due, index);
+                self.due_insert(new_due, index);
+            }
+        } else {
+            self.due_insert(new_due, index);
+        }
+    }
+
+    fn remove_waiting(&mut self, index: u32) -> Option<Waiting> {
+        let old = self.slots.remove(&index)?;
+        self.account_delta(&old, false);
+        self.due_remove(old.due, index);
+        Some(old)
+    }
+
+    fn update_waiting(&mut self, index: u32, write: u64, f: impl FnOnce(&mut Waiting)) {
+        let Some(w) = self.slots.get_mut(&index).filter(|w| w.write == write) else {
+            return;
+        };
+        let old_due = w.due;
+        let old_partly = w.mapped > 0;
+        let old_waiting = !old_partly && w.looks > 0;
+        f(w);
+        let new_due = w.due;
+        let new_partly = w.mapped > 0;
+        let new_waiting = !new_partly && w.looks > 0;
+        if old_partly != new_partly {
+            if new_partly {
+                self.partly_mapped += 1;
+            } else {
+                self.partly_mapped -= 1;
+            }
+        }
+        if old_waiting != new_waiting {
+            if new_waiting {
+                self.waiting_memory += 1;
+            } else {
+                self.waiting_memory -= 1;
+            }
+        }
+        if new_due != old_due {
+            self.due_remove(old_due, index);
+            self.due_insert(new_due, index);
+        }
+    }
+
     /// A texture view was written into slot `index` in `frame`, due from
     /// frame `due`. `seen`: it was not written, a draw or the pass made
     /// the host slot from a view the queue may hold already, which then
@@ -982,11 +1105,11 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.insert_waiting(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
     }
 
-    fn remove(&mut self, index: u32) {
-        self.slots.remove(&index);
+    fn remove(&mut self, index: u32) -> bool {
+        self.remove_waiting(index).is_some()
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -1002,9 +1125,14 @@ impl TextureQueue {
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
+        for (_, bucket) in self.by_due.range(..=frame) {
+            for &index in bucket {
+                let Some(w) = self.slots.get(&index) else {
+                    continue;
+                };
+                let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+                class.push((w.written, index, w.write));
+            }
         }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
@@ -1024,25 +1152,92 @@ impl TextureQueue {
         order
     }
 
-    /// The entry of `index` if it is still the write the pass was handed.
-    fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
-        self.slots.get_mut(&index).filter(|w| w.write == write)
+    /// Prioritized due slots for `heap_textures`, separating high-priority
+    /// streaming (`partly` and `fresh`) from low-priority `recheck` and `away`
+    /// probes so thousands of unmapped/recheck slots cannot starve new
+    /// textures or blow the per-frame time budget. Returns `(ordered,
+    /// priority_due_count)`.
+    fn due_prioritized(
+        &self,
+        frame: u64,
+        max_partly: usize,
+        max_fresh: usize,
+        max_recheck: usize,
+        max_away: usize,
+    ) -> (Vec<(u32, u64)>, usize) {
+        let total_due: usize = self.by_due.range(..=frame).map(|(_, b)| b.len()).sum();
+        if total_due == 0 {
+            return (Vec::new(), 0);
+        }
+        let scan_cap = if total_due > 4096 { 4096 } else { total_due };
+        let mut partly: Vec<(u32, u64)> = Vec::new();
+        let mut fresh: Vec<(u32, u64)> = Vec::new();
+        let mut recheck: Vec<(u32, u64)> = Vec::new();
+        let mut away: Vec<(u32, u64)> = Vec::new();
+        let mut scanned = 0usize;
+        'outer: for (_, bucket) in self.by_due.range(..=frame).rev() {
+            for &index in bucket {
+                if scanned >= scan_cap {
+                    break 'outer;
+                }
+                scanned += 1;
+                let Some(w) = self.slots.get(&index) else {
+                    continue;
+                };
+                if w.mapped > 0 {
+                    partly.push((index, w.write));
+                } else if w.checked.2 != 0 {
+                    recheck.push((index, w.write));
+                } else if w.looks > 0 {
+                    away.push((index, w.write));
+                } else {
+                    fresh.push((index, w.write));
+                }
+            }
+        }
+        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
+        partly.sort_unstable_by(newest_first);
+        fresh.sort_unstable_by(newest_first);
+        recheck.sort_unstable_by(newest_first);
+        away.sort_unstable_by(newest_first);
+        let priority_due = partly.len() + fresh.len();
+
+        let mut order = Vec::with_capacity(
+            partly.len().min(max_partly)
+                + fresh.len().min(max_fresh)
+                + recheck.len().min(max_recheck)
+                + away.len().min(max_away),
+        );
+        order.extend(partly.into_iter().take(max_partly));
+        let (mut new, mut old) = (0, fresh.len());
+        let fresh_limit = order.len() + max_fresh;
+        while new < old && order.len() < fresh_limit {
+            order.push(fresh[new]);
+            new += 1;
+            if new < old && order.len() < fresh_limit {
+                old -= 1;
+                order.push(fresh[old]);
+            }
+        }
+        order.extend(recheck.into_iter().take(max_recheck));
+        order.extend(away.into_iter().take(max_away));
+        (order, priority_due)
     }
 
     /// Slot `index` is up to date: out of the queue until written again.
     fn done(&mut self, index: u32, write: u64) {
-        if self.same(index, write).is_some() {
-            self.slots.remove(&index);
+        if self.slots.get(&index).is_some_and(|w| w.write == write) {
+            self.remove_waiting(index);
         }
     }
 
     /// Nothing to upload at slot `index` now: looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
     fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
-        if let Some(w) = self.same(index, write) {
+        self.update_waiting(index, write, |w| {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
-        }
+        });
     }
 
     /// The card has no room for the host copy slot `index` needs: it is
@@ -1056,8 +1251,12 @@ impl TextureQueue {
     /// to date, and the ones whose memory went, which is what lets host
     /// copies go and makes room.)
     fn hold(&mut self, index: u32, write: u64, due: u64) {
-        if let Some(w) = self.same(index, write) {
+        let mut held = false;
+        self.update_waiting(index, write, |w| {
             w.due = w.due.max(due);
+            held = true;
+        });
+        if held {
             self.held.insert(index, write);
         }
     }
@@ -1068,10 +1267,10 @@ impl TextureQueue {
         let held = std::mem::take(&mut self.held);
         let mut back = 0;
         for (index, write) in held {
-            if let Some(w) = self.same(index, write) {
+            self.update_waiting(index, write, |w| {
                 w.due = w.due.min(frame);
                 back += 1;
-            }
+            });
         }
         back
     }
@@ -1079,9 +1278,9 @@ impl TextureQueue {
     /// Slot `index` was uploaded with `mapped` bytes of its memory there,
     /// not all of it: looked at again from frame `due`.
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
-        if let Some(w) = self.same(index, write) {
+        self.update_waiting(index, write, |w| {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
-        }
+        });
     }
 
     /// Slot `index` was uploaded whole from memory `at` (address, bytes)
@@ -1090,10 +1289,10 @@ impl TextureQueue {
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
     fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
-        if let Some(w) = self.same(index, write) {
+        self.update_waiting(index, write, |w| {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
-        }
+        });
     }
 
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
@@ -1110,7 +1309,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.insert_waiting(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1123,16 +1322,20 @@ impl TextureQueue {
     /// waiting for their memory (looked at, never uploaded); uploaded in
     /// part; and the frames the oldest due one has waited since its write.
     fn census(&self, frame: u64) -> [u64; 5] {
-        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
-        for w in self.slots.values() {
-            if w.mapped > 0 {
-                c[3] += 1;
-            } else if w.looks > 0 {
-                c[2] += 1;
-            }
-            if w.due <= frame {
-                c[1] += 1;
-                c[4] = c[4].max(frame.saturating_sub(w.written));
+        let mut c = [self.slots.len() as u64, 0, self.waiting_memory, self.partly_mapped, 0];
+        let mut sampled = 0usize;
+        for (_, bucket) in self.by_due.range(..=frame) {
+            c[1] += bucket.len() as u64;
+            if sampled < 4096 {
+                for &index in bucket {
+                    if let Some(w) = self.slots.get(&index) {
+                        c[4] = c[4].max(frame.saturating_sub(w.written));
+                    }
+                    sampled += 1;
+                    if sampled >= 4096 {
+                        break;
+                    }
+                }
             }
         }
         c
@@ -1917,6 +2120,20 @@ impl HostHeap {
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+    }
+
+    /// Prioritized due slots for `heap_textures`, plus `(priority_due_count, census)`.
+    pub(crate) fn texture_slots_due_prioritized(
+        &self,
+        frame: u64,
+        max_partly: usize,
+        max_fresh: usize,
+        max_recheck: usize,
+        max_away: usize,
+    ) -> (Vec<(u32, u64)>, usize, [u64; 5]) {
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let (due, priority_due) = textures.due_prioritized(frame, max_partly, max_fresh, max_recheck, max_away);
+        (due, priority_due, textures.census(frame))
     }
 
     /// A number that changes when a slot is written or made due anew, and
@@ -2742,7 +2959,7 @@ impl HostHeap {
             stamp.store(now | TABLED_READ, Relaxed);
             if tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.slots.remove(&index).is_some() {
+                if textures.remove(index) {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }
@@ -2805,7 +3022,7 @@ impl HostHeap {
     /// Of [`HostHeap::buffer_slots`], those of one of `parts` parts: every
     /// slot is in the same part each time.
     pub(crate) fn buffer_slots_of(&self, part: u32, parts: u32) -> Vec<u32> {
-        self.buffers.all(|slot| slot % parts == part)
+        self.buffers.all_mod(part, parts)
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -2814,17 +3031,23 @@ impl HostHeap {
         self.changed.take()
     }
 
+    fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<(u32, u64)> {
+        self.note_buffer_inner(index, view, seen, true)
+    }
+
     /// Records what title slot `index` now holds for shaders that pick
     /// buffers from the heap: its element stride in the table, and whether
     /// it is a buffer view at all.
     /// `seen`: the slot was not written now, a draw or a pass made its
     /// host slot from what it held.
+    /// `mark_changed`: whether to mark `index` in `self.changed` for the
+    /// next [`heap_buffer_pass`] (false when `heap_buffer_pass` itself calls).
     /// Returns the title slots whose placed texture view the write made
     /// stale ([`Spans`]), each with the record its host slot is made from:
     /// out of the queue of textures already, their host slots are the
     /// caller's to make null when it has let go of its own slot's lock
     /// ([`HostHeap::unmake_stale`]).
-    fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<(u32, u64)> {
+    fn note_buffer_inner(&self, index: u32, view: Option<&View>, seen: bool, mark_changed: bool) -> Vec<(u32, u64)> {
         if self.sampler {
             return Vec::new();
         }
@@ -2843,7 +3066,6 @@ impl HostHeap {
             }
             _ => false,
         };
-        self.queue_texture(index, texture, seen, crate::frame::current());
         // The memory a placed texture view describes. Not for a slot
         // tables read (thousands of writes a frame, each read by its
         // draw): no pass looks at it, and the same texture's view in a
@@ -2861,45 +3083,56 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
-            use std::sync::atomic::Ordering::Relaxed;
-            let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            let span = placed_view.and_then(|(resource, start, first, held)| {
-                Some((start, start.saturating_add(placed.bytes(resource)?), first, held))
-            });
-            match span {
-                Some((start, end, first, held)) => {
-                    SPANNED[0].fetch_min(start, Relaxed);
-                    SPANNED[1].fetch_max(end, Relaxed);
-                    placed.rule = stale_rule();
-                    let stale = placed.note(index, start, end, !seen);
-                    placed.shows(index, first, held);
-                    // (Under the lock of `placed`: a later write of one of
-                    // them comes by here before it makes the slot.)
-                    stale.into_iter().map(|slot| (slot, self.made.get(slot).unwrap_or(0))).collect()
+        let was_buffer = self.buffers.contains(index);
+        let stale = if !texture && placed_view.is_none() && was_buffer {
+            // Already known to be a buffer: cannot be in `self.textures` or
+            // `self.placed`, so skip both mutexes.
+            Vec::new()
+        } else {
+            self.queue_texture(index, texture, seen, crate::frame::current());
+            let stale = {
+                use std::sync::atomic::Ordering::Relaxed;
+                let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+                let span = placed_view.and_then(|(resource, start, first, held)| {
+                    Some((start, start.saturating_add(placed.bytes(resource)?), first, held))
+                });
+                match span {
+                    Some((start, end, first, held)) => {
+                        SPANNED[0].fetch_min(start, Relaxed);
+                        SPANNED[1].fetch_max(end, Relaxed);
+                        placed.rule = stale_rule();
+                        let stale = placed.note(index, start, end, !seen);
+                        placed.shows(index, first, held);
+                        // (Under the lock of `placed`: a later write of one of
+                        // them comes by here before it makes the slot.)
+                        stale.into_iter().map(|slot| (slot, self.made.get(slot).unwrap_or(0))).collect()
+                    }
+                    None => {
+                        placed.forget(index);
+                        Vec::new()
+                    }
                 }
-                None => {
-                    placed.forget(index);
-                    Vec::new()
+            };
+            if !stale.is_empty() {
+                STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+                for &(slot, _) in &stale {
+                    textures.remove(slot);
                 }
             }
+            stale
         };
-        if !stale.is_empty() {
-            STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            for &(slot, _) in &stale {
-                textures.remove(slot);
-            }
-        }
         let (stride, kind) = view.map_or((None, 0), view_stride_and_kind);
         self.write_stride(index, stride.unwrap_or(0) | kind);
         let was = if stride.is_some() {
-            self.buffers.put(index);
+            if !was_buffer {
+                self.buffers.put(index);
+            }
             true
         } else {
             self.buffers.remove(index)
         };
-        if was {
+        if was && (mark_changed || stride.is_none()) {
             self.changed.put(index);
         }
         stale
@@ -3371,6 +3604,28 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_inner(index, handle, for_draw, true).map(|(v, _)| v)
+    }
+
+    /// Like [`HostHeap::mirror`] with `for_draw = true` for `heap_buffer_pass`,
+    /// returning any buffer copy already resolved during descriptor creation
+    /// so the caller avoids a duplicate `shadow::find` lookup, and skipping
+    /// re-marking `self.changed` for the slot being processed now.
+    pub(crate) fn mirror_for_pass(
+        &self,
+        index: u32,
+        handle: u64,
+    ) -> Option<(View, Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>)> {
+        self.mirror_inner(index, handle, true, false)
+    }
+
+    fn mirror_inner(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        mark_changed: bool,
+    ) -> Option<(View, Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>)> {
         if index >= self.count {
             use std::sync::atomic::Ordering::Relaxed;
             let limit = self.count.saturating_add(self.dynamic);
@@ -3410,7 +3665,7 @@ impl HostHeap {
             && self.quick.get(index as usize).is_some_and(|k| k.load(std::sync::atomic::Ordering::Acquire) == key)
             && let Some(view) = view_at(i, generation)
         {
-            return Some(view);
+            return Some((view, None));
         }
         let held = self.made.lock(index);
         let shown = self.made.get(index).unwrap_or(0);
@@ -3422,19 +3677,20 @@ impl HostHeap {
                 self.quick_is(index, 0);
                 self.made.set(index, 0);
                 self.make_null(index);
-                let _ = self.note_buffer(index, None, false);
+                let _ = self.note_buffer_inner(index, None, false, mark_changed);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
-                let _ = self.note_buffer(index, None, false);
+                let _ = self.note_buffer_inner(index, None, false, mark_changed);
             }
             return None;
         };
+        let mut made_copy = None;
         if shown != key {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
             // (When this slot's lock is let go: a lock at a time.)
-            let stale = self.note_buffer(index, Some(&view), for_draw);
+            let stale = self.note_buffer_inner(index, Some(&view), for_draw, mark_changed);
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
@@ -3460,7 +3716,7 @@ impl HostHeap {
                     KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     drop(held);
                     self.unmake_stale(index, stale);
-                    return Some(view);
+                    return Some((view, None));
                 }
                 // And of another texture that can stand for it
                 // ([`keep_shown`]): black, then grey for a frame or two is
@@ -3471,7 +3727,7 @@ impl HostHeap {
                     if kept {
                         drop(held);
                         self.unmake_stale(index, stale);
-                        return Some(view);
+                        return Some((view, None));
                     }
                 }
             }
@@ -3484,7 +3740,10 @@ impl HostHeap {
             let kept = if later {
                 None
             } else {
-                make_twinned(&view, self.at(index), self.twin(index))
+                make_twinned_with_copy(&view, self.at(index), self.twin(index)).map(|(k, copy)| {
+                    made_copy = copy;
+                    k
+                })
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.at(index));
@@ -3498,13 +3757,18 @@ impl HostHeap {
             drop(held);
             self.unmake_stale(index, stale);
         }
-        Some(view)
+        Some((view, made_copy))
     }
 
     /// Whether slot `index` was made from no record: what [`HostHeap::mirror`]
     /// would find before it did nothing for one that holds no view.
     pub(crate) fn shows_none(&self, index: u32) -> bool {
         self.made.get(index).unwrap_or(0) == 0
+    }
+
+    /// Whether slot `index` is already made from `key`.
+    pub(crate) fn shows_key(&self, index: u32, key: u64) -> bool {
+        key != 0 && self.made.get(index) == Some(key)
     }
 
     /// Slot `index` is made from record `key` and stays so (0: not). Under
@@ -3961,7 +4225,7 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)>,
-) -> Option<Kept> {
+) -> Option<(Kept, Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>)> {
     let mut shadow = crate::shadow::find(address, len)?;
     let mut offset = shadow.offset(address);
     let unit = element_size(&desc);
@@ -4058,7 +4322,9 @@ fn buffer_srv(
             null_buffer_view(twin);
         }
     }
-    Some(Some(shadow.buffer.clone()))
+    let kept = Some(shadow.buffer.clone());
+    let copy = (view_len > 0).then_some((shadow, start, view_len));
+    Some((kept, copy))
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -4072,7 +4338,7 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)>,
-) -> Option<Kept> {
+) -> Option<(Kept, Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>)> {
     let mut shadow = crate::shadow::find(address, len)?;
     let unit = {
         // SAFETY: a buffer view's union member.
@@ -4185,7 +4451,9 @@ fn buffer_uav(
             null_buffer_view(twin);
         }
     }
-    Some(Some(shadow.buffer.clone()))
+    let kept = Some(shadow.buffer.clone());
+    let copy = (view_len > 0).then_some((shadow, start, view_len));
+    Some((kept, copy))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -4343,6 +4611,14 @@ fn make_twinned(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)>,
 ) -> Option<Kept> {
+    make_twinned_with_copy(view, at, twin).map(|(kept, _)| kept)
+}
+
+fn make_twinned_with_copy(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    twin: Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)>,
+) -> Option<(Kept, Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>)> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -4378,7 +4654,9 @@ fn make_twinned(
                     device.CreateConstantBufferView(Some(&desc), twin);
                 }
             }
-            Some(Some(shadow.buffer.clone()))
+            let kept = Some(shadow.buffer.clone());
+            let copy = (need > 0).then_some((shadow, address, need));
+            Some((kept, copy))
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -4451,7 +4729,7 @@ fn make_twinned(
                         at,
                     )
                 };
-                Some(Some(texture.clone()))
+                Some((Some(texture.clone()), None))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -4513,7 +4791,7 @@ fn make_twinned(
                     at,
                 )
             };
-            Some(Some(texture.clone()))
+            Some((Some(texture.clone()), None))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -4524,17 +4802,17 @@ fn make_twinned(
             };
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            Some((None, None))
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            Some((None, None))
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                return make(&view, at).map(|k| (k, None));
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -5739,6 +6017,48 @@ mod tests {
         assert_eq!(q.room(6), 0);
     }
 
+    #[test]
+    fn prioritized_due_separates_streaming_from_throttled_probes() {
+        let mut q = TextureQueue::default();
+        // 10 away probes (`looks > 0`), 10 recheck slots (`checked.2 != 0`),
+        // 2 partly mapped slots, 3 fresh slots.
+        for i in 0..10u32 {
+            q.written(100 + i, 1, 0, false);
+            let w = q.slots[&(100 + i)].write;
+            q.later(100 + i, w, 1, 16);
+        }
+        for i in 0..10u32 {
+            q.written(200 + i, 1, 0, false);
+            let w = q.slots[&(200 + i)].write;
+            q.recheck(200 + i, w, 2, (0x1000, 4096), 0xdead_beef, 0, 1);
+        }
+        for i in 0..2u32 {
+            q.written(300 + i, 2, 0, false);
+            let w = q.slots[&(300 + i)].write;
+            q.partly(300 + i, w, 2, 4096);
+        }
+        for i in 0..3u32 {
+            q.written(400 + i, 2, 0, false);
+        }
+
+        // At frame 2, all 25 are due, but recheck & away are capped at 2 each.
+        let (order, priority_due) = q.due_prioritized(2, 16, 16, 2, 2);
+        assert_eq!(priority_due, 5);
+        assert_eq!(order.len(), 9);
+        // First 2 are partly (300..302), next 3 are fresh (400..403),
+        // next 2 are recheck (200..210), last 2 are away (100..110).
+        assert!(order[..2].iter().all(|(idx, _)| (300..302).contains(idx)));
+        assert!(order[2..5].iter().all(|(idx, _)| (400..403).contains(idx)));
+        assert!(order[5..7].iter().all(|(idx, _)| (200..210).contains(idx)));
+        assert!(order[7..9].iter().all(|(idx, _)| (100..110).contains(idx)));
+
+        let c = q.census(2);
+        assert_eq!(c[0], 25);
+        assert_eq!(c[1], 25);
+        assert_eq!(c[2], 20);
+        assert_eq!(c[3], 2);
+    }
+
     /// Textures of which only the smallest levels are held, packed into
     /// one another's address range (the three of run 188: 0x2c000 bytes
     /// each at full size, their starts 0x2000 and 0x4000 apart): writing
@@ -5980,6 +6300,26 @@ mod tests {
         assert!(set.remove(64) && !set.remove(64) && !set.remove(5));
         assert_eq!(set.take(), [0, 63, 130, 199]);
         assert!(set.take().is_empty());
+    }
+
+    #[test]
+    fn slots_all_mod_matches_modulo_filter_and_contains() {
+        let set = Slots::new(300);
+        for slot in [0, 1, 15, 16, 17, 31, 32, 63, 64, 80, 144, 255, 256, 299] {
+            set.put(slot);
+            assert!(set.contains(slot));
+        }
+        assert!(!set.contains(2));
+        assert!(!set.contains(500));
+        for parts in [1u32, 3, 16, 64] {
+            for part in 0..parts {
+                assert_eq!(
+                    set.all_mod(part, parts),
+                    set.all(|slot| slot % parts == part),
+                    "mismatch for part={part}, parts={parts}"
+                );
+            }
+        }
     }
 
     /// A slot a draw read through a table leaves the queue; the title's

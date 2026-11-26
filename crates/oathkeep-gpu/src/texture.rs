@@ -2224,19 +2224,19 @@ fn clamp_speculative_mips(
 /// texture up to 48 KiB, otherwise the first 16 KiB (packed mip tail) plus 8
 /// evenly distributed 4 KiB windows across the remainder (48 KiB total budget)
 /// so mutations in any mip level are detected cleanly.
-fn fingerprint_windows(len: usize) -> Vec<(usize, usize)> {
+fn fingerprint_windows_into(len: usize, out: &mut [(usize, usize); 9]) -> usize {
     const HEAD: usize = 16 << 10;
     const SLICE: usize = 4 << 10;
     const SLICES: usize = 8;
     const WHOLE: usize = HEAD + SLICES * SLICE;
     if len == 0 {
-        return Vec::new();
+        return 0;
     }
     if len <= WHOLE {
-        return vec![(0, len)];
+        out[0] = (0, len);
+        return 1;
     }
-    let mut out = Vec::with_capacity(1 + SLICES);
-    out.push((0, HEAD));
+    out[0] = (0, HEAD);
     let tail_start = HEAD;
     let tail_end = len - SLICE;
     let span = tail_end - tail_start;
@@ -2247,9 +2247,16 @@ fn fingerprint_windows(len: usize) -> Vec<(usize, usize)> {
             tail_start + span * i / (SLICES - 1)
         };
         let aligned = if i + 1 == SLICES { raw } else { (raw & !0xfff).clamp(tail_start, tail_end) };
-        out.push((aligned, SLICE));
+        out[1 + i] = (aligned, SLICE);
     }
-    out
+    1 + SLICES
+}
+
+#[cfg(test)]
+fn fingerprint_windows(len: usize) -> Vec<(usize, usize)> {
+    let mut out = [(0usize, 0usize); 9];
+    let n = fingerprint_windows_into(len, &mut out);
+    out[..n].to_vec()
 }
 
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
@@ -2262,14 +2269,15 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     let len = len as usize;
-    let windows = fingerprint_windows(len);
+    let mut windows = [(0usize, 0usize); 9];
+    let count = fingerprint_windows_into(len, &mut windows);
     let mut print = 0u128;
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if read.len() < MAX_WINDOW {
             read.resize(MAX_WINDOW, 0);
         }
-        for (from, bytes) in windows {
+        for &(from, bytes) in &windows[..count] {
             read[..bytes].fill(0);
             crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
             print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
@@ -2474,35 +2482,79 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     {
         return there;
     }
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
-        return 0;
-    }
     if !by_query() {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("OATHKEEP_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
+            if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+                return 0;
+            }
             // By page, without the walk: whole pages, cut to the range.
             let (there, _) = readable(start, len, false);
             return (there as u64 * 4096).min(len as u64);
         }
-        // By 64 KiB block, one page asked of each: the title's memory is
-        // mapped in blocks of that size (the console's page), and the
-        // answer is a measure of how much of a texture has arrived, not a
-        // promise that every byte can be read (the upload reads through the
-        // kernel). By page, a texture half there cost a failed kernel read
-        // for each of its missing pages, every frame it stayed due: 1,663
-        // textures "uploaded in part" kept the pass over the heap's views at
-        // 90-160 ms a frame (run 81). `OATHKEEP_MAPPED_BY_PAGE=1`: by page.
+        // Batch first+last page check, then batch 64 KiB block-head probes in
+        // chunks of up to 256 via `K32QueryWorkingSetEx` (1 syscall instead of
+        // 1 per 64 KiB block).
+        use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let proc_handle = unsafe { GetCurrentProcess() };
+        let mut edge_info: [PSAPI_WORKING_SET_EX_INFORMATION; 2] = unsafe { std::mem::zeroed() };
+        edge_info[0].VirtualAddress = (start & !0xfff) as *mut _;
+        edge_info[1].VirtualAddress = ((end - 1) & !0xfff) as *mut _;
+        let edge_n = if edge_info[0].VirtualAddress == edge_info[1].VirtualAddress { 1 } else { 2 };
+        let edge_asked = unsafe {
+            K32QueryWorkingSetEx(
+                proc_handle,
+                edge_info.as_mut_ptr().cast(),
+                (edge_n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        let mut any_edge = false;
+        for (idx, entry) in edge_info[..edge_n].iter().enumerate() {
+            let valid = edge_asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+            let addr = if idx == 0 { start } else { end - 1 };
+            let mut byte = [0u8];
+            if valid || crate::host::read_into(addr as *const u8, &mut byte) {
+                any_edge = true;
+                break;
+            }
+        }
+        if !any_edge {
+            return 0;
+        }
         const BLOCK: usize = 64 << 10;
         let mut there = 0u64;
         let mut block = start & !(BLOCK - 1);
+        let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+        let mut spans = [(0usize, 0u64); 256];
         while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
+            let mut n = 0usize;
+            while block < end && n < info.len() {
+                let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
+                info[n].VirtualAddress = (lo & !0xfff) as *mut _;
+                spans[n] = (lo, (hi - lo) as u64);
+                n += 1;
+                block = block.saturating_add(BLOCK);
             }
-            block = block.saturating_add(BLOCK);
+            let asked = unsafe {
+                K32QueryWorkingSetEx(
+                    proc_handle,
+                    info.as_mut_ptr().cast(),
+                    (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+                )
+            } != 0;
+            for i in 0..n {
+                let valid = asked && unsafe { info[i].VirtualAttributes.Flags } & 1 != 0;
+                let mut byte = [0u8];
+                if valid || crate::host::read_into(spans[i].0 as *const u8, &mut byte) {
+                    there += spans[i].1;
+                }
+            }
         }
         return there;
+    }
+    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+        return 0;
     }
     let (mut p, mut there) = (start, 0u64);
     while p < end {

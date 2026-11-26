@@ -203,10 +203,31 @@ pub(crate) fn log(frames: f64) {
 
 /// Microseconds a pool thread spins politely before sleeping on a Condvar,
 /// avoiding ~50–150 us kernel wake latency between back-to-back scan/card/back
-/// batches in one landing (`OATHKEEP_LAND_SPIN`, default 25).
+/// and flush/snapshot/send batches (`OATHKEEP_LAND_SPIN`, default 60).
 fn pool_spin_us() -> u64 {
     static US: OnceLock<u64> = OnceLock::new();
-    *US.get_or_init(|| std::env::var("OATHKEEP_LAND_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(25))
+    *US.get_or_init(|| std::env::var("OATHKEEP_LAND_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(60))
+}
+
+thread_local! {
+    /// Tracks the [`Pool`] currently executing on this thread so nested calls
+    /// to the same pool execute inline without deadlocking on `Pool::turn`.
+    static ACTIVE_POOL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct ActivePoolGuard(usize);
+
+impl ActivePoolGuard {
+    fn enter(pool: &Pool) -> Self {
+        let prev = ACTIVE_POOL.with(|p| p.replace(std::ptr::from_ref(pool) as usize));
+        Self(prev)
+    }
+}
+
+impl Drop for ActivePoolGuard {
+    fn drop(&mut self) {
+        ACTIVE_POOL.with(|p| p.set(self.0));
+    }
 }
 
 fn spin_until(ready: impl Fn() -> bool) {
@@ -308,6 +329,7 @@ impl Pool {
                 }
             };
             let working = crate::timeline::span("a landing's job");
+            let _active = ActivePoolGuard::enter(self);
             let mut panicked = false;
             loop {
                 let i = self.next.fetch_add(1, Ordering::Relaxed);
@@ -340,12 +362,14 @@ impl Pool {
     /// Calls `f` with every number below `count`, on the pool's threads and
     /// this one, and returns when every call has.
     fn each(&self, count: usize, f: &(dyn Fn(usize) + Sync)) {
-        if count < 2 || self.threads < 2 {
+        let self_addr = std::ptr::from_ref(self) as usize;
+        if count < 2 || self.threads < 2 || ACTIVE_POOL.with(|p| p.get() == self_addr) {
             (0..count).for_each(f);
             return;
         }
         let _spread = crate::timeline::span("landing: spread over threads");
         let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        let _active = ActivePoolGuard::enter(self);
         // SAFETY: the lifetime is left out only until this call returns, and
         // it does not before no helper is inside `f` and none can enter.
         let work = Work(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f) });
@@ -424,6 +448,19 @@ pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync))
         .each(count, f);
 }
 
+/// [`Pool::each`] on the fast-core helper pool backing `shadow::wide_each`,
+/// avoiding per-call `Arc`/`Box`/`VecDeque` allocations and straggler waits.
+pub(crate) fn each_wide(count: usize, f: &(dyn Fn(usize) + Sync)) {
+    static POOL: OnceLock<&'static Pool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map_or(5, |n| n.get() / 2)
+            .clamp(3, 7);
+        Pool::new("victory-wide-idx", threads)
+    })
+    .each(count, f);
+}
+
 /// A piece to land: the copy's number, the title address, its bytes.
 pub(crate) type Piece = (u64, usize, usize);
 
@@ -437,16 +474,15 @@ pub(crate) fn ordered(pieces: &[Piece]) -> Vec<(usize, usize, usize)> {
     let mut order: Vec<usize> = (0..pieces.len()).collect();
     order.sort_by_key(|&i| pieces[i].1 / BLOCK);
     let mut out: Vec<(usize, usize, usize)> = Vec::with_capacity(order.len());
-    for group in order.chunk_by(|&a, &b| pieces[a].1 / BLOCK == pieces[b].1 / BLOCK) {
+    for group in order.chunk_by_mut(|&a, &b| pieces[a].1 / BLOCK == pieces[b].1 / BLOCK) {
         let alone = group.len() > 1 && group.iter().all(|&i| pieces[i].0 == pieces[group[0]].0);
         if !alone {
             out.extend(group.iter().map(|&i| (i, pieces[i].1, pieces[i].2)));
             continue;
         }
-        let mut sorted = group.to_vec();
-        sorted.sort_by_key(|&i| pieces[i].1);
+        group.sort_by_key(|&i| pieces[i].1);
         let begun = out.len();
-        for i in sorted {
+        for &i in group.iter() {
             let (_, at, len) = pieces[i];
             match out[begun..].last_mut() {
                 Some(last) if at <= last.1 + last.2 => {
@@ -493,7 +529,113 @@ pub(crate) fn jobs(pieces: &[(usize, usize)]) -> Vec<std::ops::Range<usize>> {
 /// (Bytes left out of that merge, the title's that went up behind the
 /// fetch, went up behind that flight too, and stand over what it wrote.)
 #[derive(Default)]
-pub(crate) struct Had(Vec<(u64, std::collections::HashMap<(u64, usize), (usize, usize)>)>);
+struct FastHasher(u64);
+
+impl std::hash::Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+}
+
+type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
+
+/// Fetched byte intervals within one `(copy, block)`, storing up to two
+/// disjoint intervals inline without heap allocation and coalescing touching
+/// or overlapping ranges so disjoint sub-ranges in the same 64 KiB block are
+/// never forgotten.
+#[derive(Clone, Default)]
+struct BlockSpans {
+    inline: [(usize, usize); 2],
+    len: u8,
+    extra: Vec<(usize, usize)>,
+}
+
+impl BlockSpans {
+    fn insert(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        if self.extra.is_empty() {
+            match self.len {
+                0 => {
+                    self.inline[0] = (from, to);
+                    self.len = 1;
+                    return;
+                }
+                1 => {
+                    let (a, b) = self.inline[0];
+                    if from <= b && to >= a {
+                        self.inline[0] = (a.min(from), b.max(to));
+                    } else if to < a {
+                        self.inline = [(from, to), (a, b)];
+                        self.len = 2;
+                    } else {
+                        self.inline[1] = (from, to);
+                        self.len = 2;
+                    }
+                    return;
+                }
+                _ => {
+                    for slot in &mut self.inline {
+                        if slot.0 <= from && to <= slot.1 {
+                            return;
+                        }
+                    }
+                    self.extra.reserve(4);
+                    self.extra.push(self.inline[0]);
+                    self.extra.push(self.inline[1]);
+                }
+            }
+        }
+        self.extra.push((from, to));
+        self.extra.sort_unstable();
+        let mut w = 0usize;
+        for i in 0..self.extra.len() {
+            let (a, b) = self.extra[i];
+            if w > 0 && a <= self.extra[w - 1].1 {
+                self.extra[w - 1].1 = self.extra[w - 1].1.max(b);
+            } else {
+                self.extra[w] = (a, b);
+                w += 1;
+            }
+        }
+        self.extra.truncate(w);
+        if self.extra.len() <= 2 {
+            self.len = self.extra.len() as u8;
+            for (i, &span) in self.extra.iter().enumerate() {
+                self.inline[i] = span;
+            }
+            self.extra.clear();
+        }
+    }
+
+    #[inline]
+    fn holds(&self, from: usize, to: usize) -> bool {
+        if !self.extra.is_empty() {
+            let idx = self.extra.partition_point(|&(a, _)| a <= from);
+            return idx > 0 && self.extra[idx - 1].1 >= to;
+        }
+        (0..usize::from(self.len)).any(|i| self.inline[i].0 <= from && to <= self.inline[i].1)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Had(Vec<(u64, FastMap<(u64, usize), BlockSpans>)>);
 
 impl Had {
     /// Flights from the one behind which `fence` is signalled on are landed
@@ -505,22 +647,26 @@ impl Had {
     /// A fetch that ran behind every flight up to `fence` brought (copy,
     /// title address, bytes) `pieces`. They are merged before the next ask.
     pub(crate) fn fetched(&mut self, fence: u64, pieces: impl Iterator<Item = Piece>) {
-        let mut all = std::collections::HashMap::new();
-        for (copy, at, len) in pieces {
-            // (Two parts of a block that do not touch: the longer one.)
-            let had = all.entry((copy, at / BLOCK)).or_insert((at, at + len));
-            if len > had.1 - had.0 {
-                *had = (at, at + len);
+        if let Some((_, existing)) = self.0.last_mut().filter(|(f, _)| *f == fence) {
+            for (copy, at, len) in pieces {
+                existing.entry((copy, at / BLOCK)).or_default().insert(at, at + len);
             }
+            return;
         }
-        self.0.push((fence, all));
+        let mut all: FastMap<(u64, usize), BlockSpans> = FastMap::default();
+        for (copy, at, len) in pieces {
+            all.entry((copy, at / BLOCK)).or_default().insert(at, at + len);
+        }
+        if !all.is_empty() {
+            self.0.push((fence, all));
+        }
     }
 
     /// Whether a fetch behind the flight of `fence` brought all of the
     /// piece.
     pub(crate) fn holds(&self, fence: u64, (copy, at, len): Piece) -> bool {
-        self.0.iter().any(|(behind, all)| {
-            *behind >= fence && all.get(&(copy, at / BLOCK)).is_some_and(|had| had.0 <= at && at + len <= had.1)
+        self.0.iter().rev().any(|(behind, all)| {
+            *behind >= fence && all.get(&(copy, at / BLOCK)).is_some_and(|had| had.holds(at, at + len))
         })
     }
 }
@@ -760,35 +906,33 @@ unsafe fn piece_at(
     let Some(end) = parts.iter().map(|p| p.1).max().filter(|&e| e > 0) else {
         return 0;
     };
+    notes.stat_pieces += 1;
+    let base = title / PAGE;
+    // Check `differing_page_bounds` first for BOTH `beside` and direct pieces:
+    // unchanged pieces exit before acquiring global watch/view locks, and
+    // changed pieces skip all unchanged leading/trailing 4 KiB pages.
+    // SAFETY: the caller's.
+    let (first, last) = match unsafe { differing_page_bounds(title, now, held, parts) } {
+        Ok(bounds) => bounds,
+        Err(unchanged_pages) => {
+            notes.stat_pages += unchanged_pages;
+            return 0;
+        }
+    };
+    let mut differing = [true; BLOCK / PAGE + 1];
+    differing[..first].fill(false);
+    differing[last + 1..].fill(false);
     // From here until the piece is put the runtime changes no mapping: our
     // view's address stays where the title sees `title`. Not waited for: if
     // a change is under way, what the record of the views says now does
     // ([`anytime`]), or the title's own address.
     let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
     let beside = if reading.is_some() || beside && anytime() { crate::inplace::beside(title, end) } else { None };
-    notes.stat_pieces += 1;
     if beside.is_some() {
         notes.stat_beside += 1;
     } else {
         notes.stat_direct += 1;
-    }
-    // The page span `[first..=last]` that differs, before any is written:
-    // none, and the guard stays; else it is opened once for the piece while
-    // middle pages are checked once during `safecopy::merge` instead of twice.
-    let mut differing = [true; BLOCK / PAGE + 1];
-    let base = title / PAGE;
-    if beside.is_none() {
         drop(reading);
-        // SAFETY: the caller's.
-        let (first, last) = match unsafe { differing_page_bounds(title, now, held, parts) } {
-            Ok(bounds) => bounds,
-            Err(unchanged_pages) => {
-                notes.stat_pages += unchanged_pages;
-                return 0;
-            }
-        };
-        differing[..first].fill(false);
-        differing[last + 1..].fill(false);
         let (from, to) = (((base + first) * PAGE).max(title), ((base + last + 1) * PAGE).min(title + end));
         let opening = std::time::Instant::now();
         crate::watch::landing(from, to - from);
