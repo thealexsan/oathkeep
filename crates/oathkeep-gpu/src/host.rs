@@ -2510,23 +2510,24 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 fn stale_under_flights(runs: &[&HostList]) -> bool {
     use std::sync::Arc;
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
-    let mut index: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
             {
                 let range = (*address, *address + *len);
-                let key = Arc::as_ptr(shadow) as usize;
-                match index.get(&key) {
-                    Some(&at) => spans[at].1.push(range),
-                    None => {
-                        index.insert(key, spans.len());
-                        spans.push((shadow.clone(), vec![range]));
-                    }
+                if let Some((_, list_ranges)) =
+                    spans.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow))
+                {
+                    list_ranges.push(range);
+                } else {
+                    spans.push((shadow.clone(), vec![range]));
                 }
             }
         }
+    }
+    if spans.is_empty() {
+        return false;
     }
     for (_, ranges) in &mut spans {
         let mut merged = Vec::new();

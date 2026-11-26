@@ -133,8 +133,10 @@ pub(crate) enum C {
     TablesOverLt868k,
     TablesOver868kTo1M,
     TablesOverGe1M,
+    StageCacheHits,
+    StageCacheMisses,
 }
-const COUNTERS: usize = 148;
+const COUNTERS: usize = 150;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1218,7 +1220,7 @@ pub(crate) fn log(frames: f64) {
         "micro-diag rec/tables/frame: bind {:.2} ms (early_tex {:.2} ms, tables {:.2} ms, make_at {:.2} ms, \
          mem_ready {:.2} ms), indirect {:.2} ms; fresh_tables: over {:.0} (<868k {:.0}, 868k..1M {:.0}, >=1M {:.0}), \
          cbv_fail {:.0} (unalign {:.0}, short {:.0}, no_shadow {:.0}), hit {:.0}, uncacheable {:.0}, \
-         span_sum {:.0}, used_sum {:.0}; cbv_scratch: hit {:.0}, miss {:.0} (hoist {:.0}, in_wr {:.0}, in_bl {:.0}); \
+         span_sum {:.0}, used_sum {:.0}; stage_cache: hit {:.0}, miss {:.0}; cbv_scratch: hit {:.0}, miss {:.0} (hoist {:.0}, in_wr {:.0}, in_bl {:.0}); \
          bindless_wr {:.0}",
         ms(c[C::RecBindUs as usize]),
         ms(c[C::RecEarlyTexUs as usize]),
@@ -1238,6 +1240,8 @@ pub(crate) fn log(frames: f64) {
         c[C::TablesFreshUncacheable as usize],
         c[C::TablesFreshSpanSum as usize],
         c[C::TablesFreshUsedSum as usize],
+        c[C::StageCacheHits as usize],
+        c[C::StageCacheMisses as usize],
         c[C::CbvScratchHits as usize],
         c[C::CbvScratchMisses as usize],
         c[C::CbvScratchHoisted as usize],

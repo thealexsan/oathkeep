@@ -281,10 +281,24 @@ pub(crate) fn first_viewed(start: u64) -> Option<u32> {
 
 static RESHOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
-static STAGE_TEXTURE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+const STAGE_TEX_BUCKETS: usize = 64;
+static STAGE_TEX_EPOCHS: [std::sync::atomic::AtomicU64; STAGE_TEX_BUCKETS] =
+    [const { std::sync::atomic::AtomicU64::new(1) }; STAGE_TEX_BUCKETS];
+
+#[inline]
+fn tex_epoch_bucket(addr: u64) -> usize {
+    (((addr >> 12).wrapping_mul(0x9e37_79b9_7f4a_7c15)) >> 58) as usize & (STAGE_TEX_BUCKETS - 1)
+}
+
+pub(crate) fn bump_stage_texture_epoch_at(addr: u64) {
+    let b = tex_epoch_bucket(addr);
+    STAGE_TEX_EPOCHS[b].fetch_add(1, std::sync::atomic::Ordering::Release);
+}
 
 pub(crate) fn bump_stage_texture_epoch() {
-    STAGE_TEXTURE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    for ep in &STAGE_TEX_EPOCHS {
+        ep.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[derive(Clone)]
@@ -329,7 +343,9 @@ struct StageEntry {
     epoch: u64,
     is_buffer: bool,
     is_texture: bool,
+    tex_bucket: u8,
     view_kind: Option<oathkeep_shader::ResourceType>,
+    kept_raw: usize,
     kept: Option<ID3D12Resource>,
     action: StageAction,
 }
@@ -428,7 +444,7 @@ fn stage_view_kind(view: &View) -> Option<oathkeep_shader::ResourceType> {
 }
 
 pub(crate) fn levels_changed(start: u64) {
-    bump_stage_texture_epoch();
+    bump_stage_texture_epoch_at(start);
     RESHOWN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2366,10 +2382,61 @@ impl HostHeap {
         (kept.flatten(), shadow, placed)
     }
 
+    /// Looks up a mirrored slot's cached `StageAction` directly from the CPU staging
+    /// cache when `made_keys[index]` already matches the title descriptor at `handle`.
+    /// Bypasses `VIEWS` RwLock, `View::clone`, `shadow::find`, and `placed_texture` on hits.
+    pub(crate) fn lookup_mirrored_stage(
+        &self,
+        index: u32,
+        handle: u64,
+    ) -> Option<(StageAction, Option<oathkeep_shader::ResourceType>, bool)> {
+        if self.sampler || index >= self.count {
+            return None;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG {
+            return None;
+        }
+        let made_key = (u64::from(generation) << 32) | u64::from(i);
+        if made_key == 0
+            || self.made_keys[index as usize].load(std::sync::atomic::Ordering::Acquire) != made_key
+        {
+            return None;
+        }
+        let stage = cpu_stage_heap()?;
+        let key = (u64::from(i) << 32) | u64::from(generation);
+        let stripe_idx = ((key ^ (key >> 17) ^ (key >> 33)) as usize) & (STAGE_STRIPES - 1);
+        let guard = stage.stripes[stripe_idx]
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let &local = guard.map.get(&key)?;
+        let entry = guard.entries[local].as_ref()?;
+        if entry.key != key {
+            return None;
+        }
+        let cur_epoch = if entry.is_buffer {
+            crate::shadow::generation()
+        } else {
+            STAGE_TEX_EPOCHS[entry.tex_bucket as usize].load(std::sync::atomic::Ordering::Acquire)
+        };
+        if entry.epoch != cur_epoch {
+            return None;
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::StageCacheHits, 1);
+        Some((entry.action.clone(), entry.view_kind, entry.is_texture))
+    }
+
     /// Copies a cached CPU staging descriptor into dynamic slot `index` via
     /// `CopyDescriptorsSimple`, bypassing `descriptor::view()` RwLocks, `GetDesc()`,
     /// `shadow::find()`, and `CreateShaderResourceView` on cache hits (~99.9% steady state).
-    pub(crate) fn copy_or_make_dynamic(&self, index: u32, words: [u32; 3]) -> DynamicMade {
+    pub(crate) fn copy_or_make_dynamic(
+        &self,
+        index: u32,
+        words: [u32; 3],
+        already_kept: impl FnOnce(usize) -> bool,
+    ) -> DynamicMade {
         if self.sampler || words[0] != VIEW_TAG {
             let Some(view) = crate::descriptor::view_from_words(words) else {
                 self.make_null_dynamic(index);
@@ -2451,7 +2518,8 @@ impl HostHeap {
                 let cur_epoch = if entry.is_buffer {
                     crate::shadow::generation()
                 } else {
-                    STAGE_TEXTURE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+                    STAGE_TEX_EPOCHS[entry.tex_bucket as usize]
+                        .load(std::sync::atomic::Ordering::Acquire)
                 };
                 if entry.epoch == cur_epoch {
                     // SAFETY: dst is our dynamic shader-visible slot; src is a live CPU staging
@@ -2464,9 +2532,16 @@ impl HostHeap {
                             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                         );
                     }
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::StageCacheHits, 1);
+                    let kept = if entry.kept_raw != 0 && !already_kept(entry.kept_raw) {
+                        entry.kept.clone()
+                    } else {
+                        None
+                    };
                     return DynamicMade {
                         found: true,
-                        kept: entry.kept.clone(),
+                        kept,
                         action: entry.action.clone(),
                         view_kind: entry.view_kind,
                         is_texture: entry.is_texture,
@@ -2474,13 +2549,14 @@ impl HostHeap {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::StageCacheMisses, 1);
         let Some(view) = crate::descriptor::view_from_words(words) else {
             self.make_null_dynamic(index);
             return DynamicMade::missing();
         };
         let is_texture = is_texture_view(&view);
         let view_kind = stage_view_kind(&view);
-        let tex_epoch = STAGE_TEXTURE_EPOCH.load(std::sync::atomic::Ordering::Acquire);
         let buf_epoch = crate::shadow::generation();
         let mut guard = stage.stripes[stripe_idx]
             .write()
@@ -2492,7 +2568,8 @@ impl HostHeap {
             let cur_epoch = if entry.is_buffer {
                 crate::shadow::generation()
             } else {
-                STAGE_TEXTURE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+                STAGE_TEX_EPOCHS[entry.tex_bucket as usize]
+                    .load(std::sync::atomic::Ordering::Acquire)
             };
             if entry.epoch == cur_epoch {
                 // SAFETY: dst is our dynamic slot; src is guarded by stripe write lock.
@@ -2504,9 +2581,14 @@ impl HostHeap {
                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                     );
                 }
+                let kept = if entry.kept_raw != 0 && !already_kept(entry.kept_raw) {
+                    entry.kept.clone()
+                } else {
+                    None
+                };
                 return DynamicMade {
                     found: true,
-                    kept: entry.kept.clone(),
+                    kept,
                     action: entry.action.clone(),
                     view_kind: entry.view_kind,
                     is_texture: entry.is_texture,
@@ -2521,6 +2603,9 @@ impl HostHeap {
             at
         };
         let slot = (stripe_idx * SLOTS_PER_STRIPE + local) as u32;
+        let pre_tex_epochs: [u64; STAGE_TEX_BUCKETS] = std::array::from_fn(|b| {
+            STAGE_TEX_EPOCHS[b].load(std::sync::atomic::Ordering::Acquire)
+        });
         let (kept, made_shadow, made_placed) = make_detailed(&view, stage.cpu(slot));
         let Some(kept_res) = kept else {
             drop(guard);
@@ -2543,7 +2628,7 @@ impl HostHeap {
             );
         }
         let resolved = made_placed.as_ref().unwrap_or(&view);
-        let (action, is_buffer, epoch) = if let Some((shadow, address, len)) =
+        let (action, is_buffer, tex_bucket, epoch) = if let Some((shadow, address, len)) =
             buffer_copy_with_hint(resolved, made_shadow)
         {
             (
@@ -2553,24 +2638,33 @@ impl HostHeap {
                     len,
                 },
                 true,
+                0u8,
                 buf_epoch,
             )
         } else if let View::Shader(resource, _) | View::Unordered(resource, _, _) = resolved {
+            let addr = crate::resource::texture_memory(*resource as crate::object::This)
+                .map_or(0, |(ptr, _)| ptr as u64);
+            let b = tex_epoch_bucket(addr);
             (
                 StageAction::Texture {
                     resource: *resource,
                 },
                 false,
-                tex_epoch,
+                b as u8,
+                pre_tex_epochs[b],
             )
         } else {
-            (StageAction::None, false, tex_epoch)
+            let b = tex_epoch_bucket(0);
+            (StageAction::None, false, b as u8, pre_tex_epochs[b])
         };
         if let Some(old) = guard.entries[local].take()
             && old.key != key
         {
             guard.map.remove(&old.key);
         }
+        let kept_raw = kept_res
+            .as_ref()
+            .map_or(0, |r| windows::core::Interface::as_raw(r) as usize);
         guard.map.insert(key, local);
         guard.entries[local] = Some(StageEntry {
             key,
@@ -2578,13 +2672,20 @@ impl HostHeap {
             epoch,
             is_buffer,
             is_texture,
+            tex_bucket,
             view_kind,
+            kept_raw,
             kept: kept_res.clone(),
             action: action.clone(),
         });
+        let ret_kept = if kept_raw != 0 && !already_kept(kept_raw) {
+            kept_res
+        } else {
+            None
+        };
         DynamicMade {
             found: true,
-            kept: kept_res,
+            kept: ret_kept,
             action,
             view_kind,
             is_texture,
@@ -2913,6 +3014,15 @@ impl HostHeap {
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         self.mirror_inner(index, handle, for_draw, true, None)
             .map(|(view, ..)| view)
+    }
+
+    pub(crate) fn made_key_matches_words(&self, index: u32, words: [u32; 3]) -> bool {
+        if words[0] != VIEW_TAG || index >= self.count {
+            return false;
+        }
+        let key = (u64::from(words[2]) << 32) | u64::from(words[1]);
+        key != 0
+            && self.made_keys[index as usize].load(std::sync::atomic::Ordering::Acquire) == key
     }
 
     pub(crate) fn made_key(&self, index: u32) -> u64 {

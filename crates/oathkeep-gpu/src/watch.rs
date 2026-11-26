@@ -867,22 +867,7 @@ fn all_shards_guarded_asked_le(first: usize, last: usize, since: u64) -> bool {
 }
 
 #[inline]
-pub(crate) fn single_shard_for_range(start: usize, end: usize) -> Option<usize> {
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    if first >= last {
-        return None;
-    }
-    let s_first = first >> SHARD_SHIFT;
-    let s_last = (last - 1) >> SHARD_SHIFT;
-    if s_first == s_last {
-        Some(s_first & (GUARD_SHARDS - 1))
-    } else {
-        None
-    }
-}
-
-#[inline]
-fn shards_for_range(start: usize, end: usize) -> Option<([usize; CLEAN_EPOCH_SHARDS], usize)> {
+pub(crate) fn shards_for_range(start: usize, end: usize) -> Option<([usize; CLEAN_EPOCH_SHARDS], usize)> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     if first >= last {
         return Some(([0; CLEAN_EPOCH_SHARDS], 0));
@@ -898,6 +883,27 @@ fn shards_for_range(start: usize, end: usize) -> Option<([usize; CLEAN_EPOCH_SHA
         *s = (s_first + slot) & (GUARD_SHARDS - 1);
     }
     Some((shards, count))
+}
+
+#[inline]
+pub(crate) fn guarded_shards_epochs_match(
+    shards: &[usize],
+    epochs: &[u64],
+    since: u64,
+) -> bool {
+    use std::sync::atomic::Ordering::Acquire;
+    if since == 0 || shards.is_empty() || shards.len() != epochs.len() {
+        return false;
+    }
+    for (&s, &ep) in shards.iter().zip(epochs.iter()) {
+        if ep == 0
+            || SHARD_CLEAN_EPOCH[s].load(Acquire) != ep
+            || SHARD_GUARDED_ASKED[s].load(Acquire) > since
+        {
+            return false;
+        }
+    }
+    true
 }
 
 #[inline]
@@ -925,15 +931,6 @@ pub(crate) fn guarded_clean_epochs_match(
         }
     }
     true
-}
-
-#[inline]
-pub(crate) fn guarded_single_shard_epoch_matches(shard: usize, epoch: u64, since: u64) -> bool {
-    use std::sync::atomic::Ordering::Acquire;
-    since != 0
-        && epoch != 0
-        && SHARD_CLEAN_EPOCH[shard].load(Acquire) == epoch
-        && SHARD_GUARDED_ASKED[shard].load(Acquire) <= since
 }
 
 /// Splits `[start, end)` into contiguous subranges that are NOT known to be uncommitted
@@ -1481,9 +1478,16 @@ fn apply_alias_protection_sharded(
             while k < all_blocks.len() && shard_of(all_blocks[k]) == shard {
                 k += 1;
             }
-            let mut g = guards_write_shard(shard);
-            for &alias in &all_blocks[i..k] {
-                g.aliased.insert(alias);
+            let slice = &all_blocks[i..k];
+            let needs_insert = {
+                let g = guards_read_shard(shard);
+                slice.iter().any(|alias| !g.aliased.contains(alias))
+            };
+            if needs_insert {
+                let mut g = guards_write_shard(shard);
+                for &alias in slice {
+                    g.aliased.insert(alias);
+                }
             }
             i = k;
         }
@@ -1503,8 +1507,14 @@ fn apply_alias_protection_sharded(
     }
     for (a, b) in all_other_runs {
         for_each_shard_span(a, b, |shard, sa, sb| {
-            let mut g = guards_write_shard(shard);
-            protect_alias_range(&mut g, sa, sb);
+            let already_protected = {
+                let g = guards_read_shard(shard);
+                g.protected.contains_range(sa, sb)
+            };
+            if !already_protected {
+                let mut g = guards_write_shard(shard);
+                protect_alias_range(&mut g, sa, sb);
+            }
         });
     }
 }
@@ -1547,7 +1557,9 @@ fn protect_alias_range(g: &mut Guards, from: usize, to: usize) {
 }
 
 fn protect_alias_span(g: &mut Guards, a: usize, b: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect, VirtualQuery,
+    };
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
     if unsafe {
@@ -1561,13 +1573,46 @@ fn protect_alias_span(g: &mut Guards, a: usize, b: usize) {
         g.protected.insert_range(a, b);
         return;
     }
-    for block in a..b {
-        // SAFETY: fallback per block if the span crosses a view boundary.
-        if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) }
-            != 0
-        {
-            g.protected.insert(block);
+    let mut block = a;
+    while block < b {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe {
+            VirtualQuery(
+                (block * BLOCK) as *const _,
+                &mut info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 || info.RegionSize == 0 {
+            block += 1;
+            continue;
         }
+        let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        let next = (region_end / BLOCK).max(block + 1).min(b);
+        if info.State == MEM_COMMIT {
+            // SAFETY: committed contiguous region within `[block, next)`.
+            if unsafe {
+                VirtualProtect(
+                    (block * BLOCK) as *const _,
+                    (next - block) * BLOCK,
+                    PAGE_READONLY,
+                    &mut old,
+                ) != 0
+            } {
+                g.protected.insert_range(block, next);
+            } else {
+                for single in block..next {
+                    if unsafe {
+                        VirtualProtect((single * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old)
+                            != 0
+                    } {
+                        g.protected.insert(single);
+                    }
+                }
+            }
+        }
+        block = next;
     }
 }
 

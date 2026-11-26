@@ -2325,7 +2325,6 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    crate::descriptor::host::bump_stage_texture_epoch();
     crate::texture::placed_in_host_written(address, desc);
     resource(out)
         .host

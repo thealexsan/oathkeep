@@ -167,6 +167,15 @@ impl ScannedSubmission {
 const HOT_HASH_BLOCK: usize = 4096;
 const COPIED_CHUNK: usize = 64;
 
+struct CleanSubEntry {
+    shards: [usize; crate::watch::CLEAN_EPOCH_SHARDS],
+    epochs: [u64; crate::watch::CLEAN_EPOCH_SHARDS],
+    count: usize,
+    spans: Vec<(usize, usize)>,
+}
+
+const MAX_CLEAN_SUB_ENTRIES: usize = 16;
+
 struct CopiedState {
     pages: Vec<u64>,
     /// Per-64-page-chunk minimum timestamp (`0` iff any page in the chunk is uncopied).
@@ -177,8 +186,9 @@ struct CopiedState {
     chunk_floor: Vec<u64>,
     /// Lazily allocated per-64 KiB page quiet tracking for non-card `copy_hot` cooling.
     hot_quiet: Vec<HotPageQuiet>,
-    /// Single-shard subrange clean-guard cache: `(shard, epoch, merged_page_spans)`.
-    clean_sub: (usize, u64, Vec<(usize, usize)>),
+    /// Multi-shard subrange clean-guard cache entries (up to `MAX_CLEAN_SUB_ENTRIES` shard-sets
+    /// per shadow, eliminating ping-pong eviction across shards of large buffers).
+    clean_subs: Vec<CleanSubEntry>,
 }
 
 impl CopiedState {
@@ -190,7 +200,7 @@ impl CopiedState {
             chunk_min_nz: vec![u64::MAX; chunks],
             chunk_floor: vec![0; chunks],
             hot_quiet: Vec::new(),
-            clean_sub: (0, 0, Vec::new()),
+            clean_subs: Vec::new(),
         }
     }
 
@@ -200,59 +210,96 @@ impl CopiedState {
         self.chunk_min_nz.clear();
         self.chunk_floor.clear();
         self.hot_quiet.clear();
-        self.clean_sub = (0, 0, Vec::new());
+        self.clean_subs.clear();
     }
 
-    fn clean_covers_single_shard(&self, shard: usize, lo: usize, hi: usize, since: u64) -> bool {
-        if lo >= hi || self.clean_sub.1 == 0 || self.clean_sub.0 != shard {
+    fn clean_covers_shards(
+        &self,
+        shards: [usize; crate::watch::CLEAN_EPOCH_SHARDS],
+        count: usize,
+        lo: usize,
+        hi: usize,
+        since: u64,
+    ) -> bool {
+        if lo >= hi || count == 0 || since == 0 {
             return false;
         }
-        if !crate::watch::guarded_single_shard_epoch_matches(shard, self.clean_sub.1, since) {
-            return false;
-        }
-        self.clean_sub
-            .2
+        let Some(entry) = self
+            .clean_subs
             .iter()
-            .any(|&(a, b)| a <= lo && hi <= b)
+            .find(|e| e.count == count && e.shards[..count] == shards[..count])
+        else {
+            return false;
+        };
+        if !crate::watch::guarded_shards_epochs_match(
+            &entry.shards[..count],
+            &entry.epochs[..count],
+            since,
+        ) {
+            return false;
+        }
+        entry.spans.iter().any(|&(a, b)| a <= lo && hi <= b)
     }
 
-    fn record_clean_single_shard(&mut self, shard: usize, epoch: u64, lo: usize, hi: usize) {
-        if lo >= hi || epoch == 0 {
+    fn record_clean_shards(
+        &mut self,
+        shards: [usize; crate::watch::CLEAN_EPOCH_SHARDS],
+        count: usize,
+        epochs: [u64; crate::watch::CLEAN_EPOCH_SHARDS],
+        lo: usize,
+        hi: usize,
+    ) {
+        if lo >= hi || count == 0 || epochs[0] == 0 {
             return;
         }
-        if self.clean_sub.0 != shard || self.clean_sub.1 != epoch {
-            self.clean_sub.0 = shard;
-            self.clean_sub.1 = epoch;
-            self.clean_sub.2.clear();
-            self.clean_sub.2.push((lo, hi));
-            return;
-        }
-        let spans = &mut self.clean_sub.2;
-        if spans.len() >= 64 {
-            spans.clear();
-        }
-        let mut new_lo = lo;
-        let mut new_hi = hi;
-        let mut merged = Vec::with_capacity(spans.len() + 1);
-        let mut inserted = false;
-        for &(a, b) in spans.iter() {
-            if b < new_lo {
-                merged.push((a, b));
-            } else if new_hi < a {
-                if !inserted {
-                    merged.push((new_lo, new_hi));
-                    inserted = true;
-                }
-                merged.push((a, b));
-            } else {
-                new_lo = new_lo.min(a);
-                new_hi = new_hi.max(b);
+        if let Some(entry) = self
+            .clean_subs
+            .iter_mut()
+            .find(|e| e.count == count && e.shards[..count] == shards[..count])
+        {
+            if entry.epochs[..count] != epochs[..count] {
+                entry.epochs = epochs;
+                entry.spans.clear();
+                entry.spans.push((lo, hi));
+                return;
             }
+            let spans = &mut entry.spans;
+            if spans.len() >= 64 {
+                spans.clear();
+            }
+            let mut new_lo = lo;
+            let mut new_hi = hi;
+            let mut merged = Vec::with_capacity(spans.len() + 1);
+            let mut inserted = false;
+            for &(a, b) in spans.iter() {
+                if b < new_lo {
+                    merged.push((a, b));
+                } else if new_hi < a {
+                    if !inserted {
+                        merged.push((new_lo, new_hi));
+                        inserted = true;
+                    }
+                    merged.push((a, b));
+                } else {
+                    new_lo = new_lo.min(a);
+                    new_hi = new_hi.max(b);
+                }
+            }
+            if !inserted {
+                merged.push((new_lo, new_hi));
+            }
+            *spans = merged;
+            return;
         }
-        if !inserted {
-            merged.push((new_lo, new_hi));
+        if self.clean_subs.len() >= MAX_CLEAN_SUB_ENTRIES {
+            self.clean_subs.remove(0);
         }
-        *spans = merged;
+        self.clean_subs.push(CleanSubEntry {
+            shards,
+            epochs,
+            count,
+            spans: vec![(lo, hi)],
+        });
     }
 
     fn record_hot_quiet(
@@ -4006,8 +4053,8 @@ impl Shadow {
             };
             let lo_page = (a / PAGE).saturating_sub(base);
             let hi_page = e.div_ceil(PAGE).saturating_sub(base);
-            let sub_shard = if mode == WATCHED_GUARDED && !full {
-                crate::watch::single_shard_for_range(a, e)
+            let sub_shards = if mode == WATCHED_GUARDED && !full {
+                crate::watch::shards_for_range(a, e)
             } else {
                 None
             };
@@ -4019,9 +4066,9 @@ impl Shadow {
                 let (all, s) = copied.range_since(lo_page, hi_page, global_synced);
                 if all
                     && s != 0
-                    && let Some(shard) = sub_shard
+                    && let Some((shards, count)) = sub_shards
                 {
-                    sub_clean_hit = copied.clean_covers_single_shard(shard, lo_page, hi_page, s);
+                    sub_clean_hit = copied.clean_covers_shards(shards, count, lo_page, hi_page, s);
                 }
                 (all, s)
             } else {
@@ -4071,11 +4118,11 @@ impl Shadow {
                         self.clean_guard_epochs[i].store(ep[i], Ordering::Release);
                     }
                     self.clean_guard_epochs[0].store(ep[0], Ordering::Release);
-                } else if let Some(shard) = sub_shard {
+                } else if let Some((shards, count)) = sub_shards {
                     self.copied
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .record_clean_single_shard(shard, ep[0], lo_page, hi_page);
+                        .record_clean_shards(shards, count, ep, lo_page, hi_page);
                 }
             }
             if all_copied && written.is_empty() {
@@ -4428,8 +4475,8 @@ impl Shadow {
             };
             let lo_page = (from / PAGE).saturating_sub(base);
             let hi_page = to.div_ceil(PAGE).saturating_sub(base);
-            let sub_shard = if mode == WATCHED_GUARDED && !full {
-                crate::watch::single_shard_for_range(from, to)
+            let sub_shards = if mode == WATCHED_GUARDED && !full {
+                crate::watch::shards_for_range(from, to)
             } else {
                 None
             };
@@ -4441,9 +4488,9 @@ impl Shadow {
                 let (all, s) = copied.range_since(lo_page, hi_page, global_synced);
                 if all
                     && s != 0
-                    && let Some(shard) = sub_shard
+                    && let Some((shards, count)) = sub_shards
                 {
-                    sub_clean_hit = copied.clean_covers_single_shard(shard, lo_page, hi_page, s);
+                    sub_clean_hit = copied.clean_covers_shards(shards, count, lo_page, hi_page, s);
                 }
                 (all, s)
             } else {
@@ -4497,11 +4544,11 @@ impl Shadow {
                             self.clean_guard_epochs[i].store(ep[i], Ordering::Release);
                         }
                         self.clean_guard_epochs[0].store(ep[0], Ordering::Release);
-                    } else if let Some(shard) = sub_shard {
+                    } else if let Some((shards, count)) = sub_shards {
                         self.copied
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .record_clean_single_shard(shard, ep[0], lo_page, hi_page);
+                            .record_clean_shards(shards, count, ep, lo_page, hi_page);
                     }
                 }
                 self.refresh_check(from, to);

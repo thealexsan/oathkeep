@@ -259,6 +259,17 @@ impl State {
     }
 
     #[inline]
+    fn is_kept_dynamic(&mut self, list: &HostList, raw: usize) -> bool {
+        let list_gen = list.reset_gen();
+        if self.kept_list_gen != list_gen {
+            self.kept_ptrs.clear();
+            self.kept_list_gen = list_gen;
+            return false;
+        }
+        self.kept_ptrs.contains(&raw)
+    }
+
+    #[inline]
     fn keep_dynamic(&mut self, list: &HostList, resource: &ID3D12Resource) {
         let list_gen = list.reset_gen();
         if self.kept_list_gen != list_gen {
@@ -3159,17 +3170,47 @@ impl State {
         }
     }
 
-    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
-        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-            return;
-        };
+    fn table_entry_with_heap(
+        &mut self,
+        list: &HostList,
+        u: &UsedResource,
+        table: u64,
+        heap: &'static crate::descriptor::Heap,
+    ) {
         let handle = table + u64::from(u.table_offset_dwords) * 4;
-        let Some(heap) = self.heap_of(handle) else {
-            return;
-        };
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
+        if let Some((action, _, is_texture)) = host.lookup_mirrored_stage(index, handle) {
+            match action {
+                crate::descriptor::host::StageAction::Buffer {
+                    shadow,
+                    address,
+                    len,
+                } => {
+                    shadow.refresh(list, address, len);
+                    if u.kind == ResourceType::Uav {
+                        if STORES.get() || !write_skip() {
+                            shadow.gpu_writes(list, address, len);
+                        } else {
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
+                                crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
+                            }
+                        }
+                    }
+                }
+                crate::descriptor::host::StageAction::Texture { resource } => {
+                    readable_texture(list, resource, u.kind);
+                }
+                crate::descriptor::host::StageAction::None => {}
+            }
+            if is_texture {
+                host.texture_slot_tabled(index, true);
+            }
+            return;
+        }
         if let Some(view) = host.mirror(index, handle, true) {
             if let View::Constant(address, size) = view {
                 let size_u64 = u64::from(size);
@@ -3252,6 +3293,30 @@ impl State {
     ) {
         self.scratch_fresh.clear();
         self.scratch_made.clear();
+        let mut slot_heaps: [Option<(u64, Option<&'static crate::descriptor::Heap>)>; 32] =
+            [None; 32];
+        let resolve_slot = |state: &State,
+                            cache: &mut [Option<(u64, Option<&'static crate::descriptor::Heap>)>; 32],
+                            slot: u8|
+         -> Option<(u64, &'static crate::descriptor::Heap)> {
+            let idx = usize::from(slot);
+            if idx < cache.len()
+                && let Some((t, h)) = cache[idx]
+            {
+                return h.map(|heap| (t, heap));
+            }
+            let Some(&Root::Table(table)) = state.roots_ref(compute).get(idx) else {
+                if idx < cache.len() {
+                    cache[idx] = Some((0, None));
+                }
+                return None;
+            };
+            let heap = state.heap_of(table);
+            if idx < cache.len() {
+                cache[idx] = Some((table, heap));
+            }
+            heap.map(|h| (table, h))
+        };
         let mut fresh_mask = 0u64;
         let mark_fresh = |slot: u8, mask: &mut u64, fresh: &mut Vec<u8>| {
             if slot < 64 {
@@ -3278,13 +3343,10 @@ impl State {
             if is_fresh(u.slot, fresh_mask, &self.scratch_fresh) {
                 continue;
             }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+            let Some((table, heap)) = resolve_slot(self, &mut slot_heaps, u.slot) else {
                 continue;
             };
             let end = table + u64::from(u.table_offset_dwords) * 4;
-            let Some(heap) = self.heap_of(table) else {
-                continue;
-            };
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
@@ -3313,12 +3375,7 @@ impl State {
             if is_fresh(ix.table_slot, fresh_mask, &self.scratch_fresh) {
                 continue;
             }
-            let Some(&Root::Table(table)) =
-                self.roots_ref(compute).get(usize::from(ix.table_slot))
-            else {
-                continue;
-            };
-            let Some(heap) = self.heap_of(table) else {
+            let Some((table, heap)) = resolve_slot(self, &mut slot_heaps, ix.table_slot) else {
                 continue;
             };
             let Some(host) = heap.host() else {
@@ -3358,20 +3415,18 @@ impl State {
             }
         }
         for u in used {
-            if u.root == RootType::Table && !is_fresh(u.slot, fresh_mask, &self.scratch_fresh) {
-                self.table_entry(list, u, compute);
+            if u.root == RootType::Table
+                && !is_fresh(u.slot, fresh_mask, &self.scratch_fresh)
+                && let Some((table, heap)) = resolve_slot(self, &mut slot_heaps, u.slot)
+            {
+                self.table_entry_with_heap(list, u, table, heap);
             }
         }
         for ix in indexed {
             if is_fresh(ix.table_slot, fresh_mask, &self.scratch_fresh) {
                 continue;
             }
-            let Some(&Root::Table(table)) =
-                self.roots_ref(compute).get(usize::from(ix.table_slot))
-            else {
-                continue;
-            };
-            let Some(heap) = self.heap_of(table) else {
+            let Some((table, heap)) = resolve_slot(self, &mut slot_heaps, ix.table_slot) else {
                 continue;
             };
             let Some(host) = heap.host() else {
@@ -3388,6 +3443,44 @@ impl State {
             let Some(index) = heap.index(handle) else {
                 continue;
             };
+            if let Some((action, kind, is_texture)) = host.lookup_mirrored_stage(index, handle) {
+                if let Some(kind) = kind {
+                    match action {
+                        crate::descriptor::host::StageAction::Buffer {
+                            shadow,
+                            address,
+                            len,
+                        } => {
+                            shadow.refresh(list, address, len);
+                            if kind == ResourceType::Uav {
+                                if STORES.get() || !write_skip() {
+                                    shadow.gpu_writes(list, address, len);
+                                } else {
+                                    #[cfg(feature = "diagnostics")]
+                                    {
+                                        crate::copystat::add(
+                                            crate::copystat::C::GpuWritesLeftOut,
+                                            1,
+                                        );
+                                        crate::copystat::add(
+                                            crate::copystat::C::GpuWritesLeftOutBytes,
+                                            len,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        crate::descriptor::host::StageAction::Texture { resource } => {
+                            readable_texture(list, resource, kind);
+                        }
+                        crate::descriptor::host::StageAction::None => {}
+                    }
+                    if is_texture {
+                        host.texture_slot_tabled(index, true);
+                    }
+                }
+                continue;
+            }
             if let Some(view) = host.mirror(index, handle, true) {
                 if let View::Constant(address, size) = view {
                     let size_u64 = u64::from(size);
@@ -3407,7 +3500,7 @@ impl State {
         }
         for fresh_i in 0..self.scratch_fresh.len() {
             let slot = self.scratch_fresh[fresh_i];
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            let Some((table, heap)) = resolve_slot(self, &mut slot_heaps, slot) else {
                 continue;
             };
             self.scratch_entries.clear();
@@ -3416,9 +3509,6 @@ impl State {
                     self.scratch_entries.push(idx);
                 }
             }
-            let Some(heap) = self.heap_of(table) else {
-                continue;
-            };
             if heap.samplers() || (table - heap.start) % 32 != 0 {
                 continue;
             }
@@ -3606,7 +3696,9 @@ impl State {
                     host.constant_at_dynamic(index, gpu, size);
                     continue;
                 }
-                let made = host.copy_or_make_dynamic(index, words);
+                let made = host.copy_or_make_dynamic(index, words, |raw| {
+                    self.is_kept_dynamic(list, raw)
+                });
                 if !made.found {
                     if used_entry.is_some() {
                         once!(slot, "a table entry without a view");
@@ -3662,7 +3754,7 @@ impl State {
                     && made.is_texture
                 {
                     host.texture_slot_tabled(title + k, kind.is_some());
-                    if kind.is_some() {
+                    if kind.is_some() && !host.made_key_matches_words(title + k, words) {
                         host.mirror(title + k, table + u64::from(k) * 32, true);
                     }
                 }

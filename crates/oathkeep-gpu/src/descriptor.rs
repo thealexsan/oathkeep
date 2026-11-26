@@ -521,7 +521,13 @@ static MADE_LATE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new(
 
 #[cfg(windows)]
 pub(crate) fn texture_made(resource: usize) {
-    crate::descriptor::host::bump_stage_texture_epoch();
+    if let Some((ptr, _)) = crate::resource::texture_memory(resource as This)
+        && !ptr.is_null()
+    {
+        crate::descriptor::host::bump_stage_texture_epoch_at(ptr as u64);
+    } else {
+        crate::descriptor::host::bump_stage_texture_epoch();
+    }
     MADE_LATE
         .lock()
         .unwrap_or_else(|e| e.into_inner())

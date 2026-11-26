@@ -3,12 +3,12 @@ updated = "2026-11-26"
 commit = "perf/commit-reduction"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "10.4-15.7 fps steady (diag-run79 peak 15.7 fps / 63.6 ms, +32% over run78; 0-1.4 ms GPU wait)"
-current_frame_ms = "63.6-95.8 ms (0 refused dynamic slots, 0 crashes/TDRs, copies MB -60%)"
-current_gpu_ms = "0.0-1.4 ms wait (GPU busy 71-99%; now balanced/CPU-bound on recording + preparing)"
-current_preparing_ms = "36.6-60.3 ms (batch_flush 16.0-25.7 ms, moves shadow 13.6-18.6 ms, sparse reads 0.3 ms, kernel -77%)"
+current_fps = "11.9-17.3 fps steady (diag-run81 peak 17.3 fps / 57.7 ms, +10% over run79; heavy scenes +16-43% in run82)"
+current_frame_ms = "57.7-84.2 ms (0 refused dynamic slots, 0 crashes/TDRs, 0.0 ms GPU wait)"
+current_gpu_ms = "0.0 ms wait (GPU busy 71-98% at ~95 W; 100% CPU-bound on recording + submit thread)"
+current_preparing_ms = "36.2-53.1 ms (batch_flush 15.3-20.3 ms, moves shadow 11.3-17.5 ms, rec 121.6-134.9 ms, make_at 32.5-37.5 ms)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~15-20 min (Fix R1-R4 built: CPU staging descriptor cache + indirect pool growth -> 20-30+ FPS)"
+eta = "~15-20 min (Fix T: fix SHADOW_GEN stage-cache churn + PrepOtherUs 6-11 ms -> 20-30+ FPS)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -253,3 +253,21 @@ frame_ms = 63.6
 gpu_ms = "0.0-1.4 ms wait (71-99% busy)"
 preparing_ms = "36.6-60.3 ms (batch_flush 16.0-25.7 ms, moves shadow 13.6-18.6 ms, sparse reads 0.3 ms)"
 status = "New peak 15.7 fps (+32%, steady 10.4-15.7 fps)! Fix Q1-Q4 verified: copies MB -60% (116->44 MB), moves shadow -60% (33-72->13.6-18.6 ms), sparse reads 0.3 ms (-99%), submit kernel -77% (20.1->4.7 ms), GUARD_HOT=0 beats GUARD_HOT=1 (15.7 vs 6.9 fps); next: Fix R1-R4 CPU staging descriptor cache + indirect scratch growth"
+
+[[runs]]
+label = "diag-run81"
+commit = "2fff334"
+fps = 17.3
+frame_ms = 57.7
+gpu_ms = "0.0 ms wait (71-98% busy)"
+preparing_ms = "36.2-57.4 ms (batch_flush 16.4-27.6 ms, moves shadow 11.3-29.7 ms, rec 134.9 ms)"
+status = "New peak 17.3 fps (57.7 ms/f, +10% over run79)! Fix R1-R4 verified across all 3D intervals: between-submissions 30.7->23.4 ms, indirect miss_step -20%, 0 refusals/crashes"
+
+[[runs]]
+label = "diag-run82"
+commit = "perf/commit-reduction"
+fps = 15.9
+frame_ms = 62.7
+gpu_ms = "0.0 ms wait (53-99% busy)"
+preparing_ms = "36.5-53.1 ms (batch_flush 15.3-20.3 ms, moves shadow 12.1-17.5 ms, rec 121.6-129.2 ms, make_at 32.5-34.1 ms)"
+status = "Fix S1-S3 verified: heavy scenes +16-43% (8.9->12.7, 10.9->11.9, 6.8->7.9 fps), lowest rec/make_at/batch_flush yet; stage_cache counter exposed 3.6k-7.3k misses/f from global SHADOW_GEN bumps + PrepOtherUs 6.4-10.9 ms -> next: Fix T"
