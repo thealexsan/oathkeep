@@ -74,6 +74,11 @@ pub(super) trait Work: Send {
     }
     /// Waits until a folded one is free to go.
     fn settle(_: &Self::Ask) {}
+    /// Helps advance `ask` directly on the serving thread when blocked; whether
+    /// progress was made.
+    fn help(_: &Self::Ask) -> bool {
+        false
+    }
     /// Takes `next`, what its queue was given behind it, along to be done with
     /// it; or gives it back. Whether it is a submission that was taken.
     fn take_along(&mut self, next: Self) -> Result<bool, Self>
@@ -104,9 +109,10 @@ struct State<W> {
     /// whole look has followed.
     asked: u64,
     served: u64,
-    /// Presents and submissions in the line or being done.
+    /// Presents, submissions, and active `drain` callers in the line.
     presents: usize,
     runs: usize,
+    drainers: usize,
 }
 
 /// See the module's text.
@@ -114,8 +120,10 @@ pub(super) struct Lane<W: Work> {
     state: Mutex<State<W>>,
     /// Something to look at.
     work: Condvar,
-    /// Something was done, or a look at the line ended.
+    /// A submission ran or a look at the line ended (`wait_runs`, `drain`).
     moved: Condvar,
+    /// A present finished (`wait_presents`).
+    shown: Condvar,
 }
 
 impl<W: Work> Lane<W> {
@@ -129,9 +137,11 @@ impl<W: Work> Lane<W> {
                 served: 0,
                 presents: 0,
                 runs: 0,
+                drainers: 0,
             }),
             work: Condvar::new(),
             moved: Condvar::new(),
+            shown: Condvar::new(),
         }
     }
 
@@ -165,12 +175,12 @@ impl<W: Work> Lane<W> {
         let mut state = self.lock();
         if always || state.running == Some(queue) || state.items.iter().any(|e| e.queue == queue) {
             Self::put(&mut state, queue, what);
+            state.asked += 1;
+            drop(state);
+            self.work.notify_one();
         } else {
             now();
         }
-        state.asked += 1;
-        drop(state);
-        self.work.notify_one();
     }
 
     /// Has the line looked at: something an entry stands at may have moved.
@@ -196,17 +206,19 @@ impl<W: Work> Lane<W> {
         }
         state.asked += 1;
         let ticket = state.asked;
+        state.drainers += 1;
         self.work.notify_one();
         while state.served < ticket {
             state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
         }
+        state.drainers -= 1;
     }
 
     /// Waits until at most `most` presents are in the line.
     pub(super) fn wait_presents(&self, most: usize) {
         let mut state = self.lock();
         while state.presents > most {
-            state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+            state = self.shown.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -219,6 +231,22 @@ impl<W: Work> Lane<W> {
         }
     }
 
+    /// Pending head conditions when the line has items that could not run yet.
+    fn pending_asks(&self) -> Vec<W::Ask> {
+        let state = self.lock();
+        let mut seen: Vec<usize> = Vec::new();
+        let mut asks = Vec::new();
+        for e in &state.items {
+            if !seen.contains(&e.queue) {
+                seen.push(e.queue);
+                if let Some(ask) = e.what.ask() {
+                    asks.push(ask);
+                }
+            }
+        }
+        asks
+    }
+
     /// Looks at the line for as long as the process runs.
     fn serve(&self) -> ! {
         loop {
@@ -228,6 +256,26 @@ impl<W: Work> Lane<W> {
                     if state.items.is_empty() {
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
                     } else {
+                        drop(state);
+                        let asks = self.pending_asks();
+                        if asks.iter().any(W::help) || asks.iter().any(W::met) {
+                            state = self.lock();
+                            break;
+                        }
+                        for _ in 0..32 {
+                            std::hint::spin_loop();
+                            if asks.iter().any(W::met) {
+                                break;
+                            }
+                        }
+                        if asks.iter().any(W::met) {
+                            state = self.lock();
+                            break;
+                        }
+                        state = self.lock();
+                        if state.asked != state.served {
+                            break;
+                        }
                         // It stands at something the CPU may write without
                         // a call of ours.
                         let (back, out) =
@@ -238,13 +286,18 @@ impl<W: Work> Lane<W> {
                         }
                     }
                 }
-                (state.asked, state.next)
+                let limit = if state.drainers > 0 { state.next } else { u64::MAX };
+                (state.asked, limit)
             };
             self.look(limit);
-            let mut state = self.lock();
-            state.served = state.served.max(asked);
-            drop(state);
-            self.moved.notify_all();
+            let wake_moved = {
+                let mut state = self.lock();
+                state.served = state.served.max(asked);
+                state.drainers > 0
+            };
+            if wake_moved {
+                self.moved.notify_all();
+            }
         }
     }
 
@@ -253,11 +306,9 @@ impl<W: Work> Lane<W> {
         while self.step(limit) {}
     }
 
-    /// The parts of `entry`, which stands for them, in place `at`.
-    fn unfold(state: &mut State<W>, at: usize, entry: Entry<W>) {
-        let (number, queue, runs) = (entry.number, entry.queue, usize::from(entry.what.runs()));
-        let parts = entry.what.unfold();
-        state.runs -= runs;
+    /// Inserts `parts` of unfolded `entry` at `at`.
+    fn insert_unfolded(state: &mut State<W>, at: usize, number: u64, queue: usize, was_run: usize, parts: Vec<W>) {
+        state.runs -= was_run;
         state.runs += parts.iter().filter(|p| p.runs()).count();
         for (i, what) in parts.into_iter().enumerate() {
             state.items.insert(at + i, Entry { number, queue, what });
@@ -291,6 +342,12 @@ impl<W: Work> Lane<W> {
         let (number, forced) = match ready {
             Some(head) => (head.0, false),
             None => {
+                // If any blocked queue head can be helped directly (e.g.
+                // translating a pending thin command list chunk), do one unit
+                // of work and re-check before yielding or marking `served`.
+                if heads.iter().filter_map(|h| h.2.as_ref()).any(W::help) {
+                    return true;
+                }
                 // Nothing is free to run. With a present in the line the
                 // oldest goes on regardless: a wait is not kept across
                 // frames (`super::present`). (Not while there is work whose
@@ -318,15 +375,14 @@ impl<W: Work> Lane<W> {
         };
         let (shows, mut runs) = (entry.what.shows(), usize::from(entry.what.runs()));
         if entry.what.folded() {
-            // Its parts take its place: behind everything before it, before
-            // everything after it (they share its number; the first of them
-            // is found first).
+            // Unfold outside the lane lock (`running == Some(queue)` keeps
+            // concurrent `push_behind` and `drain` ordered behind `entry`).
+            let (entry_num, entry_queue) = (entry.number, entry.queue);
+            let parts = entry.what.unfold();
             let mut state = self.lock();
             state.running = None;
-            let at = state.items.iter().position(|e| e.number > entry.number).unwrap_or(state.items.len());
-            Self::unfold(&mut state, at, entry);
-            drop(state);
-            self.moved.notify_all();
+            let at = state.items.iter().position(|e| e.number > entry_num).unwrap_or(state.items.len());
+            Self::insert_unfolded(&mut state, at, entry_num, entry_queue, runs, parts);
             return true;
         }
         // What follows it in its queue, if that can go with it. (Nobody else
@@ -342,13 +398,15 @@ impl<W: Work> Lane<W> {
             };
             // (Back where it was: parts of one submission share a number.)
             if next.what.folded() {
-                let free = next.what.ask().is_none_or(|ask| W::met(&ask));
-                let mut state = self.lock();
-                if free {
-                    Self::unfold(&mut state, at, next);
+                if next.what.ask().is_none_or(|ask| W::met(&ask)) {
+                    let (next_num, next_queue, next_run) =
+                        (next.number, next.queue, usize::from(next.what.runs()));
+                    let parts = next.what.unfold();
+                    let mut state = self.lock();
+                    Self::insert_unfolded(&mut state, at, next_num, next_queue, next_run, parts);
                     continue;
                 }
-                state.items.insert(at, next);
+                self.lock().items.insert(at, next);
                 break;
             }
             let Entry { number, queue, what } = next;
@@ -361,13 +419,19 @@ impl<W: Work> Lane<W> {
             }
         }
         entry.what.go(forced);
-        {
+        let wake_moved = {
             let mut state = self.lock();
             state.running = None;
             state.presents -= usize::from(shows);
             state.runs -= runs;
+            runs > 0 || state.drainers > 0
+        };
+        if shows {
+            self.shown.notify_all();
         }
-        self.moved.notify_all();
+        if wake_moved {
+            self.moved.notify_all();
+        }
         true
     }
 }
@@ -446,6 +510,13 @@ impl Work for Job {
         }
     }
 
+    fn help(ask: &Ask) -> bool {
+        match ask {
+            Ask::Lists(recordings) => crate::list::thin::help(recordings),
+            _ => false,
+        }
+    }
+
     fn met(ask: &Ask) -> bool {
         match ask {
             &Ask::Wait(fence, value) => crate::fence::completed(fence as This) >= value,
@@ -490,8 +561,11 @@ impl Work for Job {
             }
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
+                if count >= most || lists.1.len() + order.len() > most_lists {
+                    return Err(next);
+                }
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                if !crate::host::joinable(hosts(), &runs) {
                     return Err(next);
                 }
             }
@@ -1082,5 +1156,39 @@ mod tests {
         while log.lock().unwrap().len() < 6 {
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn serving_thread_helps_pending_head_without_timer_stall() {
+        static HELPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        struct Helped(Log);
+        impl Work for Helped {
+            type Ask = ();
+            fn ask(&self) -> Option<()> {
+                (!HELPED.load(std::sync::atomic::Ordering::Acquire)).then_some(())
+            }
+            fn met(_: &()) -> bool {
+                HELPED.load(std::sync::atomic::Ordering::Acquire)
+            }
+            fn help(_: &()) -> bool {
+                HELPED.store(true, std::sync::atomic::Ordering::Release);
+                true
+            }
+            fn shows(&self) -> bool {
+                false
+            }
+            fn runs(&self) -> bool {
+                true
+            }
+            fn go(self, _: bool) {
+                self.0.lock().unwrap().push("helped".into());
+            }
+        }
+        let lane: &'static Lane<Helped> = Box::leak(Box::new(Lane::new()));
+        std::thread::spawn(|| lane.serve());
+        let log: Log = Default::default();
+        lane.push(1, [Helped(log.clone())]);
+        lane.drain();
+        assert_eq!(*log.lock().unwrap(), ["helped"]);
     }
 }

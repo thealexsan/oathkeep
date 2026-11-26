@@ -96,10 +96,18 @@ impl Front {
     }
 
     #[inline]
+    fn ensure_words(&mut self) {
+        if self.words.capacity() == 0 {
+            self.words = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
+        }
+    }
+
+    #[inline]
     fn put(&mut self, op: u64, args: &[u64]) {
         if self.closed || self.recording.is_none() {
             return;
         }
+        self.ensure_words();
         self.words.push(op | (args.len() as u64) << 16);
         self.words.extend_from_slice(args);
         if self.words.len() >= CHUNK {
@@ -112,6 +120,7 @@ impl Front {
         if self.closed || self.recording.is_none() {
             return;
         }
+        self.ensure_words();
         let at = self.words.len();
         self.words.push(0);
         self.words.extend_from_slice(args);
@@ -135,8 +144,12 @@ impl Front {
         if self.words.is_empty() {
             return;
         }
-        let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
-        let words = std::mem::replace(&mut self.words, fresh);
+        let words = if self.closed {
+            std::mem::take(&mut self.words)
+        } else {
+            let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
+            std::mem::replace(&mut self.words, fresh)
+        };
         CHUNKS.fetch_add(1, Relaxed);
         let schedule = {
             let mut inner = held(&recording.inner);
@@ -144,7 +157,7 @@ impl Front {
             !std::mem::replace(&mut inner.scheduled, true)
         };
         if schedule {
-            held(&READY).push_back(recording.clone());
+            held(&READY).push(recording.clone());
             WORK.notify_one();
         }
     }
@@ -153,17 +166,113 @@ impl Front {
         if self.closed {
             return;
         }
-        self.put(CLOSE, &[]);
+        if self.recording.is_some() {
+            self.ensure_words();
+            self.words.push(CLOSE);
+        }
         self.closed = true;
         self.hand_over();
+    }
+}
+
+/// Recordings with words to translate: submitted recordings run in submission
+/// order (`urgent`) ahead of unsubmitted background chunks (`ahead`).
+#[derive(Default)]
+struct Ready {
+    urgent: VecDeque<(u64, Arc<Recording>)>,
+    ahead: VecDeque<Arc<Recording>>,
+}
+
+impl Ready {
+    fn sync_top(&self) {
+        URGENT_TOP.store(self.urgent.front().map_or(u64::MAX, |&(seq, _)| seq), Relaxed);
+    }
+
+    fn insert_urgent(&mut self, seq: u64, rec: Arc<Recording>) {
+        let pos = self
+            .urgent
+            .iter()
+            .rposition(|&(s, _)| s <= seq)
+            .map_or(0, |i| i + 1);
+        self.urgent.insert(pos, (seq, rec));
+    }
+
+    fn push(&mut self, rec: Arc<Recording>) {
+        let seq = rec.urgent.load(Acquire);
+        if seq != 0 {
+            self.insert_urgent(seq, rec);
+            self.sync_top();
+        } else {
+            self.ahead.push_back(rec);
+        }
+    }
+
+    fn pop(&mut self) -> Option<Arc<Recording>> {
+        if let Some((_, rec)) = self.urgent.pop_front() {
+            self.sync_top();
+            return Some(rec);
+        }
+        self.ahead.pop_front()
+    }
+
+    fn pop_wanted(&mut self, wanted: &[Arc<Recording>]) -> Option<Arc<Recording>> {
+        if let Some(pos) = self
+            .urgent
+            .iter()
+            .position(|(_, r)| wanted.iter().any(|w| Arc::ptr_eq(w, r)))
+        {
+            let (_, rec) = self.urgent.remove(pos)?;
+            self.sync_top();
+            return Some(rec);
+        }
+        if let Some(pos) = self
+            .ahead
+            .iter()
+            .position(|r| wanted.iter().any(|w| Arc::ptr_eq(w, r)))
+        {
+            return self.ahead.remove(pos);
+        }
+        self.urgent.pop_front().map(|(_, rec)| {
+            self.sync_top();
+            rec
+        })
+    }
+
+    /// Promotes any already-queued recordings that now carry a submission
+    /// sequence number from `ahead` into `urgent`.
+    fn promote(&mut self) -> usize {
+        let mut promoted = 0;
+        let mut i = 0;
+        while i < self.ahead.len() {
+            let seq = self.ahead[i].urgent.load(Acquire);
+            if seq != 0 {
+                if let Some(rec) = self.ahead.remove(i) {
+                    self.insert_urgent(seq, rec);
+                    promoted += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if promoted > 0 {
+            self.sync_top();
+        }
+        promoted
     }
 }
 
 /// Streams' memory to use again.
 static WORDS: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
 /// Recordings with words to translate.
-static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
+static READY: Mutex<Ready> = Mutex::new(Ready {
+    urgent: VecDeque::new(),
+    ahead: VecDeque::new(),
+});
 static WORK: Condvar = Condvar::new();
+/// Lowest submission sequence number waiting in [`READY`], or `u64::MAX`.
+static URGENT_TOP: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Next monotonic submission sequence number (`>= 1`).
+static NEXT_SUBMIT: AtomicU64 = AtomicU64::new(0);
 /// Lists of ours nobody uses, closed.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Since the last line of the log: streams handed over; calls translated and
@@ -185,6 +294,8 @@ pub(crate) struct Recording {
     done: AtomicBool,
     moved: Condvar,
     abandoned: AtomicBool,
+    /// `0` while unsubmitted; monotonic submission order (`>= 1`) once submitted.
+    urgent: AtomicU64,
 }
 
 #[derive(Default)]
@@ -198,6 +309,8 @@ struct Inner {
     back: usize,
     /// That list was closed by the stream.
     closed: bool,
+    /// Remaining untranslated lists of its submission, woken once the last finishes.
+    group: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Recording {
@@ -208,6 +321,7 @@ impl Recording {
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
+            urgent: AtomicU64::new(0),
         }
     }
 
@@ -228,20 +342,26 @@ impl Recording {
         held(&self.inner).back as This
     }
 
-    /// Translates what there is.
-    fn run(&self) {
-        loop {
-            let (chunk, back) = {
-                let mut inner = held(&self.inner);
-                let Some(chunk) = inner.chunks.pop_front() else {
-                    inner.scheduled = false;
-                    return;
-                };
-                if inner.back == 0 {
-                    inner.back = back_list(self.kind) as usize;
-                }
-                (chunk, inner.back as This)
+    /// Translates what there is, yielding between chunks if an earlier
+    /// submitted recording is waiting in [`READY`].
+    fn run(self: Arc<Self>) {
+        let (mut chunk, mut back) = {
+            let mut inner = held(&self.inner);
+            let Some(chunk) = inner.chunks.pop_front() else {
+                inner.scheduled = false;
+                return;
             };
+            (chunk, inner.back as This)
+        };
+        if back.is_null() {
+            let fresh = back_list(self.kind);
+            let mut inner = held(&self.inner);
+            if inner.back == 0 {
+                inner.back = fresh as usize;
+            }
+            back = inner.back as This;
+        }
+        loop {
             let began = std::time::Instant::now();
             let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
             STATS[0].fetch_add(calls, Relaxed);
@@ -250,16 +370,54 @@ impl Recording {
             inner.kept.push(chunk);
             if closed {
                 inner.closed = true;
+                inner.scheduled = false;
                 let kept = std::mem::take(&mut inner.kept);
+                let wake_line = inner.group.take().is_some_and(|g| g.fetch_sub(1, AcqRel) == 1);
                 self.done.store(true, Release);
                 self.moved.notify_all();
                 drop(inner);
                 give_back(kept);
                 STATS[2].fetch_add(1, Relaxed);
-                crate::queue::line_moved();
+                if wake_line {
+                    crate::queue::line_moved();
+                }
+                return;
             }
+            if inner.chunks.is_empty() {
+                inner.scheduled = false;
+                return;
+            }
+            let my_seq = match self.urgent.load(Relaxed) {
+                0 => u64::MAX,
+                s => s,
+            };
+            if URGENT_TOP.load(Relaxed) < my_seq {
+                // Keep `scheduled = true` while re-queuing so no second worker
+                // can run `self` concurrently.
+                drop(inner);
+                held(&READY).push(self);
+                WORK.notify_one();
+                return;
+            }
+            let Some(next) = inner.chunks.pop_front() else {
+                inner.scheduled = false;
+                return;
+            };
+            chunk = next;
         }
     }
+}
+
+/// Helps translate one ready recording among `wanted` (or the earliest urgent
+/// submission) when the submitting thread would otherwise wait idle.
+pub(crate) fn help(wanted: &[Arc<Recording>]) -> bool {
+    let Some(recording) = held(&READY).pop_wanted(wanted) else {
+        return false;
+    };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recording.run())).is_err() {
+        crate::host::fail(format_args!("a thread that translates lists panicked"));
+    }
+    true
 }
 
 impl Drop for Recording {
@@ -309,7 +467,7 @@ fn start() {
                 let recording = {
                     let mut ready = held(&READY);
                     loop {
-                        match ready.pop_front() {
+                        match ready.pop() {
                             Some(r) => break r,
                             None => ready = WORK.wait(ready).unwrap_or_else(|e| e.into_inner()),
                         }
@@ -328,19 +486,40 @@ fn start() {
 }
 
 /// The recordings of submitted lists, in order (one that was not begun is left
-/// out).
+/// out). Marks them with their monotonic submission priority so translating
+/// workers finish the earliest submissions first, and wakes the submission
+/// line once the last untranslated list of the submission finishes.
 pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
-    lists
-        .iter()
-        .filter(|l| !l.is_null())
-        .filter_map(|&l| {
-            // SAFETY: the title passes its lists, which nobody records into now.
-            let front = unsafe { &mut (*l.cast_mut().cast::<List>()).thin };
-            front.close();
-            front.submitted = true;
-            front.recording.clone()
-        })
-        .collect()
+    let seq = NEXT_SUBMIT.fetch_add(1, Relaxed) + 1;
+    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let mut recs: Vec<Arc<Recording>> = Vec::with_capacity(lists.len());
+    for &l in lists.iter().filter(|l| !l.is_null()) {
+        // SAFETY: the title passes its lists, which nobody records into now.
+        let front = unsafe { &mut (*l.cast_mut().cast::<List>()).thin };
+        if let Some(rec) = &front.recording {
+            rec.urgent.store(seq, Release);
+        }
+        front.close();
+        front.submitted = true;
+        if let Some(rec) = front.recording.clone() {
+            {
+                let mut inner = held(&rec.inner);
+                if !inner.closed {
+                    pending.fetch_add(1, AcqRel);
+                    inner.group = Some(pending.clone());
+                }
+            }
+            recs.push(rec);
+        }
+    }
+    let promoted = held(&READY).promote();
+    for _ in 0..promoted {
+        WORK.notify_one();
+    }
+    // Release our construction guard; if still > 0, the last worker to finish
+    // one of `recs` will wake the submission line.
+    let _ = pending.fetch_sub(1, AcqRel);
+    recs.into()
 }
 
 /// For the frame-rate line.
@@ -972,5 +1151,31 @@ mod tests {
         slot[1] = 99;
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
+    }
+
+    #[test]
+    fn submitted_recordings_outrank_unsubmitted_and_release_closed_buffer() {
+        let mut ready = Ready::default();
+        let unsubmitted = Arc::new(Recording::new(0));
+        let later = Arc::new(Recording::new(0));
+        later.urgent.store(20, Release);
+        let earlier_queued = Arc::new(Recording::new(0));
+        ready.push(unsubmitted.clone());
+        ready.push(earlier_queued.clone());
+        ready.push(later.clone());
+        // `earlier_queued` becomes submitted with seq 10 and is promoted ahead of seq 20 and unsubmitted.
+        earlier_queued.urgent.store(10, Release);
+        assert_eq!(ready.promote(), 1);
+        assert!(Arc::ptr_eq(&ready.pop().unwrap(), &earlier_queued));
+        assert!(Arc::ptr_eq(&ready.pop().unwrap(), &later));
+        assert!(Arc::ptr_eq(&ready.pop().unwrap(), &unsubmitted));
+        assert!(ready.pop().is_none());
+
+        // Closing a Front hands over its stream without retaining an idle buffer.
+        let mut f = Front::default();
+        f.recording = Some(Arc::new(Recording::new(0)));
+        f.put(Plain::TOPOLOGY as u64, &[4]);
+        f.close();
+        assert_eq!(f.words.capacity(), 0);
     }
 }
