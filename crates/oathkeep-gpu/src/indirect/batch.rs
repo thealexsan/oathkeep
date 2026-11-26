@@ -111,7 +111,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (active && kind > 2) {
         uint was;
         InterlockedMax(largest_asked, asked, was);
-        InterlockedAdd(all_asked, min(asked, 1u << 24), was);
+        InterlockedAdd(all_asked, min(asked * (job.x >> 16), 1u << 24), was);
     }
     uint first = id.x - gi;
     uint n = count > first ? min(64u, count - first) : 0u;

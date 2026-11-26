@@ -117,6 +117,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
         uint3 g = src_args.Load3(src_at);
+        // Unfilled tail slots in a window clamped ahead must run empty and
+        // charge nothing, matching draws and mesh dispatches.
+        if (ahead && (g.x > WIDEST || g.y > 65535u || g.z > 65535u)) {
+            g = uint3(0, 0, 0);
+        }
         // Up to WIDEST groups in x run as asked (`widest`).
         g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
         // x * y fits 32 bits where it is looked at; the whole count may not.
@@ -579,18 +584,23 @@ pub(crate) fn open_batch(
     source: (u64, &ID3D12Resource),
     recent: &[(u64, ID3D12Resource)],
 ) -> Option<(batch::Table, ID3D12Resource)> {
-    let c = batch_clamp()?;
-    let budget = list.budget()?;
-    let (jobs, at) = list.scratch(batch::TABLE)?;
-    let (dst, base, before) = list.batch_place()?;
     let gpu = |b: &ID3D12Resource| {
         // SAFETY: a live buffer.
         Some(unsafe { b.GetGPUVirtualAddress() }).filter(|at| at.is_multiple_of(4))
     };
+    // Validate the primary source before allocating scratch or advancing
+    // `batch_place`'s resource-state tracking so a rejected source never
+    // leaves the batch scratch buffer's expected state out of sync.
+    let first_gpu = gpu(source.1)?;
+    let c = batch_clamp()?;
+    let budget = list.budget()?;
+    let (jobs, at) = list.scratch(batch::TABLE)?;
+    let (dst, base, before) = list.batch_place()?;
     // A source there is none of is the first again, which no job names.
     let mut ids = [0u64; batch::SOURCES];
-    let mut sources = [gpu(source.1)?; batch::SOURCES];
+    let mut sources = [first_gpu; batch::SOURCES];
     ids[0] = source.0;
+    list.keep(source.1);
     let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
     for (i, (id, buffer)) in others.enumerate() {
         if let Some(at) = gpu(buffer) {
@@ -3199,6 +3209,95 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(spent, expected_spent);
         }
+    }
+
+    #[test]
+    fn warp_window_dispatch_clamps_garbage_tail_to_empty() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let (src, src_ptr, _) = warp.shared_buffer(4096);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (back, back_ptr, _) = warp.shared_buffer(4096);
+        let dst = warp.default_uav(4096);
+        // SAFETY: mapped buffers; nothing runs yet.
+        unsafe {
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            // Slot 0: valid dispatch (10, 2, 1) -> cost 20 * 64 = 1280.
+            // Slot 1: unfilled garbage tail (u32::MAX, 1, 1) -> must run empty (0, 0, 0) when ahead=true.
+            for (i, words) in [[10u32, 2, 1], [u32::MAX, 1, 1]].into_iter().enumerate() {
+                for (w, v) in words.into_iter().enumerate() {
+                    src_ptr.cast::<u32>().add(i * 3 + w).write_volatile(v);
+                }
+            }
+        }
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            (&dst, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&src, 0),
+            None,
+            (2, 12, 2),
+            true,
+        ));
+        // SAFETY: open list; dst is readable as indirect arguments.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&back, 0, &dst, 0, 24);
+        }
+        warp.submit_and_wait();
+        // SAFETY: list finished; mapped words.
+        let out: Vec<u32> = (0..6)
+            .map(|i| unsafe { back_ptr.cast::<u32>().add(i).read_volatile() })
+            .collect();
+        let spent = unsafe { budget_ptr.cast::<u32>().read_volatile() };
+        assert_eq!(out, [10, 2, 1, 0, 0, 0]);
+        assert_eq!(spent, 10 * 2 * 64);
+    }
+
+    #[test]
+    fn warp_batch_mesh_all_asked_counts_repeated_executions() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let pass = make_from(&warp.device, batch::SOURCE).expect("batched clamp compiles on WARP");
+        let (_src, src_ptr, src_gpu) = warp.shared_buffer(4096);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+        let dst = warp.default_uav(64 << 10);
+        // SAFETY: mapped buffers; list has not run yet.
+        unsafe {
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            for (w, v) in [12u32, 1, 1].into_iter().enumerate() {
+                src_ptr.cast::<u32>().add(w).write_volatile(v);
+            }
+        }
+        batch::record(
+            &pass,
+            &warp.list,
+            (&dst, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            [src_gpu; 4],
+            table_gpu,
+        );
+        // SAFETY: mapped table; list has not run yet.
+        let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 0, 0, 0]) };
+        for _ in 0..3 {
+            assert_eq!(table.place(1, 0, 10), Some(0));
+        }
+        warp.submit_and_wait();
+        // SAFETY: list finished; mapped words.
+        let words: [u32; 3] = std::array::from_fn(|i| unsafe {
+            budget_ptr.cast::<u32>().add(i).read_volatile()
+        });
+        assert_eq!(words[0], 12 * 128 * 3, "budget spent");
+        assert_eq!(words[1], 12, "largest mesh dispatch asked");
+        assert_eq!(words[2], 36, "total mesh groups asked across 3 executions");
     }
 
     /// Two batches through a host list, twice (the second recording finds

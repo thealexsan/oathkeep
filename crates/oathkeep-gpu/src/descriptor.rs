@@ -343,7 +343,14 @@ pub(crate) fn sync_heaps() {
         let taken = written.take(start as usize, end as usize);
         spent[0] += since(began);
         let mut parts: Vec<(usize, usize)> = Vec::new();
+        let capped_from = (mirrored_count < heap.desc.count)
+            .then(|| (start + u64::from(mirrored_count) * step) as usize);
         for (range_from, range_end) in taken {
+            if let Some(cap_at) = capped_from
+                && range_end > cap_at
+            {
+                host.note_capped_raw_page();
+            }
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
@@ -529,6 +536,31 @@ pub(crate) fn sync_line(frames: f64) {
             twins as f64 / frames,
             moved as f64 / frames,
             lost as f64 / frames
+        );
+    }
+    if let Some(Some((
+        count,
+        title_count,
+        dynamic,
+        peak_dynamic,
+        highest_direct,
+        highest_capped,
+        [below_null, past_null, for_draw],
+        raw_pages,
+    ))) = with_view_heap(host::HostHeap::capped_telemetry)
+    {
+        tracing::info!(
+            direct_slots = count,
+            title_slots = title_count,
+            dynamic_slots = dynamic,
+            peak_dynamic,
+            highest_direct,
+            highest_capped,
+            past_count_below_null = below_null,
+            past_null,
+            past_count_for_draw = for_draw,
+            capped_raw_pages = raw_pages,
+            "capped host view heap telemetry (direct slots past cap require table snapshots or shader-side remap)"
         );
     }
     let [pages, looked, mirrored, micros, tabled, later, waited] = [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
