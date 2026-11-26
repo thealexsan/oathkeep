@@ -3125,11 +3125,12 @@ fn make_detailed(
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
+            let aligned = size.next_multiple_of(256);
+            let Some(shadow) = crate::shadow::find(address, u64::from(aligned)) else {
                 return (None, None, None);
             };
             let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
+            if gpu % 256 != 0 || shadow.left(address) < u64::from(aligned) {
                 once!(
                     address = format_args!("{address:#x}"),
                     "constant buffer not 256-byte aligned on the host"
@@ -3138,7 +3139,7 @@ fn make_detailed(
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: aligned,
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };

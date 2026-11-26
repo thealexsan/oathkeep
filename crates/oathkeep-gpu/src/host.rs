@@ -842,6 +842,7 @@ pub(crate) struct HostList {
     scratch: Mutex<Scratch>,
     states: Mutex<States>,
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    has_twins: std::sync::atomic::AtomicBool,
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     budget: OnceLock<Option<ID3D12Resource>>,
     indirect_pool: Mutex<IndirectPool>,
@@ -3583,6 +3584,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                has_twins: std::sync::atomic::AtomicBool::new(false),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_pool: Mutex::default(),
@@ -6733,7 +6735,11 @@ impl HostList {
         let old_deferred = std::mem::take(&mut *self.deferred());
         let old_states =
             std::mem::take(&mut *self.states.lock().unwrap_or_else(|e| e.into_inner()));
-        let old_twins = std::mem::take(&mut *self.twins.lock().unwrap_or_else(|e| e.into_inner()));
+        let old_twins = if self.has_twins.swap(false, Ordering::AcqRel) {
+            std::mem::take(&mut *self.twins.lock().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            std::collections::HashMap::new()
+        };
         let old_pipelines =
             std::mem::take(&mut *self.pipelines.lock().unwrap_or_else(|e| e.into_inner()));
         #[cfg(feature = "diagnostics")]
@@ -6845,6 +6851,7 @@ impl HostList {
         };
         let side = usize::from(colour);
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        self.has_twins.store(true, Ordering::Release);
         let u = twins
             .entry(std::sync::Arc::as_ptr(&twin) as usize)
             .or_insert_with(|| TwinUse {
@@ -6920,6 +6927,9 @@ impl HostList {
     }
 
     fn twins_to_depth(&self) {
+        if !self.has_twins.load(Ordering::Acquire) {
+            return;
+        }
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let written: Vec<_> = twins
@@ -6943,6 +6953,9 @@ impl HostList {
     }
 
     pub(crate) fn twins_written(&self) {
+        if !self.has_twins.load(Ordering::Acquire) {
+            return;
+        }
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         for u in twins.values_mut().filter(|u| u.writing) {
             u.writing = false;
@@ -6956,21 +6969,22 @@ impl HostList {
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let mut syncs = Vec::new();
-        let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
-        for u in twins.values() {
-            let real = u.twin.behind.load(Ordering::Relaxed);
-            let mut behind = [real & 1 != 0, real & 2 != 0];
-            for side in [0, 1] {
-                if u.needs[side] && behind[side] {
-                    syncs.push((u.depth.clone(), u.twin.clone(), side == 1));
-                    behind = [false; 2];
+        if self.has_twins.load(Ordering::Acquire) {
+            let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+            for u in twins.values() {
+                let real = u.twin.behind.load(Ordering::Relaxed);
+                let mut behind = [real & 1 != 0, real & 2 != 0];
+                for side in [0, 1] {
+                    if u.needs[side] && behind[side] {
+                        syncs.push((u.depth.clone(), u.twin.clone(), side == 1));
+                        behind = [false; 2];
+                    }
                 }
+                let left = [0, 1].map(|side| u.behind[side].unwrap_or(behind[side]));
+                let left = u32::from(left[0]) | (u32::from(left[1]) << 1);
+                u.twin.behind.store(left, Ordering::Relaxed);
             }
-            let left = [0, 1].map(|side| u.behind[side].unwrap_or(behind[side]));
-            let left = u32::from(left[0]) | (u32::from(left[1]) << 1);
-            u.twin.behind.store(left, Ordering::Relaxed);
         }
-        drop(twins);
         let mut to_copy = Vec::new();
         let mut barriers = Vec::new();
         let mut copying = std::collections::HashMap::new();
@@ -7102,11 +7116,7 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty()
-            && self
-                .twins
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
+            && !self.has_twins.load(Ordering::Acquire)
     }
 
     pub(crate) fn used_pipeline(&self, name: &str) {

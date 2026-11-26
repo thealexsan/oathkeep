@@ -195,11 +195,14 @@ pub(crate) struct State {
     host_pipeline: usize,
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    fresh_tables: std::collections::HashMap<(u64, u32, u128), u32>,
+    fresh_tables: std::collections::HashMap<(usize, u32, u128), u32>,
     dynamic: Vec<(usize, u32, u32)>,
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     tables_gone: bool,
+    shadow_cache: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    shadow_cache_gen: u64,
+    constants_pool: Vec<Vec<u32>>,
     scratch_fresh: Vec<u8>,
     scratch_made: Vec<(u8, u32)>,
     scratch_entries: Vec<usize>,
@@ -655,38 +658,125 @@ pub(crate) fn dispatched() -> u64 {
 
 fn direct_cbv() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OATHKEEP_DIRECT_CBV").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_DIRECT_CBV").is_none_or(|v| v != "0"))
 }
 
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
-    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        std::env::var("OATHKEEP_ROOT_VIEW_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map_or(u64::MAX, |mb| mb << 20)
-    });
-    let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow.left(address).min(if srv { limit } else { 1 << 16 });
-    let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
-        shadow.refresh(list, address, len);
-        if !srv && shadow.ever_written() {
-            list.uav_barrier_if_dirty();
+const SHADOW_CACHE_CAP: usize = 16;
+
+impl State {
+    #[inline]
+    fn sync_shadow_cache(&mut self) {
+        let g = crate::shadow::generation();
+        if self.shadow_cache_gen != g {
+            self.shadow_cache.clear();
+            self.shadow_cache_gen = g;
         }
-        return Some(gpu);
     }
-    if shadow.is_gpu_active(list, address, len) {
-        shadow.refresh(list, address, len);
-        if let Some((_, _, scratch_gpu)) =
-            list.gpu_copy_scratch(&shadow.buffer, shadow.offset(address), len, 256)
+
+    #[inline]
+    fn cache_shadow(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+        if let Some(pos) = self
+            .shadow_cache
+            .iter()
+            .position(|s| std::sync::Arc::ptr_eq(s, shadow))
         {
-            return Some(scratch_gpu);
+            if pos > 0 {
+                self.shadow_cache[..=pos].rotate_right(1);
+            }
+            return;
         }
+        if self.shadow_cache.len() >= SHADOW_CACHE_CAP {
+            self.shadow_cache.pop();
+        }
+        self.shadow_cache.insert(0, shadow.clone());
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+
+    #[inline]
+    fn lookup_shadow_cached(
+        &mut self,
+        address: u64,
+        len: u64,
+    ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        self.sync_shadow_cache();
+        let end = address.checked_add(len.max(1))?;
+        let unsized_ask = len <= 1;
+        let pos = self.shadow_cache.iter().position(|s| {
+            let (start, slen) = s.span();
+            start <= address
+                && end <= start.saturating_add(slen)
+                && (!unsized_ask || !s.is_window() || s.left(address) >= (256 << 10))
+        })?;
+        if pos > 0 {
+            self.shadow_cache[..=pos].rotate_right(1);
+        }
+        Some(self.shadow_cache[0].clone())
+    }
+
+    fn find_shadow(&mut self, address: u64, len: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        if let Some(s) = self.lookup_shadow_cached(address, len) {
+            return Some(s);
+        }
+        let s = crate::shadow::find(address, len)?;
+        self.cache_shadow(&s);
+        Some(s)
+    }
+
+    fn find_shadow_any(
+        &mut self,
+        address: u64,
+        len: u64,
+    ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        if let Some(s) = self.lookup_shadow_cached(address, len) {
+            return Some(s);
+        }
+        let s = crate::shadow::find_any(address, len)?;
+        self.cache_shadow(&s);
+        Some(s)
+    }
+
+    fn find_shadow_existing(
+        &mut self,
+        address: u64,
+        len: u64,
+    ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        if let Some(s) = self.lookup_shadow_cached(address, len) {
+            return Some(s);
+        }
+        let s = crate::shadow::find_existing(address, len)?;
+        self.cache_shadow(&s);
+        Some(s)
+    }
+
+    fn root_view(&mut self, list: &HostList, address: u64, srv: bool) -> Option<u64> {
+        static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let limit = *LIMIT.get_or_init(|| {
+            std::env::var("OATHKEEP_ROOT_VIEW_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map_or(u64::MAX, |mb| mb << 20)
+        });
+        let shadow = self.find_shadow(address, 1)?;
+        let len = shadow.left(address).min(if srv { limit } else { 1 << 16 });
+        let gpu = shadow.gpu(address);
+        if srv || gpu % 256 == 0 {
+            shadow.refresh(list, address, len);
+            if !srv && shadow.ever_written() {
+                list.uav_barrier_if_dirty();
+            }
+            return Some(gpu);
+        }
+        if shadow.is_gpu_active(list, address, len) {
+            shadow.refresh(list, address, len);
+            if let Some((_, _, scratch_gpu)) =
+                list.gpu_copy_scratch(&shadow.buffer, shadow.offset(address), len, 256)
+            {
+                return Some(scratch_gpu);
+            }
+        }
+        let (gpu, to) = list.scratch(len)?;
+        list.defer_fill(to, address as *const u8, len as usize);
+        Some(gpu)
+    }
 }
 
 macro_rules! once {
@@ -710,8 +800,14 @@ impl State {
         self.tables_gone = false;
         self.pipeline = pipeline as usize;
         self.heaps = [0; 2];
-        self.graphics.clear();
-        self.compute.clear();
+        for r in self.graphics.drain(..).chain(self.compute.drain(..)) {
+            if let Root::Constants(mut v) = r
+                && self.constants_pool.len() < 32
+            {
+                v.clear();
+                self.constants_pool.push(v);
+            }
+        }
         self.vertex = [VertexView::default(); 32];
         self.index = IndexView::default();
         self.targets.clear();
@@ -731,6 +827,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.shadow_cache.clear();
     }
 
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
@@ -782,12 +879,20 @@ impl State {
     }
 
     pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) {
-        let roots = self.roots(compute);
         let s = slot as usize;
-        if !matches!(roots.get(s), Some(Root::Constants(_))) {
-            set(roots, slot, Root::Constants(Vec::new()));
+        let needs_new = {
+            let roots = if compute {
+                &self.compute
+            } else {
+                &self.graphics
+            };
+            !matches!(roots.get(s), Some(Root::Constants(_)))
+        };
+        if needs_new {
+            let buf = self.constants_pool.pop().unwrap_or_default();
+            set(self.roots(compute), slot, Root::Constants(buf));
         }
-        if let Root::Constants(c) = &mut roots[s] {
+        if let Root::Constants(c) = &mut self.roots(compute)[s] {
             let end = offset as usize + values.len();
             if c.len() < end {
                 c.resize(end, 0);
@@ -998,14 +1103,30 @@ impl State {
             return memory.map_or(0, |m| m.base);
         }
         if kind == USER_VIEW_BIAS {
-            return match self.roots_ref(compute).get(usize::from(slot)) {
-                Some(&Root::View(address)) => crate::shadow::find(address, 1).map_or(0, |s| {
-                    // SAFETY: a live buffer.
-                    let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                    ((s.gpu(address) - base) & 15) as u32
-                }),
-                _ => 0,
+            let address = match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::View(address)) => Some(address),
+                _ => None,
             };
+            let Some(address) = address else { return 0 };
+            let shadow = (self.shadow_cache_gen == crate::shadow::generation())
+                .then(|| {
+                    self.shadow_cache
+                        .iter()
+                        .find(|s| {
+                            let (start, slen) = s.span();
+                            start <= address
+                                && address < start.saturating_add(slen)
+                                && (!s.is_window() || s.left(address) >= (256 << 10))
+                        })
+                        .cloned()
+                })
+                .flatten()
+                .or_else(|| crate::shadow::find(address, 1));
+            return shadow.map_or(0, |s| {
+                // SAFETY: a live buffer.
+                let base = unsafe { s.buffer.GetGPUVirtualAddress() };
+                ((s.gpu(address) - base) & 15) as u32
+            });
         }
         if kind != USER_VIEW_ADDRESS && kind != USER_VIEW_ADDRESS + 1 {
             once!(kind, "a shader reads a host value this build does not know");
@@ -1101,15 +1222,12 @@ impl State {
         if p.slots != 0 {
             let limit = 32 - p.slots.leading_zeros() as usize;
             let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
-            for (slot, (view, &v)) in views[..limit]
-                .iter_mut()
-                .zip(&self.vertex[..limit])
-                .enumerate()
-            {
+            for (slot, view) in views[..limit].iter_mut().enumerate() {
+                let v = self.vertex[slot];
                 if p.slots & (1 << slot) == 0 || v.address == 0 || v.size == 0 {
                     continue;
                 }
-                let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                let Some(shadow) = self.find_shadow_any(v.address, u64::from(v.size)) else {
                     continue;
                 };
                 shadow.refresh(list, v.address, u64::from(v.size));
@@ -1126,7 +1244,7 @@ impl State {
         }
         if indexed {
             let v = self.index;
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+            let Some(shadow) = self.find_shadow_any(v.address, u64::from(v.size)) else {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -1324,7 +1442,7 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(mut gpu) = root_view(list, address, srv) else {
+                    let Some(mut gpu) = self.root_view(list, address, srv) else {
                         continue;
                     };
                     if biased {
@@ -1397,8 +1515,8 @@ impl State {
                 .and_then(|v| v.parse::<u64>().ok())
                 .map_or(u64::MAX, |mb| mb << 20)
         });
-        let find = |a: u64| {
-            let s = crate::shadow::find(a, 1)?;
+        let find = |state: &mut Self, a: u64| {
+            let s = state.find_shadow(a, 1)?;
             // SAFETY: a live buffer.
             let flags = unsafe { s.buffer.GetDesc() }.Flags;
             if flags.0 & UNORDERED == 0 {
@@ -1415,7 +1533,7 @@ impl State {
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
-            let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
+            let Some((a, s)) = address.and_then(|a| Some((a, find(self, a)?))) else {
                 once!("a root UAV with nothing to bind: the draw is dropped");
                 return false;
             };
@@ -1448,7 +1566,7 @@ impl State {
             }
             *index
         } else {
-            let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
+            let shadow = address.and_then(|a| find(self, a).map(|s| (a, s)));
             let Some(index) = host.dynamic(1) else {
                 return false;
             };
@@ -1510,7 +1628,7 @@ impl State {
             }
             *index
         } else {
-            let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+            let shadow = address.and_then(|a| self.find_shadow(a, 1).map(|s| (a, s)));
             let Some(index) = host.dynamic(1) else {
                 return false;
             };
@@ -2893,7 +3011,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -2905,11 +3023,33 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
+            if let View::Constant(address, size) = view {
+                let size_u64 = u64::from(size);
+                if let Some(shadow) = self.find_shadow(address, size_u64) {
+                    shadow.refresh(list, address, size_u64);
+                    if shadow.ever_written() {
+                        list.uav_barrier_if_dirty();
+                    }
+                }
+                return;
+            }
             readable(list, u.kind, &view);
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
             }
         }
+    }
+
+    fn can_direct_cbv(&mut self, handle: u64) -> bool {
+        if !direct_cbv() {
+            return false;
+        }
+        let Some(View::Constant(address, size)) = crate::descriptor::view(handle) else {
+            return false;
+        };
+        let aligned = u64::from(size.next_multiple_of(256));
+        self.find_shadow(address, aligned)
+            .is_some_and(|shadow| shadow.gpu(address) % 256 == 0 && shadow.left(address) >= aligned)
     }
 
     fn tables_into(
@@ -2923,12 +3063,6 @@ impl State {
         self.scratch_made.clear();
         for u in used {
             if u.root != RootType::Table {
-                continue;
-            }
-            if u.kind == ResourceType::Cbv {
-                if !self.scratch_fresh.contains(&u.slot) {
-                    self.scratch_fresh.push(u.slot);
-                }
                 continue;
             }
             if self.scratch_fresh.contains(&u.slot) {
@@ -2946,6 +3080,43 @@ impl State {
             };
             if index >= host.count() {
                 self.scratch_fresh.push(u.slot);
+                continue;
+            }
+            if u.kind == ResourceType::Cbv && !self.can_direct_cbv(end) {
+                self.scratch_fresh.push(u.slot);
+            }
+        }
+        for ix in indexed {
+            if self.scratch_fresh.contains(&ix.table_slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) =
+                self.roots_ref(compute).get(usize::from(ix.table_slot))
+            else {
+                continue;
+            };
+            let Some(heap) = self.heap_of(table) else {
+                continue;
+            };
+            let Some(host) = heap.host() else {
+                continue;
+            };
+            let constant = self.user_value(
+                compute,
+                ix.constant_slot,
+                RootType::Constants,
+                ix.constant_dword,
+            );
+            let k = ix.byte_offset.wrapping_add(constant << ix.shift) / 32;
+            let handle = table + u64::from(k) * 32;
+            let Some(index) = heap.index(handle) else {
+                continue;
+            };
+            if index >= host.count()
+                || (matches!(crate::descriptor::view(handle), Some(View::Constant(..)))
+                    && !self.can_direct_cbv(handle))
+            {
+                self.scratch_fresh.push(ix.table_slot);
             }
         }
         self.scratch_fresh.sort_unstable();
@@ -2953,6 +3124,49 @@ impl State {
         for u in used {
             if u.root == RootType::Table && !self.scratch_fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
+            }
+        }
+        for ix in indexed {
+            if self.scratch_fresh.contains(&ix.table_slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) =
+                self.roots_ref(compute).get(usize::from(ix.table_slot))
+            else {
+                continue;
+            };
+            let Some(heap) = self.heap_of(table) else {
+                continue;
+            };
+            let Some(host) = heap.host() else {
+                continue;
+            };
+            let constant = self.user_value(
+                compute,
+                ix.constant_slot,
+                RootType::Constants,
+                ix.constant_dword,
+            );
+            let k = ix.byte_offset.wrapping_add(constant << ix.shift) / 32;
+            let handle = table + u64::from(k) * 32;
+            let Some(index) = heap.index(handle) else {
+                continue;
+            };
+            if let Some(view) = host.mirror(index, handle, true) {
+                if let View::Constant(address, size) = view {
+                    let size_u64 = u64::from(size);
+                    if let Some(shadow) = self.find_shadow(address, size_u64) {
+                        shadow.refresh(list, address, size_u64);
+                        if shadow.ever_written() {
+                            list.uav_barrier_if_dirty();
+                        }
+                    }
+                } else if let Some(kind) = view_kind(&view) {
+                    readable(list, kind, &view);
+                    if crate::descriptor::host::is_texture_view(&view) {
+                        host.texture_slot_tabled(index, true);
+                    }
+                }
             }
         }
         for fresh_i in 0..self.scratch_fresh.len() {
@@ -3006,32 +3220,34 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
+            let heap_id = std::ptr::from_ref(heap) as usize;
             let key = {
                 let mut h1 = 0xcbf2_9ce4_8422_2325_u64 ^ u64::from(n);
-                let mut h2 = 0x517c_c1b7_2722_0a95_u64 ^ table;
+                let mut h2 = 0x517c_c1b7_2722_0a95_u64 ^ (heap_id as u64);
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     let words = unsafe { (at as *const [u32; 3]).read_unaligned() };
                     hash_table_words(&words, &mut h1, &mut h2);
                 }
-                (table, n, finalize_table_hash(h1, h2))
+                (heap_id, n, finalize_table_hash(h1, h2))
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for &idx in &self.scratch_entries {
+                for entry_i in 0..self.scratch_entries.len() {
+                    let idx = self.scratch_entries[entry_i];
                     let u = &used[idx];
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if u.kind == ResourceType::Cbv {
                         if let Some(View::Constant(address, size)) = crate::descriptor::view(handle)
                         {
                             let size_u64 = u64::from(size);
-                            let existing = crate::shadow::find_existing(address, size_u64);
+                            let existing = self.find_shadow_existing(address, size_u64);
                             let gpu_active = existing
                                 .as_ref()
                                 .is_some_and(|s| s.is_gpu_active(list, address, size_u64));
                             if (direct_cbv() || gpu_active)
                                 && let Some(shadow) =
-                                    existing.or_else(|| crate::shadow::find(address, size_u64))
+                                    existing.or_else(|| self.find_shadow(address, size_u64))
                             {
                                 let gpu = shadow.gpu(address);
                                 let aligned = size.next_multiple_of(256);
@@ -3049,7 +3265,8 @@ impl State {
                         readable(list, u.kind, &view);
                     }
                 }
-                for &k in &self.scratch_selected {
+                for sel_i in 0..self.scratch_selected.len() {
+                    let k = self.scratch_selected[sel_i];
                     if self
                         .scratch_entries
                         .iter()
@@ -3072,8 +3289,7 @@ impl State {
                 continue;
             };
             let mut cacheable = true;
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            self.dynamic.push((heap_id, first, n));
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
             for k in 0..n {
                 let index = first + k;
@@ -3085,13 +3301,13 @@ impl State {
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let size_u64 = u64::from(size);
-                        let existing = crate::shadow::find_existing(address, size_u64);
+                        let existing = self.find_shadow_existing(address, size_u64);
                         let gpu_active = existing
                             .as_ref()
                             .is_some_and(|s| s.is_gpu_active(list, address, size_u64));
                         if (direct_cbv() || gpu_active)
                             && let Some(shadow) =
-                                existing.or_else(|| crate::shadow::find(address, size_u64))
+                                existing.or_else(|| self.find_shadow(address, size_u64))
                         {
                             let gpu = shadow.gpu(address);
                             let aligned = size.next_multiple_of(256);
@@ -3400,12 +3616,12 @@ impl State {
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
-        let Some(args) = crate::shadow::find_any(arguments, len) else {
+        let Some(args) = self.find_shadow_any(arguments, len) else {
             why("arguments outside title buffers");
             return false;
         };
         let counter = match count {
-            Some(at) => match crate::shadow::find_any(at, 4) {
+            Some(at) => match self.find_shadow_any(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
                     why("count outside title buffers");
@@ -3679,37 +3895,58 @@ impl State {
 }
 
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+    thread_local! {
+        static LOCAL: std::cell::RefCell<Vec<((u32, u32), ID3D12CommandSignature)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(s) = LOCAL.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(k, _)| *k == (kind, stride))
+            .map(|(_, s)| s.clone())
+    }) {
+        return Some(s);
+    }
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
-    }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-        ..Default::default()
+    let signature = if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+        s.clone()
+    } else {
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: stride,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a description of one argument; no root arguments.
+        let result = unsafe {
+            crate::host::host()?.device.CreateCommandSignature(
+                &desc,
+                None::<&ID3D12RootSignature>,
+                &mut signature,
+            )
+        };
+        if let Err(e) = result {
+            once!(error = %e, kind, stride, "host command signature refused");
+            return None;
+        }
+        let signature = signature?;
+        made.push(((kind, stride), signature.clone()));
+        signature
     };
-    let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
-        NodeMask: 0,
-    };
-    let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
-    let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
-    };
-    if let Err(e) = result {
-        once!(error = %e, kind, stride, "host command signature refused");
-        return None;
-    }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
+    drop(made);
+    LOCAL.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() < 32 && !c.iter().any(|(k, _)| *k == (kind, stride)) {
+            c.push(((kind, stride), signature.clone()));
+        }
+    });
     Some(signature)
 }
 

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use oathkeep_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -21,11 +21,13 @@ struct Memory {
     refused: std::collections::HashSet<u64>,
 }
 
-// SAFETY: the mappings are of buffers the struct owns; all access is under
-// the mutex.
+// SAFETY: the mappings are of buffers the struct owns; all mutation is under
+// the write lock and shared readers only read immutable fields or atomic/volatile
+// directory entries.
 unsafe impl Send for Memory {}
+unsafe impl Sync for Memory {}
 
-static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
+static MEMORY: RwLock<Option<Memory>> = RwLock::new(None);
 
 pub(crate) struct Ready {
     pub(crate) directory: u64,
@@ -157,6 +159,47 @@ impl Memory {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
     }
+
+    #[inline]
+    fn is_mapped(&self, address: u64) -> bool {
+        let page = address / PAGE;
+        if page >= u64::from(MEMORY_PAGES) - 1 {
+            return true;
+        }
+        // SAFETY: inside the directory's mapping.
+        let entry = unsafe { self.directory.1.add(page as usize * 2) };
+        // SAFETY: as above.
+        if unsafe { entry.read_volatile() } != 0 {
+            return true;
+        }
+        self.refused.contains(&page)
+    }
+
+    #[inline]
+    fn is_named(&self, address: u64) -> bool {
+        self.is_mapped(address) && self.is_mapped((address & !(CELL - 1)) + CELL)
+    }
+
+    fn all_named(&self, addresses: &[u64], constants: &[u32]) -> bool {
+        for &address in addresses {
+            if !self.is_named(address) {
+                return false;
+            }
+        }
+        for (i, &c) in constants.iter().enumerate() {
+            if let Some(&high) = constants.get(i + 1)
+                && (1..=0xFF).contains(&high)
+                && c >= 0x1_0000
+                && !self.is_named(u64::from(c) | u64::from(high) << 32)
+            {
+                return false;
+            }
+            if c >= 0x0100_0000 && !self.is_named(u64::from(c) << 8) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 pub(crate) fn ready(
@@ -166,12 +209,47 @@ pub(crate) fn ready(
     constants: &[u32],
     writes: bool,
 ) -> Option<Ready> {
-    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    const READ: usize = usize::MAX - 0x6d;
+    const WRITE: usize = usize::MAX - 0x6e;
+    let frame = crate::frame::current();
+    let key = std::ptr::from_ref(heap) as usize;
+    {
+        let guard = MEMORY.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = guard.as_ref()
+            && m.frame == frame
+            && let Some(&(base, made)) = m.heaps.get(&key)
+            && made as usize == m.copies.len()
+            && m.all_named(addresses, constants)
+        {
+            let first_read = list.first_use(READ);
+            let first_write = writes && list.first_use(WRITE);
+            if first_read || first_write {
+                for shadow in &m.copies {
+                    let (start, len) = shadow.span();
+                    if first_read {
+                        shadow.refresh(list, start, len);
+                    }
+                    if first_write {
+                        shadow.gpu_writes(list, start, len);
+                    }
+                }
+                if first_read {
+                    list.keep(&m.directory.0);
+                    list.keep(&m.faults.0);
+                }
+            }
+            return Some(Ready {
+                directory: m.directory.2,
+                faults: m.faults.2,
+                base,
+            });
+        }
+    }
+    let mut guard = MEMORY.write().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Memory::new();
     }
     let m = guard.as_mut()?;
-    let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;
         m.refused.clear();
@@ -192,7 +270,6 @@ pub(crate) fn ready(
             m.name(u64::from(c) << 8);
         }
     }
-    let key = std::ptr::from_ref(heap) as usize;
     let (base, made) = match m.heaps.get(&key) {
         Some(&run) => run,
         None => {
@@ -206,8 +283,6 @@ pub(crate) fn ready(
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
-    const READ: usize = usize::MAX - 0x6d;
-    const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
     for (n, shadow) in m.copies.iter().enumerate() {

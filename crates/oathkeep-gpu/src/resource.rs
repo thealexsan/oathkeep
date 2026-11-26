@@ -984,8 +984,8 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 }
 
 #[cfg(windows)]
-static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static TARGETS_AT: std::sync::RwLock<std::collections::BTreeMap<u64, usize>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
 
 #[cfg(windows)]
 pub(crate) fn alias_of(this: This) -> Option<This> {
@@ -1010,7 +1010,7 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     if !r.host.placed.load(Relaxed) || !fills(&r.desc) || !one(&r.desc) {
         return None;
     }
-    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let targets = TARGETS_AT.read().unwrap_or_else(|e| e.into_inner());
     let other = *targets.get(&(r.data() as u64))? as This;
     let o = resource(other);
     const DEPTH: u32 = 0x2;
@@ -1249,7 +1249,7 @@ pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;
     key[13] = 0;
-    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = PLACED_TEXTURES.read().unwrap_or_else(|e| e.into_inner());
     map.get(&(address, key))
         .or_else(|| map.get(&(address, *desc)))
         .map(|&r| r as This)
@@ -1722,7 +1722,7 @@ impl Drop for HostTexture {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_textures() -> u64 {
     PLACED_TEXTURES
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .len() as u64
 }
@@ -2030,7 +2030,7 @@ fn hand_out_resource(
         textures().insert(at);
         if !fills(&desc) {
             TARGETS_AT
-                .lock()
+                .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(resource.data() as u64, at);
         }
@@ -2052,7 +2052,7 @@ impl Drop for Resource {
         if self.desc.dimension != BUFFER {
             textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
             if !fills(&self.desc) {
-                let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+                let mut targets = TARGETS_AT.write().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
                 if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
                     targets.remove(&at);
@@ -2232,8 +2232,8 @@ pub(crate) extern "system" fn create_at_address(
 }
 
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static PLACED_TEXTURES: std::sync::RwLock<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
 
 #[cfg(windows)]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
@@ -2262,7 +2262,7 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;
     key[13] = 0;
-    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = PLACED_TEXTURES.read().unwrap_or_else(|e| e.into_inner());
     let found = map
         .get(&(address, key))
         .or_else(|| map.get(&(address, *desc)))?;
@@ -2279,7 +2279,16 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         key[13] = 0;
     }
     let desc = &key;
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let map = PLACED_TEXTURES.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(&r) = map.get(&(address, *desc)) {
+            return Some(r as This);
+        }
+    }
+    let mut map = PLACED_TEXTURES.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(&r) = map.get(&(address, *desc)) {
+        return Some(r as This);
+    }
     if raw != key {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((address, raw)) {
@@ -2295,9 +2304,6 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
                 PLACED_TWINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
-    }
-    if let Some(&r) = map.get(&(address, *desc)) {
-        return Some(r as This);
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };

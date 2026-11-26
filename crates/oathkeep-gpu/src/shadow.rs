@@ -3327,6 +3327,7 @@ fn let_go_idle_with(urgent: bool) {
         }
     };
     if !gone_loose.is_empty() || !gone_buffers.is_empty() {
+        SHADOW_GEN.fetch_add(1, Ordering::Release);
         let went = gone_loose.len() + gone_buffers.len();
         let bytes: u64 = gone_loose
             .iter()
@@ -3934,6 +3935,10 @@ impl Shadow {
         }
     }
 
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
+
     pub(crate) fn merge_under_writes(
         &self,
         address: usize,
@@ -3958,9 +3963,7 @@ impl Shadow {
         }
         let mode = self.watched.load(Ordering::Relaxed);
         if mode == NOT_WATCHED {
-            #[cfg(feature = "diagnostics")]
-            Self::log_why_stale("not_watched", self, 0, from, to);
-            return true;
+            return self.merge_unwatched(start, &busy, runs_left);
         }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
@@ -4145,6 +4148,160 @@ impl Shadow {
                     if page >= base && page - base < copied.len() && copied.set_page(page - base, now) {
                         self.uncopied.fetch_sub(1, Ordering::Release);
                     }
+                }
+            }
+        }
+        false
+    }
+
+    fn merge_unwatched(
+        &self,
+        start: usize,
+        busy: &[(usize, usize)],
+        runs_left: &mut usize,
+    ) -> bool {
+        if let Some(card) = &self.card {
+            if !card.has_old.load(Ordering::Acquire) {
+                #[cfg(feature = "diagnostics")]
+                if let Some(&(a, e)) = busy.first() {
+                    Self::log_why_stale("no_card_old", self, 0, a, e);
+                }
+                return true;
+            }
+            let mut piece_title = vec![0u8; PIECE];
+            let mut diffs: Vec<(usize, MergeDiff)> = Vec::new();
+            for &(a, e) in busy {
+                let first_piece = self.pieces(a - start, e - start);
+                for p in first_piece {
+                    let (p_lo, p_hi) = self.piece(p);
+                    let c_lo = (a - start).max(p_lo);
+                    let c_hi = (e - start).min(p_hi);
+                    if c_lo >= c_hi {
+                        continue;
+                    }
+                    let n = c_hi - c_lo;
+                    let title = &mut piece_title[..n];
+                    diffs.clear();
+                    {
+                        let _before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                        if !crate::host::read_into((start + c_lo) as *const u8, title) {
+                            continue;
+                        }
+                        let mut old = card.old.lock().unwrap_or_else(|e| e.into_inner());
+                        let Some(piece_buf) = old.get_mut(&p) else {
+                            #[cfg(feature = "diagnostics")]
+                            Self::log_why_stale("no_card_old", self, p, start + c_lo, start + c_hi);
+                            return true;
+                        };
+                        let held_piece = &mut piece_buf[c_lo - p_lo..c_hi - p_lo];
+                        if title == held_piece {
+                            continue;
+                        }
+                        let lo_page = (start + c_lo) / PAGE;
+                        let hi_page = (start + c_hi).div_ceil(PAGE);
+                        for page in lo_page..hi_page {
+                            let pg_lo = (page * PAGE).max(start + c_lo) - start;
+                            let pg_hi = ((page + 1) * PAGE).min(start + c_hi) - start;
+                            if pg_lo >= pg_hi {
+                                continue;
+                            }
+                            let t_pg = &title[pg_lo - c_lo..pg_hi - c_lo];
+                            let h_pg = &mut held_piece[pg_lo - c_lo..pg_hi - c_lo];
+                            if t_pg == h_pg {
+                                continue;
+                            }
+                            MERGED[0].fetch_add(1, Ordering::Relaxed);
+                            let max_runs = (*runs_left).min(16);
+                            let diff = diff_runs_or_masked(
+                                pg_lo,
+                                card.size as usize,
+                                t_pg,
+                                h_pg,
+                                max_runs,
+                            );
+                            if let MergeDiff::Runs(ref runs) = diff {
+                                *runs_left = runs_left.saturating_sub(runs.len());
+                            }
+                            if !matches!(diff, MergeDiff::Empty) {
+                                diffs.push((pg_lo, diff));
+                            }
+                        }
+                    }
+                    for (pg_lo, diff) in diffs.drain(..) {
+                        match diff {
+                            MergeDiff::Empty => {}
+                            MergeDiff::Runs(runs) => {
+                                for (r, m) in runs {
+                                    MERGED[1].fetch_add(1, Ordering::Relaxed);
+                                    MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                                    let (c_from, c_to) = (pg_lo + r, pg_lo + r + m);
+                                    card.clear_hot_hashes(c_from, c_to);
+                                    self.card_changed(c_from, c_to);
+                                }
+                            }
+                            MergeDiff::Masked {
+                                offset,
+                                data,
+                                mask,
+                                changed_runs,
+                                changed_bytes,
+                                first_off,
+                                last_end,
+                            } => {
+                                MERGED[1].fetch_add(changed_runs as u64, Ordering::Relaxed);
+                                MERGED[2].fetch_add(changed_bytes as u64, Ordering::Relaxed);
+                                card.clear_hot_hashes(first_off, last_end);
+                                self.card_masked_push(offset, data, mask);
+                            }
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+        const MAX_UNWATCHED_NONCARDED: usize = 1 << 20;
+        let mut title = vec![0u8; PAGE];
+        for &(a, e) in busy {
+            if e - a > MAX_UNWATCHED_NONCARDED {
+                #[cfg(feature = "diagnostics")]
+                Self::log_why_stale("not_watched_big", self, e - a, a, e);
+                return true;
+            }
+            let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(snapshot) = before.as_mut() else {
+                #[cfg(feature = "diagnostics")]
+                Self::log_why_stale("no_before", self, 0, a, e);
+                return true;
+            };
+            for page in (a / PAGE)..e.div_ceil(PAGE) {
+                let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                if lo >= hi {
+                    continue;
+                }
+                let n = hi - lo;
+                let t = &mut title[..n];
+                if !crate::host::read_into(lo as *const u8, t) {
+                    continue;
+                }
+                let at = lo - start;
+                // SAFETY: the snapshot's allocation holds the copy's bytes at
+                // the copy's offsets (`writing`), and these are in a declared range.
+                let held =
+                    unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
+                if t == held {
+                    continue;
+                }
+                MERGED[0].fetch_add(1, Ordering::Relaxed);
+                for (r, m) in changed_runs(t, held) {
+                    // SAFETY: inside the copy's mapping. The card may be writing
+                    // the copy beside these bytes; they are written here and
+                    // nothing around them.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(t.as_ptr().add(r), self.data.add(at + r), m)
+                    };
+                    held[r..r + m].copy_from_slice(&t[r..r + m]);
+                    MERGED[1].fetch_add(1, Ordering::Relaxed);
+                    MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                 }
             }
         }
@@ -6473,8 +6630,16 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
     );
 }
 
+static SHADOW_GEN: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn generation() -> u64 {
+    SHADOW_GEN.load(Ordering::Acquire)
+}
+
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers_write().remove(&(start, resource));
+    if buffers_write().remove(&(start, resource)).is_some() {
+        SHADOW_GEN.fetch_add(1, Ordering::Release);
+    }
 }
 
 #[cfg(feature = "diagnostics")]
@@ -6516,6 +6681,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     }
     let n = gone.len() as u64;
     if !gone.is_empty() {
+        SHADOW_GEN.fetch_add(1, Ordering::Release);
         let mut evicted = INPLACE_EVICTED.lock().unwrap_or_else(|e| e.into_inner());
         for shadow in &gone {
             evicted.push((shadow.start, shadow.start.saturating_add(shadow.len)));
@@ -6716,10 +6882,19 @@ fn tails() -> bool {
 
 const TAIL_STEP: u64 = 256 << 10;
 
-fn tail_of(address: u64, end: u64) -> (u64, u64) {
-    let (cell, len) = window_of(address, end, WINDOW);
+fn tail_of_grid(address: u64, end: u64, cell_grid: u64) -> (u64, u64) {
+    let step_grid = cell_grid.max(TAIL_STEP);
+    let (cell, len) = window_of(
+        address,
+        end.max(address.saturating_add(TAIL_STEP)),
+        step_grid,
+    );
     let start = address & !(TAIL_STEP - 1);
     (start, cell + len - start)
+}
+
+fn tail_of(address: u64, end: u64) -> (u64, u64) {
+    tail_of_grid(address, end, window())
 }
 
 fn inplace_unsized_fallback(address: u64, end: u64) -> (u64, u64) {
@@ -6758,22 +6933,36 @@ fn cover(windows: impl Iterator<Item = (u64, u64)>) -> u64 {
     covered
 }
 
+fn longest_tail_grid(
+    windows: impl Iterator<Item = (u64, u64)>,
+    address: u64,
+    end: u64,
+    cell_grid: u64,
+) -> Option<(u64, u64)> {
+    let step_grid = cell_grid.max(TAIL_STEP);
+    let (cell, len) = window_of(
+        address,
+        end.max(address.saturating_add(TAIL_STEP)),
+        step_grid,
+    );
+    let step = address & !(TAIL_STEP - 1);
+    windows
+        .filter(|&(start, bytes)| start <= step && start + bytes == cell + len)
+        .min()
+}
+
 fn longest_tail(
     windows: impl Iterator<Item = (u64, u64)>,
     address: u64,
     end: u64,
 ) -> Option<(u64, u64)> {
-    let (cell, len) = window_of(address, end, WINDOW);
-    let step = address & !(TAIL_STEP - 1);
-    windows
-        .filter(|&(start, bytes)| start >= cell && start <= step && start + bytes == cell + len)
-        .min()
+    longest_tail_grid(windows, address, end, window())
 }
 
 static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
-    let (cell, _) = window_of(address, end, WINDOW);
+    let unsized_grid = window().max(TAIL_STEP);
     let search_from = address.saturating_sub(WINDOW);
     let inplace_l3 = crate::inplace::level() >= 3;
     let pick_existing = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| -> Option<(u64, u64)> {
@@ -6789,7 +6978,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             holder(there, address, end)
         } else if unsized_ask && tails() {
             let there = map
-                .range((cell, 0)..=(address, u64::MAX))
+                .range((search_from, 0)..=(address, u64::MAX))
                 .map(|(key, _)| *key);
             Some(longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end)))
         } else if (fine() || inplace_l3) && !unsized_ask {
@@ -6799,8 +6988,13 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 .map(|(key, _)| *key);
             holder(there, address, end)
         } else {
-            let grid_size = if unsized_ask { WINDOW } else { window() };
-            Some(window_of(address, end, grid_size))
+            let grid_size = if unsized_ask { unsized_grid } else { window() };
+            let target_end = if unsized_ask {
+                end.max(address.saturating_add(TAIL_STEP))
+            } else {
+                end
+            };
+            Some(window_of(address, target_end, grid_size))
         }
     };
     let note = |shadow: &Shadow| {
@@ -6821,8 +7015,13 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         }
     }
     let named = {
-        let grid_size = if unsized_ask { WINDOW } else { window() };
-        let grid = window_of(address, end, grid_size);
+        let grid_size = if unsized_ask { unsized_grid } else { window() };
+        let target_end = if unsized_ask {
+            end.max(address.saturating_add(TAIL_STEP))
+        } else {
+            end
+        };
+        let grid = window_of(address, target_end, grid_size);
         if inplace_l3 && !crate::inplace::section_run_in_place(grid.0, grid.1) {
             if let Some((rs, rl, next_mapped)) =
                 crate::inplace::section_run_around(address, end, grid_size)
@@ -6900,8 +7099,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 #[cfg(test)]
 mod window_tests {
     use super::{
-        TAIL_STEP, WINDOW, cover, grid, holder, inplace_unsized_fallback, longest_tail, tail_of,
-        window_of,
+        TAIL_STEP, WINDOW, cover, grid, holder, inplace_unsized_fallback, longest_tail_grid,
+        tail_of_grid, window_of,
     };
 
     #[test]
@@ -6961,15 +7160,18 @@ mod window_tests {
         let cell = 0xd_1200_0000u64;
         let ask = cell + 0x12_3456;
         assert_eq!(
-            tail_of(ask, ask + 1),
+            tail_of_grid(ask, ask + 1, WINDOW),
             (cell + 0x10_0000, WINDOW - 0x10_0000)
         );
-        assert_eq!(tail_of(cell + 0xffff, cell + 0x1_0000), (cell, WINDOW));
+        assert_eq!(
+            tail_of_grid(cell + 0xffff, cell + 0x1_0000, WINDOW),
+            (cell, WINDOW)
+        );
         let end = cell + WINDOW;
         let tail = |from: u64| (cell + from, WINDOW - from);
-        assert_eq!(longest_tail([].into_iter(), ask, ask + 1), None);
+        assert_eq!(longest_tail_grid([].into_iter(), ask, ask + 1, WINDOW), None);
         assert_eq!(
-            longest_tail([tail(0x20_0000)].into_iter(), ask, ask + 1),
+            longest_tail_grid([tail(0x20_0000)].into_iter(), ask, ask + 1, WINDOW),
             None
         );
         let there = [
@@ -6981,15 +7183,37 @@ mod window_tests {
             tail(0x20_0000),
         ];
         assert_eq!(
-            longest_tail(there.into_iter(), ask, ask + 1),
+            longest_tail_grid(there.into_iter(), ask, ask + 1, WINDOW),
             Some(tail(0x8_0000))
         );
         let (start, bytes) = tail(0x8_0000);
         assert!(start <= ask && start + bytes == end);
         let with_whole = [(cell, WINDOW), tail(0x8_0000)];
         assert_eq!(
-            longest_tail(with_whole.into_iter(), ask, ask + 1),
+            longest_tail_grid(with_whole.into_iter(), ask, ask + 1, WINDOW),
             Some((cell, WINDOW))
+        );
+
+        // 1 MiB window grid keeps at least TAIL_STEP headroom and snaps to 1 MiB cells.
+        let one_mb = 1u64 << 20;
+        assert_eq!(
+            tail_of_grid(cell + 0x1_2345, cell + 0x1_2346, one_mb),
+            (cell, one_mb)
+        );
+        assert_eq!(
+            tail_of_grid(cell + 0x5_0000, cell + 0x5_0001, one_mb),
+            (cell + 0x4_0000, one_mb - 0x4_0000)
+        );
+        // Near the end of a 1 MiB cell (<256 KiB left), extends into the next 1 MiB cell.
+        let near_end = cell + 0xd_0000;
+        let (ns, nl) = tail_of_grid(near_end, near_end + 1, one_mb);
+        assert_eq!((ns, nl), (cell + 0xc_0000, 0x14_0000));
+        assert!(ns + nl >= near_end + TAIL_STEP);
+        // A subsequent ask inside the next 1 MiB cell reuses that spanning tail without overlap.
+        let next_cell_ask = cell + one_mb + 0x2_0000;
+        assert_eq!(
+            longest_tail_grid([(ns, nl)].into_iter(), next_cell_ask, next_cell_ask + 1, one_mb),
+            Some((ns, nl))
         );
     }
 
@@ -7537,6 +7761,44 @@ mod window_tests {
 
         // New submission invalidates cache.
         assert_eq!(s.uncovered(2, st3, 50, 400), vec![(50, 400)]);
+    }
+
+    #[test]
+    fn unwatched_diff_helpers_merge_noncarded_8b_and_carded_pieces() {
+        use super::{MergeDiff, PAGE, PIECE, changed_runs, diff_runs_or_masked};
+
+        // 1. Non-carded 8-byte unwatched buffer (like 0x2e79cdf0000+0x8):
+        // unchanged bytes skip, changed bytes copy only the changed run and update snapshot.
+        let mut title_8 = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut host_8 = title_8;
+        let mut before_8 = title_8;
+        assert_eq!(title_8, before_8);
+        title_8[4..8].copy_from_slice(&[9, 10, 11, 12]);
+        let runs = changed_runs(&title_8, &before_8);
+        assert_eq!(runs, vec![(4, 4)]);
+        for (r, m) in runs {
+            host_8[r..r + m].copy_from_slice(&title_8[r..r + m]);
+            before_8[r..r + m].copy_from_slice(&title_8[r..r + m]);
+        }
+        assert_eq!(host_8, title_8);
+        assert_eq!(before_8, title_8);
+
+        // 2. Carded multi-page unwatched piece: equal pieces skip, changed piece emits runs
+        // at the piece's exact buffer offset `pg_lo + r`.
+        let mut old_piece = vec![0x22u8; PIECE];
+        let mut new_piece = old_piece.clone();
+        let piece_offset = 3 * PIECE;
+        new_piece[4096 + 16..4096 + 24].copy_from_slice(&[0xaa; 8]);
+        assert_ne!(new_piece, old_piece);
+        match diff_runs_or_masked(piece_offset, 4 * PIECE, &new_piece, &mut old_piece, 16) {
+            MergeDiff::Runs(runs) => {
+                assert_eq!(runs, vec![(4096 + 16, 8)]);
+                assert_eq!(piece_offset + runs[0].0, 3 * PIECE + 4096 + 16);
+            }
+            other => panic!("expected Runs, got {:?}", std::mem::discriminant(&other)),
+        }
+        assert_eq!(old_piece, new_piece);
+        let _ = PAGE;
     }
 }
 
