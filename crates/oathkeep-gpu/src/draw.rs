@@ -706,6 +706,7 @@ struct SlotView {
     to: u64,
     words: [u32; 3],
     pos: u32,
+    forgot: u32,
     flags: u8,
 }
 
@@ -801,7 +802,18 @@ impl<T> HeapRanges<T> {
         self.copies.get(&copy_key).map(|e| &e.copy)
     }
 
+    #[inline]
+    fn touch_forgot(&mut self, slot: u32, forgot: u32) {
+        if let Some(Some(entry)) = self.slots.get_mut(slot as usize) {
+            entry.forgot = forgot;
+        }
+    }
+
     fn set(&mut self, slot: u32, next: Option<(usize, T, u64, u64, [u32; 3], u8)>) {
+        self.set_with_forgot(slot, next, 0);
+    }
+
+    fn set_with_forgot(&mut self, slot: u32, next: Option<(usize, T, u64, u64, [u32; 3], u8)>, forgot: u32) {
         let idx = slot as usize;
         let Some((copy_key, copy, from, to, words, flags)) = next else {
             self.clear_slot(slot);
@@ -815,6 +827,7 @@ impl<T> HeapRanges<T> {
                     to,
                     words,
                     pos: old.pos,
+                    forgot,
                     flags,
                 });
                 return;
@@ -841,6 +854,7 @@ impl<T> HeapRanges<T> {
             to,
             words,
             pos,
+            forgot,
             flags,
         });
         self.active_views += 1;
@@ -1232,6 +1246,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     };
     *passes += 1;
 
+    let forgot = crate::descriptor::views_forgot() as u32;
     let mut unordered = Vec::new();
     let mut slots = Vec::with_capacity(changed.len() + 64);
 
@@ -1267,14 +1282,25 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             ranges.clear_slot(index);
             continue;
         }
-        if !was_changed
-            && let Some(cached) = ranges.get(index)
+        if let Some(cached) = ranges.get(index)
             && !cached.in_place()
-            && !host.shows_none(index)
             && let Some(handle) = heap.handle(index)
             && crate::descriptor::record_at(handle) == Some(cached.words)
-            && (!cached.has_object() || crate::descriptor::view(handle).is_some())
+            && {
+                let key = u64::from(cached.words[2]) << 32 | u64::from(cached.words[1]);
+                if was_changed {
+                    host.shows_key(index, key)
+                } else {
+                    !host.shows_none(index)
+                }
+            }
+            && (!cached.has_object()
+                || cached.forgot == forgot
+                || crate::descriptor::view_exists(handle))
         {
+            if cached.has_object() && cached.forgot != forgot {
+                ranges.touch_forgot(index, forgot);
+            }
             if picked_on
                 && cached.is_uav()
                 && let Some(shadow) = ranges.copy_of(cached.copy)
@@ -1305,9 +1331,12 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let heap = Shared(heap);
     let look = |index: u32| {
         let handle = heap.handle(index)?;
-        let view = host.mirror(index, handle, true)?;
+        let (view, made_copy) = host.mirror_for_pass(index, handle)?;
         let words = crate::descriptor::record_at(handle).unwrap_or([0; 3]);
-        let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
+        let (shadow, address, len) = match made_copy {
+            Some(copy) => copy,
+            None => crate::descriptor::host::buffer_copy(&view)?,
+        };
         #[cfg(feature = "diagnostics")]
         if host.shows(index, &shadow.buffer) == Some(false) {
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
@@ -1338,9 +1367,10 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             crate::host::log_removal_context();
         }
     };
-    // Run small delta batches inline to avoid thread-pool wakeup overhead on
-    // 6-core hosts; fan out across `each_view` only for larger batches.
-    const AT_A_TIME: usize = 256;
+    // Run small delta batches inline to avoid thread-pool wakeup overhead;
+    // fan out across `each_view` with a flat output buffer to avoid per-chunk
+    // `OnceLock<Vec<_>>` allocation churn.
+    const AT_A_TIME: usize = 32;
     if !slots.is_empty() {
         if slots.len() <= AT_A_TIME {
             for &index in &slots {
@@ -1351,29 +1381,49 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
                 {
                     unordered.push((shadow.clone(), from, to));
                 }
-                ranges.set(index, shows);
+                ranges.set_with_forgot(index, shows, forgot);
             }
             if alive && let Some(why) = crate::descriptor::host::device_removed() {
                 report_removal(&slots, why);
             }
         } else {
-            let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
-            let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
-            crate::land::each_view(false, parts.len(), &|n| {
-                let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
-                if alive && let Some(why) = crate::descriptor::host::device_removed() {
-                    report_removal(parts[n], why);
+            struct DisjointOut<T>(Vec<std::cell::UnsafeCell<Option<T>>>);
+            // SAFETY: each worker `n` writes exclusively to indices
+            // `n * AT_A_TIME .. ((n + 1) * AT_A_TIME).min(len)`, and `each_view`
+            // joins all workers before `DisjointOut` is read.
+            unsafe impl<T: Send> Sync for DisjointOut<T> {}
+            impl<T> DisjointOut<T> {
+                /// SAFETY: `pos` must be uniquely owned by the calling worker.
+                #[inline]
+                unsafe fn write(&self, pos: usize, value: Option<T>) {
+                    unsafe { *self.0[pos].get() = value };
                 }
-                let _ = found[n].set(looked);
+            }
+            let mut out = Vec::with_capacity(slots.len());
+            out.resize_with(slots.len(), || std::cell::UnsafeCell::new(None));
+            let found = DisjointOut(out);
+            let parts = slots.len().div_ceil(AT_A_TIME);
+            crate::land::each_view(false, parts, &|n| {
+                let start = n * AT_A_TIME;
+                let end = (start + AT_A_TIME).min(slots.len());
+                for pos in start..end {
+                    let shows = look(slots[pos]);
+                    // SAFETY: `pos` is uniquely owned by worker `n`.
+                    unsafe { found.write(pos, shows) };
+                }
+                if alive && let Some(why) = crate::descriptor::host::device_removed() {
+                    report_removal(&slots[start..end], why);
+                }
             });
-            for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
+            for (&index, cell) in slots.iter().zip(found.0) {
+                let shows = cell.into_inner();
                 if let Some((_, ref shadow, from, to, _, flags)) = shows
                     && picked_on
                     && flags & SLOT_FLAG_UAV != 0
                 {
                     unordered.push((shadow.clone(), from, to));
                 }
-                ranges.set(index, shows);
+                ranges.set_with_forgot(index, shows, forgot);
             }
         }
     }
