@@ -3220,10 +3220,32 @@ pub(crate) fn window_use() -> [u64; 8] {
 ///
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
+/// Whether `(start, len)` in a sorted, unique list of `(start, len)` window
+/// keys is strictly covered by another window in `keys`.
+fn superseded_window_flags(keys: &[(u64, u64)]) -> Vec<bool> {
+    let mut out = vec![false; keys.len()];
+    let mut max_end = 0u64;
+    for (i, &(start, len)) in keys.iter().enumerate() {
+        let end = start.saturating_add(len);
+        let covered_by_earlier = end <= max_end;
+        let covered_by_same_start = keys.get(i + 1).is_some_and(|&(next_start, next_len)| {
+            next_start == start && next_len > len
+        });
+        out[i] = covered_by_earlier || covered_by_same_start;
+        max_end = max_end.max(end);
+    }
+    out
+}
+
 pub(crate) fn let_go_idle() {
-    const IDLE_FRAMES: u64 = 4;
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-    let_go_idle_aligned_cbv(idle_ms, IDLE_FRAMES);
+    let (idle_ms, idle_frames) = if crate::residency::critical_commit() {
+        (crate::host::ram_idle_ms(crate::host::available_physical_ram()).min(500), 2)
+    } else if crate::residency::pressured() {
+        (crate::host::ram_idle_ms(crate::host::available_physical_ram()).min(1_000), 3)
+    } else {
+        (crate::host::ram_idle_ms(crate::host::available_physical_ram()), 4)
+    };
+    let_go_idle_aligned_cbv(idle_ms, idle_frames);
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -3231,14 +3253,22 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
+        let all_keys: Vec<(u64, u64)> = map.keys().copied().collect();
+        let superseded = superseded_window_flags(&all_keys);
         let idle: Vec<(u64, u64)> = map
             .iter()
-            .filter(|(_, s)| {
+            .zip(superseded)
+            .filter(|((_, s), is_superseded)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                    && (*is_superseded
+                        || crate::host::long_ago(
+                            s.used.load(Ordering::Relaxed),
+                            idle_ms,
+                            idle_frames,
+                        ))
                     && crate::host::references(&s.buffer) == 1
             })
-            .map(|(key, _)| *key)
+            .map(|((key, _), _)| *key)
             .collect();
         idle.into_iter().filter_map(|key| map.remove(&key)).collect()
     };
@@ -3336,6 +3366,11 @@ impl Shadow {
     /// Whether it is no copy but title memory in place (`crate::inplace`).
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()
+    }
+
+    /// Whether this copy is a window of title memory outside buffer objects.
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
     }
 
     /// Offset of a title address from the buffer's start.
@@ -5511,32 +5546,41 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 /// [`window`] cuts the windows of asks that give a length on a finer grid.
 const WINDOW: u64 = 4 << 20;
 
-/// The grid the windows of asks with a length are cut on, in bytes: 4 MiB
-/// unless `OATHKEEP_WINDOW_KB` names a smaller power of two (64 at least).
+/// The grid the windows of asks with a length are cut on, in bytes: 512 KiB
+/// on hosts with `<= 32 GiB` RAM (`limited_host_ram`), 1 MiB on larger hosts,
+/// unless `OATHKEEP_WINDOW_KB` names another power of two from 64 KiB to 4 MiB.
 /// A window is the PC's memory, all of it, however little of it is read:
-/// 803 windows held 3.3 GB in run 60's gameplay, and all that was ever
-/// asked for in them lay within 1.6 GB. On a grid of 1 MiB or 256 KiB a
-/// window ends nearer to what is read. An ask without a length keeps the
-/// 4 MiB grid whatever is set: a root view reads from its address to its
-/// window's end, and mesh streams bound that way reach megabytes.
-/// shortcut: the default stays 4 MiB until a run with the memory line's
-/// window counts has shown what the finer grids give; the same memory
-/// asked for with different ranges then lies in more than one window.
+/// 853 windows on the 4 MiB grid committed 3.57 GB while only 1.78 GB lay
+/// between the lowest and highest address ever asked for in each. On a finer
+/// grid a window ends near what is read while keeping nearby constant/buffer
+/// descriptors coalesced. Unsized asks (root SRVs/UAVs) use tail windows
+/// ([`tails`]) clamped to their `MEM_PRIVATE` virtual allocation where bounded.
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
         let kb = std::env::var("OATHKEEP_WINDOW_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        grid(kb)
+        grid_for(kb, crate::residency::limited_host_ram())
     })
 }
 
+/// Default sized-window grid in bytes when `OATHKEEP_WINDOW_KB` is unset or
+/// invalid: 512 KiB on `<= 32 GiB` hosts, 1 MiB otherwise.
+fn default_grid(limited_host_ram: bool) -> u64 {
+    if limited_host_ram { 512 << 10 } else { 1 << 20 }
+}
+
 /// The window grid in bytes for a setting in KiB: a power of two from
-/// 64 KiB to 4 MiB, 4 MiB for anything else.
-fn grid(kb: Option<u64>) -> u64 {
+/// 64 KiB to 4 MiB, or [`default_grid`] for anything else.
+fn grid_for(kb: Option<u64>, limited_host_ram: bool) -> u64 {
     match kb {
         Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
-        _ => WINDOW,
+        _ => default_grid(limited_host_ram),
     }
+}
+
+#[cfg(test)]
+fn grid(kb: Option<u64>) -> u64 {
+    grid_for(kb, true)
 }
 
 /// The window (start, bytes) of title memory for an ask of `[address,
@@ -5547,24 +5591,17 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 }
 
 /// Whether the window of an ask without a length begins at the ask instead
-/// of at the 4 MiB line below it. Such an ask (a root view) reads from its
-/// address to the end of its 4 MiB cell; what lies below the lowest
-/// address ever asked for in the cell is memory the host zeroed and nothing
-/// reads (513 of run 65's 782 windows were asked for that way, 2,052 MB;
-/// of all windows' 3,236 MB, 1,988 MB were ever copied). With this on, the
-/// window is the cell's tail from the ask's step on ([`TAIL_STEP`]); an ask
-/// lower in the cell later makes a longer tail, which every ask from then
-/// on takes, and the shorter one goes when nothing holds it any more.
-/// shortcut: off unless `OATHKEEP_WINDOW_TAILS=1`. A longer tail is another
-/// host buffer than the shorter one: what was bound to the shorter stays
-/// right only because every list brings up to date the copy it bound
-/// (`draw.rs` keeps a root view's copy with its slot). It pays only
-/// together with `OATHKEEP_WINDOW_KB` below 4096: on the 4 MiB grid an ask
-/// with a length in the same cell makes the whole cell's window, and the
-/// tail is that.
+/// of at the 4 MiB line below it (`OATHKEEP_WINDOW_TAILS=0` disables it; on
+/// by default). Such an ask (a root SRV/UAV) reads from its address forward;
+/// what lies below the lowest address ever asked for in the cell is memory
+/// the host zeroed and nothing reads. With this on, the window is the cell's
+/// tail from the ask's step on ([`TAIL_STEP`]), clamped to the end of its
+/// `MEM_PRIVATE` virtual allocation when smaller than the 4 MiB cell; an ask
+/// lower in the cell later makes a longer tail, which every ask from then on
+/// takes, and the shorter one goes as soon as nothing holds it ([`let_go_idle`]).
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OATHKEEP_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_WINDOW_TAILS").is_none_or(|v| v != "0"))
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,
@@ -5581,6 +5618,66 @@ fn tail_of(address: u64, end: u64) -> (u64, u64) {
     let (cell, len) = window_of(address, end, WINDOW);
     let start = address & !(TAIL_STEP - 1);
     (start, cell + len - start)
+}
+
+/// Bounds `(step_start, reach_end)` of a tail ask `[address, end)` given an
+/// optional enclosing `MEM_PRIVATE` virtual allocation `(alloc_base, vad_end)`.
+/// Both `step_start` and `reach_end - step_start` are multiples of `PAGE` (64 KiB).
+fn tail_bounds(address: u64, end: u64, vad: Option<(u64, u64)>) -> (u64, u64) {
+    let (cell, cell_len) = window_of(address, end, WINDOW);
+    let cell_end = cell + cell_len;
+    let page_mask = !(PAGE as u64 - 1);
+    if let Some((alloc_base, vad_end)) = vad
+        && alloc_base <= address
+        && end <= vad_end
+    {
+        let reach = vad_end.next_multiple_of(PAGE as u64).min(cell_end);
+        let floor = (alloc_base & page_mask).max(cell);
+        let start = (address & !(TAIL_STEP - 1)).max(floor);
+        return (start, reach);
+    }
+    let (start, len) = tail_of(address, end);
+    (start, start + len)
+}
+
+/// Queries the enclosing `MEM_PRIVATE` `VirtualAlloc` bounds `(alloc_base, vad_end)`
+/// (clamped at `cap_end`) when `address` lies in committed private memory.
+/// Returns `None` for `MEM_MAPPED` placeholder views so streamed placeholder
+/// arenas keep their full cell reach.
+fn private_vad_bounds(address: u64, cap_end: u64) -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_FREE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    if address == 0 || address >= cap_end {
+        return None;
+    }
+    // SAFETY: plain data filled in by `VirtualQuery`.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: valid output struct size.
+    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT || info.Type != MEM_PRIVATE {
+        return None;
+    }
+    let alloc_base = info.AllocationBase as u64;
+    let mut cur = (info.BaseAddress as u64).saturating_add(info.RegionSize as u64);
+    // Walk sub-regions of the same `VirtualAlloc` (`MEM_COMMIT` or `MEM_RESERVE`)
+    // up to `cap_end` so uncommitted tail pages inside the same reservation stay covered.
+    for _ in 0..16 {
+        if cur >= cap_end {
+            return Some((alloc_base, cap_end));
+        }
+        // SAFETY: valid output struct size.
+        let n = unsafe { VirtualQuery(cur as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.State == MEM_FREE || info.AllocationBase as u64 != alloc_base {
+            return Some((alloc_base, cur));
+        }
+        let next = (info.BaseAddress as u64).saturating_add(info.RegionSize as u64);
+        if next <= cur {
+            break;
+        }
+        cur = next;
+    }
+    None
 }
 
 /// Of `windows` (start, bytes), the one an ask of `[address, end)` that
@@ -5623,9 +5720,25 @@ fn cover(windows: impl Iterator<Item = (u64, u64)>) -> u64 {
     covered
 }
 
+/// Of `windows` (start, bytes; in order), the longest window a tail ask at
+/// `address` reaching `reach` (from step `step`) can reuse: the longest
+/// window starting at or below `step` (within `[floor, step]`) that covers
+/// at least up to `reach`.
+fn longest_tail_to(
+    windows: impl Iterator<Item = (u64, u64)>,
+    floor: u64,
+    step: u64,
+    reach: u64,
+) -> Option<(u64, u64)> {
+    windows
+        .filter(|&(start, bytes)| start >= floor && start <= step && start + bytes >= reach)
+        .max_by_key(|&(start, bytes)| (bytes, std::cmp::Reverse(start)))
+}
+
 /// Of `windows` (start, bytes; in order), the longest tail a tail ask at
 /// `address` can take: the first that begins in the ask's cell at or below
 /// the ask's page and ends where the cell ends.
+#[cfg(test)]
 fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u64) -> Option<(u64, u64)> {
     let (cell, len) = window_of(address, end, WINDOW);
     let step = address & !(TAIL_STEP - 1);
@@ -5709,9 +5822,13 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
-    let (cell, _) = window_of(address, end, WINDOW);
+    let (cell, cell_len) = window_of(address, end, WINDOW);
+    let cell_end = cell + cell_len;
+    let search_floor = address.saturating_sub(WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
-    // Under the lock, with the handing out: see `let_go_idle`.
+    // Under the lock (`read` or `write`), with the handing out: `let_go_idle`
+    // takes `LOOSE.write()`, so cloning `Arc<Shadow>` under `LOOSE.read()` is
+    // mutually exclusive with eviction.
     let note = |shadow: &Shadow| {
         // (Read first: the lines are shared by all recording threads.)
         let now = crate::host::moment();
@@ -5728,23 +5845,70 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
-    // The window is there already (nearly always): readers share the lock.
-    if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+    let mut queried_vad: Option<Option<(u64, u64)>> = None;
+    // Fast path under shared `LOOSE.read()` for all window modes (`named`, `holder`, and `tails`).
+    {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
+        if unsized_ask && tails() {
+            let (full_step, _) = tail_bounds(address, end, None);
+            let full_hit = longest_tail_to(
+                map.range((search_floor, 0)..=(full_step, u64::MAX)).map(|(k, _)| *k),
+                search_floor,
+                full_step,
+                cell_end,
+            );
+            if let Some(key) = full_hit
+                && let Some(shadow) = map.get(&key)
+            {
+                note(shadow);
+                return Some(shadow.clone());
+            }
+            let vad = private_vad_bounds(address, cell_end);
+            queried_vad = Some(vad);
+            if vad.is_some() {
+                let (step, reach) = tail_bounds(address, end, vad);
+                let vad_hit = longest_tail_to(
+                    map.range((search_floor, 0)..=(step, u64::MAX)).map(|(k, _)| *k),
+                    search_floor,
+                    step,
+                    reach,
+                );
+                if let Some(key) = vad_hit
+                    && let Some(shadow) = map.get(&key)
+                {
+                    note(shadow);
+                    return Some(shadow.clone());
+                }
+            }
+        } else if any && fine() && !unsized_ask {
+            if let Some(shadow) = map.get(&named) {
+                note(shadow);
+                return Some(shadow.clone());
+            }
+            let there = map.range((search_floor, 0)..=(address, u64::MAX)).map(|(k, _)| *k);
+            if let Some(key) = holder(there, address, end)
+                && let Some(shadow) = map.get(&key)
+            {
+                note(shadow);
+                return Some(shadow.clone());
+            }
+        } else if let Some(shadow) = map.get(&named) {
             note(shadow);
             return Some(shadow.clone());
         }
     }
+    let vad = if unsized_ask && tails() {
+        queried_vad.unwrap_or_else(|| private_vad_bounds(address, cell_end))
+    } else {
+        None
+    };
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     let (start, len) = if unsized_ask && tails() {
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
+        let (step, reach) = tail_bounds(address, end, vad);
+        let there = map.range((search_floor, 0)..=(step, u64::MAX)).map(|(key, _)| *key);
+        longest_tail_to(there, search_floor, step, reach).unwrap_or((step, reach - step))
     } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+        let there = map.range((search_floor, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         holder(there, address, end).unwrap_or(named)
     } else {
         named
@@ -6373,17 +6537,77 @@ mod window_tests {
     }
 
     /// The setting takes powers of two from 64 KiB to 4 MiB; anything else
-    /// leaves the grid as it was.
+    /// falls back to the host RAM tier default (512 KiB on `<= 32 GiB`, 1 MiB
+    /// on larger hosts).
     #[test]
     fn the_grid_is_a_power_of_two_or_the_default() {
-        assert_eq!(grid(None), WINDOW);
-        assert_eq!(grid(Some(4096)), WINDOW);
-        assert_eq!(grid(Some(1024)), 1 << 20);
-        assert_eq!(grid(Some(256)), 256 << 10);
-        assert_eq!(grid(Some(64)), 64 << 10);
+        use super::{grid_for, longest_tail_to, superseded_window_flags, tail_bounds};
+        assert_eq!(grid(None), 512 << 10);
+        assert_eq!(grid_for(None, true), 512 << 10);
+        assert_eq!(grid_for(None, false), 1 << 20);
+        assert_eq!(grid_for(Some(4096), true), WINDOW);
+        assert_eq!(grid_for(Some(1024), true), 1 << 20);
+        assert_eq!(grid_for(Some(512), false), 512 << 10);
+        assert_eq!(grid_for(Some(256), true), 256 << 10);
+        assert_eq!(grid_for(Some(64), true), 64 << 10);
         for bad in [0, 32, 100, 1000, 8192] {
-            assert_eq!(grid(Some(bad)), WINDOW, "{bad}");
+            assert_eq!(grid_for(Some(bad), true), 512 << 10, "{bad}");
+            assert_eq!(grid_for(Some(bad), false), 1 << 20, "{bad}");
         }
+
+        // Private VAD bounds clamp tail start/end to 64 KiB pages within the
+        // allocation and let unsized asks reuse existing sized windows covering it.
+        let cell = 0x2000_0000u64;
+        let vad = Some((cell + 0x2_0000, cell + 0x8_0000));
+        let ask = cell + 0x3_1000;
+        let (step, reach) = tail_bounds(ask, ask + 1, vad);
+        assert_eq!((step, reach), (cell + 0x2_0000, cell + 0x8_0000));
+        assert!(step <= ask && reach > ask);
+        let sized_512k = [(cell, 0x8_0000u64)];
+        assert_eq!(
+            longest_tail_to(sized_512k.into_iter(), cell, step, reach),
+            Some((cell, 0x8_0000))
+        );
+
+        // Superseded sub-windows are detected in linear sorted order, whether
+        // covered by an earlier start or a longer window at the same start.
+        let keys = [
+            (cell, 0x8_0000),
+            (cell, 0x10_0000),
+            (cell + 0x4_0000, 0x8_0000),
+            (cell + 0x20_0000, 0x8_0000),
+        ];
+        assert_eq!(superseded_window_flags(&keys), vec![true, false, true, false]);
+    }
+
+    #[test]
+    fn private_vad_bounds_detects_virtual_alloc_extent_including_reserved_tail() {
+        use super::{WINDOW, private_vad_bounds, tail_bounds};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // Reserve 384 KiB (`MEM_PRIVATE`), commit the first 128 KiB, leave the
+        // trailing 256 KiB `MEM_RESERVE` under the same `AllocationBase`.
+        let total = 384 * 1024;
+        let committed = 128 * 1024;
+        // SAFETY: standard Win32 private reservation + commit, released before return.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), total, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        // SAFETY: committing inside `base`.
+        let comm = unsafe { VirtualAlloc(base, committed, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(comm, base);
+        let addr = base as u64 + 0x4000;
+        let cap = (addr & !(WINDOW - 1)) + WINDOW;
+        let vad = private_vad_bounds(addr, cap);
+        // SAFETY: releasing our test reservation.
+        unsafe {
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
+        let expected_end = (base as u64 + total as u64).min(cap);
+        assert_eq!(vad, Some((base as u64, expected_end)));
+        let (step, reach) = tail_bounds(addr, addr + 1, vad);
+        assert!(step >= (base as u64 & !0xffff) && step <= addr);
+        assert_eq!(reach, expected_end.next_multiple_of(1 << 16).min(cap));
     }
 
     /// A window holds its ask and is cut on the grid; on the default grid
