@@ -938,7 +938,9 @@ fn lookup_shadow_cached_in(
             shadow_cache[i].2 = cur_gen;
         }
         let shadow = shadow_cache[i].4.clone();
-        shadow.touch_used(crate::host::moment());
+        if i > 0 || cached_gen != cur_gen {
+            shadow.touch_used(crate::host::moment());
+        }
         if i > 0 {
             shadow_cache[..=i].rotate_right(1);
         }

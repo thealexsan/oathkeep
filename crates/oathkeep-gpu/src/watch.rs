@@ -332,7 +332,6 @@ struct Journal {
     /// write happened since `since`.
     guarded_asked: u64,
     written: BTreeMap<usize, u64>,
-    found: Vec<usize>,
     ahead: Vec<(usize, usize)>,
     ahead_asked: u64,
     kept: bool,
@@ -342,7 +341,6 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     asked: 1,
     guarded_asked: 1,
     written: BTreeMap::new(),
-    found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 1,
     kept: false,
@@ -366,31 +364,149 @@ fn journal_write() -> std::sync::RwLockWriteGuard<'static, Journal> {
     JOURNAL.write().unwrap_or_else(|e| e.into_inner())
 }
 
-const AHEAD_GAP: usize = (512 << 10) / PAGE;
-const AHEAD_MAX: usize = (16 << 20) / PAGE;
+const AHEAD_MAX: usize = (64 << 20) / PAGE;
 
-fn ask_ahead_locked(j: &mut Journal, pieces: &[(usize, usize)], allow_single: bool) {
+/// Serializes `GetWriteWatch(WRITE_WATCH_FLAG_RESET)` syscalls across threads without
+/// holding `JOURNAL.write()` across kernel transitions, so `JOURNAL.read()` callers
+/// (guarded shadows in `stale_under_flights`, `Batch::flush`, and relay) are never stalled.
+static WRITE_WATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Cached `VirtualQuery` allocation extents (`reg_start_page -> (reg_end_page, alloc_base, is_private)`).
+/// Prevents merging `GetWriteWatch` across separate `VirtualAlloc` VADs and skips `GetWriteWatch`
+/// entirely on `MEM_MAPPED` regions. Invalidated on `title_memory_remapped`.
+static WRITE_WATCH_REGIONS: RwLock<BTreeMap<usize, (usize, usize, bool)>> =
+    RwLock::new(BTreeMap::new());
+
+fn query_write_watch_region(page: usize) -> (usize, usize, bool) {
+    {
+        let map = WRITE_WATCH_REGIONS
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((_, &(end_page, alloc_base, is_private))) = map.range(..=page).next_back()
+            && page < end_page
+        {
+            return (end_page, alloc_base, is_private);
+        }
+    }
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: `mbi` is valid for `size_of::<MEMORY_BASIC_INFORMATION>()`.
+    let queried = unsafe {
+        VirtualQuery(
+            (page * PAGE) as *const _,
+            &mut mbi,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if queried == 0 || (mbi.State != MEM_COMMIT && mbi.State != MEM_RESERVE) {
+        return (page + 1, 0, false);
+    }
+    let reg_start = (mbi.BaseAddress as usize) / PAGE;
+    let reg_end = (mbi.BaseAddress as usize)
+        .saturating_add(mbi.RegionSize)
+        .div_ceil(PAGE);
+    if reg_start >= reg_end {
+        return (page + 1, 0, false);
+    }
+    let alloc_base = mbi.AllocationBase as usize;
+    let is_private = mbi.Type == MEM_PRIVATE;
+    let mut map = WRITE_WATCH_REGIONS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut remove_keys = Vec::new();
+    if let Some((&prev_k, &(prev_e, _, _))) = map.range(..reg_start).next_back()
+        && prev_e > reg_start
+    {
+        remove_keys.push(prev_k);
+    }
+    for (&k, _) in map.range(reg_start..reg_end) {
+        remove_keys.push(k);
+    }
+    for k in remove_keys {
+        map.remove(&k);
+    }
+    map.insert(reg_start, (reg_end, alloc_base, is_private));
+    (reg_end, alloc_base, is_private)
+}
+
+fn invalidate_write_watch_regions(first: usize, last: usize) {
+    if first >= last {
+        return;
+    }
+    let has_overlap = {
+        let map = WRITE_WATCH_REGIONS
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            false
+        } else {
+            map.range(..first)
+                .next_back()
+                .is_some_and(|(_, &(e, _, _))| e > first)
+                || map.range(first..last).next().is_some()
+        }
+    };
+    if !has_overlap {
+        return;
+    }
+    let mut map = WRITE_WATCH_REGIONS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut remove_keys = Vec::new();
+    if let Some((&prev_k, &(prev_e, _, _))) = map.range(..first).next_back()
+        && prev_e > first
+    {
+        remove_keys.push(prev_k);
+    }
+    for (&k, _) in map.range(first..last) {
+        remove_keys.push(k);
+    }
+    for k in remove_keys {
+        map.remove(&k);
+    }
+}
+
+thread_local! {
+    static WW_FOUND_BUF: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn ask_ahead_unlocked(
+    found: &mut Vec<usize>,
+    written_pages: &mut Vec<usize>,
+    ahead: &mut Vec<(usize, usize)>,
+    pieces: &[(usize, usize)],
+    allow_single: bool,
+) {
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
         let mut last = pieces[i].1;
+        let (_, alloc_base, is_private) = query_write_watch_region(first);
+        if !is_private || alloc_base == 0 {
+            i += 1;
+            continue;
+        }
         let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
+        while k < pieces.len() && last.max(pieces[k].1) - first <= AHEAD_MAX {
+            let (_, next_alloc, next_private) = query_write_watch_region(pieces[k].0);
+            if !next_private || next_alloc != alloc_base {
+                break;
+            }
             last = last.max(pieces[k].1);
             k += 1;
         }
         if k - i == 1 {
             if allow_single
-                && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
-                && ask_kernel(j, first, last)
+                && !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+                && ask_kernel_unlocked(found, written_pages, first, last)
             {
-                j.ahead.push((first, last));
+                ahead.push((first, last));
             }
         } else {
-            ask_run(j, &pieces[i..k], allow_single);
+            ask_run_unlocked(found, written_pages, ahead, &pieces[i..k], allow_single);
         }
         i = k;
     }
@@ -405,7 +521,30 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if pieces.len() < 2 {
         return;
     }
+    if JOURNAL_KEPT.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     pieces.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
+    for (a, b) in pieces {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    if merged.len() < 2 {
+        return;
+    }
+    let _ww = WRITE_WATCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if JOURNAL_KEPT.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let mut written_pages = Vec::new();
+    let mut ahead = Vec::new();
+    WW_FOUND_BUF.with(|cell| {
+        let mut found = cell.borrow_mut();
+        ask_ahead_unlocked(&mut found, &mut written_pages, &mut ahead, &merged, false);
+    });
     let mut j = journal_write();
     let j = &mut *j;
     if j.kept {
@@ -413,8 +552,10 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
     let now = bump_journal_asked(j, 1);
     j.ahead_asked = now;
-    j.ahead.clear();
-    ask_ahead_locked(j, &pieces, false);
+    j.ahead = ahead;
+    for page in written_pages {
+        j.written.insert(page, now);
+    }
 }
 
 #[cfg(feature = "diagnostics")]
@@ -470,6 +611,13 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             _ => merged.push((a, b)),
         }
     }
+    let _ww = WRITE_WATCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut written_pages = Vec::new();
+    let mut ahead = Vec::new();
+    WW_FOUND_BUF.with(|cell| {
+        let mut found = cell.borrow_mut();
+        ask_ahead_unlocked(&mut found, &mut written_pages, &mut ahead, &merged, true);
+    });
     let mut j = journal_write();
     let j = &mut *j;
     let was_kept = j.kept;
@@ -480,8 +628,10 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     let now = bump_journal_asked(j, 1);
     j.ahead_asked = now;
-    j.ahead.clear();
-    ask_ahead_locked(j, &merged, true);
+    j.ahead = ahead;
+    for page in written_pages {
+        j.written.insert(page, now);
+    }
     j.kept = !j.ahead.is_empty();
     JOURNAL_KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
 }
@@ -491,7 +641,6 @@ pub(crate) fn is_journal_kept() -> bool {
 }
 
 pub(crate) fn ask_once_end() {
-    bump_global_write_epoch();
     if !JOURNAL_KEPT.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
@@ -500,7 +649,13 @@ pub(crate) fn ask_once_end() {
         j.kept = false;
         JOURNAL_KEPT.store(false, std::sync::atomic::Ordering::Release);
         j.ahead.clear();
+        bump_global_write_epoch();
     }
+}
+
+pub(crate) fn ask_once_end_after_run() {
+    bump_global_write_epoch();
+    ask_once_end();
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -554,35 +709,48 @@ fn wrote_journal_only(at: usize, len: usize) {
     }
 }
 
-fn ask_run(j: &mut Journal, pieces: &[(usize, usize)], allow_single: bool) {
+fn ask_run_unlocked(
+    found: &mut Vec<usize>,
+    written_pages: &mut Vec<usize>,
+    ahead: &mut Vec<(usize, usize)>,
+    pieces: &[(usize, usize)],
+    allow_single: bool,
+) {
     if pieces.is_empty() {
         return;
     }
     if pieces.len() == 1 {
         if allow_single {
             let (first, last) = pieces[0];
-            if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-                j.ahead.push((first, last));
+            if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+                && ask_kernel_unlocked(found, written_pages, first, last)
+            {
+                ahead.push((first, last));
             }
         }
         return;
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if ask_kernel(j, first, last) {
-        j.ahead.push((first, last));
+    if ask_kernel_unlocked(found, written_pages, first, last) {
+        ahead.push((first, last));
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
-    ask_run(j, a, allow_single);
-    ask_run(j, b, allow_single);
+    ask_run_unlocked(found, written_pages, ahead, a, allow_single);
+    ask_run_unlocked(found, written_pages, ahead, b, allow_single);
 }
 
-fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
+fn ask_kernel_unlocked(
+    found: &mut Vec<usize>,
+    written_pages: &mut Vec<usize>,
+    first: usize,
+    last: usize,
+) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
+    found.resize(count.max(found.len()), 0);
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -592,7 +760,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             WRITE_WATCH_FLAG_RESET,
             (first * PAGE) as *const _,
             (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
+            found.as_mut_ptr().cast(),
             &mut count,
             &mut granularity,
         )
@@ -607,12 +775,11 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
-    let now = j.ahead_asked;
     let mut prev_page = usize::MAX;
-    for k in 0..count {
-        let page = j.found[k] / PAGE;
+    for &addr in &found[..count] {
+        let page = addr / PAGE;
         if page != prev_page {
-            j.written.insert(page, now);
+            written_pages.push(page);
             prev_page = page;
         }
     }
@@ -645,8 +812,6 @@ pub(crate) fn writes_kind(
     end: usize,
     guarded: bool,
 ) -> Option<(u64, Vec<(usize, u64)>, WatchKind)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     {
         let j = journal_read();
@@ -662,61 +827,47 @@ pub(crate) fn writes_kind(
         }
     }
     let failed = {
-        let mut j = journal_write();
-        let j = &mut *j;
-        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-            return Some((
-                j.ahead_asked,
-                j.written
-                    .range(first..last)
-                    .map(|(&p, &w)| (p, w))
-                    .collect(),
-                WatchKind::WriteWatch,
-            ));
-        }
-        let mut count = (last - first) * PAGE / KERNEL_PAGE;
-        j.found.resize(count.max(j.found.len()), 0);
-        let mut granularity = 0;
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        // SAFETY: the answer buffer holds `count` entries.
-        let failed = unsafe {
-            GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
-                (first * PAGE) as *const _,
-                (last - first) * PAGE,
-                j.found.as_mut_ptr().cast(),
-                &mut count,
-                &mut granularity,
-            )
-        } != 0;
-        if !failed {
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::Watches, 1);
-                add(C::WatchUs, started.elapsed().as_micros() as u64);
-                slow(started.elapsed().as_micros() as u64);
+        let _ww = WRITE_WATCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let j = journal_read();
+            if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+                return Some((
+                    j.ahead_asked,
+                    j.written
+                        .range(first..last)
+                        .map(|(&p, &w)| (p, w))
+                        .collect(),
+                    WatchKind::WriteWatch,
+                ));
             }
-            let now = bump_journal_asked(j, 1);
-            let mut prev_page = usize::MAX;
-            for k in 0..count {
-                let page = j.found[k] / PAGE;
-                if page != prev_page {
+        }
+        let (_, _, is_private) = query_write_watch_region(first);
+        if !is_private {
+            true
+        } else {
+            let mut written_pages = Vec::new();
+            let ok = WW_FOUND_BUF.with(|cell| {
+                let mut found = cell.borrow_mut();
+                ask_kernel_unlocked(&mut found, &mut written_pages, first, last)
+            });
+            if ok {
+                let mut j = journal_write();
+                let j = &mut *j;
+                let now = bump_journal_asked(j, 1);
+                for page in written_pages {
                     j.written.insert(page, now);
-                    prev_page = page;
                 }
+                return Some((
+                    now,
+                    j.written
+                        .range(first..last)
+                        .map(|(&p, &w)| (p, w))
+                        .collect(),
+                    WatchKind::WriteWatch,
+                ));
             }
-            return Some((
-                now,
-                j.written
-                    .range(first..last)
-                    .map(|(&p, &w)| (p, w))
-                    .collect(),
-                WatchKind::WriteWatch,
-            ));
+            true
         }
-        true
     };
     debug_assert!(failed);
     if !guarded {
@@ -2915,6 +3066,86 @@ pub(crate) fn writing_copy(at: usize, len: usize) {
     }
 }
 
+fn renew_hot_gpu_back_sharded(first: usize, last: usize) {
+    if !gpu_back_hot_enabled() || first >= last {
+        return;
+    }
+    let frame = crate::frame::current();
+    let base_hot = hot_frames();
+    let renew_below = frame.saturating_add(base_hot / 2);
+    for_each_shard_span(first, last, |shard, a, b| {
+        let needs_renew = {
+            let g = guards_read_shard(shard);
+            if g.hot.is_empty() {
+                false
+            } else {
+                g.hot.range(a..b).any(|(_, &until)| until <= renew_below)
+            }
+        };
+        if !needs_renew {
+            return;
+        }
+        let mut g = guards_write_shard(shard);
+        let keys: Vec<usize> = g
+            .hot
+            .range(a..b)
+            .filter_map(|(&blk, &until)| (until <= renew_below).then_some(blk))
+            .collect();
+        for blk in keys {
+            let shift = g
+                .cool_count
+                .get(&blk)
+                .copied()
+                .unwrap_or(0)
+                .min(MAX_COOL_BACKOFF);
+            let until = frame.saturating_add(base_hot.saturating_mul(1u64 << shift));
+            g.hot.insert(blk, until);
+        }
+    });
+}
+
+/// Returns `true` when every block overlapped by `(start + a)..(start + b)` in `spans`
+/// is already open (not `PAGE_READONLY` protected) and has no active view-guard aliases,
+/// enabling single-pass direct writeback from relay workers without a second thread barrier.
+pub(crate) fn range_is_open_and_unaliased(start: usize, spans: &[(usize, usize)]) -> bool {
+    let check_aliases = view_guard();
+    let mut ok = true;
+    for &(a, b) in spans {
+        if a >= b {
+            continue;
+        }
+        let first = (start + a) / BLOCK;
+        let last = (start + b).div_ceil(BLOCK);
+        for_each_shard_span(first, last, |shard, sa, sb| {
+            if !ok {
+                return;
+            }
+            let g = guards_read_shard(shard);
+            if g.protected.overlaps(sa, sb)
+                || (check_aliases && !g.aliased.is_empty() && g.aliased.overlaps(sa, sb))
+            {
+                ok = false;
+            }
+        });
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Companion to `range_is_open_and_unaliased`: records the written range and refreshes
+/// hot-block expiry for blocks that were already open and written directly in-pass.
+pub(crate) fn note_gpu_write_back_open(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    record_written_range(at, end);
+    let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+    renew_hot_gpu_back_sharded(first, last);
+}
+
 /// Opens guarded blocks for GPU-to-title readback merges and promotes repeatedly
 /// written blocks (within `HOT_WINDOW_FRAMES`) into `g.hot` + `g.accounted` so
 /// active GPU writebacks avoid `VirtualProtect` ping-pong without flooding `g.hot`.
@@ -2932,8 +3163,11 @@ pub(crate) fn writing_gpu_back(at: usize, len: usize) {
     if range_needs_open(first, last) {
         let (opened_spans, _) = open_and_aliases_block_spans_sharded(first, last);
         promote_opened_hot_sharded(&opened_spans);
-    } else if view_guard() {
-        dirty_clean_aliases_for_range_sharded(first, last);
+    } else {
+        renew_hot_gpu_back_sharded(first, last);
+        if view_guard() {
+            dirty_clean_aliases_for_range_sharded(first, last);
+        }
     }
 }
 
@@ -3135,6 +3369,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     if first >= last {
         return;
     }
+    invalidate_write_watch_regions(first, last);
     let has_journal = journal_read().written.range(first..last).next().is_some();
     if has_journal {
         let mut j = journal_write();

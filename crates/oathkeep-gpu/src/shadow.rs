@@ -23,6 +23,8 @@ pub(crate) struct Shadow {
     watched: AtomicU8,
     dead: AtomicBool,
     has_pending: AtomicBool,
+    pending_min: AtomicU64,
+    pending_max: AtomicU64,
     pending: Mutex<Vec<(usize, usize)>>,
     flights: Mutex<Flights>,
     before: Mutex<Option<Vec<u8>>>,
@@ -32,6 +34,7 @@ pub(crate) struct Shadow {
     asked: [AtomicU64; 2],
     unsized_asks: AtomicU64,
     id: u64,
+    card_before_gpu_va: AtomicU64,
     card: Option<Card>,
     window: bool,
     place: Option<(crate::inplace::PlaceHeap, u64)>,
@@ -1860,6 +1863,51 @@ impl Flights {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_piece_avx2(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    use std::arch::x86_64::{
+        _mm256_blendv_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_or_si256,
+        _mm256_setzero_si256, _mm256_storeu_si256, _mm256_testz_si256, _mm256_xor_si256,
+    };
+    let n = now.len().min(held.len()).min(title.len());
+    let mut i = 0usize;
+    let mut diff_acc = _mm256_setzero_si256();
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n`, so all 32-byte unaligned loads/stores are in-bounds.
+        unsafe {
+            let vn = _mm256_loadu_si256(now.as_ptr().add(i).cast());
+            let vh = _mm256_loadu_si256(held.as_ptr().add(i).cast());
+            let vt = _mm256_loadu_si256(title.as_ptr().add(i).cast());
+            // `eq` is 0xff where `now == held` (GPU did not change byte -> keep `vt`),
+            // and 0x00 where `now != held` (GPU changed byte -> take `vn`).
+            let eq = _mm256_cmpeq_epi8(vn, vh);
+            let merged = _mm256_blendv_epi8(vn, vt, eq);
+            diff_acc = _mm256_or_si256(diff_acc, _mm256_xor_si256(merged, vt));
+            _mm256_storeu_si256(title.as_mut_ptr().add(i).cast(), merged);
+            _mm256_storeu_si256(held.as_mut_ptr().add(i).cast(), vn);
+        }
+        i += 32;
+    }
+    let mut differs = if _mm256_testz_si256(diff_acc, diff_acc) == 0 {
+        1u8
+    } else {
+        0u8
+    };
+    for ((n_b, h_b), t_b) in now[i..n]
+        .iter()
+        .zip(held[i..n].iter_mut())
+        .zip(title[i..n].iter_mut())
+    {
+        let wrote = if *n_b != *h_b { 0xffu8 } else { 0 };
+        let merged = (*t_b & !wrote) | (*n_b & wrote);
+        differs |= merged ^ *t_b;
+        *t_b = merged;
+        *h_b = *n_b;
+    }
+    differs != 0
+}
+
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     if title == held {
         if now == held {
@@ -1873,13 +1921,18 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
         held.copy_from_slice(now);
         return false;
     }
+    #[cfg(target_arch = "x86_64")]
+    if now.len() >= 32 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 support verified via `is_x86_feature_detected!`.
+        return unsafe { merge_piece_avx2(now, held, title) };
+    }
     let mut differs = 0u8;
     for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
         let merged = (*t & !wrote) | (*n & wrote);
         differs |= merged ^ *t;
         *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+        *h = *n;
     }
     differs != 0
 }
@@ -2504,8 +2557,8 @@ fn relay_workers() -> &'static Workers {
     STARTED.call_once(|| {
         let count = std::thread::available_parallelism()
             .map(usize::from)
-            .unwrap_or(4)
-            .clamp(2, 6);
+            .unwrap_or(3)
+            .clamp(2, 3);
         for i in 0..count {
             let _ = std::thread::Builder::new()
                 .name(format!("oathkeep-relay-w-{i}"))
@@ -2583,7 +2636,7 @@ fn stale_worker_count() -> usize {
         std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(4)
-            .clamp(2, 8)
+            .clamp(2, 4)
     })
 }
 
@@ -3882,6 +3935,8 @@ impl Shadow {
             watched: AtomicU8::new(0),
             dead: AtomicBool::new(false),
             has_pending: AtomicBool::new(false),
+            pending_min: AtomicU64::new(u64::MAX),
+            pending_max: AtomicU64::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -3894,6 +3949,7 @@ impl Shadow {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
             },
+            card_before_gpu_va: AtomicU64::new(0),
             card: None,
             window: false,
             place: None,
@@ -3933,7 +3989,17 @@ impl Shadow {
             return;
         }
         if self.card.is_some() {
+            let was_empty = pending.is_empty();
             pending.push(range);
+            if was_empty {
+                self.pending_min.store(range.0 as u64, Ordering::Release);
+                self.pending_max.store(range.1 as u64, Ordering::Release);
+            } else {
+                self.pending_min
+                    .fetch_min(range.0 as u64, Ordering::Release);
+                self.pending_max
+                    .fetch_max(range.1 as u64, Ordering::Release);
+            }
             self.has_pending.store(true, Ordering::Release);
             return;
         }
@@ -3955,7 +4021,17 @@ impl Shadow {
             }
             parts = rest;
         }
+        let was_empty = pending.is_empty();
         pending.push(range);
+        if was_empty {
+            self.pending_min.store(range.0 as u64, Ordering::Release);
+            self.pending_max.store(range.1 as u64, Ordering::Release);
+        } else {
+            self.pending_min
+                .fetch_min(range.0 as u64, Ordering::Release);
+            self.pending_max
+                .fetch_max(range.1 as u64, Ordering::Release);
+        }
         self.has_pending.store(true, Ordering::Release);
         let taken: usize = parts
             .iter()
@@ -4229,7 +4305,21 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
-        self.has_pending.store(!pending.is_empty(), Ordering::Release);
+        if pending.is_empty() {
+            self.has_pending.store(false, Ordering::Release);
+            self.pending_min.store(u64::MAX, Ordering::Release);
+            self.pending_max.store(0, Ordering::Release);
+        } else {
+            let mut lo = usize::MAX;
+            let mut hi = 0usize;
+            for &(a, e) in pending.iter() {
+                lo = lo.min(a);
+                hi = hi.max(e);
+            }
+            self.pending_min.store(lo as u64, Ordering::Release);
+            self.pending_max.store(hi as u64, Ordering::Release);
+            self.has_pending.store(true, Ordering::Release);
+        }
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -4276,6 +4366,16 @@ impl Shadow {
     #[inline]
     pub(crate) fn writes_pending(&self) -> bool {
         self.has_pending.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn pending_overlaps(&self, from: usize, to: usize) -> bool {
+        if !self.has_pending.load(Ordering::Acquire) {
+            return false;
+        }
+        let lo = self.pending_min.load(Ordering::Acquire) as usize;
+        let hi = self.pending_max.load(Ordering::Acquire) as usize;
+        lo < hi && from < hi && to > lo
     }
 
     pub(crate) fn byte_len(&self) -> u64 {
@@ -4352,12 +4452,9 @@ impl Shadow {
         runs_left: &mut usize,
         allow_wide: bool,
     ) -> bool {
-        if !self.writes_pending() || self.is_guarded_clean() {
-            return false;
-        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
-        if from >= to {
+        if from >= to || !self.pending_overlaps(from, to) || self.is_guarded_clean() {
             return false;
         }
         let busy: Vec<(usize, usize)> = self
@@ -4481,11 +4578,22 @@ impl Shadow {
                 None
             };
             if all_copied && written.is_empty() {
-                if let Some((shards, count, ep)) = record_sub_clean {
-                    self.copied
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .record_clean_shards(shards, count, ep, lo_page, hi_page);
+                let advance = now != 0 && now > since;
+                if advance && full && uncopied_zero && record_sub_clean.is_none() {
+                    self.synced_at.fetch_max(now, Ordering::Release);
+                } else if advance || record_sub_clean.is_some() {
+                    if advance && full && uncopied_zero {
+                        self.synced_at.fetch_max(now, Ordering::Release);
+                    }
+                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    if advance && !(full && uncopied_zero) {
+                        let (full_lo, full_hi) =
+                            full_page_range(start, end, a, e, base, copied.len());
+                        copied.advance_synced(full_lo, full_hi, now);
+                    }
+                    if let Some((shards, count, ep)) = record_sub_clean {
+                        copied.record_clean_shards(shards, count, ep, lo_page, hi_page);
+                    }
                 }
                 continue;
             }
@@ -4499,7 +4607,18 @@ impl Shadow {
                 if let Some((shards, count, ep)) = record_sub_clean {
                     copied.record_clean_shards(shards, count, ep, lo_page, hi_page);
                 }
-                copied.stale_pages_in(base, global_synced, a, e, &written)
+                let stale = copied.stale_pages_in(base, global_synced, a, e, &written);
+                if stale.is_empty() && all_copied && now != 0 && now > since {
+                    if full && uncopied_zero {
+                        drop(copied);
+                        self.synced_at.fetch_max(now, Ordering::Release);
+                    } else {
+                        let (full_lo, full_hi) =
+                            full_page_range(start, end, a, e, base, copied.len());
+                        copied.advance_synced(full_lo, full_hi, now);
+                    }
+                }
+                stale
             };
             if stale.is_empty() {
                 continue;
@@ -4919,7 +5038,28 @@ impl Shadow {
                 }
                 return true;
             }
-            let mut piece_title = vec![0u8; PIECE];
+            thread_local! {
+                static MERGE_UNWATCHED_BUF: std::cell::RefCell<Vec<u8>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
+            }
+            let piece_buf = MERGE_UNWATCHED_BUF.with(|cell| {
+                let mut v = cell.take();
+                if v.len() < PIECE {
+                    v.resize(PIECE, 0);
+                }
+                v
+            });
+            struct ReturnUnwatchedBuf(Vec<u8>);
+            impl Drop for ReturnUnwatchedBuf {
+                fn drop(&mut self) {
+                    let v = std::mem::take(&mut self.0);
+                    MERGE_UNWATCHED_BUF.with(|cell| {
+                        *cell.borrow_mut() = v;
+                    });
+                }
+            }
+            let mut piece_title_guard = ReturnUnwatchedBuf(piece_buf);
+            let piece_title = &mut piece_title_guard.0;
             let mut diffs: Vec<(usize, MergeDiff)> = Vec::new();
             for &(a, e) in busy {
                 let first_piece = self.pieces(a - start, e - start);
@@ -5826,6 +5966,7 @@ impl Shadow {
         });
     }
 
+    #[allow(dead_code)]
     pub(crate) fn card_sides(&self) -> Option<(Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card
@@ -5834,6 +5975,13 @@ impl Shadow {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         Some((before, card.size))
+    }
+
+    #[inline]
+    pub(crate) fn card_before_gpu_va(&self) -> Option<(u64, u64)> {
+        let card = self.card.as_ref()?;
+        let va = self.card_before_gpu_va.load(Ordering::Acquire);
+        (va != 0).then_some((va, card.size))
     }
 
     fn copy_card_spans(&self, card: &Card, spans: &[(usize, usize)], clear_hot: bool) -> usize {
@@ -6107,6 +6255,168 @@ impl Shadow {
         }
     }
 
+    /// Fills card upload staging buffers in parallel without contending on `card.old.lock()`
+    /// inside worker threads: acquires each unique shadow's `card.old` lock once on the calling
+    /// thread in canonical pointer order, resolves all piece pointers up front, and fans out
+    /// lock-free copies into write-combined upload memory across up to 4 workers.
+    pub(crate) fn card_fill_uploads_parallel(
+        dirty: &[(Arc<Shadow>, Vec<(usize, usize)>)],
+        chunks: &[(u64, Vec<(usize, usize, usize, usize)>)],
+        plan_uploads: &[(ID3D12Resource, usize, u64)],
+        split_bytes: usize,
+    ) {
+        let mut needed_si: Vec<(usize, usize)> = Vec::new();
+        let mut seen = vec![false; dirty.len()];
+        for (_, items) in chunks {
+            for &(si, _, len, _) in items {
+                if len > 0
+                    && !seen[si]
+                    && dirty[si]
+                        .0
+                        .card
+                        .as_ref()
+                        .is_some_and(|c| c.has_old.load(Ordering::Acquire))
+                {
+                    seen[si] = true;
+                    needed_si.push((Arc::as_ptr(&dirty[si].0) as usize, si));
+                }
+            }
+        }
+        needed_si.sort_unstable_by_key(|&(ptr, _)| ptr);
+        let mut guards: Vec<std::sync::MutexGuard<'_, BTreeMap<usize, Vec<u8>>>> =
+            Vec::with_capacity(needed_si.len());
+        let mut guard_idx_by_si: Vec<Option<usize>> = vec![None; dirty.len()];
+        for (_, si) in needed_si {
+            if let Some(card) = &dirty[si].0.card {
+                let g = card.old.lock().unwrap_or_else(|e| e.into_inner());
+                if !g.is_empty() {
+                    let gi = guards.len();
+                    guards.push(g);
+                    guard_idx_by_si[si] = Some(gi);
+                }
+            }
+        }
+        struct CopySeg {
+            src: usize,
+            dst: usize,
+            len: usize,
+            from_old: bool,
+        }
+        let mut segs: Vec<CopySeg> = Vec::new();
+        for (ci, (_, items)) in chunks.iter().enumerate() {
+            let base_ptr = plan_uploads[ci].1;
+            for &(si, a, len, dst_off) in items {
+                if len == 0 {
+                    continue;
+                }
+                let shadow = &dirty[si].0;
+                let start = shadow.start as usize;
+                let dst_base = base_ptr + dst_off;
+                if let Some(gi) = guard_idx_by_si[si] {
+                    let old = &*guards[gi];
+                    let mut cursor = a;
+                    let end = a + len;
+                    for p in shadow.pieces(a, end) {
+                        let (p_lo, p_hi) = shadow.piece(p);
+                        let seg_lo = cursor.max(p_lo);
+                        let seg_hi = end.min(p_hi);
+                        if seg_lo >= seg_hi {
+                            continue;
+                        }
+                        let seg_len = seg_hi - seg_lo;
+                        let seg_dst = dst_base + (seg_lo - a);
+                        if let Some(buf) = old.get(&p) {
+                            // SAFETY: `buf` covers `[p_lo, p_hi)` and stays pinned while `guards` is held.
+                            let src = unsafe { buf.as_ptr().add(seg_lo - p_lo) } as usize;
+                            segs.push(CopySeg {
+                                src,
+                                dst: seg_dst,
+                                len: seg_len,
+                                from_old: true,
+                            });
+                        } else {
+                            segs.push(CopySeg {
+                                src: start + seg_lo,
+                                dst: seg_dst,
+                                len: seg_len,
+                                from_old: false,
+                            });
+                        }
+                        cursor = seg_hi;
+                    }
+                } else {
+                    let mut off = 0usize;
+                    while off < len {
+                        let part = (len - off).min(split_bytes);
+                        segs.push(CopySeg {
+                            src: start + a + off,
+                            dst: dst_base + off,
+                            len: part,
+                            from_old: false,
+                        });
+                        off += part;
+                    }
+                }
+            }
+        }
+        if segs.len() >= 2 {
+            let worker_count = segs.len().min(4);
+            let mut buckets: Vec<Vec<CopySeg>> = (0..worker_count).map(|_| Vec::new()).collect();
+            let mut bucket_bytes = vec![0usize; worker_count];
+            segs.sort_unstable_by(|a, b| b.len.cmp(&a.len));
+            for seg in segs {
+                let dst = bucket_bytes
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, b)| **b)
+                    .map_or(0, |(i, _)| i);
+                bucket_bytes[dst] += seg.len;
+                buckets[dst].push(seg);
+            }
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                .into_iter()
+                .filter(|b| !b.is_empty())
+                .map(|bucket| {
+                    Box::new(move || {
+                        for seg in bucket {
+                            if seg.from_old {
+                                // SAFETY: `seg.src` points into a `card.old` `Vec<u8>` kept locked
+                                // by `guards` on the calling thread until `wide_run` joins; `seg.dst`
+                                // is a disjoint range in the mapped upload buffer.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        seg.src as *const u8,
+                                        seg.dst as *mut u8,
+                                        seg.len,
+                                    );
+                                }
+                            } else {
+                                copy_mapped_skip_absent(seg.dst as *mut u8, seg.src, seg.len);
+                            }
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            wide_run(jobs);
+        } else {
+            for seg in segs {
+                if seg.from_old {
+                    // SAFETY: as above.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            seg.src as *const u8,
+                            seg.dst as *mut u8,
+                            seg.len,
+                        );
+                    }
+                } else {
+                    copy_mapped_skip_absent(seg.dst as *mut u8, seg.src, seg.len);
+                }
+            }
+        }
+        drop(guards);
+    }
+
     pub(crate) fn card_make_before(
         &self,
         make: impl FnOnce(u64) -> Option<ID3D12Resource>,
@@ -6119,7 +6429,10 @@ impl Shadow {
             return false;
         }
         *before = make(card.size);
-        if before.is_some() {
+        if let Some(res) = before.as_ref() {
+            // SAFETY: `res` is a live D3D12 buffer resource.
+            self.card_before_gpu_va
+                .store(unsafe { res.GetGPUVirtualAddress() }, Ordering::Release);
             CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
         }
         before.is_some()
@@ -6359,39 +6672,58 @@ impl Shadow {
         }
 
         let record_race = merge_race_on();
+        let direct_write = if !record_race {
+            let mut work_spans: Vec<(usize, usize)> = Vec::with_capacity(works.len());
+            for w in &works {
+                for &(at, _, gpu_len, _) in &w.items {
+                    work_spans.push((at, at + gpu_len));
+                }
+            }
+            let coalesced = coalesce_watch_spans(start, &work_spans);
+            crate::watch::range_is_open_and_unaliased(start, &coalesced)
+        } else {
+            false
+        };
         let raw_buckets: Vec<RelayMergeBucket> = if parallel && works.len() >= 16 {
-            let worker_count = (works.len() / 8).clamp(2, 6);
+            let worker_count = (works.len() / 8).clamp(2, 4);
             let chunk_size = works.len().div_ceil(worker_count);
-            let mut results: Vec<Arc<Mutex<Option<RelayMergeBucket>>>> =
-                Vec::with_capacity(worker_count);
-            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(worker_count);
+            let mut chunks: Vec<Vec<RelayPieceWork>> = Vec::with_capacity(worker_count);
             let mut iter = works.into_iter();
             loop {
                 let chunk: Vec<RelayPieceWork> = iter.by_ref().take(chunk_size).collect();
                 if chunk.is_empty() {
                     break;
                 }
-                let skip = skip.clone();
-                let slot = Arc::new(Mutex::new(None));
-                results.push(slot.clone());
-                jobs.push(Box::new(move || {
-                    let out = merge_relay_chunk(start, chunk, &skip, record_race);
-                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
-                }));
+                chunks.push(chunk);
             }
-            wide_relay_run(jobs);
-            results
+            let slots: Arc<Vec<Mutex<Option<RelayMergeBucket>>>> = Arc::new(
+                (0..chunks.len()).map(|_| Mutex::new(None)).collect(),
+            );
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = chunks
                 .into_iter()
+                .enumerate()
+                .map(|(idx, chunk)| {
+                    let skip = skip.clone();
+                    let slots = slots.clone();
+                    Box::new(move || {
+                        let out = merge_relay_chunk(start, chunk, &skip, record_race, direct_write);
+                        *slots[idx].lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            wide_relay_run(jobs);
+            slots
+                .iter()
                 .filter_map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).take())
                 .collect()
         } else {
-            vec![merge_relay_chunk(start, works, &skip, record_race)]
+            vec![merge_relay_chunk(start, works, &skip, record_race, direct_write)]
         };
 
         let mut buckets: Vec<RelayMergeBucket> = Vec::with_capacity(raw_buckets.len());
         for b in raw_buckets {
             total_stats.merge_from(&b.stats);
-            if !b.writes.is_empty() {
+            if !b.writes.is_empty() || !b.direct_spans.is_empty() {
                 buckets.push(b);
             }
         }
@@ -6402,17 +6734,26 @@ impl Shadow {
         }
         self.scanned.lock().unwrap_or_else(|e| e.into_inner()).clear();
 
-        let total_writes: usize = buckets.iter().map(|b| b.writes.len()).sum();
-        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(total_writes);
+        let total_spans: usize = buckets
+            .iter()
+            .map(|b| b.writes.len() + b.direct_spans.len())
+            .sum();
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(total_spans);
         let mut total_written = 0usize;
+        let mut pending_written = 0usize;
         let mut has_hash_updates = false;
         let mut has_hash_clears = false;
         for b in &buckets {
             has_hash_updates |= !b.hash_updates.is_empty();
             has_hash_clears |= !b.hash_clears.is_empty();
+            for &(a, e) in &b.direct_spans {
+                spans.push((a, e));
+                total_written += e - a;
+            }
             for w in &b.writes {
                 spans.push((w.at, w.at + w.len));
                 total_written += w.len;
+                pending_written += w.len;
             }
         }
 
@@ -6464,14 +6805,21 @@ impl Shadow {
                 card.has_hot_hashes.store(true, Ordering::Release);
             }
         }
+        if direct_write && pending_written == 0 {
+            for (a, b) in coalesce_watch_spans(start, &spans) {
+                crate::watch::note_gpu_write_back_open(start + a, b - a);
+            }
+            return total_written;
+        }
         for (a, b) in coalesce_watch_spans(start, &spans) {
             crate::watch::writing_gpu_back(start + a, b - a);
         }
 
         let copy_span = (self.start, self.len);
-        if parallel && buckets.len() >= 2 && total_written >= (2 << 20) {
+        if parallel && buckets.len() >= 2 && pending_written >= (2 << 20) {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
                 .into_iter()
+                .filter(|b| !b.writes.is_empty())
                 .map(|bucket| {
                     Box::new(move || {
                         for w in &bucket.writes {
@@ -6849,9 +7197,35 @@ fn card_range_is_superseded(
 struct RelayMergeBucket {
     arena: Vec<u8>,
     writes: Vec<RelayPendingWrite>,
+    direct_spans: Vec<(usize, usize)>,
     hash_updates: Vec<(usize, u128)>,
     hash_clears: Vec<(usize, usize)>,
     stats: RelayMergeStats,
+}
+
+fn push_hot_hashes_for_slice(
+    diff_at: usize,
+    bytes: &[u8],
+    hash_updates: &mut Vec<(usize, u128)>,
+    hash_clears: &mut Vec<(usize, usize)>,
+) {
+    let diff_end = diff_at + bytes.len();
+    let first_full = diff_at.next_multiple_of(HOT_HASH_BLOCK);
+    let last_full = (diff_end / HOT_HASH_BLOCK) * HOT_HASH_BLOCK;
+    if diff_at < first_full {
+        hash_clears.push((diff_at, first_full.min(diff_end)));
+    }
+    if first_full < last_full {
+        let mut b_at = first_full;
+        while b_at < last_full {
+            let h = hot_page_hash(&bytes[b_at - diff_at..b_at - diff_at + HOT_HASH_BLOCK]) | 1;
+            hash_updates.push((b_at / HOT_HASH_BLOCK, h));
+            b_at += HOT_HASH_BLOCK;
+        }
+    }
+    if last_full < diff_end {
+        hash_clears.push((last_full.max(diff_at), diff_end));
+    }
 }
 
 fn merge_relay_chunk(
@@ -6859,13 +7233,16 @@ fn merge_relay_chunk(
     works: Vec<RelayPieceWork>,
     skip: &RelaySkipSnapshot,
     record_race: bool,
+    direct_write: bool,
 ) -> RelayMergeBucket {
     let mut arena = Vec::new();
     let mut writes = Vec::new();
+    let mut direct_spans = Vec::new();
     let mut hash_updates = Vec::new();
     let mut hash_clears = Vec::new();
     let mut scratch = Vec::new();
     let mut active = Vec::new();
+    let mut title_blk = [0u8; HOT_HASH_BLOCK];
     let mut stats = RelayMergeStats::default();
     for work in works {
         // SAFETY: `old_map` is locked exclusively by `card_merge_relay_batch` until
@@ -6878,6 +7255,162 @@ fn merge_relay_chunk(
             // the duration of `card_merge_relay_batch`, which joins before returning.
             let gpu = unsafe { std::slice::from_raw_parts(gpu_ptr as *const u8, gpu_len) };
             let held = &mut piece_buf[at - work.p_lo..at - work.p_lo + gpu_len];
+            skip.active_ranges(at, at + gpu_len, fetched_after, &mut active);
+            if active.is_empty() {
+                stats.add(RELAY_OUT_SUPERSEDED, gpu_len as u64);
+                continue;
+            }
+            let full_active = active.len() == 1 && active[0] == (at, at + gpu_len);
+            if !record_race && full_active {
+                // Single-pass L1-resident 4 KiB chunk loop: reads `gpu` once, keeps
+                // `held`, `title_blk`, and `hot_page_hash` hot in L1D, and writes directly
+                // to title memory when blocks are already open and unaliased.
+                let piece_end = at + gpu_len;
+                let held_base = held.as_ptr();
+                let mut cur = at;
+                let mut any_diff = false;
+                let mut piece_written_bytes = 0u64;
+                let mut any_unmapped = false;
+                let mut run_start = 0usize;
+                let mut run_end = 0usize;
+                while cur < piece_end {
+                    let next = (((cur / HOT_HASH_BLOCK) + 1) * HOT_HASH_BLOCK).min(piece_end);
+                    let blk_len = next - cur;
+                    let rel = cur - at;
+                    let g_blk = &gpu[rel..rel + blk_len];
+                    let h_blk = &mut held[rel..rel + blk_len];
+                    let Some(blk_first) = first_difference(g_blk, h_blk) else {
+                        if !direct_write && run_start < run_end {
+                            let held_ptr = unsafe { held_base.add(run_start - at) } as usize;
+                            writes.push(RelayPendingWrite {
+                                at: run_start,
+                                len: run_end - run_start,
+                                src: RelayWriteSrc::Gpu(held_ptr),
+                                as_read: None,
+                            });
+                            run_start = 0;
+                            run_end = 0;
+                        }
+                        cur = next;
+                        continue;
+                    };
+                    let blk_last = last_difference(g_blk, h_blk).unwrap_or(blk_first);
+                    any_diff = true;
+                    let sub_at = cur + blk_first;
+                    let sub_len = blk_last + 1 - blk_first;
+                    let sub_end = sub_at + sub_len;
+                    let g_sub = &g_blk[blk_first..=blk_last];
+                    let h_sub = &mut h_blk[blk_first..=blk_last];
+                    let t_sub = &mut title_blk[..sub_len];
+                    if !crate::host::read_into((start + sub_at) as *const u8, t_sub) {
+                        h_sub.copy_from_slice(g_sub);
+                        any_unmapped = true;
+                        if !direct_write && run_start < run_end {
+                            let held_ptr = unsafe { held_base.add(run_start - at) } as usize;
+                            writes.push(RelayPendingWrite {
+                                at: run_start,
+                                len: run_end - run_start,
+                                src: RelayWriteSrc::Gpu(held_ptr),
+                                as_read: None,
+                            });
+                            run_start = 0;
+                            run_end = 0;
+                        }
+                        cur = next;
+                        continue;
+                    }
+                    if t_sub == &*h_sub {
+                        h_sub.copy_from_slice(g_sub);
+                        piece_written_bytes += sub_len as u64;
+                        if sub_len == HOT_HASH_BLOCK && sub_at.is_multiple_of(HOT_HASH_BLOCK) {
+                            hash_updates.push((sub_at / HOT_HASH_BLOCK, hot_page_hash(h_sub) | 1));
+                        } else {
+                            hash_clears.push((sub_at, sub_end));
+                        }
+                        if direct_write {
+                            crate::host::write_mapped(
+                                (start + sub_at) as *mut u8,
+                                h_sub.as_ptr(),
+                                sub_len,
+                            );
+                            push_coalesced_span(&mut direct_spans, sub_at, sub_end);
+                        } else if run_start < run_end && run_end == sub_at {
+                            run_end = sub_end;
+                        } else {
+                            if run_start < run_end {
+                                let held_ptr =
+                                    unsafe { held_base.add(run_start - at) } as usize;
+                                writes.push(RelayPendingWrite {
+                                    at: run_start,
+                                    len: run_end - run_start,
+                                    src: RelayWriteSrc::Gpu(held_ptr),
+                                    as_read: None,
+                                });
+                            }
+                            run_start = sub_at;
+                            run_end = sub_end;
+                        }
+                    } else {
+                        if !direct_write && run_start < run_end {
+                            let held_ptr = unsafe { held_base.add(run_start - at) } as usize;
+                            writes.push(RelayPendingWrite {
+                                at: run_start,
+                                len: run_end - run_start,
+                                src: RelayWriteSrc::Gpu(held_ptr),
+                                as_read: None,
+                            });
+                            run_start = 0;
+                            run_end = 0;
+                        }
+                        if merge_piece(g_sub, h_sub, t_sub) {
+                            piece_written_bytes += sub_len as u64;
+                            if sub_len == HOT_HASH_BLOCK && sub_at.is_multiple_of(HOT_HASH_BLOCK) {
+                                hash_updates
+                                    .push((sub_at / HOT_HASH_BLOCK, hot_page_hash(t_sub) | 1));
+                            } else {
+                                hash_clears.push((sub_at, sub_end));
+                            }
+                            if direct_write {
+                                crate::host::write_mapped(
+                                    (start + sub_at) as *mut u8,
+                                    t_sub.as_ptr(),
+                                    sub_len,
+                                );
+                                push_coalesced_span(&mut direct_spans, sub_at, sub_end);
+                            } else {
+                                let arena_off = arena.len();
+                                arena.extend_from_slice(t_sub);
+                                writes.push(RelayPendingWrite {
+                                    at: sub_at,
+                                    len: sub_len,
+                                    src: RelayWriteSrc::Arena(arena_off),
+                                    as_read: None,
+                                });
+                            }
+                        }
+                    }
+                    cur = next;
+                }
+                if !direct_write && run_start < run_end {
+                    let held_ptr = unsafe { held_base.add(run_start - at) } as usize;
+                    writes.push(RelayPendingWrite {
+                        at: run_start,
+                        len: run_end - run_start,
+                        src: RelayWriteSrc::Gpu(held_ptr),
+                        as_read: None,
+                    });
+                }
+                if piece_written_bytes > 0 {
+                    stats.add(RELAY_OUT_WRITTEN, piece_written_bytes);
+                } else if !any_diff {
+                    stats.add(RELAY_OUT_EQUAL_OLD, gpu_len as u64);
+                } else if any_unmapped {
+                    stats.add(RELAY_OUT_UNMAPPED, gpu_len as u64);
+                } else {
+                    stats.add(RELAY_OUT_ALREADY_EQUAL, gpu_len as u64);
+                }
+                continue;
+            }
             let Some(first) = first_difference(gpu, held) else {
                 stats.add(RELAY_OUT_EQUAL_OLD, gpu_len as u64);
                 continue;
@@ -6904,39 +7437,21 @@ fn merge_relay_chunk(
                 continue;
             }
             let as_read = record_race.then(|| scratch_slice.to_vec());
-            let full_active = active.len() == 1 && active[0] == (diff_at, diff_at + n);
-            if full_active && scratch_slice[..] == held[..] {
+            let sub_full_active = active.len() == 1 && active[0] == (diff_at, diff_at + n);
+            if sub_full_active && scratch_slice[..] == held[..] {
                 held.copy_from_slice(gpu);
                 stats.add(RELAY_OUT_WRITTEN, n as u64);
-                // Point to `held` (cached system RAM inside `old_map`, locked for the
-                // entire `card_merge_relay_batch` and disjoint across items) instead of
-                // re-reading `gpu` from the `D3D12_HEAP_TYPE_READBACK` mapping.
-                writes.push(RelayPendingWrite {
-                    at: diff_at,
-                    len: n,
-                    src: RelayWriteSrc::Gpu(held.as_ptr() as usize),
-                    as_read,
-                });
-                // Populate `hot_hashes` for the GPU-written bytes so next frame's
-                // `scan_card_pages` sees them match and skips re-uploading them back to the GPU.
-                let diff_end = diff_at + n;
-                let first_full = diff_at.next_multiple_of(HOT_HASH_BLOCK);
-                let last_full = (diff_end / HOT_HASH_BLOCK) * HOT_HASH_BLOCK;
-                if diff_at < first_full {
-                    hash_clears.push((diff_at, first_full.min(diff_end)));
-                }
-                if first_full < last_full {
-                    let mut b_at = first_full;
-                    while b_at < last_full {
-                        let h =
-                            hot_page_hash(&held[b_at - diff_at..b_at - diff_at + HOT_HASH_BLOCK])
-                                | 1;
-                        hash_updates.push((b_at / HOT_HASH_BLOCK, h));
-                        b_at += HOT_HASH_BLOCK;
-                    }
-                }
-                if last_full < diff_end {
-                    hash_clears.push((last_full.max(diff_at), diff_end));
+                push_hot_hashes_for_slice(diff_at, held, &mut hash_updates, &mut hash_clears);
+                if direct_write {
+                    crate::host::write_mapped((start + diff_at) as *mut u8, held.as_ptr(), n);
+                    push_coalesced_span(&mut direct_spans, diff_at, diff_at + n);
+                } else {
+                    writes.push(RelayPendingWrite {
+                        at: diff_at,
+                        len: n,
+                        src: RelayWriteSrc::Gpu(held.as_ptr() as usize),
+                        as_read,
+                    });
                 }
                 continue;
             }
@@ -6950,20 +7465,26 @@ fn merge_relay_chunk(
                 continue;
             }
             stats.add(RELAY_OUT_WRITTEN, n as u64);
-            let arena_off = arena.len();
-            arena.extend_from_slice(scratch_slice);
-            writes.push(RelayPendingWrite {
-                at: diff_at,
-                len: n,
-                src: RelayWriteSrc::Arena(arena_off),
-                as_read,
-            });
-            hash_clears.push((diff_at, diff_at + n));
+            push_hot_hashes_for_slice(diff_at, scratch_slice, &mut hash_updates, &mut hash_clears);
+            if direct_write {
+                crate::host::write_mapped((start + diff_at) as *mut u8, scratch_slice.as_ptr(), n);
+                push_coalesced_span(&mut direct_spans, diff_at, diff_at + n);
+            } else {
+                let arena_off = arena.len();
+                arena.extend_from_slice(scratch_slice);
+                writes.push(RelayPendingWrite {
+                    at: diff_at,
+                    len: n,
+                    src: RelayWriteSrc::Arena(arena_off),
+                    as_read,
+                });
+            }
         }
     }
     RelayMergeBucket {
         arena,
         writes,
+        direct_spans,
         hash_updates,
         hash_clears,
         stats,
@@ -7211,7 +7732,7 @@ mod relay_batch_tests {
             },
         ];
         let start = title_mem.as_ptr() as usize;
-        let bucket = merge_relay_chunk(start, works, &skip, false);
+        let bucket = merge_relay_chunk(start, works, &skip, false, false);
         assert_eq!(bucket.writes.len(), 2);
         assert_eq!(bucket.stats.pieces[super::RELAY_OUT_WRITTEN], 2);
         for w in &bucket.writes {
@@ -7286,7 +7807,7 @@ mod relay_batch_tests {
             old_len: old0.len(),
             items: vec![(0, gpu0.as_ptr() as usize, gpu0.len(), 1)],
         }];
-        let bucket = merge_relay_chunk(title_mem.as_ptr() as usize, works, &skip, false);
+        let bucket = merge_relay_chunk(title_mem.as_ptr() as usize, works, &skip, false, false);
         assert_eq!(bucket.writes.len(), 1);
         assert!(bucket.arena.is_empty(), "clean GPU write should borrow gpu slice directly");
         assert!(matches!(bucket.writes[0].src, RelayWriteSrc::Gpu(_)));
@@ -7376,7 +7897,7 @@ mod relay_batch_tests {
                 items: vec![(3 * PAGE, gpu3.as_ptr() as usize, gpu3.len(), 5)],
             },
         ];
-        let bucket = merge_relay_chunk(title_mem.as_ptr() as usize, works, &skip, false);
+        let bucket = merge_relay_chunk(title_mem.as_ptr() as usize, works, &skip, false, false);
         assert_eq!(bucket.writes.len(), 1);
         assert_eq!(bucket.stats.pieces[RELAY_OUT_EQUAL_OLD], 1);
         assert_eq!(bucket.stats.bytes[RELAY_OUT_EQUAL_OLD], PAGE as u64);
@@ -7409,6 +7930,7 @@ mod relay_batch_tests {
                 items: vec![(0, gpu_u.as_ptr() as usize, gpu_u.len(), 5)],
             }],
             &empty_skip,
+            false,
             false,
         );
         assert!(bucket_u.writes.is_empty());

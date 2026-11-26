@@ -2543,8 +2543,10 @@ impl HostHeap {
                 n_cand += 1;
                 n_stripes += 1;
             }
-            if n_cand >= 2 {
-                stripes[..n_stripes].sort_unstable();
+            if n_cand >= 1 {
+                if n_stripes > 1 {
+                    stripes[..n_stripes].sort_unstable();
+                }
                 let mut uniq = 0usize;
                 for j in 0..n_stripes {
                     if uniq == 0 || stripes[j] != stripes[uniq - 1] {

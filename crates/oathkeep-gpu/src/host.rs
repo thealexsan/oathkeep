@@ -2653,7 +2653,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
-                && shadow.writes_pending()
+                && shadow.pending_overlaps(*address, *address + *len)
             {
                 let ptr = Arc::as_ptr(shadow) as usize;
                 let idx = if ptr == last_ptr {
@@ -2711,7 +2711,12 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         if small.is_empty() {
             return false;
         }
-        if small.len() >= 2 && allow_wide {
+        let small_bytes: usize = small
+            .iter()
+            .flat_map(|(_, rs)| rs.iter())
+            .map(|&(a, b)| b.saturating_sub(a))
+            .sum();
+        if allow_wide && (small.len() >= 4 || (small.len() >= 2 && small_bytes >= (256 << 10))) {
             let any_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let per_budget = (runs_left / small.len()).max(16);
             let jobs: Vec<Box<dyn FnOnce() + Send>> = small
@@ -4005,8 +4010,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let prep_write_start = std::time::Instant::now();
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
-        let mut decl_index: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::new();
+        let mut decl_index: FastHashMap<usize, usize> = FastHashMap::default();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
@@ -4131,12 +4135,11 @@ impl Host {
                 (buf, ptr as usize, cap)
             };
             let emit_hashes = |list: &ID3D12GraphicsCommandList,
-                               copied_in_this_list: &std::collections::HashSet<usize>,
-                               uav_in_this_list: &std::collections::HashSet<usize>| {
+                               copied_in_this_list: &FastHashMap<usize, ()>,
+                               uav_in_this_list: &FastHashMap<usize, ()>| {
                 let mut targets: Vec<(&Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
                     Vec::with_capacity(dirty.len() + masked.len());
-                let mut target_idx: std::collections::HashMap<usize, usize> =
-                    std::collections::HashMap::with_capacity(dirty.len() + masked.len());
+                let mut target_idx: FastHashMap<usize, usize> = FastHashMap::default();
                 for (shadow, ranges) in &dirty {
                     let ptr = Arc::as_ptr(shadow) as usize;
                     let idx = *target_idx.entry(ptr).or_insert_with(|| {
@@ -4159,37 +4162,49 @@ impl Host {
                             .push((item.offset, item.offset + item.data.len()));
                     }
                 }
+                let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+                let mut active_targets: Vec<(&Arc<crate::shadow::Shadow>, &[(usize, usize)], u64, u64)> =
+                    Vec::with_capacity(targets.len());
                 for (shadow, ranges) in &targets {
-                    let Some((Some(before), size)) = shadow.card_sides() else {
+                    let Some((before_va, size)) = shadow.card_before_gpu_va() else {
                         continue;
                     };
                     let ptr = Arc::as_ptr(shadow) as usize;
-                    // SAFETY: live buffers and compute root signature/PSO.
-                    unsafe {
-                        if uav_in_this_list.contains(&ptr) {
-                            list.ResourceBarrier(&[transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )]);
-                        } else if copied_in_this_list.contains(&ptr) {
-                            list.ResourceBarrier(&[transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )]);
-                        }
-                        list.SetComputeRootSignature(&work.root);
-                        list.SetPipelineState(&work.pso);
+                    if uav_in_this_list.contains_key(&ptr) {
+                        barriers.push(transition(
+                            &shadow.buffer,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        ));
+                    } else if copied_in_this_list.contains_key(&ptr) {
+                        barriers.push(transition(
+                            &shadow.buffer,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        ));
+                    }
+                    active_targets.push((shadow, ranges.as_slice(), before_va, size));
+                }
+                if active_targets.is_empty() {
+                    return;
+                }
+                // SAFETY: live buffers and compute root signature/PSO.
+                unsafe {
+                    if !barriers.is_empty() {
+                        list.ResourceBarrier(&barriers);
+                    }
+                    list.SetComputeRootSignature(&work.root);
+                    list.SetPipelineState(&work.pso);
+                    list.SetComputeRootUnorderedAccessView(
+                        3,
+                        work.differs.0.GetGPUVirtualAddress(),
+                    );
+                    for &(shadow, ranges, before_va, size) in &active_targets {
                         list.SetComputeRootShaderResourceView(
                             1,
                             shadow.buffer.GetGPUVirtualAddress(),
                         );
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(
-                            3,
-                            work.differs.0.GetGPUVirtualAddress(),
-                        );
+                        list.SetComputeRootUnorderedAccessView(2, before_va);
                         let runs: Vec<crate::shadow::CardSpan> =
                             if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                                 vec![shadow.card_run(0, usize::MAX)]
@@ -4223,7 +4238,7 @@ impl Host {
                     if total_copy == 0 && masked.is_empty() {
                         allocator.Reset()?;
                         list.Reset(allocator, None)?;
-                        let empty = std::collections::HashSet::new();
+                        let empty = FastHashMap::default();
                         emit_hashes(list, &empty, &empty);
                         list.Close()?;
                         list.cast()
@@ -4244,58 +4259,12 @@ impl Host {
                         #[cfg(feature = "diagnostics")]
                         let fill_start = std::time::Instant::now();
                         if total_copy >= CARD_UPLOAD_WIDE_MIN {
-                            let mut tasks: Vec<(Arc<crate::shadow::Shadow>, usize, usize, usize)> =
-                                Vec::new();
-                            for (ci, (_, items)) in chunks.iter().enumerate() {
-                                let base_ptr = plan_uploads[ci].1;
-                                for &(si, a, len, dst_off) in items {
-                                    let shadow = &dirty[si].0;
-                                    let mut off = 0usize;
-                                    while off < len {
-                                        let part = (len - off).min(CARD_UPLOAD_SPLIT);
-                                        tasks.push((
-                                            shadow.clone(),
-                                            a + off,
-                                            part,
-                                            base_ptr + dst_off + off,
-                                        ));
-                                        off += part;
-                                    }
-                                }
-                            }
-                            if tasks.len() >= 2 {
-                                let worker_count = tasks.len().min(6);
-                                let mut buckets: Vec<
-                                    Vec<(Arc<crate::shadow::Shadow>, usize, usize, usize)>,
-                                > = (0..worker_count).map(|_| Vec::new()).collect();
-                                let mut bucket_bytes = vec![0usize; worker_count];
-                                tasks.sort_unstable_by(|a, b| b.2.cmp(&a.2));
-                                for task in tasks {
-                                    let dst = bucket_bytes
-                                        .iter()
-                                        .enumerate()
-                                        .min_by_key(|(_, b)| **b)
-                                        .map_or(0, |(i, _)| i);
-                                    bucket_bytes[dst] += task.2;
-                                    buckets[dst].push(task);
-                                }
-                                let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
-                                    .into_iter()
-                                    .filter(|b| !b.is_empty())
-                                    .map(|bucket| {
-                                        Box::new(move || {
-                                            for (shadow, a, len, dst_ptr) in bucket {
-                                                shadow.card_fill_upload(a, len, dst_ptr as *mut u8);
-                                            }
-                                        }) as Box<dyn FnOnce() + Send>
-                                    })
-                                    .collect();
-                                crate::shadow::wide_run(jobs);
-                            } else {
-                                for (shadow, a, len, dst_ptr) in tasks {
-                                    shadow.card_fill_upload(a, len, dst_ptr as *mut u8);
-                                }
-                            }
+                            crate::shadow::Shadow::card_fill_uploads_parallel(
+                                &dirty,
+                                &chunks,
+                                &plan_uploads,
+                                CARD_UPLOAD_SPLIT,
+                            );
                         } else if total_copy > 0 {
                             for (ci, (_, items)) in chunks.iter().enumerate() {
                                 let base_ptr = plan_uploads[ci].1;
@@ -4368,8 +4337,7 @@ impl Host {
                         }
                         allocator.Reset()?;
                         list.Reset(allocator, None)?;
-                        let mut copied_shadows: std::collections::HashSet<usize> =
-                            std::collections::HashSet::with_capacity(dirty.len());
+                        let mut copied_shadows: FastHashMap<usize, ()> = FastHashMap::default();
                         for (ci, (_, items)) in chunks.iter().enumerate() {
                             let upload_buf = &plan_uploads[ci].0;
                             for &(si, a, len, dst_off) in items {
@@ -4381,29 +4349,32 @@ impl Host {
                                     dst_off as u64,
                                     len as u64,
                                 );
-                                copied_shadows.insert(Arc::as_ptr(shadow) as usize);
+                                copied_shadows.insert(Arc::as_ptr(shadow) as usize, ());
                             }
                         }
-                        let mut uav_shadows: std::collections::HashSet<usize> =
-                            std::collections::HashSet::with_capacity(masked.len());
+                        let mut uav_shadows: FastHashMap<usize, ()> = FastHashMap::default();
                         if !masked_ops.is_empty() {
+                            let mut uav_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
                             for (shadow, items) in &masked {
                                 if items.is_empty() {
                                     continue;
                                 }
                                 let ptr = Arc::as_ptr(shadow) as usize;
-                                if uav_shadows.insert(ptr) {
-                                    let before_state = if copied_shadows.remove(&ptr) {
+                                if uav_shadows.insert(ptr, ()).is_none() {
+                                    let before_state = if copied_shadows.remove(&ptr).is_some() {
                                         D3D12_RESOURCE_STATE_COPY_DEST
                                     } else {
                                         D3D12_RESOURCE_STATE_COMMON
                                     };
-                                    list.ResourceBarrier(&[transition(
+                                    uav_barriers.push(transition(
                                         &shadow.buffer,
                                         before_state,
                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                    )]);
+                                    ));
                                 }
+                            }
+                            if !uav_barriers.is_empty() {
+                                list.ResourceBarrier(&uav_barriers);
                             }
                             list.SetComputeRootSignature(&work.merge_root);
                             list.SetPipelineState(&work.merge_pso);
@@ -4456,9 +4427,7 @@ impl Host {
         };
         let mut at = work.taken;
         for (shadow, spans) in &declared {
-            let twin = shadow
-                .card_sides()
-                .is_some_and(|(before, _)| before.is_some());
+            let twin = shadow.card_before_gpu_va().is_some();
             let mut shadow_spans: Vec<crate::shadow::CardSpan> = Vec::with_capacity(spans.len());
             for &(from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
@@ -4517,7 +4486,7 @@ impl Host {
                         work.differs.0.GetGPUVirtualAddress(),
                     );
                     for c in plan.compares.iter().filter(|c| c.compared) {
-                        let Some((Some(before), size)) = c.shadow.card_sides() else {
+                        let Some((before_va, size)) = c.shadow.card_before_gpu_va() else {
                             continue;
                         };
                         let constants = [
@@ -4533,7 +4502,7 @@ impl Host {
                             1,
                             c.shadow.buffer.GetGPUVirtualAddress(),
                         );
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(2, before_va);
                         list.Dispatch(c.span.pieces.div_ceil(64), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
@@ -8038,7 +8007,7 @@ impl HostList {
                     }
                     work();
                     if matches!(step, Step::Run(_)) {
-                        crate::watch::ask_once_end();
+                        crate::watch::ask_once_end_after_run();
                     }
                     #[cfg(feature = "diagnostics")]
                     {
@@ -8519,46 +8488,31 @@ impl Batch {
         let prelude_only = total_units == 0 && !plans.is_empty();
         let prelude_only_start = prelude_only.then(std::time::Instant::now);
 
-        // Fix AD1: partition refreshes into dirty guarded shadows (needing coalesced
-        // `pre_guard_batch`) vs already-clean/non-guarded refreshes, then overlap
-        // `pre_guard_batch` with prelude command-list recording, texture staging refreshes,
-        // and non-guarded/clean buffer refreshes in Phase A before fanning out `dirty_guarded`
-        // refreshes in Phase B.
-        let mut dirty_guarded: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
-            Vec::new();
-        let mut other_refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
-            Vec::new();
-        for (shadow, spans) in self.refreshes.drain(..) {
-            if shadow.guarded()
-                && !shadow.writes_pending()
-                && !shadow.is_in_place()
-                && !shadow.is_guarded_clean()
-            {
-                dirty_guarded.push((shadow, spans));
-            } else {
-                other_refreshes.push((shadow, spans));
+        // Fix AE1: restore run94's full `pre_guard_batch` coverage over ALL guarded, non-pending,
+        // non-in-place shadows, and overlap ONLY `record_prelude` (pure D3D12 COM recording with
+        // zero `VirtualProtect` / `GUARDS` locks) with `pre_guard_batch` before running ALL
+        // refreshes + `pending_textures` in one unified wave.
+        let mut guarded_shadows = 0usize;
+        for (shadow, _) in &self.refreshes {
+            if shadow.guarded() && !shadow.writes_pending() && !shadow.is_in_place() {
+                guarded_shadows += 1;
             }
         }
-        let use_pre_guard = dirty_guarded.len() >= 2
-            || (wide_refresh()
-                && dirty_guarded.len() == 1
-                && (!plans.is_empty()
-                    || !self.pending_textures.is_empty()
-                    || !other_refreshes.is_empty()));
-        if !use_pre_guard {
-            other_refreshes.append(&mut dirty_guarded);
-        }
-
-        let mut phase_a_jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(40);
+        let use_pre_guard =
+            guarded_shadows >= 2 || (wide_refresh() && guarded_shadows == 1 && !plans.is_empty());
         let guarded_ranges: Vec<(usize, usize)> = if use_pre_guard {
             let mut ranges = Vec::new();
-            for (_, spans) in &dirty_guarded {
-                ranges.extend_from_slice(spans);
+            for (shadow, spans) in &self.refreshes {
+                if shadow.guarded() && !shadow.writes_pending() && !shadow.is_in_place() {
+                    ranges.extend_from_slice(spans);
+                }
             }
             ranges
         } else {
             Vec::new()
         };
+
+        let mut prelude_jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(4);
         let mut prelude_outs: Vec<std::sync::Arc<Mutex<Vec<(usize, SendCmdList)>>>> = Vec::new();
         if let Some(host) = host
             && !plans.is_empty()
@@ -8574,7 +8528,7 @@ impl Batch {
                 .map(|_| std::sync::Arc::new(Mutex::new(Vec::new())))
                 .collect();
             for (part, out) in buckets.into_iter().zip(prelude_outs.iter().cloned()) {
-                phase_a_jobs.push(Box::new(move || {
+                prelude_jobs.push(Box::new(move || {
                     // SAFETY: `host` is live for the entire `flush_with_preludes` call, and
                     // `wide_run_two_stage` / `run_wide_capped` joins all workers before returning.
                     let host = unsafe { &*(host_ptr as *const Host) };
@@ -8586,7 +8540,10 @@ impl Batch {
                 }));
             }
         }
-        Self::push_refresh_jobs(other_refreshes, &mut phase_a_jobs);
+
+        let mut refresh_jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(40);
+        let all_refreshes: Vec<_> = self.refreshes.drain(..).collect();
+        Self::push_refresh_jobs(all_refreshes, &mut refresh_jobs);
         if !self.pending_textures.is_empty() {
             let mut texs: Vec<_> = self.pending_textures.drain(..).collect();
             texs.sort_unstable_by(|a, b| {
@@ -8594,7 +8551,7 @@ impl Batch {
             });
             if texs.len() <= 16 {
                 for (_, _, staging) in texs {
-                    phase_a_jobs.push(Box::new(move || staging.refresh()));
+                    refresh_jobs.push(Box::new(move || staging.refresh()));
                 }
             } else {
                 let mut tex_buckets: Vec<Vec<std::sync::Arc<crate::texture::Staging>>> =
@@ -8604,7 +8561,7 @@ impl Batch {
                 }
                 for part in tex_buckets {
                     if !part.is_empty() {
-                        phase_a_jobs.push(Box::new(move || {
+                        refresh_jobs.push(Box::new(move || {
                             for staging in part {
                                 staging.refresh();
                             }
@@ -8613,16 +8570,15 @@ impl Batch {
                 }
             }
         }
-        if !guarded_ranges.is_empty() && wide_refresh() {
-            let mut phase_b_jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(24);
-            Self::push_refresh_jobs(dirty_guarded, &mut phase_b_jobs);
+
+        if !guarded_ranges.is_empty() && !prelude_jobs.is_empty() && wide_refresh() {
             let started = std::time::Instant::now();
             let before_buf = PREPARING[0].load(Ordering::Relaxed);
             let before_tex = PREPARING[2].load(Ordering::Relaxed);
             crate::shadow::wide_run_two_stage(
-                phase_a_jobs,
+                prelude_jobs,
                 || crate::watch::pre_guard_batch(&guarded_ranges),
-                phase_b_jobs,
+                refresh_jobs,
             );
             let wall = started.elapsed().as_micros() as u64;
             let sum_buf = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before_buf);
@@ -8640,8 +8596,8 @@ impl Batch {
             if !guarded_ranges.is_empty() {
                 crate::watch::pre_guard_batch(&guarded_ranges);
             }
-            Self::push_refresh_jobs(dirty_guarded, &mut phase_a_jobs);
-            Self::run_wide_capped(phase_a_jobs);
+            prelude_jobs.append(&mut refresh_jobs);
+            Self::run_wide_capped(prelude_jobs);
         }
         for out in prelude_outs {
             for (idx, rec) in
