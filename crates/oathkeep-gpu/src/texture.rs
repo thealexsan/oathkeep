@@ -730,7 +730,7 @@ static LRU_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic
 /// Records an uploaded picked-by-index texture in the LRU tracker.
 pub(crate) fn note_picked_upload(resource: This, copy: &crate::resource::HostTexture, staging: &Staging) {
     let now = crate::host::now_ms();
-    let bytes = staging.bytes.max(staging.read as u64);
+    let bytes = copy.vram_bytes().max(staging.bytes).max(staging.read as u64);
     let _ = copy.serial;
     let mut lru = PICKED_LRU.lock().unwrap_or_else(|e| e.into_inner());
     lru.get_or_insert_with(LruTracker::default).note_upload(
@@ -943,11 +943,26 @@ fn evict_cold_picked() {
     })
     .unwrap_or(start_cursor);
 
+    // Protect only actively busy/in-flight staging entries (held by a command
+    // list, dirty, not yet uploaded, or touched within the last 2 seconds).
+    // Idle uploaded staging buffers (such as on-demand tiled textures whose
+    // `once` flag is false) must not block cold VRAM eviction; `let_go_idle`
+    // unstages them under `r.host.made` when their host copy is reclaimed.
     let staged_set: std::collections::HashSet<usize> = STAGING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .map(|m| m.keys().copied().collect())
+        .map(|m| {
+            m.iter()
+                .filter(|(_, s)| {
+                    Arc::strong_count(s) > 1
+                        || s.dirty.load(Relaxed)
+                        || !s.uploaded.load(Relaxed)
+                        || !crate::host::long_ago(s.used.load(Relaxed), 2_000, 4)
+                })
+                .map(|(&res, _)| res)
+                .collect()
+        })
         .unwrap_or_default();
     let written_set: std::collections::HashSet<usize> = HOST_WRITTEN
         .lock()
@@ -958,7 +973,8 @@ fn evict_cold_picked() {
 
     // Phase 2: Select coldest victims with their slot lists under `PICKED_LRU`,
     // then drop the lock before touching `HostHeap`.
-    let victims: Vec<(u64, u64, Vec<u32>)> = {
+    // Tuple: (start, bytes, unmapped, idle_ms, slots)
+    let victims: Vec<(u64, u64, bool, u64, Vec<u32>)> = {
         let mut guard = PICKED_LRU.lock().unwrap_or_else(|e| e.into_inner());
         let lru = guard.get_or_insert_with(LruTracker::default);
         lru.scan_cursor = next_cursor;
@@ -975,9 +991,13 @@ fn evict_cold_picked() {
         );
         chosen
             .into_iter()
-            .filter_map(|(start, _, bytes, _)| {
+            .filter_map(|(start, _, bytes, unmapped)| {
                 let slots = lru.slots_by_start.get(&start)?.clone();
-                (!slots.is_empty()).then_some((start, bytes, slots))
+                let idle_ms = lru
+                    .entries
+                    .get(&start)
+                    .map_or(u64::MAX, |e| now_ms.saturating_sub(e.last_used_ms));
+                (!slots.is_empty()).then_some((start, bytes, unmapped, idle_ms, slots))
             })
             .collect()
     };
@@ -986,19 +1006,30 @@ fn evict_cold_picked() {
         return;
     }
 
-    // Phase 3: Arm or complete fence-deferred slot eviction via
-    // `HostHeap::texture_slot_gone`.
+    // Phase 3: Evict selected slots behind in-flight GPU fences.
+    // Freshly unmapped textures (< 3s idle) keep `texture_slot_gone`'s grace
+    // window against transient streaming remaps; already-cold unmapped and
+    // cold mapped victims unpin immediately via `evict_texture_slot` so
+    // `resource::let_go_idle` can reclaim their VRAM right after fences pass.
+    let frame = crate::frame::current();
     let mut evicted_starts = Vec::new();
     let (mut armed, mut unmade, mut freed_bytes) = (0u64, 0u64, 0u64);
     let _ = crate::descriptor::with_view_heap(|host| {
-        for (start, bytes, slots) in &victims {
+        for (start, bytes, unmapped, idle_ms, slots) in &victims {
             let mut all_gone = true;
             let mut any_unmade = false;
+            let immediate = !*unmapped || *idle_ms >= 3_000;
+            let requeue = (!*unmapped).then_some((frame, frame + 240));
             for &slot in slots {
                 if host.shows_none(slot) {
                     continue;
                 }
-                if host.texture_slot_gone(slot) {
+                let done = if immediate {
+                    host.evict_texture_slot(slot, requeue)
+                } else {
+                    host.texture_slot_gone(slot)
+                };
+                if done {
                     unmade += 1;
                     any_unmade = true;
                 } else {

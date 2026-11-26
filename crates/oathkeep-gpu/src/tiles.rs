@@ -126,6 +126,14 @@ pub(crate) fn given_total() -> u64 {
     STATS[2].load(Ordering::Relaxed)
 }
 
+/// The bytes of already-allocated pool heaps currently free for reuse without
+/// taking additional DXGI local VRAM (`heaps - given`).
+pub(crate) fn free_room() -> u64 {
+    STATS[3]
+        .load(Ordering::Relaxed)
+        .saturating_sub(STATS[2].load(Ordering::Relaxed))
+}
+
 /// One heap of the pool and its free runs of tiles (first tile, tiles), in
 /// order, no two touching.
 struct Heap {

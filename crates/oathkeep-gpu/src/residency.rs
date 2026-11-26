@@ -203,9 +203,9 @@ pub(crate) fn sample_vram() -> VramPlan {
     let video = crate::host::host().and_then(|h| h.video_memory());
     let plan = match video {
         Some([budget, used, ..]) => {
-            let pool_free = crate::pool::texture_room();
-            let reserved_extra =
-                crate::shadow::card_room_kept().saturating_add(crate::resource::targets_room_kept());
+            let pool_free = crate::pool::texture_room().saturating_add(crate::tiles::free_room());
+            let reserved_extra = crate::shadow::card_room_kept()
+                .saturating_add(crate::resource::targets_room_kept(Some(budget)));
             let filled_textures =
                 crate::resource::KINDS[1].load(Ordering::Relaxed).saturating_add(crate::tiles::given_total());
             vram_plan(budget, used, pool_free, reserved_extra, filled_textures)

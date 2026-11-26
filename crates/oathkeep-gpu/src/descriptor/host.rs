@@ -2301,6 +2301,33 @@ impl HostHeap {
         true
     }
 
+    /// Immediately evicts a cold or long-unmapped texture slot under VRAM
+    /// pressure without waiting for `AWAY_MS` (`texture_slot_gone`): writes a
+    /// null view and retires the held `ID3D12Resource` behind in-flight GPU
+    /// fences via [`HostHeap::unmake`] -> [`HostHeap::keep`] ->
+    /// `host::retire_resource`. When `requeue_due` is `Some((frame, due))`,
+    /// re-queues the slot so a still-mapped texture can re-upload once VRAM
+    /// headroom returns.
+    pub(crate) fn evict_texture_slot(&self, index: u32, requeue_due: Option<(u64, u64)>) -> bool {
+        {
+            let _made = self.made.lock(index);
+            if !self.made.get(index).is_some_and(|key| key != 0) {
+                return false;
+            }
+            {
+                let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
+                away.remove(&index);
+            }
+            self.unmake(index);
+        }
+        if let Some((frame, due)) = requeue_due {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            textures.changed(index, frame, due);
+        }
+        STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
     /// Whether host slot `index` shows the placed texture the title's record
     /// at `handle` views, by an earlier view of it.
     pub(crate) fn texture_slot_shows_other(&self, index: u32, handle: u64) -> bool {
