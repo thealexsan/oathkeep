@@ -38,6 +38,13 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     window: bool,
     place: Option<(crate::inplace::PlaceHeap, u64)>,
+    cbv_slab: Option<CbvSlabSlot>,
+}
+
+struct CbvSlabSlot {
+    slab_idx: usize,
+    offset: u64,
+    size: u64,
 }
 
 #[derive(Default)]
@@ -3420,6 +3427,9 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] =
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if let Some(slot) = self.cbv_slab.take() {
+            free_cbv_slab_slot(slot);
+        }
         if self.place.is_some() {
             crate::inplace::gone(self.window, self.len);
             return;
@@ -3720,29 +3730,70 @@ fn let_go_idle_with(urgent: bool) {
             Vec::new()
         }
     };
-    if !gone_loose.is_empty() || !gone_buffers.is_empty() || !gone_aligned.is_empty() {
+    let gone_aligned_cbv: Vec<Arc<Shadow>> = {
+        let map = if urgent {
+            ALIGNED_CBV.try_write().ok()
+        } else {
+            Some(ALIGNED_CBV.write().unwrap_or_else(|e| e.into_inner()))
+        };
+        if let Some(mut map) = map
+            && !map.is_empty()
+        {
+            let idle: Vec<u64> = map
+                .iter()
+                .filter(|(_, s)| {
+                    Arc::strong_count(s) == 1
+                        && !s.writes_pending()
+                        && crate::host::long_ago(
+                            s.used.load(Ordering::Relaxed),
+                            idle_ms,
+                            idle_frames,
+                        )
+                        && (s.cbv_slab.is_some() || crate::host::references(&s.buffer) == 1)
+                })
+                .map(|(key, _)| *key)
+                .collect();
+            let gone: Vec<Arc<Shadow>> = idle
+                .into_iter()
+                .filter_map(|key| map.remove(&key))
+                .collect();
+            ALIGNED_CBV_LEN.store(map.len(), Ordering::Release);
+            gone
+        } else {
+            Vec::new()
+        }
+    };
+    if !gone_loose.is_empty()
+        || !gone_buffers.is_empty()
+        || !gone_aligned.is_empty()
+        || !gone_aligned_cbv.is_empty()
+    {
         for s in gone_loose
             .iter()
             .chain(gone_buffers.iter())
             .chain(gone_aligned.iter())
+            .chain(gone_aligned_cbv.iter())
         {
             s.mark_dead();
         }
         SHADOW_GEN.fetch_add(1, Ordering::Release);
-        let went = gone_loose.len() + gone_buffers.len() + gone_aligned.len();
+        let went =
+            gone_loose.len() + gone_buffers.len() + gone_aligned.len() + gone_aligned_cbv.len();
         let bytes: u64 = gone_loose
             .iter()
             .chain(gone_buffers.iter())
             .chain(gone_aligned.iter())
+            .chain(gone_aligned_cbv.iter())
             .map(|s| s.len)
             .sum();
         crate::host::trail(|| {
             format!(
-                "sweep: {went} host copies of title memory let go ({} KiB; {} windows, {} buffers, {} aligned), held by no list and no slot",
+                "sweep: {went} host copies of title memory let go ({} KiB; {} windows, {} buffers, {} aligned, {} cbv_slab), held by no list and no slot",
                 bytes >> 10,
                 gone_loose.len(),
                 gone_buffers.len(),
-                gone_aligned.len()
+                gone_aligned.len(),
+                gone_aligned_cbv.len()
             )
         });
     }
@@ -3750,6 +3801,7 @@ fn let_go_idle_with(urgent: bool) {
         .into_iter()
         .chain(gone_buffers)
         .chain(gone_aligned)
+        .chain(gone_aligned_cbv)
     {
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
@@ -3977,6 +4029,33 @@ impl Shadow {
         let allow_uav = desc.Flags.0
             & windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0
             != 0;
+        Self::new_inner(buffer, host_width, allow_uav, data, gpu, start, len, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_suballocated(
+        buffer: ID3D12Resource,
+        host_width: u64,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        cbv_slab: Option<CbvSlabSlot>,
+    ) -> Shadow {
+        Self::new_inner(buffer, host_width, false, data, gpu, start, len, cbv_slab)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        buffer: ID3D12Resource,
+        host_width: u64,
+        allow_uav: bool,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        cbv_slab: Option<CbvSlabSlot>,
+    ) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
@@ -4014,6 +4093,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            cbv_slab,
         }
     }
 
@@ -8312,14 +8392,181 @@ fn longest_tail(
 }
 
 pub(crate) const ALIGNED_WINDOW: u64 = 64 << 10;
+const CBV_SLAB_BYTES: u64 = 4 << 20;
+const CBV_SLAB_MAX_SLOT: u64 = 1 << 20;
 
 static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 static ALIGNED: RwLock<BTreeMap<u64, Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 static ALIGNED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ALIGNED_CBV: RwLock<BTreeMap<u64, Arc<Shadow>>> = RwLock::new(BTreeMap::new());
+static ALIGNED_CBV_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct CbvSlab {
+    buffer: ID3D12Resource,
+    data: usize,
+    gpu: u64,
+    next: u64,
+    cap: u64,
+}
+
+#[derive(Default)]
+struct CbvSlabPool {
+    slabs: Vec<CbvSlab>,
+    free: BTreeMap<u64, Vec<(usize, u64)>>,
+}
+
+static CBV_SLAB_POOL: Mutex<CbvSlabPool> = Mutex::new(CbvSlabPool {
+    slabs: Vec::new(),
+    free: BTreeMap::new(),
+});
+
+fn free_cbv_slab_slot(slot: CbvSlabSlot) {
+    let mut pool = CBV_SLAB_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.free
+        .entry(slot.size)
+        .or_default()
+        .push((slot.slab_idx, slot.offset));
+}
+
+fn alloc_cbv_slab(aligned_size: u64) -> Option<(ID3D12Resource, *mut u8, u64, Option<CbvSlabSlot>)> {
+    debug_assert!(aligned_size.is_multiple_of(256) && aligned_size > 0);
+    if aligned_size > CBV_SLAB_MAX_SLOT {
+        let (buffer, data) = host()?.shared_buffer(aligned_size)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        return Some((buffer, data, gpu, None));
+    }
+    {
+        let mut pool = CBV_SLAB_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((slab_idx, offset)) = pool.free.get_mut(&aligned_size).and_then(Vec::pop) {
+            let slab = &pool.slabs[slab_idx];
+            return Some((
+                slab.buffer.clone(),
+                (slab.data + offset as usize) as *mut u8,
+                slab.gpu + offset,
+                Some(CbvSlabSlot {
+                    slab_idx,
+                    offset,
+                    size: aligned_size,
+                }),
+            ));
+        }
+        if let Some((slab_idx, slab)) = pool.slabs.iter_mut().enumerate().last()
+            && slab.cap.saturating_sub(slab.next) >= aligned_size
+        {
+            let offset = slab.next;
+            slab.next += aligned_size;
+            return Some((
+                slab.buffer.clone(),
+                (slab.data + offset as usize) as *mut u8,
+                slab.gpu + offset,
+                Some(CbvSlabSlot {
+                    slab_idx,
+                    offset,
+                    size: aligned_size,
+                }),
+            ));
+        }
+    }
+    let (buffer, data) = host()?.shared_buffer(CBV_SLAB_BYTES)?;
+    crate::host::name(&buffer, || {
+        format!("aligned CBV slab ({} KiB)", CBV_SLAB_BYTES >> 10)
+    });
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut pool = CBV_SLAB_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let slab_idx = pool.slabs.len();
+    pool.slabs.push(CbvSlab {
+        buffer: buffer.clone(),
+        data: data as usize,
+        gpu,
+        next: aligned_size,
+        cap: CBV_SLAB_BYTES,
+    });
+    let slab_count = pool.slabs.len();
+    drop(pool);
+    tracing::info!(
+        slab_count,
+        slab_kib = CBV_SLAB_BYTES >> 10,
+        "aligned CBV slab allocated"
+    );
+    Some((
+        buffer,
+        data,
+        gpu,
+        Some(CbvSlabSlot {
+            slab_idx,
+            offset: 0,
+            size: aligned_size,
+        }),
+    ))
+}
 
 #[inline]
 pub(crate) fn has_aligned() -> bool {
     ALIGNED_LEN.load(Ordering::Relaxed) != 0
+}
+
+#[inline]
+pub(crate) fn has_aligned_cbv() -> bool {
+    ALIGNED_CBV_LEN.load(Ordering::Relaxed) != 0
+}
+
+pub(crate) fn find_aligned_cbv_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if !has_aligned_cbv() {
+        return None;
+    }
+    let need = len.max(1);
+    let map = ALIGNED_CBV.read().unwrap_or_else(|e| e.into_inner());
+    let s = map.get(&address)?;
+    if s.len >= need {
+        s.used.store(crate::host::moment(), Ordering::Relaxed);
+        return Some(s.clone());
+    }
+    None
+}
+
+/// Returns or sub-allocates an exact-size 256-byte-aligned CBV shadow from the
+/// shared 4 MiB CBV slab pool for an unaligned static-heap `View::Constant`.
+/// Unlike 64 KiB phase-windowed shadows, each entry covers only `[address, address + len)`
+/// (zero 16x overlapping page amplification) and shares one committed D3D12 buffer.
+pub(crate) fn find_aligned_cbv(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let need = len.max(1);
+    let _ = address.checked_add(need)?;
+    if let Some(s) = find_aligned_cbv_existing(address, need) {
+        return Some(s);
+    }
+    let aligned = need.checked_next_multiple_of(256)?;
+    let (buffer, data, gpu, slab_slot) = alloc_cbv_slab(aligned)?;
+    let candidate = Arc::new(Shadow::new_suballocated(
+        buffer, aligned, data, gpu, address, need, slab_slot,
+    ));
+    candidate.used.store(crate::host::moment(), Ordering::Relaxed);
+    let mut map = ALIGNED_CBV.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = map.get(&address)
+        && existing.len >= need
+    {
+        existing.used.store(crate::host::moment(), Ordering::Relaxed);
+        return Some(existing.clone());
+    }
+    if let Some(old) = map.insert(address, candidate.clone()) {
+        old.mark_dead();
+        bump_shadow_epochs(old.start, old.len);
+        SHADOW_GEN.fetch_add(1, Ordering::Release);
+        crate::host::retire(old);
+    }
+    let total = map.len();
+    ALIGNED_CBV_LEN.store(total, Ordering::Release);
+    if total <= 8 || total.is_power_of_two() {
+        tracing::info!(
+            view_start = format_args!("{address:#x}"),
+            view_len = need,
+            aligned_size = aligned,
+            aligned_cbv_shadows = total,
+            "aligned CBV slab shadow created"
+        );
+    }
+    Some(candidate)
 }
 
 fn aligned_window_bounds(
