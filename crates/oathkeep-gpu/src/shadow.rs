@@ -2410,6 +2410,90 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide_leaf_on(workers(), jobs);
 }
 
+/// Runs `stage1` jobs on `workers()` while the calling thread runs `before_stage2`, then
+/// immediately enqueues `stage2` jobs without waiting for `stage1` to finish, and joins
+/// both stages on the calling thread.
+pub(crate) fn wide_run_two_stage(
+    stage1: Vec<Box<dyn FnOnce() + Send>>,
+    before_stage2: impl FnOnce(),
+    stage2: Vec<Box<dyn FnOnce() + Send>>,
+) {
+    let n1 = stage1.len();
+    let n2 = stage2.len();
+    if n1 == 0 {
+        before_stage2();
+        wide_leaf_on(workers(), stage2);
+        return;
+    }
+    struct TwoStageBatch {
+        queue: Mutex<std::collections::VecDeque<Job>>,
+        rem: (Mutex<usize>, std::sync::Condvar),
+    }
+    let pool = workers();
+    let batch = Arc::new(TwoStageBatch {
+        queue: Mutex::new(std::collections::VecDeque::from(stage1)),
+        rem: (Mutex::new(n1 + n2), std::sync::Condvar::new()),
+    });
+    let enqueue_wakeups = |count: usize| {
+        if count == 0 {
+            return;
+        }
+        let mut queue = pool.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..count.min(8) {
+            let batch = batch.clone();
+            queue.push_back(Box::new(move || {
+                loop {
+                    let job = batch
+                        .queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pop_front();
+                    let Some(job) = job else {
+                        break;
+                    };
+                    job();
+                    let mut rem = batch.rem.0.lock().unwrap_or_else(|e| e.into_inner());
+                    *rem -= 1;
+                    if *rem == 0 {
+                        batch.rem.1.notify_all();
+                    }
+                }
+            }));
+        }
+        drop(queue);
+        pool.more.notify_all();
+    };
+    enqueue_wakeups(n1);
+    before_stage2();
+    if n2 > 0 {
+        {
+            let mut q = batch.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.extend(stage2);
+        }
+        enqueue_wakeups(n2);
+    }
+    loop {
+        let job = batch
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        let Some(job) = job else {
+            break;
+        };
+        job();
+        let mut rem = batch.rem.0.lock().unwrap_or_else(|e| e.into_inner());
+        *rem -= 1;
+        if *rem == 0 {
+            batch.rem.1.notify_all();
+        }
+    }
+    let mut rem = batch.rem.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *rem > 0 {
+        rem = batch.rem.1.wait(rem).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
 fn relay_workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -2806,6 +2890,46 @@ mod wide_tests {
                 .collect();
             wide(jobs);
             assert_eq!(ran.load(Ordering::Relaxed), n * (n + 1) / 2, "{n} jobs");
+        }
+    }
+
+    #[test]
+    fn wide_run_two_stage_orders_stage2_after_before_hook_without_waiting_for_stage1() {
+        use std::sync::atomic::AtomicBool;
+        for (n1, n2) in [(0usize, 4), (4, 0), (1, 1), (5, 7)] {
+            let hook_done = Arc::new(AtomicBool::new(false));
+            let s1_ran = Arc::new(AtomicUsize::new(0));
+            let s2_ran = Arc::new(AtomicUsize::new(0));
+            let stage1: Vec<Job> = (0..n1)
+                .map(|_| {
+                    let s1_ran = s1_ran.clone();
+                    Box::new(move || {
+                        s1_ran.fetch_add(1, Ordering::Relaxed);
+                    }) as Job
+                })
+                .collect();
+            let stage2: Vec<Job> = (0..n2)
+                .map(|_| {
+                    let hook_done = hook_done.clone();
+                    let s2_ran = s2_ran.clone();
+                    Box::new(move || {
+                        assert!(
+                            hook_done.load(Ordering::Acquire),
+                            "stage2 job must only run after before_stage2 completes"
+                        );
+                        s2_ran.fetch_add(1, Ordering::Relaxed);
+                    }) as Job
+                })
+                .collect();
+            let hook_flag = hook_done.clone();
+            super::wide_run_two_stage(
+                stage1,
+                move || hook_flag.store(true, Ordering::Release),
+                stage2,
+            );
+            assert!(hook_done.load(Ordering::Acquire));
+            assert_eq!(s1_ran.load(Ordering::Relaxed), n1);
+            assert_eq!(s2_ran.load(Ordering::Relaxed), n2);
         }
     }
 
@@ -6235,7 +6359,6 @@ impl Shadow {
         }
 
         let record_race = merge_race_on();
-        let clear_hashes = card.has_hot_hashes.load(Ordering::Acquire);
         let raw_buckets: Vec<RelayMergeBucket> = if parallel && works.len() >= 16 {
             let worker_count = (works.len() / 8).clamp(2, 6);
             let chunk_size = works.len().div_ceil(worker_count);
@@ -6252,7 +6375,7 @@ impl Shadow {
                 let slot = Arc::new(Mutex::new(None));
                 results.push(slot.clone());
                 jobs.push(Box::new(move || {
-                    let out = merge_relay_chunk(start, chunk, &skip, record_race, clear_hashes);
+                    let out = merge_relay_chunk(start, chunk, &skip, record_race);
                     *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
                 }));
             }
@@ -6262,7 +6385,7 @@ impl Shadow {
                 .filter_map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).take())
                 .collect()
         } else {
-            vec![merge_relay_chunk(start, works, &skip, record_race, clear_hashes)]
+            vec![merge_relay_chunk(start, works, &skip, record_race)]
         };
 
         let mut buckets: Vec<RelayMergeBucket> = Vec::with_capacity(raw_buckets.len());
@@ -6282,8 +6405,10 @@ impl Shadow {
         let total_writes: usize = buckets.iter().map(|b| b.writes.len()).sum();
         let mut spans: Vec<(usize, usize)> = Vec::with_capacity(total_writes);
         let mut total_written = 0usize;
+        let mut has_hash_updates = false;
         let mut has_hash_clears = false;
         for b in &buckets {
+            has_hash_updates |= !b.hash_updates.is_empty();
             has_hash_clears |= !b.hash_clears.is_empty();
             for w in &b.writes {
                 spans.push((w.at, w.at + w.len));
@@ -6291,9 +6416,15 @@ impl Shadow {
             }
         }
 
-        if has_hash_clears && card.has_hot_hashes.load(Ordering::Acquire) {
+        if has_hash_updates || (has_hash_clears && card.has_hot_hashes.load(Ordering::Acquire)) {
             let mut guard = card.hot_hashes.lock().unwrap_or_else(|e| e.into_inner());
-            if !guard.slots.is_empty() {
+            if has_hash_updates {
+                let slots_needed = (self.len as usize).div_ceil(HOT_HASH_BLOCK);
+                if guard.slots.len() < slots_needed {
+                    guard.slots.resize(slots_needed, 0);
+                }
+            }
+            if has_hash_clears && !guard.slots.is_empty() {
                 let mut clear_spans: Vec<(usize, usize)> = Vec::new();
                 for b in &buckets {
                     clear_spans.extend_from_slice(&b.hash_clears);
@@ -6306,21 +6437,31 @@ impl Shadow {
                     }
                 }
             }
-            if !guard.quiet.is_empty() {
-                let frame = crate::frame::current();
-                let base = start / PAGE;
-                for &(a, b) in &spans {
-                    let q_lo = ((start + a) / PAGE)
-                        .saturating_sub(base)
-                        .min(guard.quiet.len());
-                    let q_hi = (start + b)
-                        .div_ceil(PAGE)
-                        .saturating_sub(base)
-                        .min(guard.quiet.len());
-                    for q in &mut guard.quiet[q_lo..q_hi] {
-                        q.mark_changed(frame);
+            if has_hash_updates {
+                for b in &buckets {
+                    for &(slot, hash) in &b.hash_updates {
+                        if let Some(dst) = guard.slots.get_mut(slot) {
+                            *dst = hash;
+                        }
                     }
                 }
+                if !guard.quiet.is_empty() {
+                    let frame = crate::frame::current();
+                    let base = start / PAGE;
+                    for &(a, b) in &spans {
+                        let q_lo = ((start + a) / PAGE)
+                            .saturating_sub(base)
+                            .min(guard.quiet.len());
+                        let q_hi = (start + b)
+                            .div_ceil(PAGE)
+                            .saturating_sub(base)
+                            .min(guard.quiet.len());
+                        for q in &mut guard.quiet[q_lo..q_hi] {
+                            q.mark_changed(frame);
+                        }
+                    }
+                }
+                card.has_hot_hashes.store(true, Ordering::Release);
             }
         }
         for (a, b) in coalesce_watch_spans(start, &spans) {
@@ -6708,6 +6849,7 @@ fn card_range_is_superseded(
 struct RelayMergeBucket {
     arena: Vec<u8>,
     writes: Vec<RelayPendingWrite>,
+    hash_updates: Vec<(usize, u128)>,
     hash_clears: Vec<(usize, usize)>,
     stats: RelayMergeStats,
 }
@@ -6717,10 +6859,10 @@ fn merge_relay_chunk(
     works: Vec<RelayPieceWork>,
     skip: &RelaySkipSnapshot,
     record_race: bool,
-    clear_hashes: bool,
 ) -> RelayMergeBucket {
     let mut arena = Vec::new();
     let mut writes = Vec::new();
+    let mut hash_updates = Vec::new();
     let mut hash_clears = Vec::new();
     let mut scratch = Vec::new();
     let mut active = Vec::new();
@@ -6775,8 +6917,26 @@ fn merge_relay_chunk(
                     src: RelayWriteSrc::Gpu(held.as_ptr() as usize),
                     as_read,
                 });
-                if clear_hashes {
-                    hash_clears.push((diff_at, diff_at + n));
+                // Populate `hot_hashes` for the GPU-written bytes so next frame's
+                // `scan_card_pages` sees them match and skips re-uploading them back to the GPU.
+                let diff_end = diff_at + n;
+                let first_full = diff_at.next_multiple_of(HOT_HASH_BLOCK);
+                let last_full = (diff_end / HOT_HASH_BLOCK) * HOT_HASH_BLOCK;
+                if diff_at < first_full {
+                    hash_clears.push((diff_at, first_full.min(diff_end)));
+                }
+                if first_full < last_full {
+                    let mut b_at = first_full;
+                    while b_at < last_full {
+                        let h =
+                            hot_page_hash(&held[b_at - diff_at..b_at - diff_at + HOT_HASH_BLOCK])
+                                | 1;
+                        hash_updates.push((b_at / HOT_HASH_BLOCK, h));
+                        b_at += HOT_HASH_BLOCK;
+                    }
+                }
+                if last_full < diff_end {
+                    hash_clears.push((last_full.max(diff_at), diff_end));
                 }
                 continue;
             }
@@ -6798,14 +6958,13 @@ fn merge_relay_chunk(
                 src: RelayWriteSrc::Arena(arena_off),
                 as_read,
             });
-            if clear_hashes {
-                hash_clears.push((diff_at, diff_at + n));
-            }
+            hash_clears.push((diff_at, diff_at + n));
         }
     }
     RelayMergeBucket {
         arena,
         writes,
+        hash_updates,
         hash_clears,
         stats,
     }
@@ -7052,7 +7211,7 @@ mod relay_batch_tests {
             },
         ];
         let start = title_mem.as_ptr() as usize;
-        let bucket = merge_relay_chunk(start, works, &skip, false, false);
+        let bucket = merge_relay_chunk(start, works, &skip, false);
         assert_eq!(bucket.writes.len(), 2);
         assert_eq!(bucket.stats.pieces[super::RELAY_OUT_WRITTEN], 2);
         for w in &bucket.writes {
@@ -7098,8 +7257,8 @@ mod relay_batch_tests {
     }
 
     #[test]
-    fn relay_merge_fast_path_skips_arena_copy_and_only_clears_hot_hashes_when_enabled() {
-        use super::RelayWriteSrc;
+    fn relay_merge_fast_path_skips_arena_copy_and_emits_hot_hash_updates() {
+        use super::{RelayWriteSrc, hot_page_hash};
 
         let title_mem: Vec<u8> = (0..PAGE).map(|i| (i * 7 + 1) as u8).collect();
         let mut old0 = title_mem.clone();
@@ -7127,31 +7286,17 @@ mod relay_batch_tests {
             old_len: old0.len(),
             items: vec![(0, gpu0.as_ptr() as usize, gpu0.len(), 1)],
         }];
-        let bucket = merge_relay_chunk(title_mem.as_ptr() as usize, works, &skip, false, false);
+        let bucket = merge_relay_chunk(title_mem.as_ptr() as usize, works, &skip, false);
         assert_eq!(bucket.writes.len(), 1);
         assert!(bucket.arena.is_empty(), "clean GPU write should borrow gpu slice directly");
         assert!(matches!(bucket.writes[0].src, RelayWriteSrc::Gpu(_)));
-        assert!(
-            bucket.hash_clears.is_empty(),
-            "clear_hashes=false should skip hot_hashes work entirely"
-        );
+        assert!(bucket.hash_clears.is_empty());
+        assert_eq!(bucket.hash_updates.len(), PAGE / HOT_HASH_BLOCK);
+        for &(slot, hash) in &bucket.hash_updates {
+            let off = slot * HOT_HASH_BLOCK;
+            assert_eq!(hash, hot_page_hash(&gpu0[off..off + HOT_HASH_BLOCK]) | 1);
+        }
         assert_eq!(old0, gpu0);
-
-        // When hot_hashes are active (`clear_hashes=true`), clean GPU write invalidates the span
-        // via `hash_clears` instead of hashing every 4 KiB page.
-        let mut old1 = title_mem.clone();
-        let works1 = vec![RelayPieceWork {
-            p_lo: 0,
-            old_ptr: old1.as_mut_ptr() as usize,
-            old_len: old1.len(),
-            items: vec![(0, gpu0.as_ptr() as usize, gpu0.len(), 1)],
-        }];
-        let bucket1 = merge_relay_chunk(title_mem.as_ptr() as usize, works1, &skip, false, true);
-        assert_eq!(bucket1.writes.len(), 1);
-        assert!(bucket1.arena.is_empty());
-        assert!(matches!(bucket1.writes[0].src, RelayWriteSrc::Gpu(_)));
-        assert_eq!(bucket1.hash_clears, vec![(0, PAGE)]);
-        assert_eq!(old1, gpu0);
     }
 
     #[test]
@@ -7231,7 +7376,7 @@ mod relay_batch_tests {
                 items: vec![(3 * PAGE, gpu3.as_ptr() as usize, gpu3.len(), 5)],
             },
         ];
-        let bucket = merge_relay_chunk(title_mem.as_ptr() as usize, works, &skip, false, false);
+        let bucket = merge_relay_chunk(title_mem.as_ptr() as usize, works, &skip, false);
         assert_eq!(bucket.writes.len(), 1);
         assert_eq!(bucket.stats.pieces[RELAY_OUT_EQUAL_OLD], 1);
         assert_eq!(bucket.stats.bytes[RELAY_OUT_EQUAL_OLD], PAGE as u64);
@@ -7264,7 +7409,6 @@ mod relay_batch_tests {
                 items: vec![(0, gpu_u.as_ptr() as usize, gpu_u.len(), 5)],
             }],
             &empty_skip,
-            false,
             false,
         );
         assert!(bucket_u.writes.is_empty());

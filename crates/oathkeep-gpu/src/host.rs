@@ -8550,17 +8550,15 @@ impl Batch {
         }
 
         let mut phase_a_jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(40);
-        if use_pre_guard {
-            let mut guarded_ranges: Vec<(usize, usize)> = Vec::new();
+        let guarded_ranges: Vec<(usize, usize)> = if use_pre_guard {
+            let mut ranges = Vec::new();
             for (_, spans) in &dirty_guarded {
-                guarded_ranges.extend_from_slice(spans);
+                ranges.extend_from_slice(spans);
             }
-            if !guarded_ranges.is_empty() {
-                phase_a_jobs.push(Box::new(move || {
-                    crate::watch::pre_guard_batch(&guarded_ranges);
-                }));
-            }
-        }
+            ranges
+        } else {
+            Vec::new()
+        };
         let mut prelude_outs: Vec<std::sync::Arc<Mutex<Vec<(usize, SendCmdList)>>>> = Vec::new();
         if let Some(host) = host
             && !plans.is_empty()
@@ -8578,7 +8576,7 @@ impl Batch {
             for (part, out) in buckets.into_iter().zip(prelude_outs.iter().cloned()) {
                 phase_a_jobs.push(Box::new(move || {
                     // SAFETY: `host` is live for the entire `flush_with_preludes` call, and
-                    // `run_wide_capped` joins all worker threads before returning.
+                    // `wide_run_two_stage` / `run_wide_capped` joins all workers before returning.
                     let host = unsafe { &*(host_ptr as *const Host) };
                     let mut local = Vec::with_capacity(part.len());
                     for (idx, plan) in part {
@@ -8615,7 +8613,36 @@ impl Batch {
                 }
             }
         }
-        Self::run_wide_capped(phase_a_jobs);
+        if !guarded_ranges.is_empty() && wide_refresh() {
+            let mut phase_b_jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(24);
+            Self::push_refresh_jobs(dirty_guarded, &mut phase_b_jobs);
+            let started = std::time::Instant::now();
+            let before_buf = PREPARING[0].load(Ordering::Relaxed);
+            let before_tex = PREPARING[2].load(Ordering::Relaxed);
+            crate::shadow::wide_run_two_stage(
+                phase_a_jobs,
+                || crate::watch::pre_guard_batch(&guarded_ranges),
+                phase_b_jobs,
+            );
+            let wall = started.elapsed().as_micros() as u64;
+            let sum_buf = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before_buf);
+            let sum_tex = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before_tex);
+            let total_sum = sum_buf.saturating_add(sum_tex);
+            if total_sum > wall {
+                let excess = total_sum - wall;
+                let cut_buf =
+                    (u128::from(excess) * u128::from(sum_buf) / u128::from(total_sum)) as u64;
+                let cut_tex = excess - cut_buf;
+                PREPARING[0].fetch_sub(cut_buf.min(sum_buf), Ordering::Relaxed);
+                PREPARING[2].fetch_sub(cut_tex.min(sum_tex), Ordering::Relaxed);
+            }
+        } else {
+            if !guarded_ranges.is_empty() {
+                crate::watch::pre_guard_batch(&guarded_ranges);
+            }
+            Self::push_refresh_jobs(dirty_guarded, &mut phase_a_jobs);
+            Self::run_wide_capped(phase_a_jobs);
+        }
         for out in prelude_outs {
             for (idx, rec) in
                 std::mem::take(&mut *out.lock().unwrap_or_else(|e| e.into_inner()))
@@ -8627,12 +8654,6 @@ impl Batch {
         }
         let prelude_only_us =
             prelude_only_start.map_or(0, |t| t.elapsed().as_micros() as u64);
-
-        if !dirty_guarded.is_empty() {
-            let mut phase_b_jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(24);
-            Self::push_refresh_jobs(dirty_guarded, &mut phase_b_jobs);
-            Self::run_wide_capped(phase_b_jobs);
-        }
 
         if !self.pending_gpu_writes.is_empty() {
             self.pending_gpu_min = 0;
