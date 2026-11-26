@@ -180,26 +180,54 @@ pub(crate) fn cards() -> bool {
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
-/// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
-///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
+/// - Unknown (`None`, e.g. WARP) or `< 6 GiB`: `(16, 512)` MiB.
+/// - `>= 6 GiB` and `<= 12 GiB` (8–12 GB cards, whose WDDM budget is ~7.0–11.2
+///   GiB): `(1, 512)` MiB. `Card::before` stores only 16-byte per-64-KiB hashes
+///   (`0.024%` overhead), `max_mb` stays strictly capped at 512 MiB (already
+///   reserved from the texture pool by [`card_room_kept`]), and [`card_tier_most`]
+///   reserves the upper 128 MiB of that 512 MiB cap for `>= 8 MiB` buffers so
+///   small buffers never crowd out heavy shader-written buffers.
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
-///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
+///   ~13.5–15.2 GiB): `(1, 2048)` MiB.
 /// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
-///   capping at 25% of local budget (at most 8 GiB) so "before" twins (up to 2x)
-///   still leave headroom for textures and render targets.
+///   capping at 25% of local budget (at most 8 GiB).
 fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     let Some(budget_bytes) = local_vram_budget else {
         return (16, 512);
     };
     let budget_mb = budget_bytes >> 20;
+    const SIX_GIB_MB: u64 = 6 * 1024;
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
-    if budget_mb <= TWELVE_GIB_MB {
+    if budget_mb < SIX_GIB_MB {
         (16, 512)
+    } else if budget_mb <= TWELVE_GIB_MB {
+        (1, 512)
     } else if budget_mb < TWENTY_GIB_MB {
-        (4, 2048)
+        (1, 2048)
     } else {
         (1, (budget_mb / 4).min(8192))
+    }
+}
+
+/// Effective `CARD_BYTES[0]` ceiling for a candidate allocation of `size` bytes
+/// within `most`. On `<= 1 GiB` card-buffer caps (such as 512 MiB on 8–12 GB
+/// cards), sub-1-MiB buffers (e.g. from `OATHKEEP_CARD_BUFFERS_MIN_KB=64`) may
+/// use only the first half of `most`, and `1..8 MiB` buffers up to `3/4` of
+/// `most`, reserving the top quarter (128 MiB of 512 MiB) for `>= 8 MiB`
+/// buffers so hundreds of tiny early buffers do not push 8–50 MiB UAV buffers
+/// onto CPU snapshots.
+fn card_tier_most(size: u64, most: u64, all: bool) -> u64 {
+    const MIB: u64 = 1 << 20;
+    if all || !(128 * MIB..=1024 * MIB).contains(&most) {
+        return most;
+    }
+    if size < MIB {
+        most / 2
+    } else if size < 8 * MIB {
+        most / 4 * 3
+    } else {
+        most
     }
 }
 
@@ -433,7 +461,8 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         }
         return None;
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
+    let tier_most = card_tier_most(size, most, card_all());
+    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > tier_most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
@@ -912,6 +941,116 @@ mod card_tests {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
     }
+
+    #[test]
+    fn card_tier_reserves_top_headroom_for_large_buffers_under_tight_caps() {
+        use super::card_tier_most;
+        const MIB: u64 = 1 << 20;
+        let cap = 512 * MIB;
+        assert_eq!(card_tier_most(64 << 10, cap, false), 256 * MIB);
+        assert_eq!(card_tier_most(512 << 10, cap, false), 256 * MIB);
+        assert_eq!(card_tier_most(MIB, cap, false), 384 * MIB);
+        assert_eq!(card_tier_most(4 * MIB, cap, false), 384 * MIB);
+        assert_eq!(card_tier_most(8 * MIB, cap, false), cap);
+        assert_eq!(card_tier_most(24 * MIB, cap, false), cap);
+        // `card_all` or >1 GiB caps use the full limit.
+        assert_eq!(card_tier_most(64 << 10, cap, true), cap);
+        assert_eq!(card_tier_most(64 << 10, 2048 * MIB, false), 2048 * MIB);
+        assert_eq!(card_tier_most(64 << 10, 64 * MIB, false), 64 * MIB);
+    }
+
+    #[test]
+    fn avx2_diff_and_merge_match_scalar_across_boundaries() {
+        use super::{
+            SNAP_CHUNK, back_piece, card_merge_bytes, card_merge_bytes_scalar, changed_runs,
+            changed_runs_scalar, merge_piece, merge_piece_scalar, split_copy_chunks,
+        };
+        let mut seed = 0x9e37_79b9u32;
+        let mut rng = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 8
+        };
+        for len in [0usize, 1, 7, 31, 32, 33, 63, 64, 65, 255, 256, 257, 511, 512, 513, 1055] {
+            let old: Vec<u8> = (0..len).map(|_| rng() as u8).collect();
+            let mut now = old.clone();
+            let mut title = old.clone();
+            // Perturb across 32-byte and 256-byte boundaries, plus overlapping CPU/GPU writes.
+            for &edge in &[0usize, 31, 32, 63, 64, 255, 256, 511, 512] {
+                if edge < len {
+                    now[edge] ^= 0x5a;
+                }
+                if edge + 1 < len {
+                    title[edge + 1] ^= 0x33;
+                }
+            }
+            for _ in 0..16 {
+                if len > 0 {
+                    let p = rng() as usize % len;
+                    if rng() & 1 == 0 {
+                        now[p] = rng() as u8;
+                    } else {
+                        title[p] = rng() as u8;
+                    }
+                }
+            }
+            assert_eq!(changed_runs(&now, &old), changed_runs_scalar(&now, &old), "changed_runs len={len}");
+
+            let (mut h1, mut t1) = (old.clone(), title.clone());
+            let (mut h2, mut t2) = (old.clone(), title.clone());
+            assert_eq!(
+                merge_piece(&now, &mut h1, &mut t1),
+                merge_piece_scalar(&now, &mut h2, &mut t2, 0),
+                "merge_piece bool len={len}"
+            );
+            assert_eq!((&h1, &t1), (&h2, &t2), "merge_piece bytes len={len}");
+
+            let (mut o1, mut ct1) = (old.clone(), title.clone());
+            let (mut o2, mut ct2) = (old.clone(), title.clone());
+            assert_eq!(
+                card_merge_bytes(&now, &mut o1, &mut ct1),
+                card_merge_bytes_scalar(&now, &mut o2, &mut ct2, 0),
+                "card_merge_bytes bool len={len}"
+            );
+            assert_eq!((&o1, &ct1), (&o2, &ct2), "card_merge_bytes bytes len={len}");
+
+            if len > 0 {
+                let mut host_a = now.clone();
+                let (mut s_title, mut s_mask, mut s_runs) = (Vec::new(), Vec::new(), Vec::new());
+                let got = back_piece(&mut host_a, &old, &mut s_title, &mut s_mask, &mut s_runs, |first, into| {
+                    into.copy_from_slice(&title[first..first + into.len()]);
+                    true
+                });
+                // Verify byte-by-byte reference semantics of `back_piece`.
+                if let Some((first, span_n)) = got {
+                    let mut exp_title = title[first..first + span_n].to_vec();
+                    let mut exp_mask = vec![0u8; span_n];
+                    for k in 0..span_n {
+                        let h = now[first + k];
+                        let o = old[first + k];
+                        let t = exp_title[k];
+                        if h != o && t == o {
+                            exp_mask[k] = h ^ t;
+                            exp_title[k] = h;
+                        }
+                    }
+                    assert_eq!(s_title, exp_title, "back_piece title len={len}");
+                    assert_eq!(&host_a[first..first + span_n], &exp_title[..], "back_piece host len={len}");
+                    assert_eq!(s_mask, exp_mask, "back_piece mask len={len}");
+                    assert_eq!(s_runs, changed_runs_scalar(&s_mask, &vec![0u8; span_n]), "back_piece runs len={len}");
+                }
+            }
+        }
+        let chunks = split_copy_chunks(vec![(0x1000, 0x2000, 2 * SNAP_CHUNK + 17), (0x9000, 0xa000, 64)], SNAP_CHUNK);
+        assert_eq!(
+            chunks,
+            vec![
+                (0x1000, 0x2000, SNAP_CHUNK),
+                (0x1000 + SNAP_CHUNK, 0x2000 + SNAP_CHUNK, SNAP_CHUNK),
+                (0x1000 + 2 * SNAP_CHUNK, 0x2000 + 2 * SNAP_CHUNK, 17),
+                (0x9000, 0xa000, 64),
+            ]
+        );
+    }
 }
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
@@ -1016,8 +1155,17 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is detected.
+        return unsafe { merge_piece_avx2(now, held, title) };
+    }
+    merge_piece_scalar(now, held, title, 0)
+}
+
+fn merge_piece_scalar(now: &[u8], held: &mut [u8], title: &mut [u8], from: usize) -> bool {
     let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+    for ((n, h), t) in now[from..].iter().zip(held[from..].iter_mut()).zip(title[from..].iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
         let merged = (*t & !wrote) | (*n & wrote);
         differs |= merged ^ *t;
@@ -1025,6 +1173,83 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
         *h = (*h & !wrote) | (*n & wrote);
     }
     differs != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_piece_avx2(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    use std::arch::x86_64::*;
+    let len = now.len().min(held.len()).min(title.len());
+    let mut diff_acc = _mm256_setzero_si256();
+    let mut i = 0;
+    while i + 32 <= len {
+        // SAFETY: `i + 32 <= len` for all three slices.
+        unsafe {
+            let vn = _mm256_loadu_si256(now.as_ptr().add(i).cast());
+            let vh = _mm256_loadu_si256(held.as_ptr().add(i).cast());
+            let same = _mm256_cmpeq_epi8(vn, vh);
+            if _mm256_movemask_epi8(same) != -1 {
+                let vt = _mm256_loadu_si256(title.as_ptr().add(i).cast());
+                let merged = _mm256_blendv_epi8(vn, vt, same);
+                diff_acc = _mm256_or_si256(diff_acc, _mm256_xor_si256(merged, vt));
+                _mm256_storeu_si256(title.as_mut_ptr().add(i).cast(), merged);
+                _mm256_storeu_si256(held.as_mut_ptr().add(i).cast(), vn);
+            }
+        }
+        i += 32;
+    }
+    let vec_differs = _mm256_testz_si256(diff_acc, diff_acc) == 0;
+    let tail_differs = merge_piece_scalar(&now[..len], &mut held[..len], &mut title[..len], i);
+    vec_differs || tail_differs
+}
+
+/// Non-relay [`Shadow::card_merge`] inner merge: where `gpu` differs from `old`,
+/// `gpu` wins; elsewhere `title` wins, and `old` takes the merged result (`*o = merged`).
+fn card_merge_bytes(gpu: &[u8], old: &mut [u8], title: &mut [u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is detected.
+        return unsafe { card_merge_bytes_avx2(gpu, old, title) };
+    }
+    card_merge_bytes_scalar(gpu, old, title, 0)
+}
+
+fn card_merge_bytes_scalar(gpu: &[u8], old: &mut [u8], title: &mut [u8], from: usize) -> bool {
+    let mut differs = 0u8;
+    for ((t, g), o) in title[from..].iter_mut().zip(&gpu[from..]).zip(old[from..].iter_mut()) {
+        let wrote = if *g != *o { 0xffu8 } else { 0 };
+        let merged = (*t & !wrote) | (*g & wrote);
+        differs |= merged ^ *t;
+        *t = merged;
+        *o = merged;
+    }
+    differs != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn card_merge_bytes_avx2(gpu: &[u8], old: &mut [u8], title: &mut [u8]) -> bool {
+    use std::arch::x86_64::*;
+    let len = gpu.len().min(old.len()).min(title.len());
+    let mut diff_acc = _mm256_setzero_si256();
+    let mut i = 0;
+    while i + 32 <= len {
+        // SAFETY: `i + 32 <= len` for all three slices.
+        unsafe {
+            let vg = _mm256_loadu_si256(gpu.as_ptr().add(i).cast());
+            let vo = _mm256_loadu_si256(old.as_ptr().add(i).cast());
+            let vt = _mm256_loadu_si256(title.as_ptr().add(i).cast());
+            let same = _mm256_cmpeq_epi8(vg, vo);
+            let merged = _mm256_blendv_epi8(vg, vt, same);
+            diff_acc = _mm256_or_si256(diff_acc, _mm256_xor_si256(merged, vt));
+            _mm256_storeu_si256(title.as_mut_ptr().add(i).cast(), merged);
+            _mm256_storeu_si256(old.as_mut_ptr().add(i).cast(), merged);
+        }
+        i += 32;
+    }
+    let vec_differs = _mm256_testz_si256(diff_acc, diff_acc) == 0;
+    let tail_differs = card_merge_bytes_scalar(&gpu[..len], &mut old[..len], &mut title[..len], i);
+    vec_differs || tail_differs
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1483,12 +1708,12 @@ struct Workers {
 }
 
 /// Waits awake until `there` says so, `OATHKEEP_WIDE_SPIN` microseconds at
-/// most (0, the default: not at all): asleep, a thread is woken in 50 us and
-/// more, 95 times a frame.
+/// most (25, the default; `0`: sleep immediately): asleep, a thread is woken
+/// in 50–150 us, ~95 times a frame across refreshes and snapshots.
 fn spin(there: impl Fn() -> bool) {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| std::env::var("OATHKEEP_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
-    if most == 0 {
+    let most = *MOST.get_or_init(|| std::env::var("OATHKEEP_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(25));
+    if most == 0 || there() {
         return;
     }
     let began = std::time::Instant::now();
@@ -1499,9 +1724,12 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many helper threads are kept for [`wide`] (plus the calling thread:
+/// e.g. 5 helpers + 1 caller = 6 threads on a 6c/12t CPU).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    std::thread::available_parallelism()
+        .map_or(4, |n| (n.get() / 2).saturating_sub(1))
+        .clamp(2, 6)
 }
 
 fn workers() -> &'static Workers {
@@ -1617,20 +1845,54 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
 
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
+/// Granularity for parallel snapshot copies and piece diff scans (256 KiB = 4
+/// 64 KiB pieces), giving balanced work distribution across 6 threads even on
+/// 1–4 MiB per-submission ranges.
+const SNAP_CHUNK: usize = 256 << 10;
 
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
 /// (from, to, bytes), taken by [`take_snapshots`].
 static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 
+/// Splits `(src, dst, len)` copies into chunks of at most `chunk_bytes` so no
+/// single range monopolizes one thread while helpers sit idle.
+fn split_copy_chunks(copies: Vec<(usize, usize, usize)>, chunk_bytes: usize) -> Vec<(usize, usize, usize)> {
+    let mut chunks = Vec::with_capacity(copies.len());
+    for (src, dst, len) in copies {
+        let mut at = 0;
+        while at < len {
+            let n = chunk_bytes.min(len - at);
+            chunks.push((src + at, dst + at, n));
+            at += n;
+        }
+    }
+    chunks
+}
+
 /// With [`wide_back`], when a submission's refreshes are done and before
 /// its lists go to the card: takes the snapshots [`Shadow::writing`] noted.
-/// Nothing to do without the switch.
+/// Small snapshots (`<= 128 KiB`) copy inline on the submitting thread without
+/// waking workers; larger ones fan out in 256 KiB chunks via [`wide_each`].
 pub(crate) fn take_snapshots() {
     let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
     if snaps.is_empty() {
         return;
     }
-    wide(copy_jobs(snaps));
+    let total_bytes: usize = snaps.iter().map(|s| s.2).sum();
+    if total_bytes <= 128 << 10 {
+        for (src, dst, len) in snaps {
+            // SAFETY: non-overlapping host copy mapping and snapshot buffer.
+            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+        }
+        return;
+    }
+    let chunks = Arc::new(split_copy_chunks(snaps, SNAP_CHUNK));
+    let count = chunks.len();
+    wide_each(count, move |i| {
+        let (src, dst, len) = chunks[i];
+        // SAFETY: non-overlapping chunk of host copy mapping and snapshot buffer.
+        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+    });
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
@@ -1692,81 +1954,57 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
 /// are, the title address the copy starts at, offsets from and to): the
 /// 64 KiB pieces (cut at multiples of 64 KiB of title memory, as
 /// [`Shadow::differing`] cuts them) of `[from, to)` whose bytes differ, as
-/// (offset, bytes) in order. On several threads ([`wide`]), in pieces of
-/// work of about [`WIDE_JOB`] bytes that hold whole pieces.
+/// (offset, bytes) in order.
+///
+/// Dispatched on [`crate::land::each`] (idle during `SCAN_BESIDE` and `SCAN`)
+/// rather than [`wide`], so background relay diff scans never queue ahead of
+/// or get stolen by the submitting thread's `take_snapshots` / refreshes, and
+/// using [`crate::safecopy::differ`] (4x unrolled AVX2, safe under concurrent
+/// GPU writes) with zero per-job `Box` allocations or result sorting.
 fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
-    // What a job finds: (which scan, its place among that scan's jobs, the
-    // pieces).
-    type Found = Vec<(usize, usize, Vec<(usize, usize)>)>;
-    // A job's part of a scan: the scan, then which and place.
-    type Part = (usize, usize, usize, usize, usize, usize, usize);
-    let found: Arc<Mutex<Found>> = Arc::default();
-    let mut jobs: Vec<Job> = Vec::new();
-    let mut group: Vec<Part> = Vec::new();
-    let mut bytes = 0;
-    let flush = |group: &mut Vec<Part>, jobs: &mut Vec<Job>| {
-        let group = std::mem::take(group);
-        if group.is_empty() {
-            return;
-        }
-        let found = found.clone();
-        jobs.push(Box::new(move || {
-            let mut mine: Found = Vec::with_capacity(group.len());
-            for (data, before, start, from, to, which, place) in group {
-                let mut pieces = Vec::new();
-                let mut at = from;
-                while at < to {
-                    let n = (PIECE - (start + at) % PIECE).min(to - at);
-                    // SAFETY: inside the copy's mapping and its snapshot
-                    // (which holds the copy's bytes at the copy's offsets);
-                    // nothing writes either while a submission's results
-                    // are compared.
-                    let (now, old) = unsafe {
-                        (
-                            std::slice::from_raw_parts((data + at) as *const u8, n),
-                            std::slice::from_raw_parts((before + at) as *const u8, n),
-                        )
-                    };
-                    if now != old {
-                        pieces.push((at, n));
-                    }
-                    at += n;
-                }
-                mine.push((which, place, pieces));
-            }
-            found.lock().unwrap_or_else(|e| e.into_inner()).extend(mine);
-        }));
-    };
+    type Part = (usize, usize, usize, usize, usize, usize);
     let count = scans.len();
+    let mut parts: Vec<Part> = Vec::new();
     for (which, (data, before, start, from, to)) in scans.into_iter().enumerate() {
-        let (mut at, mut place) = (from, 0);
+        let mut at = from;
         while at < to {
-            // Cut where pieces end, so that every job sees whole pieces.
-            let room = (WIDE_JOB - bytes).max(PIECE);
-            let mut next = (at + room).min(to);
+            // Cut where pieces end, in ~256 KiB chunks (4 pieces per chunk).
+            let mut next = (at + SNAP_CHUNK).min(to);
             if next < to {
                 next -= (start + next) % PIECE;
                 if next <= at {
                     next = (at + PIECE - (start + at) % PIECE).min(to);
                 }
             }
-            group.push((data, before, start, at, next, which, place));
-            bytes += next - at;
-            place += 1;
+            parts.push((data, before, start, at, next, which));
             at = next;
-            if bytes >= WIDE_JOB {
-                flush(&mut group, &mut jobs);
-                bytes = 0;
-            }
         }
     }
-    flush(&mut group, &mut jobs);
-    wide(jobs);
-    let mut found = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
-    found.sort_unstable_by_key(|f| (f.0, f.1));
+    if parts.is_empty() {
+        return vec![Vec::new(); count];
+    }
+    let results: Vec<std::sync::OnceLock<Vec<(usize, usize)>>> =
+        (0..parts.len()).map(|_| std::sync::OnceLock::new()).collect();
+    crate::land::each(parts.len(), &|idx| {
+        let (data, before, start, from, to, _) = parts[idx];
+        let mut pieces = Vec::new();
+        let mut at = from;
+        while at < to {
+            let n = (PIECE - (start + at) % PIECE).min(to - at);
+            // SAFETY: inside the copy's mapping and its snapshot; `differ`
+            // tolerates concurrent card writes under `OATHKEEP_RELAY`.
+            if unsafe { crate::safecopy::differ((data + at) as *const u8, (before + at) as *const u8, n) } {
+                pieces.push((at, n));
+            }
+            at += n;
+        }
+        let _ = results[idx].set(pieces);
+    });
     let mut out = vec![Vec::new(); count];
-    for (which, _, pieces) in found {
-        out[which].extend(pieces);
+    for (part, res) in parts.into_iter().zip(results) {
+        if let Some(pieces) = res.into_inner() {
+            out[part.5].extend(pieces);
+        }
     }
     out
 }
@@ -1931,6 +2169,12 @@ fn back_piece(
     // through 0xffffffff00000000; PalmVIDev e0b70476, Oathkeep f39c6c2).
     mask.clear();
     mask.resize(n, 0);
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is detected, and `title`, `host`, `old`, and `mask` all have length `n`.
+        unsafe { back_piece_avx2(title, host, old, mask, runs) };
+        return (!runs.is_empty()).then_some((first, n));
+    }
     let mut differs = 0u8;
     for (((t, h), o), m) in title.iter_mut().zip(host.iter_mut()).zip(old).zip(mask.iter_mut()) {
         let gpu = if (*h != *o) & (*t == *o) { 0xffu8 } else { 0 };
@@ -1957,6 +2201,76 @@ fn back_piece(
         }
     }
     Some((first, n))
+}
+
+#[inline]
+fn push_byte_run(runs: &mut Vec<(usize, usize)>, start: usize, len: usize) {
+    match runs.last_mut() {
+        Some((a, l)) if *a + *l == start => *l += len,
+        _ => runs.push((start, len)),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn back_piece_avx2(
+    title: &mut [u8],
+    host: &mut [u8],
+    old: &[u8],
+    mask: &mut [u8],
+    runs: &mut Vec<(usize, usize)>,
+) {
+    use std::arch::x86_64::*;
+    let n = title.len();
+    let zero = _mm256_setzero_si256();
+    let mut i = 0;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` for all four slices.
+        let mut diff = unsafe {
+            let vt = _mm256_loadu_si256(title.as_ptr().add(i).cast());
+            let vh = _mm256_loadu_si256(host.as_ptr().add(i).cast());
+            let vo = _mm256_loadu_si256(old.as_ptr().add(i).cast());
+            let h_eq_o = _mm256_cmpeq_epi8(vh, vo);
+            let t_eq_o = _mm256_cmpeq_epi8(vt, vo);
+            let gpu_mask = _mm256_andnot_si256(h_eq_o, t_eq_o);
+            let merged = _mm256_blendv_epi8(vt, vh, gpu_mask);
+            let vm = _mm256_xor_si256(merged, vt);
+            _mm256_storeu_si256(title.as_mut_ptr().add(i).cast(), merged);
+            _mm256_storeu_si256(host.as_mut_ptr().add(i).cast(), merged);
+            _mm256_storeu_si256(mask.as_mut_ptr().add(i).cast(), vm);
+            !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(vm, zero)) as u32)
+        };
+        while diff != 0 {
+            let first = diff.trailing_zeros();
+            let count = (diff >> first).trailing_ones();
+            push_byte_run(runs, i + first as usize, count as usize);
+            if first + count >= 32 {
+                break;
+            }
+            diff &= u32::MAX << (first + count);
+        }
+        i += 32;
+    }
+    let tail_start = i;
+    for k in tail_start..n {
+        let gpu = if (host[k] != old[k]) & (title[k] == old[k]) { 0xffu8 } else { 0 };
+        let merged = (title[k] & !gpu) | (host[k] & gpu);
+        mask[k] = merged ^ title[k];
+        title[k] = merged;
+        host[k] = merged;
+    }
+    while i < n {
+        while i < n && mask[i] == 0 {
+            i += 1;
+        }
+        let start = i;
+        while i < n && mask[i] != 0 {
+            i += 1;
+        }
+        if i > start {
+            push_byte_run(runs, start, i - start);
+        }
+    }
 }
 
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
@@ -1991,6 +2305,15 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is detected.
+        return unsafe { changed_runs_avx2(now, was) };
+    }
+    changed_runs_scalar(now, was)
+}
+
+fn changed_runs_scalar(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -2014,6 +2337,81 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
             i += 1;
         }
         runs.push((first, i - first));
+    }
+    runs
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::*;
+    let n = now.len().min(was.len());
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i + 256 <= n {
+        // SAFETY: `i + 256 <= n` in both slices.
+        let equal_256 = unsafe {
+            let mut any = _mm256_setzero_si256();
+            for k in 0..8 {
+                let x = _mm256_loadu_si256(now.as_ptr().add(i + 32 * k).cast());
+                let y = _mm256_loadu_si256(was.as_ptr().add(i + 32 * k).cast());
+                any = _mm256_or_si256(any, _mm256_xor_si256(x, y));
+            }
+            _mm256_testz_si256(any, any) != 0
+        };
+        if equal_256 {
+            i += 256;
+            continue;
+        }
+        for _ in 0..8 {
+            // SAFETY: `i + 32 <= n` across all 8 sub-blocks.
+            let mut diff = unsafe {
+                let x = _mm256_loadu_si256(now.as_ptr().add(i).cast());
+                let y = _mm256_loadu_si256(was.as_ptr().add(i).cast());
+                !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32)
+            };
+            while diff != 0 {
+                let first = diff.trailing_zeros();
+                let count = (diff >> first).trailing_ones();
+                push_byte_run(&mut runs, i + first as usize, count as usize);
+                if first + count >= 32 {
+                    break;
+                }
+                diff &= u32::MAX << (first + count);
+            }
+            i += 32;
+        }
+    }
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` in both slices.
+        let mut diff = unsafe {
+            let x = _mm256_loadu_si256(now.as_ptr().add(i).cast());
+            let y = _mm256_loadu_si256(was.as_ptr().add(i).cast());
+            !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32)
+        };
+        while diff != 0 {
+            let first = diff.trailing_zeros();
+            let count = (diff >> first).trailing_ones();
+            push_byte_run(&mut runs, i + first as usize, count as usize);
+            if first + count >= 32 {
+                break;
+            }
+            diff &= u32::MAX << (first + count);
+        }
+        i += 32;
+    }
+    while i < n {
+        while i < n && now[i] == was[i] {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let first = i;
+        while i < n && now[i] != was[i] {
+            i += 1;
+        }
+        push_byte_run(&mut runs, first, i - first);
     }
     runs
 }
@@ -3110,11 +3508,21 @@ impl Shadow {
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
+        let initial = self.inside(address, len);
+        if initial.0 >= initial.1 {
+            pending.push(range);
+            return;
+        }
+        let mut parts = Vec::with_capacity(4);
+        let mut rest = Vec::with_capacity(4);
+        parts.push(initial);
         for &(a, e) in pending.iter() {
             let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
+            if a >= e {
+                continue;
+            }
+            rest.clear();
+            for &(from, to) in &parts {
                 if e <= from || a >= to {
                     rest.push((from, to));
                     continue;
@@ -3126,10 +3534,16 @@ impl Shadow {
                     rest.push((e, to));
                 }
             }
-            parts = rest;
+            std::mem::swap(&mut parts, &mut rest);
+            if parts.is_empty() {
+                break;
+            }
         }
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
+        if taken == 0 {
+            return;
+        }
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -3242,7 +3656,7 @@ impl Shadow {
             // Sized to each stretch read (`back_piece`): a zeroed 64 KiB per
             // range, most of whose ranges differ nowhere, was most of the
             // work for small ranges.
-            let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut title, mut mask, mut runs, mut was) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -3254,9 +3668,10 @@ impl Shadow {
                 };
                 // Title memory as read, beside it with the card's bytes put
                 // in: only the dwords that differ are written.
-                let was: Vec<u8> = title.iter().zip(&mask).map(|(now, changed)| now ^ changed).collect();
                 if !runs.is_empty() {
-                    written += put_changed(start + at + first, &was[..n], &title[..n]);
+                    was.clear();
+                    was.extend(title[..n].iter().zip(&mask[..n]).map(|(now, changed)| now ^ changed));
+                    written += put_changed(start + at + first, &was, &title[..n]);
                 }
             }
             // Our write shows as a title write at the copy's next refresh,
@@ -3358,10 +3773,8 @@ impl Shadow {
             let mut at = a;
             while at < b {
                 let n = (PIECE - (start + at) % PIECE).min(b - at);
-                // SAFETY: inside the mapping, which nothing writes while a
-                // submission's results are compared.
-                let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
-                if host != &before[at - from..at - from + n] {
+                // SAFETY: inside the mapping and snapshot slice.
+                if unsafe { crate::safecopy::differ((data + at) as *const u8, before[at - from..].as_ptr(), n) } {
                     found.push((at, n));
                 }
                 at += n;
@@ -3992,16 +4405,29 @@ impl Shadow {
     }
 
     /// What shaders wrote in `[from, to)` (offsets) was put into title memory.
+    #[cfg(test)]
     fn note_landing(&self, from: usize, to: usize) {
+        self.note_landings(&[(from, to)]);
+    }
+
+    /// Batched [`Shadow::note_landing`] across multiple `(from, to)` ranges so
+    /// [`Shadow::land_card`] acquires `self.landings` once per job instead of
+    /// once per 64 KiB piece.
+    fn note_landings(&self, ranges: &[(usize, usize)]) {
+        if ranges.is_empty() {
+            return;
+        }
         let first = self.start as usize / KERNEL_PAGE;
-        let pages = (self.start as usize + from) / KERNEL_PAGE - first..(self.start as usize + to).div_ceil(KERNEL_PAGE) - first;
         let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
         if bits.is_empty() {
             let all = (self.start + self.len).div_ceil(KERNEL_PAGE as u64) as usize - first;
             bits.resize(all.div_ceil(64), 0);
         }
-        for page in pages {
-            bits[page / 64] |= 1 << (page % 64);
+        for &(from, to) in ranges {
+            let pages = (self.start as usize + from) / KERNEL_PAGE - first..(self.start as usize + to).div_ceil(KERNEL_PAGE) - first;
+            for page in pages {
+                bits[page / 64] |= 1 << (page % 64);
+            }
         }
         self.landing.store(true, Ordering::Release);
     }
@@ -4376,16 +4802,8 @@ impl Shadow {
             // title's, and may have been written again since.
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
-            let mut differs = 0u8;
             let was = title.clone();
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                let wrote = if *g != *o { 0xffu8 } else { 0 };
-                let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
-                *t = merged;
-                *o = merged;
-            }
-            if differs != 0 {
+            if card_merge_bytes(gpu, old, title) {
                 written = put_changed(start + at, &was, title);
             }
         } else {
@@ -4539,6 +4957,7 @@ impl Shadow {
             skip
         };
         let mut put = 0;
+        let mut landed_ranges: Vec<(usize, usize)> = Vec::new();
         for &(lo, hi, now) in pieces {
             if lo >= hi || hi > self.len as usize {
                 continue;
@@ -4554,9 +4973,12 @@ impl Shadow {
                 unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
-                self.note_landing(lo, hi);
+                landed_ranges.push((lo, hi));
             }
             put += merged;
+        }
+        if !landed_ranges.is_empty() {
+            self.note_landings(&landed_ranges);
         }
         put
     }
@@ -5853,17 +6275,20 @@ mod window_tests {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
 
-        // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
+        // Unknown (WARP / query failure) and < 6 GiB keep the 16 MiB floor;
+        // 6..=12 GiB (8–12 GB cards) use 1 MiB min while strictly keeping the 512 MiB cap.
         assert_eq!(default_card_limits_mb(None), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(4 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(7 * GIB)), (1, 512));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (1, 512));
+        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (1, 512));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (1, 512));
 
         // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
-        assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
-        assert_eq!(default_card_limits_mb(Some(14 * GIB)), (4, 2048));
-        assert_eq!(default_card_limits_mb(Some(15 * GIB)), (4, 2048));
-        assert_eq!(default_card_limits_mb(Some(16 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(13 * GIB)), (1, 2048));
+        assert_eq!(default_card_limits_mb(Some(14 * GIB)), (1, 2048));
+        assert_eq!(default_card_limits_mb(Some(15 * GIB)), (1, 2048));
+        assert_eq!(default_card_limits_mb(Some(16 * GIB)), (1, 2048));
 
         // 24–32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
         assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));

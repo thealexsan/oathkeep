@@ -143,6 +143,48 @@ fn only_what_a_fetch_behind_the_flight_brought_is_left_out() {
     assert!(had.0.is_empty());
 }
 
+#[test]
+fn differing_page_bounds_match_full_page_scan_across_alignments_and_parts() {
+    let mut random = Random(0x5150);
+    for title in [0x10_0000usize, 0x10_0010, 0x10_0ff4, 0x10_3abc] {
+        let base = title / PAGE;
+        let max_len = BLOCK - title % BLOCK;
+        let mut held = vec![0x22u8; max_len];
+        for (i, b) in held.iter_mut().enumerate() {
+            *b = (i * 17 + 3) as u8;
+        }
+        // Empty / completely identical -> Err(page_slices).
+        let parts = [(0, max_len.min(5 * PAGE + 123)), (6 * PAGE, max_len.min(9 * PAGE + 7))];
+        let parts: Vec<(usize, usize)> = parts.into_iter().filter(|(a, b)| a < b).collect();
+        let mut expected_slices = 0u64;
+        for_pages(title, &parts, |_, _| expected_slices += 1);
+        // SAFETY: `held` has `max_len` bytes.
+        let same = unsafe { differing_page_bounds(title, held.as_ptr(), held.as_ptr(), &parts) };
+        assert_eq!(same, Err(expected_slices));
+
+        for _ in 0..80 {
+            let mut now = held.clone();
+            let edits = 1 + random.next() % 4;
+            for _ in 0..edits {
+                let p = &parts[random.next() % parts.len()];
+                let off = p.0 + random.next() % (p.1 - p.0);
+                now[off] ^= 0x81;
+            }
+            let mut full = [false; BLOCK / PAGE + 1];
+            for_pages(title, &parts, |from, n| {
+                if now[from..from + n] != held[from..from + n] {
+                    full[(title + from) / PAGE - base] = true;
+                }
+            });
+            let exp_first = full.iter().position(|&d| d).unwrap();
+            let exp_last = full.iter().rposition(|&d| d).unwrap();
+            // SAFETY: `now` and `held` both hold `max_len` bytes.
+            let got = unsafe { differing_page_bounds(title, now.as_ptr(), held.as_ptr(), &parts) };
+            assert_eq!(got, Ok((exp_first, exp_last)), "title={title:#x}");
+        }
+    }
+}
+
 /// A piece landed through either address holds what the merge of one thread
 /// and one pass ([`crate::safecopy::merge`]) is to leave, with parts left
 /// out, wherever it begins and ends.
