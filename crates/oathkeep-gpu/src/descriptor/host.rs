@@ -2199,14 +2199,6 @@ impl HostHeap {
         crate::host::retire_batch(retired);
     }
 
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make(view, self.cpu(index));
-        if kept.is_none() {
-            null_for(view, self.cpu(index));
-        }
-        self.keep(index, kept.flatten());
-    }
-
     pub(crate) fn make_at_into(
         &self,
         index: u32,
@@ -2376,20 +2368,6 @@ impl HostHeap {
         }
     }
 
-    pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        self.keep(index, None);
-        let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
-        };
-        // SAFETY: a slot of our heap; the memory is the caller's.
-        unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
-        };
-    }
-
     pub(crate) fn constant_at_into(
         &self,
         index: u32,
@@ -2404,26 +2382,6 @@ impl HostHeap {
             SizeInBytes: size.next_multiple_of(256),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
-        unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
-        };
-    }
-
-    pub(crate) fn constant_at_kept(
-        &self,
-        index: u32,
-        gpu: u64,
-        size: u32,
-        buffer: ID3D12Resource,
-    ) {
-        self.keep(index, Some(buffer));
-        let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
-        };
-        // SAFETY: a slot of our heap; the buffer is kept in `self.kept`.
         unsafe {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
@@ -3189,11 +3147,11 @@ fn make_detailed(
     match view {
         &View::Constant(address, size) => {
             let aligned = size.next_multiple_of(256);
-            let Some(shadow) = crate::shadow::find(address, u64::from(aligned)) else {
+            let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
                 return (None, None, None);
             };
             let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 || shadow.left(address) < u64::from(aligned) {
+            if !shadow.can_bind_cbv(address, size) {
                 once!(
                     address = format_args!("{address:#x}"),
                     "constant buffer not 256-byte aligned on the host"

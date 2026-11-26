@@ -3434,6 +3434,17 @@ impl Shadow {
         self.host_width
     }
 
+    /// Whether `address..address+size` can be bound directly as a D3D12 CBV:
+    /// 256-byte aligned GPU VA, the title's requested `size` fits in the shadow's
+    /// logical span, and the 256-byte-rounded D3D12 CBV size fits in the host buffer.
+    pub(crate) fn can_bind_cbv(&self, address: u64, size: u32) -> bool {
+        let size_u64 = u64::from(size);
+        let aligned = u64::from(size.next_multiple_of(256));
+        self.gpu(address).is_multiple_of(256)
+            && self.left(address) >= size_u64
+            && self.host_width.saturating_sub(self.offset(address)) >= aligned
+    }
+
     pub(crate) fn allow_uav(&self) -> bool {
         self.allow_uav
     }
@@ -3512,6 +3523,7 @@ impl Shadow {
 
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         self.used.store(crate::host::moment(), Ordering::Relaxed);
+        list.note_shadow_gpu_write(self.id);
         if self.place.is_some() {
             return;
         }

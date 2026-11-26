@@ -121,8 +121,13 @@ pub(crate) enum C {
     TablesFreshSpanSum,
     TablesFreshUsedSum,
     TablesFreshUncacheable,
+    TablesCbvUnaligned,
+    TablesCbvShort,
+    TablesCbvNoShadow,
+    CbvScratchHits,
+    CbvScratchMisses,
 }
-const COUNTERS: usize = 128;
+const COUNTERS: usize = 136;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1204,8 +1209,9 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "micro-diag rec/tables/frame: bind {:.2} ms (early_tex {:.2} ms, tables {:.2} ms, make_at {:.2} ms, \
-         mem_ready {:.2} ms), indirect {:.2} ms; fresh_tables: over {:.0}, cbv_fail {:.0}, hit {:.0}, \
-         uncacheable {:.0}, span_sum {:.0}, used_sum {:.0}",
+         mem_ready {:.2} ms), indirect {:.2} ms; fresh_tables: over {:.0}, cbv_fail {:.0} (unalign {:.0}, \
+         short {:.0}, no_shadow {:.0}), hit {:.0}, uncacheable {:.0}, span_sum {:.0}, used_sum {:.0}; \
+         cbv_scratch: hit {:.0}, miss {:.0}",
         ms(c[C::RecBindUs as usize]),
         ms(c[C::RecEarlyTexUs as usize]),
         ms(c[C::RecTablesUs as usize]),
@@ -1214,10 +1220,15 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::RecIndirectUs as usize]),
         c[C::TablesFreshOver as usize],
         c[C::TablesFreshCbv as usize],
+        c[C::TablesCbvUnaligned as usize],
+        c[C::TablesCbvShort as usize],
+        c[C::TablesCbvNoShadow as usize],
         c[C::TablesFreshHit as usize],
         c[C::TablesFreshUncacheable as usize],
         c[C::TablesFreshSpanSum as usize],
         c[C::TablesFreshUsedSum as usize],
+        c[C::CbvScratchHits as usize],
+        c[C::CbvScratchMisses as usize],
     );
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut whole: Vec<_> = whole.into_iter().flatten().collect();

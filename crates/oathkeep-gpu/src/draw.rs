@@ -170,6 +170,12 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("OATHKEEP_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
+struct FreshTable {
+    offset: u32,
+    bindless_seq: u64,
+    deps: Vec<(u64, u64)>,
+}
+
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
@@ -195,7 +201,8 @@ pub(crate) struct State {
     host_pipeline: usize,
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    fresh_tables: std::collections::HashMap<(usize, u32, u128), u32>,
+    fresh_tables: std::collections::HashMap<(usize, u32, u128), FreshTable>,
+    cbv_scratch_cache: std::collections::HashMap<(u64, u64, u64), (u64, u64, ID3D12Resource, u64)>,
     dynamic: Vec<(usize, u32, u32)>,
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
@@ -222,6 +229,7 @@ impl Drop for State {
 
 impl State {
     pub(crate) fn tables_done(&mut self) {
+        self.cbv_scratch_cache.clear();
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }
@@ -755,6 +763,36 @@ impl State {
         Some(s)
     }
 
+    fn cbv_gpu_scratch(
+        &mut self,
+        list: &HostList,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: u64,
+        len: u64,
+    ) -> Option<(ID3D12Resource, u64, u64, u64)> {
+        let sid = shadow.id();
+        let src_offset = shadow.offset(address);
+        let write_seq = list.shadow_write_seq(sid);
+        let bindless_seq = list.bindless_write_seq();
+        let key = (sid, src_offset, len);
+        if let Some((cached_seq, cached_bindless, res, gpu)) = self.cbv_scratch_cache.get(&key)
+            && *cached_seq == write_seq
+            && *cached_bindless == bindless_seq
+        {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::CbvScratchHits, 1);
+            return Some((res.clone(), *gpu, write_seq, bindless_seq));
+        }
+        shadow.refresh(list, address, len);
+        let (scratch, _, scratch_gpu) =
+            list.gpu_copy_scratch(&shadow.buffer, src_offset, len, 256)?;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::CbvScratchMisses, 1);
+        self.cbv_scratch_cache
+            .insert(key, (write_seq, bindless_seq, scratch.clone(), scratch_gpu));
+        Some((scratch, scratch_gpu, write_seq, bindless_seq))
+    }
+
     fn root_view(&mut self, list: &HostList, address: u64, srv: bool) -> Option<u64> {
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let limit = *LIMIT.get_or_init(|| {
@@ -773,13 +811,10 @@ impl State {
             }
             return Some(gpu);
         }
-        if shadow.is_gpu_active(list, address, len) {
-            shadow.refresh(list, address, len);
-            if let Some((_, _, scratch_gpu)) =
-                list.gpu_copy_scratch(&shadow.buffer, shadow.offset(address), len, 256)
-            {
-                return Some(scratch_gpu);
-            }
+        if shadow.is_gpu_active(list, address, len)
+            && let Some((_, scratch_gpu, _, _)) = self.cbv_gpu_scratch(list, &shadow, address, len)
+        {
+            return Some(scratch_gpu);
         }
         let (gpu, to) = list.scratch(len)?;
         list.defer_fill(to, address as *const u8, len as usize);
@@ -1302,14 +1337,42 @@ impl Drop for ScopeUs {
     }
 }
 
+struct DrawWriteGuard<'a> {
+    list: &'a HostList,
+    committed: bool,
+}
+
+impl<'a> DrawWriteGuard<'a> {
+    #[inline]
+    fn new(list: &'a HostList) -> Self {
+        list.begin_draw_writes();
+        Self {
+            list,
+            committed: false,
+        }
+    }
+
+    #[inline]
+    fn commit(mut self) {
+        self.committed = true;
+        self.list.commit_draw_writes();
+    }
+}
+
+impl Drop for DrawWriteGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if !self.committed {
+            self.list.cancel_draw_writes();
+        }
+    }
+}
+
 impl State {
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         let _bind_scope = ScopeUs::start(crate::copystat::C::RecBindUs);
         let l = &list.list;
-        if compute || p.stages.iter().any(|s| s.translated().stores) {
-            list.mark_uav_dirty();
-        }
         {
             #[cfg(feature = "diagnostics")]
             let _early_scope = ScopeUs::start(crate::copystat::C::RecEarlyTexUs);
@@ -1361,6 +1424,8 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        let draw_writes = DrawWriteGuard::new(list);
+        let mut bindless_writes = false;
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -1376,6 +1441,13 @@ impl State {
             }
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            if writes
+                && t.host
+                    .root_srvs
+                    .contains(&oathkeep_shader::emit::SLOT_STRIDES)
+            {
+                bindless_writes = true;
+            }
             let memory = if t
                 .host
                 .root_srvs
@@ -1534,6 +1606,13 @@ impl State {
             }
         }
         list.twins_written();
+        draw_writes.commit();
+        if bindless_writes {
+            list.note_bindless_gpu_write();
+        }
+        if compute || p.stages.iter().any(|s| s.translated().stores) {
+            list.mark_uav_dirty();
+        }
         true
     }
 
@@ -3084,11 +3163,42 @@ impl State {
         }
         match crate::descriptor::view(handle) {
             Some(View::Constant(address, size)) => {
-                let aligned = u64::from(size.next_multiple_of(256));
-                self.find_shadow(address, aligned)
-                    .is_some_and(|shadow| {
-                        shadow.gpu(address) % 256 == 0 && shadow.left(address) >= aligned
-                    })
+                let size_u64 = u64::from(size);
+                let Some(shadow) = self.find_shadow(address, size_u64) else {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::TablesCbvNoShadow, 1);
+                    return false;
+                };
+                if shadow.can_bind_cbv(address, size) {
+                    return true;
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    let gpu = shadow.gpu(address);
+                    if !gpu.is_multiple_of(256) {
+                        crate::copystat::add(crate::copystat::C::TablesCbvUnaligned, 1);
+                    } else {
+                        crate::copystat::add(crate::copystat::C::TablesCbvShort, 1);
+                    }
+                    static LOGGED: AtomicU64 = AtomicU64::new(0);
+                    if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
+                        let aligned = u64::from(size.next_multiple_of(256));
+                        let left = shadow.left(address);
+                        let host_left = shadow.host_width().saturating_sub(shadow.offset(address));
+                        tracing::info!(
+                            addr_mod256 = address % 256,
+                            gpu_mod256 = gpu % 256,
+                            size,
+                            aligned,
+                            left,
+                            host_left,
+                            ever_written = shadow.ever_written(),
+                            in_place = shadow.is_in_place(),
+                            "cbv_fail sample"
+                        );
+                    }
+                }
+                false
             }
             _ => true,
         }
@@ -3292,7 +3402,20 @@ impl State {
                 }
                 (heap_id, span, finalize_table_hash(h1, h2))
             };
-            if let Some(&offset) = self.fresh_tables.get(&key) {
+            let cached_offset = self.fresh_tables.get(&key).and_then(|entry| {
+                if entry.deps.is_empty()
+                    || (list.bindless_write_seq() == entry.bindless_seq
+                        && entry
+                            .deps
+                            .iter()
+                            .all(|&(sid, seq)| list.shadow_write_seq(sid) == seq))
+                {
+                    Some(entry.offset)
+                } else {
+                    None
+                }
+            });
+            if let Some(offset) = cached_offset {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TablesFreshHit, 1);
                 for entry_i in 0..self.scratch_entries.len() {
@@ -3310,14 +3433,11 @@ impl State {
                             if (direct_cbv() || gpu_active)
                                 && let Some(shadow) =
                                     existing.or_else(|| self.find_shadow(address, size_u64))
+                                && shadow.can_bind_cbv(address, size)
                             {
-                                let gpu = shadow.gpu(address);
-                                let aligned = size.next_multiple_of(256);
-                                if gpu % 256 == 0 && shadow.left(address) >= u64::from(aligned) {
-                                    shadow.refresh(list, address, size_u64);
-                                    if gpu_active {
-                                        list.uav_barrier_if_dirty();
-                                    }
+                                shadow.refresh(list, address, size_u64);
+                                if gpu_active {
+                                    list.uav_barrier_if_dirty();
                                 }
                             }
                         }
@@ -3358,7 +3478,7 @@ impl State {
                     self.scratch_used_k.len() as u64,
                 );
             }
-            let mut cacheable = true;
+            let mut deps: Vec<(u64, u64)> = Vec::new();
             self.dynamic.push((heap_id, first, span));
             let title_first = heap.index(table);
             #[cfg(feature = "diagnostics")]
@@ -3382,9 +3502,8 @@ impl State {
                             && let Some(shadow) =
                                 existing.or_else(|| self.find_shadow(address, size_u64))
                         {
-                            let gpu = shadow.gpu(address);
-                            let aligned = size.next_multiple_of(256);
-                            if gpu % 256 == 0 && shadow.left(address) >= u64::from(aligned) {
+                            if shadow.can_bind_cbv(address, size) {
+                                let gpu = shadow.gpu(address);
                                 shadow.refresh(list, address, size_u64);
                                 if gpu_active {
                                     list.uav_barrier_if_dirty();
@@ -3398,24 +3517,23 @@ impl State {
                                 );
                                 continue;
                             }
-                            if gpu_active && shadow.left(address) >= size_u64 {
-                                shadow.refresh(list, address, size_u64);
-                                if let Some((scratch, _, scratch_gpu)) = list.gpu_copy_scratch(
-                                    &shadow.buffer,
-                                    shadow.offset(address),
-                                    size_u64,
-                                    256,
-                                ) {
-                                    cacheable = false;
-                                    host.constant_at_kept_into(
-                                        index,
-                                        scratch_gpu,
-                                        size,
-                                        scratch,
-                                        &mut retired,
-                                    );
-                                    continue;
+                            if gpu_active
+                                && shadow.left(address) >= size_u64
+                                && let Some((scratch, scratch_gpu, write_seq, _)) =
+                                    self.cbv_gpu_scratch(list, &shadow, address, size_u64)
+                            {
+                                let sid = shadow.id();
+                                if !deps.iter().any(|&(id, _)| id == sid) {
+                                    deps.push((sid, write_seq));
                                 }
+                                host.constant_at_kept_into(
+                                    index,
+                                    scratch_gpu,
+                                    size,
+                                    scratch,
+                                    &mut retired,
+                                );
+                                continue;
                             }
                         }
                         let Some((gpu, to)) = list.scratch(size_u64) else {
@@ -3460,12 +3578,14 @@ impl State {
                 t_make.elapsed().as_micros() as u64,
             );
             let offset = (first - trim) * 32;
-            if cacheable {
-                self.fresh_tables.insert(key, offset);
-            } else {
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TablesFreshUncacheable, 1);
-            }
+            self.fresh_tables.insert(
+                key,
+                FreshTable {
+                    offset,
+                    bindless_seq: list.bindless_write_seq(),
+                    deps,
+                },
+            );
             self.scratch_made.push((slot, offset));
         }
         if !retired.is_empty() {

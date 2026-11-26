@@ -835,6 +835,13 @@ struct GpuScratchPool {
     in_read: bool,
 }
 
+#[derive(Default)]
+struct ShadowWrites {
+    seqs: Vec<(u64, u64)>,
+    deferring: bool,
+    pending: Vec<u64>,
+}
+
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
@@ -847,6 +854,8 @@ pub(crate) struct HostList {
     budget: OnceLock<Option<ID3D12Resource>>,
     indirect_pool: Mutex<IndirectPool>,
     gpu_scratch_pool: Mutex<GpuScratchPool>,
+    shadow_writes: Mutex<ShadowWrites>,
+    bindless_write_seq: std::sync::atomic::AtomicU64,
     uav_dirty: std::sync::atomic::AtomicBool,
     indirect_uav_dirty: std::sync::atomic::AtomicBool,
     indirect_epoch: std::sync::atomic::AtomicU64,
@@ -3589,6 +3598,8 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_pool: Mutex::default(),
                 gpu_scratch_pool: Mutex::default(),
+                shadow_writes: Mutex::default(),
+                bindless_write_seq: std::sync::atomic::AtomicU64::new(0),
                 uav_dirty: std::sync::atomic::AtomicBool::new(true),
                 indirect_uav_dirty: std::sync::atomic::AtomicBool::new(true),
                 indirect_epoch: std::sync::atomic::AtomicU64::new(1),
@@ -6601,6 +6612,78 @@ impl HostList {
         self.uav_dirty.store(true, Ordering::Relaxed);
     }
 
+    pub(crate) fn begin_draw_writes(&self) {
+        let mut writes = self
+            .shadow_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        writes.deferring = true;
+        writes.pending.clear();
+    }
+
+    pub(crate) fn commit_draw_writes(&self) {
+        let mut writes = self
+            .shadow_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        writes.deferring = false;
+        let pending = std::mem::take(&mut writes.pending);
+        for shadow_id in pending {
+            if let Some((_, seq)) = writes.seqs.iter_mut().find(|(id, _)| *id == shadow_id) {
+                *seq = seq.wrapping_add(1);
+            } else {
+                writes.seqs.push((shadow_id, 1));
+            }
+        }
+    }
+
+    pub(crate) fn cancel_draw_writes(&self) {
+        let mut writes = self
+            .shadow_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        writes.deferring = false;
+        writes.pending.clear();
+    }
+
+    pub(crate) fn note_shadow_gpu_write(&self, shadow_id: u64) {
+        let mut writes = self
+            .shadow_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if writes.deferring {
+            if !writes.pending.contains(&shadow_id) {
+                writes.pending.push(shadow_id);
+            }
+            return;
+        }
+        if let Some((_, seq)) = writes.seqs.iter_mut().find(|(id, _)| *id == shadow_id) {
+            *seq = seq.wrapping_add(1);
+        } else {
+            writes.seqs.push((shadow_id, 1));
+        }
+    }
+
+    pub(crate) fn shadow_write_seq(&self, shadow_id: u64) -> u64 {
+        let writes = self
+            .shadow_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        writes
+            .seqs
+            .iter()
+            .find_map(|&(id, seq)| (id == shadow_id).then_some(seq))
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn note_bindless_gpu_write(&self) {
+        self.bindless_write_seq.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn bindless_write_seq(&self) -> u64 {
+        self.bindless_write_seq.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn indirect_epoch(&self) -> u64 {
         self.indirect_epoch.load(Ordering::Relaxed)
     }
@@ -6732,6 +6815,16 @@ impl HostList {
             pool.used = 0;
             pool.in_read = false;
         }
+        {
+            let mut writes = self
+                .shadow_writes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            writes.seqs.clear();
+            writes.deferring = false;
+            writes.pending.clear();
+        }
+        self.bindless_write_seq.store(0, Ordering::Relaxed);
         let old_deferred = std::mem::take(&mut *self.deferred());
         let old_states =
             std::mem::take(&mut *self.states.lock().unwrap_or_else(|e| e.into_inner()));
