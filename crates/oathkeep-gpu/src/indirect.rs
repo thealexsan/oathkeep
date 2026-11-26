@@ -267,9 +267,9 @@ pub(crate) fn bound(
         need_uav,
         was_indirect,
     ) {
-        list.mark_indirect_state(true);
         Some((dst, dst_offset, evicted))
     } else {
+        list.mark_indirect_state(was_indirect);
         None
     }
 }
@@ -295,9 +295,9 @@ pub(crate) fn bound_ahead(
         need_uav,
         was_indirect,
     ) {
-        list.mark_indirect_state(true);
         Some((dst, dst_offset, evicted))
     } else {
+        list.mark_indirect_state(was_indirect);
         None
     }
 }

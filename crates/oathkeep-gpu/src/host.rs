@@ -185,7 +185,7 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
-fn sweep() {
+fn sweep_with_commit(known_avail: Option<u64>) {
     crate::inplace::tick();
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("OATHKEEP_SWEEP").is_none_or(|v| v != "0")) {
@@ -197,7 +197,7 @@ fn sweep() {
     if now < last + 250 {
         return;
     }
-    let avail_commit = available_commit();
+    let avail_commit = known_avail.or_else(available_commit);
     let interval = if avail_commit.is_some_and(|c| c < (2560u64 << 20)) {
         250
     } else {
@@ -6155,20 +6155,18 @@ impl Host {
         let t_after_late = std::time::Instant::now();
         let behind = late && flying();
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if !behind {
-            sweep();
-            SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() {
+        if !behind || late_free_present() {
             let now = now_ms();
             let last_swept = SWEPT.load(Ordering::Relaxed);
             if now > last_swept + 500 {
-                let tight = available_commit().is_some_and(|c| c < (2560u64 << 20));
-                let behind_sweep_ms = if tight { 500 } else { 4000 };
-                if now > last_swept + behind_sweep_ms {
-                    if tight {
+                let avail_commit = available_commit();
+                let tight = avail_commit.is_some_and(|c| c < (2560u64 << 20));
+                let sweep_ms = if tight { 500 } else { 4000 };
+                if now > last_swept + sweep_ms {
+                    if behind && tight {
                         self.settle(&mut submitted, WHY_SYNC);
                     }
-                    sweep();
+                    sweep_with_commit(avail_commit);
                     SWEPT.store(now_ms(), Ordering::Relaxed);
                 }
             }
@@ -7872,12 +7870,16 @@ impl HostList {
         if let Some(buf) = pool.buffer.clone() {
             if pool.used.saturating_add(alloc_bytes) <= pool.cap {
                 let offset = pool.used;
+                let was_indirect = pool.in_indirect;
                 pool.used += alloc_bytes;
-                return Some((buf, offset, pool.in_indirect, false));
+                pool.in_indirect = true;
+                return Some((buf, offset, was_indirect, false));
             }
             if alloc_bytes <= pool.cap && pool.cap >= MAX_GROW_CAP {
+                let was_indirect = pool.in_indirect;
                 pool.used = alloc_bytes;
-                return Some((buf, 0, pool.in_indirect, true));
+                pool.in_indirect = true;
+                return Some((buf, 0, was_indirect, true));
             }
             drop(buf);
             let new_cap = pool
@@ -7892,7 +7894,7 @@ impl HostList {
             let old_in_indirect = pool.in_indirect;
             pool.cap = new_cap;
             pool.used = alloc_bytes;
-            pool.in_indirect = false;
+            pool.in_indirect = true;
             drop(pool);
             if let Some(old_buf) = old_buf {
                 if old_in_indirect {
@@ -7908,7 +7910,7 @@ impl HostList {
         pool.buffer = Some(buffer.clone());
         pool.cap = cap;
         pool.used = alloc_bytes;
-        pool.in_indirect = false;
+        pool.in_indirect = true;
         Some((buffer, 0, false, false))
     }
 
@@ -8451,6 +8453,21 @@ impl Batch {
             }
         };
         let total_units = self.refreshes.len() + self.pending_textures.len();
+        // Fix AC2: pre-guard all dirty watched-guarded refresh ranges in a single coalesced pass
+        // before spawning `wide_run`, so adjacent spans across shadows merge into maximal
+        // `VirtualProtect` calls and sibling-view `alias_apply` runs ONCE per flush instead of
+        // per-shadow across 8 competing worker threads.
+        if self.refreshes.len() >= 2 {
+            let mut guarded_ranges: Vec<(usize, usize)> = Vec::new();
+            for (shadow, spans) in &self.refreshes {
+                if shadow.guarded() && !shadow.writes_pending() && !shadow.is_in_place() {
+                    guarded_ranges.extend_from_slice(spans);
+                }
+            }
+            if !guarded_ranges.is_empty() {
+                crate::watch::pre_guard_batch(&guarded_ranges);
+            }
+        }
         if wide_refresh() && total_units >= 2 {
             let started = std::time::Instant::now();
             let before_buf = PREPARING[0].load(Ordering::Relaxed);

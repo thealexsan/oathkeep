@@ -1448,6 +1448,17 @@ fn guard_with_hot_fast(
     #[cfg(feature = "diagnostics")]
     let t_pre = std::time::Instant::now();
     let pre_aliases = if view_guard() && !pre_gaps.is_empty() {
+        if pre_gaps.len() > 1 {
+            pre_gaps.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(pre_gaps.len());
+            for (ga, gb) in pre_gaps {
+                match merged.last_mut() {
+                    Some(last) if ga <= last.1 => last.1 = last.1.max(gb),
+                    _ => merged.push((ga, gb)),
+                }
+            }
+            pre_gaps = merged;
+        }
         let seq = crate::inplace::views_seq();
         let mut all_blocks = Vec::new();
         let mut other_runs = Vec::new();
@@ -1692,6 +1703,365 @@ fn guard_with_hot_fast(
             },
             epochs,
         ))
+    }
+}
+
+/// Coalesces and pre-guards dirty 64 KiB blocks across an entire `Batch::flush` submission
+/// in a single pass before parallel `Shadow::update` workers run.
+///
+/// Adjacent/overlapping ranges across shadows merge into maximal contiguous `VirtualProtect`
+/// calls, sibling-view `apply_alias_protection_sharded` executes ONCE per flush instead of
+/// per-shadow across competing worker threads, and `JOURNAL` is updated once so subsequent
+/// parallel `writes_guarded_since_with_clean` calls hit the lock-free / read-only fast path.
+pub(crate) fn pre_guard_batch(ranges: &[(usize, usize)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ASK.get_or_init(|| std::env::var_os("OATHKEEP_GUARD_ASK").is_some_and(|v| v == "1")) {
+        return;
+    }
+    let mut block_spans: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for &(start, end) in ranges {
+        if start < end {
+            let first = start / BLOCK;
+            let last = end.div_ceil(BLOCK);
+            if first < last {
+                block_spans.push((first, last));
+            }
+        }
+    }
+    if block_spans.is_empty() {
+        return;
+    }
+    if block_spans.len() > 1 {
+        block_spans.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(block_spans.len());
+        for (a, b) in block_spans {
+            match merged.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        block_spans = merged;
+    }
+    #[cfg(feature = "diagnostics")]
+    let guarding = std::time::Instant::now();
+    let frame = crate::frame::current();
+    let probe_absent = COMMIT_TITLE_MEMORY.get().is_none();
+    let mut pre_gaps: Vec<(usize, usize)> = Vec::new();
+    let mut slow_spans: Vec<(usize, usize, usize)> = Vec::new();
+    for &(first, last) in &block_spans {
+        for_each_shard_span(first, last, |shard, a, b| {
+            let g = guards_read_shard(shard);
+            if g.clean.contains_range(a, b) {
+                return;
+            }
+            if g.accounted.contains_range(a, b)
+                && (!probe_absent || !g.absent.overlaps(a, b))
+                && (g.hot.is_empty() || g.hot.range(a..b).all(|(_, &until)| until > frame))
+            {
+                return;
+            }
+            if view_guard() {
+                for (ga, gb) in g.accounted.gaps_in(a, b) {
+                    if !g.protected.overlaps(ga, gb) {
+                        pre_gaps.push((ga, gb));
+                    } else {
+                        pre_gaps.extend(g.protected.gaps_in(ga, gb));
+                        g.alias_dirty.for_each_overlap(ga, gb, |da, db| {
+                            pre_gaps.push((da, db));
+                        });
+                    }
+                }
+                if !g.hot.is_empty() {
+                    for (&block, &until) in g.hot.range(a..b) {
+                        if until <= frame {
+                            match pre_gaps.last_mut() {
+                                Some(last_gap) if last_gap.1 == block => last_gap.1 = block + 1,
+                                _ => pre_gaps.push((block, block + 1)),
+                            }
+                        }
+                    }
+                }
+            }
+            slow_spans.push((shard, a, b));
+        });
+    }
+    if slow_spans.is_empty() {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    let t_pre = std::time::Instant::now();
+    let pre_aliases = if view_guard() && !pre_gaps.is_empty() {
+        if pre_gaps.len() > 1 {
+            pre_gaps.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(pre_gaps.len());
+            for (ga, gb) in pre_gaps {
+                match merged.last_mut() {
+                    Some(last) if ga <= last.1 => last.1 = last.1.max(gb),
+                    _ => merged.push((ga, gb)),
+                }
+            }
+            pre_gaps = merged;
+        }
+        let seq = crate::inplace::views_seq();
+        let mut all_blocks = Vec::new();
+        let mut other_runs = Vec::new();
+        let mut total_count = 0u64;
+        for &(from, to) in &pre_gaps {
+            let (all, others, count) = crate::inplace::alias_blocks_between(
+                from.saturating_mul(BLOCK),
+                to.saturating_mul(BLOCK),
+                MANY_VIEWS,
+            );
+            if count > 0 {
+                total_count += count;
+                all_blocks.extend(all);
+                other_runs.extend(others);
+            }
+        }
+        Some((seq, pre_gaps, all_blocks, other_runs, total_count))
+    } else {
+        None
+    };
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::GuardPreAliasUs,
+        t_pre.elapsed().as_micros() as u64,
+    );
+    install();
+    if slow_spans.len() > 1 {
+        slow_spans.sort_unstable();
+    }
+    let mut written: Vec<usize> = Vec::new();
+    let mut protected_runs: Vec<(usize, usize)> = Vec::new();
+    let mut already_aliased: Vec<(usize, usize)> = Vec::new();
+    let mut idx = 0usize;
+    while idx < slow_spans.len() {
+        let shard = slow_spans[idx].0;
+        let mut end_idx = idx + 1;
+        while end_idx < slow_spans.len() && slow_spans[end_idx].0 == shard {
+            end_idx += 1;
+        }
+        #[cfg(feature = "diagnostics")]
+        let t_wlock = std::time::Instant::now();
+        let mut g = guards_write_shard(shard);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::GuardWriteWaitUs,
+            t_wlock.elapsed().as_micros() as u64,
+        );
+        for &(_, a, b) in &slow_spans[idx..end_idx] {
+            if g.clean.contains_range(a, b) {
+                continue;
+            }
+            let mut expired_hot = Vec::new();
+            if !g.hot.is_empty() {
+                for (&block, &until) in g.hot.range(a..b) {
+                    if until <= frame {
+                        expired_hot.push(block);
+                    }
+                }
+            }
+            if !expired_hot.is_empty() {
+                for &block in &expired_hot {
+                    bump_sub_clean_block(block);
+                }
+                bump_shard_clean_epoch(shard);
+                for block in expired_hot {
+                    g.hot.remove(&block);
+                    g.accounted.remove(block);
+                    g.cool_count
+                        .entry(block)
+                        .and_modify(|c| *c = c.saturating_add(1).min(MAX_COOL_BACKOFF))
+                        .or_insert(1);
+                }
+            }
+            if probe_absent && g.absent.overlaps(a, b) {
+                let mut newly_committed: Vec<(usize, usize)> = Vec::new();
+                let mut uncommitted_until = a;
+                g.absent.for_each_overlap(a, b, |oa, ob| {
+                    let mut block = oa;
+                    while block < ob {
+                        if block >= uncommitted_until {
+                            uncommitted_until = uncommitted_end(block);
+                        }
+                        if block < uncommitted_until {
+                            block = uncommitted_until.min(ob);
+                        } else {
+                            match newly_committed.last_mut() {
+                                Some(last_run) if last_run.1 == block => last_run.1 = block + 1,
+                                _ => newly_committed.push((block, block + 1)),
+                            }
+                            block += 1;
+                        }
+                    }
+                });
+                if !newly_committed.is_empty() {
+                    for &(na, nb) in &newly_committed {
+                        bump_sub_clean_range(na, nb);
+                    }
+                    bump_shard_clean_epoch(shard);
+                    for (na, nb) in newly_committed {
+                        g.absent.remove_range(na, nb);
+                        g.accounted.remove_range(na, nb);
+                    }
+                }
+            }
+            if g.accounted.contains_range(a, b) {
+                continue;
+            }
+            #[cfg(feature = "diagnostics")]
+            let t_prot = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            let written_before = written.len();
+            for (gap_first, gap_last) in g.accounted.gaps_in(a, b) {
+                written.extend(gap_first * BLOCK / PAGE..gap_last * BLOCK / PAGE);
+                if !g.protected.overlaps(gap_first, gap_last) {
+                    protect_here(&mut g, gap_first, gap_last, &mut protected_runs);
+                } else {
+                    let mut already = Vec::new();
+                    g.protected.for_each_overlap(gap_first, gap_last, |pa, pb| {
+                        already.push((pa, pb));
+                    });
+                    for (pa, pb) in g.protected.gaps_in(gap_first, gap_last) {
+                        protect_here(&mut g, pa, pb, &mut protected_runs);
+                    }
+                    for (pa, pb) in already {
+                        if view_guard() && g.alias_dirty.overlaps(pa, pb) {
+                            protected_runs.push((pa, pb));
+                            already_aliased.push((pa, pb));
+                        } else {
+                            g.clean.insert_range(pa, pb);
+                            g.accounted.insert_range(pa, pb);
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(
+                    crate::copystat::C::GuardProtectUs,
+                    t_prot.elapsed().as_micros() as u64,
+                );
+                crate::copystat::add(
+                    crate::copystat::C::GuardRetGuardedPages,
+                    (written.len() - written_before) as u64,
+                );
+            }
+        }
+        idx = end_idx;
+    }
+    let alias_ep_before = ALIAS_FAULT_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    if !protected_runs.is_empty() {
+        if protected_runs.len() > 1 {
+            protected_runs.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(protected_runs.len());
+            for (pa, pb) in protected_runs {
+                match merged.last_mut() {
+                    Some(last) if pa <= last.1 => last.1 = last.1.max(pb),
+                    _ => merged.push((pa, pb)),
+                }
+            }
+            protected_runs = merged;
+        }
+        #[cfg(feature = "diagnostics")]
+        let t_alias = std::time::Instant::now();
+        let reused = if let Some((seq, ref covered, all_blocks, other_runs, total_count)) =
+            pre_aliases
+            && crate::inplace::views_seq() == seq
+            && protected_runs
+                .iter()
+                .all(|&(a, b)| covered.iter().any(|&(ca, cb)| ca <= a && b <= cb))
+        {
+            if total_count > 0 {
+                apply_alias_protection_sharded(all_blocks, other_runs, total_count);
+            }
+            true
+        } else {
+            false
+        };
+        if !reused {
+            protect_aliases_sharded(&protected_runs);
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::GuardAliasApplyUs,
+            t_alias.elapsed().as_micros() as u64,
+        );
+    }
+    if !already_aliased.is_empty() {
+        let can_clear_dirty =
+            ALIAS_FAULT_EPOCH.load(std::sync::atomic::Ordering::Acquire) == alias_ep_before;
+        let mut by_shard: Vec<(usize, usize, usize)> = Vec::with_capacity(already_aliased.len());
+        for (aa, ab) in already_aliased {
+            for_each_shard_span(aa, ab, |shard, sa, sb| {
+                by_shard.push((shard, sa, sb));
+            });
+        }
+        if by_shard.len() > 1 {
+            by_shard.sort_unstable();
+        }
+        let mut i = 0usize;
+        while i < by_shard.len() {
+            let shard = by_shard[i].0;
+            let mut k = i + 1;
+            while k < by_shard.len() && by_shard[k].0 == shard {
+                k += 1;
+            }
+            let mut g = guards_write_shard(shard);
+            for &(_, sa, sb) in &by_shard[i..k] {
+                if can_clear_dirty {
+                    g.alias_dirty.remove_range(sa, sb);
+                }
+                let mut still_prot = Vec::new();
+                g.protected.for_each_overlap(sa, sb, |pa, pb| {
+                    still_prot.push((pa, pb));
+                });
+                for (pa, pb) in still_prot {
+                    g.clean.insert_range(pa, pb);
+                    g.accounted.insert_range(pa, pb);
+                }
+            }
+            i = k;
+        }
+    }
+    if !written.is_empty() {
+        if written.len() > 1 {
+            written.sort_unstable();
+            written.dedup();
+        }
+        let mut j = journal_write();
+        let now = bump_journal_asked(&mut j, 1);
+        j.guarded_asked = now;
+        let mut prev_shard = usize::MAX;
+        let mut prev_mid = usize::MAX;
+        let mut prev_sub = usize::MAX;
+        for &page in &written {
+            j.written.insert(page, now);
+            let sub = sub_of(page);
+            if sub != prev_sub {
+                SUB_GUARDED_ASKED[sub].fetch_max(now, std::sync::atomic::Ordering::Release);
+                prev_sub = sub;
+            }
+            let mid = mid_of(page);
+            if mid != prev_mid {
+                MID_GUARDED_ASKED[mid].fetch_max(now, std::sync::atomic::Ordering::Release);
+                prev_mid = mid;
+            }
+            let s = shard_of(page);
+            if s != prev_shard {
+                SHARD_GUARDED_ASKED[s].fetch_max(now, std::sync::atomic::Ordering::Release);
+                prev_shard = s;
+            }
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        let us = guarding.elapsed().as_micros() as u64;
+        crate::copystat::add(crate::copystat::C::GuardUs, us);
+        crate::copystat::add(crate::copystat::C::WatchUs, us);
     }
 }
 
@@ -4199,6 +4569,86 @@ mod mapping_tests {
         title_memory_remapped(b, BLOCK);
         crate::inplace::views_gone(a, BLOCK);
         crate::inplace::views_gone(b, BLOCK);
+        unsafe {
+            UnmapViewOfFile(v1);
+            UnmapViewOfFile(v2);
+            CloseHandle(mapping);
+        }
+    }
+
+    #[test]
+    fn pre_guard_batch_coalesces_dirty_aliases_and_surfaces_writes_to_readers() {
+        let _guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use super::{
+            BLOCK, guards_read_shard, pre_guard_batch, shard_of, title_memory_remapped,
+            writes_guarded_since_with_clean,
+        };
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+        };
+        let bytes = 2 * BLOCK;
+        let mapping = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                bytes as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!mapping.is_null());
+        let v1 = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, bytes) };
+        let v2 = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, bytes) };
+        assert!(!v1.Value.is_null() && !v2.Value.is_null());
+        let a = v1.Value as usize;
+        let b = v2.Value as usize;
+        let sec = mapping as usize;
+        crate::inplace::title_memory_view(a, bytes, sec, 0);
+        crate::inplace::title_memory_view(b, bytes, sec, 0);
+
+        // Baseline guard on B across both blocks.
+        let (ts0, _, _) = writes_guarded_since_with_clean(b, b + bytes, u64::MAX).unwrap();
+        assert!(guards_read_shard(shard_of(a / BLOCK)).protected.contains(a / BLOCK));
+        assert!(guards_read_shard(shard_of((a + BLOCK) / BLOCK)).protected.contains((a + BLOCK) / BLOCK));
+
+        // Write both blocks through alias A.
+        unsafe {
+            (a as *mut u8).write_volatile(0x11);
+            ((a + BLOCK) as *mut u8).write_volatile(0x22);
+        }
+        assert!(!guards_read_shard(shard_of(b / BLOCK)).clean.contains(b / BLOCK));
+
+        // Coalesced pre_guard_batch across two adjacent sub-ranges of B.
+        pre_guard_batch(&[(b, b + BLOCK), (b + BLOCK, b + bytes)]);
+        assert!(
+            guards_read_shard(shard_of(a / BLOCK)).protected.contains(a / BLOCK)
+                && guards_read_shard(shard_of((a + BLOCK) / BLOCK))
+                    .protected
+                    .contains((a + BLOCK) / BLOCK),
+            "pre_guard_batch must re-arm both sibling alias blocks in A"
+        );
+        assert!(
+            guards_read_shard(shard_of(b / BLOCK)).clean.contains(b / BLOCK)
+                && guards_read_shard(shard_of((b + BLOCK) / BLOCK))
+                    .clean
+                    .contains((b + BLOCK) / BLOCK),
+            "pre_guard_batch must promote B blocks to clean"
+        );
+
+        // Subsequent reader on B with `since = ts0` MUST still see both dirty pages from JOURNAL.
+        let (_, written, _) = writes_guarded_since_with_clean(b, b + bytes, ts0).unwrap();
+        assert!(
+            written.iter().any(|&(p, t)| p == b / BLOCK && t > ts0)
+                && written.iter().any(|&(p, t)| p == (b + BLOCK) / BLOCK && t > ts0),
+            "subsequent shadow update must observe pre_guard_batch journaled pages"
+        );
+
+        title_memory_remapped(a, bytes);
+        title_memory_remapped(b, bytes);
+        crate::inplace::views_gone(a, bytes);
+        crate::inplace::views_gone(b, bytes);
         unsafe {
             UnmapViewOfFile(v1);
             UnmapViewOfFile(v2);

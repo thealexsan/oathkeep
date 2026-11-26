@@ -156,7 +156,6 @@ struct Window {
     step: u32,
     base: u64,
     records: u32,
-    epoch: u64,
     dst_offset: u64,
     scratch: ID3D12Resource,
 }
@@ -238,6 +237,8 @@ type DrawFastMap<K, V> =
     std::collections::HashMap<K, V, std::hash::BuildHasherDefault<DrawFastHasher>>;
 type DrawFastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<DrawFastHasher>>;
 
+type ShadowCacheEntry = (u64, u64, u64, u64, std::sync::Arc<crate::shadow::Shadow>);
+
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
@@ -260,6 +261,8 @@ pub(crate) struct State {
     stencil: Option<u32>,
     depth_bounds: Option<[f32; 2]>,
     windows: Vec<Window>,
+    windows_epoch: u64,
+    indirect_sigs: Vec<((u32, u32), ID3D12CommandSignature)>,
     host_pipeline: usize,
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
@@ -267,6 +270,9 @@ pub(crate) struct State {
     mirrored_done: DrawFastMap<(usize, u32), MirroredDone>,
     local_copy_seq: u64,
     local_refreshed: DrawFastSet<(usize, u64, u64)>,
+    local_tex_ready: DrawFastSet<(usize, u8)>,
+    local_tex_state_seq: u64,
+    local_tex_copy_seq: u64,
     cbv_scratch_cache: DrawFastMap<(u64, u64, u64), (u64, u64, ID3D12Resource, u64)>,
     kept_ptrs: DrawFastSet<usize>,
     kept_list_gen: u64,
@@ -276,7 +282,7 @@ pub(crate) struct State {
     tables_gone: bool,
     /// `(valid_start, valid_end, shadow_gen, range_epoch, shadow)` range-containment LRU cache
     /// shared across `find_shadow`, `find_shadow_any`, and `find_shadow_existing`.
-    shadow_cache: Vec<(u64, u64, u64, u64, std::sync::Arc<crate::shadow::Shadow>)>,
+    shadow_cache: Vec<ShadowCacheEntry>,
     constants_pool: Vec<Vec<u32>>,
     scratch_fresh: Vec<u8>,
     scratch_made: Vec<(u8, u32)>,
@@ -315,6 +321,9 @@ impl State {
         self.mirrored_done.clear();
         self.local_refreshed.clear();
         self.local_copy_seq = 0;
+        self.local_tex_ready.clear();
+        self.local_tex_state_seq = 0;
+        self.local_tex_copy_seq = 0;
         self.kept_ptrs.clear();
         self.kept_list_gen = 0;
         self.root_srv_slots.clear();
@@ -329,18 +338,13 @@ impl State {
             self.mirrored_done.clear();
             self.local_refreshed.clear();
             self.local_copy_seq = 0;
+            self.local_tex_ready.clear();
+            self.local_tex_state_seq = 0;
+            self.local_tex_copy_seq = 0;
+            self.windows.clear();
+            self.windows_epoch = 0;
             self.kept_list_gen = list_gen;
         }
-    }
-
-    #[inline]
-    fn is_kept_dynamic(&mut self, list: &HostList, raw: usize) -> bool {
-        let list_gen = list.reset_gen();
-        if self.kept_list_gen != list_gen {
-            self.sync_list_gen(list_gen);
-            return false;
-        }
-        self.kept_ptrs.contains(&raw)
     }
 
     #[inline]
@@ -369,6 +373,62 @@ impl State {
             len,
         );
     }
+    #[inline]
+    fn readable_texture_fast(
+        &mut self,
+        list: &HostList,
+        resource: usize,
+        kind: ResourceType,
+    ) -> bool {
+        self.sync_list_gen(list.reset_gen());
+        readable_texture_in(
+            &mut self.local_tex_ready,
+            &mut self.local_tex_state_seq,
+            &mut self.local_tex_copy_seq,
+            list,
+            resource,
+            kind,
+        )
+    }
+}
+
+#[inline]
+fn readable_texture_in(
+    local_tex_ready: &mut DrawFastSet<(usize, u8)>,
+    local_tex_state_seq: &mut u64,
+    local_tex_copy_seq: &mut u64,
+    list: &HostList,
+    resource: usize,
+    kind: ResourceType,
+) -> bool {
+    let kind_u8 = match kind {
+        ResourceType::Srv => 1u8,
+        ResourceType::Uav => 2u8,
+        _ => return false,
+    };
+    let tested = TESTED_DEPTH.get().0;
+    let st_seq = list.state_seq();
+    let cp_seq = list.copy_seq();
+    if *local_tex_state_seq != st_seq || *local_tex_copy_seq != cp_seq {
+        local_tex_ready.clear();
+        *local_tex_state_seq = st_seq;
+        *local_tex_copy_seq = cp_seq;
+    }
+    if resource != tested && local_tex_ready.contains(&(resource, kind_u8)) {
+        return false;
+    }
+    let was_twin = readable_texture(list, resource, kind);
+    if !was_twin && resource != tested {
+        let st_after = list.state_seq();
+        let cp_after = list.copy_seq();
+        if st_after != *local_tex_state_seq || cp_after != *local_tex_copy_seq {
+            local_tex_ready.clear();
+            *local_tex_state_seq = st_after;
+            *local_tex_copy_seq = cp_after;
+        }
+        local_tex_ready.insert((resource, kind_u8));
+    }
+    was_twin
 }
 
 #[inline]
@@ -814,6 +874,95 @@ fn direct_cbv() -> bool {
 
 const SHADOW_CACHE_CAP: usize = 24;
 
+#[inline]
+fn cache_shadow_in(
+    shadow_cache: &mut Vec<ShadowCacheEntry>,
+    valid_start: u64,
+    valid_end: u64,
+    shadow_gen: u64,
+    epoch: u64,
+    shadow: &std::sync::Arc<crate::shadow::Shadow>,
+) {
+    let sid = shadow.id();
+    if let Some(pos) = shadow_cache
+        .iter()
+        .position(|(vs, ve, _, _, s)| s.id() == sid && *vs == valid_start && *ve == valid_end)
+    {
+        shadow_cache[pos].2 = shadow_gen;
+        shadow_cache[pos].3 = epoch;
+        shadow_cache[pos].4 = shadow.clone();
+        if pos > 0 {
+            shadow_cache[..=pos].rotate_right(1);
+        }
+        return;
+    }
+    if shadow_cache.len() >= SHADOW_CACHE_CAP {
+        shadow_cache.pop();
+    }
+    shadow_cache.insert(
+        0,
+        (valid_start, valid_end, shadow_gen, epoch, shadow.clone()),
+    );
+}
+
+#[inline]
+fn lookup_shadow_cached_in(
+    shadow_cache: &mut Vec<ShadowCacheEntry>,
+    address: u64,
+    len: u64,
+) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    let norm_len = len.max(1);
+    let end = address.checked_add(norm_len)?;
+    let unsized_ask = len <= 1;
+    let cur_gen = crate::shadow::generation();
+    let mut i = 0;
+    while i < shadow_cache.len() {
+        let (vs, ve, cached_gen, ep, ref s) = shadow_cache[i];
+        if address < vs || end > ve {
+            i += 1;
+            continue;
+        }
+        if unsized_ask && s.is_window() && ve.saturating_sub(address) < (256 << 10) {
+            i += 1;
+            continue;
+        }
+        if s.is_dead() {
+            shadow_cache.remove(i);
+            continue;
+        }
+        if cached_gen != cur_gen {
+            if crate::shadow::epoch_for_range(vs, ve.saturating_sub(vs).max(1)) != ep {
+                shadow_cache.remove(i);
+                continue;
+            }
+            shadow_cache[i].2 = cur_gen;
+        }
+        let shadow = shadow_cache[i].4.clone();
+        shadow.touch_used(crate::host::moment());
+        if i > 0 {
+            shadow_cache[..=i].rotate_right(1);
+        }
+        return Some(shadow);
+    }
+    None
+}
+
+#[inline]
+fn find_shadow_in(
+    shadow_cache: &mut Vec<ShadowCacheEntry>,
+    address: u64,
+    len: u64,
+) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    if let Some(s) = lookup_shadow_cached_in(shadow_cache, address, len) {
+        return Some(s);
+    }
+    let cur_gen = crate::shadow::generation();
+    let (s, vs, ve) = crate::shadow::find_with_range(address, len)?;
+    let ep = crate::shadow::epoch_for_range(vs, ve.saturating_sub(vs).max(1));
+    cache_shadow_in(shadow_cache, vs, ve, cur_gen, ep, &s);
+    Some(s)
+}
+
 impl State {
     #[inline]
     fn cache_shadow(
@@ -824,25 +973,7 @@ impl State {
         epoch: u64,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
     ) {
-        let sid = shadow.id();
-        if let Some(pos) = self.shadow_cache.iter().position(|(vs, ve, _, _, s)| {
-            s.id() == sid && *vs == valid_start && *ve == valid_end
-        }) {
-            self.shadow_cache[pos].2 = shadow_gen;
-            self.shadow_cache[pos].3 = epoch;
-            self.shadow_cache[pos].4 = shadow.clone();
-            if pos > 0 {
-                self.shadow_cache[..=pos].rotate_right(1);
-            }
-            return;
-        }
-        if self.shadow_cache.len() >= SHADOW_CACHE_CAP {
-            self.shadow_cache.pop();
-        }
-        self.shadow_cache.insert(
-            0,
-            (valid_start, valid_end, shadow_gen, epoch, shadow.clone()),
-        );
+        cache_shadow_in(&mut self.shadow_cache, valid_start, valid_end, shadow_gen, epoch, shadow);
     }
 
     #[inline]
@@ -851,51 +982,11 @@ impl State {
         address: u64,
         len: u64,
     ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-        let norm_len = len.max(1);
-        let end = address.checked_add(norm_len)?;
-        let unsized_ask = len <= 1;
-        let cur_gen = crate::shadow::generation();
-        let mut i = 0;
-        while i < self.shadow_cache.len() {
-            let (vs, ve, cached_gen, ep, ref s) = self.shadow_cache[i];
-            if address < vs || end > ve {
-                i += 1;
-                continue;
-            }
-            if unsized_ask && s.is_window() && ve.saturating_sub(address) < (256 << 10) {
-                i += 1;
-                continue;
-            }
-            if s.is_dead() {
-                self.shadow_cache.remove(i);
-                continue;
-            }
-            if cached_gen != cur_gen {
-                if crate::shadow::epoch_for_range(vs, ve.saturating_sub(vs).max(1)) != ep {
-                    self.shadow_cache.remove(i);
-                    continue;
-                }
-                self.shadow_cache[i].2 = cur_gen;
-            }
-            let shadow = self.shadow_cache[i].4.clone();
-            shadow.touch_used(crate::host::moment());
-            if i > 0 {
-                self.shadow_cache[..=i].rotate_right(1);
-            }
-            return Some(shadow);
-        }
-        None
+        lookup_shadow_cached_in(&mut self.shadow_cache, address, len)
     }
 
     fn find_shadow(&mut self, address: u64, len: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-        if let Some(s) = self.lookup_shadow_cached(address, len) {
-            return Some(s);
-        }
-        let cur_gen = crate::shadow::generation();
-        let (s, vs, ve) = crate::shadow::find_with_range(address, len)?;
-        let ep = crate::shadow::epoch_for_range(vs, ve.saturating_sub(vs).max(1));
-        self.cache_shadow(vs, ve, cur_gen, ep, &s);
-        Some(s)
+        find_shadow_in(&mut self.shadow_cache, address, len)
     }
 
     fn find_shadow_any(
@@ -1428,6 +1519,16 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
+        self.prepare_for_pipeline(list, p, indexed, mesh)
+    }
+
+    fn prepare_for_pipeline(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        indexed: bool,
+        mesh: bool,
+    ) -> bool {
         if p.compute || p.mesh != mesh {
             once!(
                 mesh,
@@ -3428,7 +3529,7 @@ impl State {
                     }
                 }
                 crate::descriptor::host::StageAction::Texture { resource } => {
-                    let was_twin = readable_texture(list, resource, kind);
+                    let was_twin = self.readable_texture_fast(list, resource, kind);
                     if !was_twin && matches!(kind, ResourceType::Srv | ResourceType::Uav) {
                         let flags = MIRRORED_FLAG_TEX
                             | if kind == ResourceType::Uav {
@@ -3795,7 +3896,7 @@ impl State {
                             }
                         }
                         crate::descriptor::host::StageAction::Texture { resource } => {
-                            let was_twin = readable_texture(list, resource, kind);
+                            let was_twin = self.readable_texture_fast(list, resource, kind);
                             if !was_twin && matches!(kind, ResourceType::Srv | ResourceType::Uav) {
                                 let flags = MIRRORED_FLAG_TEX
                                     | if kind == ResourceType::Uav {
@@ -4018,7 +4119,14 @@ impl State {
                     if entry.tex_state_seq != cur_state_seq {
                         let mut any_twin = false;
                         for &(resource, kind) in &entry.textures {
-                            if readable_texture(list, resource, kind) {
+                            if readable_texture_in(
+                                &mut self.local_tex_ready,
+                                &mut self.local_tex_state_seq,
+                                &mut self.local_tex_copy_seq,
+                                list,
+                                resource,
+                                kind,
+                            ) {
                                 any_twin = true;
                             }
                         }
@@ -4172,9 +4280,15 @@ impl State {
                             crate::descriptor::host::BatchSlot::MissEpoch(mk) => Some(mk),
                             _ => None,
                         };
-                        let m = host.copy_or_make_dynamic_probed(index, words, probed, |raw| {
-                            self.is_kept_dynamic(list, raw)
-                        });
+                        let kept_ptrs = &self.kept_ptrs;
+                        let shadow_cache = &mut self.shadow_cache;
+                        let m = host.copy_or_make_dynamic_probed_with_shadow(
+                            index,
+                            words,
+                            probed,
+                            |raw| kept_ptrs.contains(&raw),
+                            |addr, len| find_shadow_in(shadow_cache, addr, len),
+                        );
                         #[cfg(feature = "diagnostics")]
                         {
                             miss_ns += t_miss.elapsed().as_nanos() as u64;
@@ -4206,7 +4320,14 @@ impl State {
                             address,
                             len,
                         } => {
-                            self.refresh_shadow(list, &shadow, address, len);
+                            refresh_shadow_in(
+                                &mut self.local_refreshed,
+                                &mut self.local_copy_seq,
+                                list,
+                                &shadow,
+                                address,
+                                len,
+                            );
                             if kind == ResourceType::Uav {
                                 refresh_buffers.push((shadow.clone(), address, len));
                                 if record_uav_writes {
@@ -4231,7 +4352,14 @@ impl State {
                         }
                         crate::descriptor::host::StageAction::Texture { resource } => {
                             textures.push((resource, kind));
-                            if readable_texture(list, resource, kind) {
+                            if readable_texture_in(
+                                &mut self.local_tex_ready,
+                                &mut self.local_tex_state_seq,
+                                &mut self.local_tex_copy_seq,
+                                list,
+                                resource,
+                                kind,
+                            ) {
                                 any_twin_tex = true;
                             }
                         }
@@ -4488,6 +4616,18 @@ impl State {
 }
 
 impl State {
+    #[inline]
+    fn indirect_signature_idx(&mut self, kind: u32, stride: u32) -> Option<usize> {
+        let key = (kind, stride);
+        if let Some(pos) = self.indirect_sigs.iter().position(|(k, _)| *k == key) {
+            return Some(pos);
+        }
+        let sig = host_signature(kind, stride)?;
+        let pos = self.indirect_sigs.len();
+        self.indirect_sigs.push((key, sig));
+        Some(pos)
+    }
+
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
@@ -4496,7 +4636,7 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         #[cfg(feature = "diagnostics")]
-        let _ind_scope = ScopeUs::start(crate::copystat::C::RecIndirectUs);
+        let ind_pre = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
@@ -4555,8 +4695,8 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+        let Some(sig_idx) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+            .then(|| self.indirect_signature_idx(kind, stride))
             .flatten()
         else {
             why("no host signature");
@@ -4566,38 +4706,43 @@ impl State {
             why("mesh draws are switched off (OATHKEEP_MESH_TEST=skip)");
             return false;
         }
-        const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let epoch = list.indirect_epoch();
         let windowed = windows() && max == 1 && count.is_none();
-        if list.first_use(WINDOW_USE) {
+        self.sync_list_gen(list.reset_gen());
+        if self.windows_epoch != epoch {
             self.windows.clear();
-        } else {
-            self.windows.retain(|w| w.epoch == epoch);
+            self.windows_epoch = epoch;
         }
-        let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
+        let args_id = args.id();
+        let same = |w: &Window| w.copy == args_id && w.kind == kind && w.stride == stride;
         let hit = windowed
             .then(|| {
                 self.windows
                     .iter()
+                    .enumerate()
                     .rev()
-                    .find(|w| {
+                    .find(|(_, w)| {
                         same(w)
                             && offset >= w.base
                             && (offset - w.base) % u64::from(w.step) == 0
                             && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
                     })
-                    .map(|w| {
+                    .map(|(w_idx, w)| {
                         let idx = (offset - w.base) / u64::from(w.step);
-                        (w.scratch.clone(), w.dst_offset + idx * u64::from(w.stride))
+                        (w_idx, w.dst_offset + idx * u64::from(w.stride))
                     })
             })
             .flatten();
-        let (bounded, at) = match hit {
-            Some(hit) => {
+        enum BoundedRef {
+            Window(usize),
+            Owned(ID3D12Resource),
+        }
+        let (bounded_ref, at) = match hit {
+            Some((w_idx, at)) => {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::IndHits, 1);
-                hit
+                (BoundedRef::Window(w_idx), at)
             }
             None => {
                 let prev_window = windowed
@@ -4755,33 +4900,42 @@ impl State {
                 }
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
+                let idx = (offset - base_off) / u64::from(step);
+                let at = dst_offset + idx * u64::from(stride);
                 if windowed {
                     if self.windows.len() >= MAX_WINDOWS {
                         self.windows.remove(0);
                     }
+                    let w_idx = self.windows.len();
                     self.windows.push(Window {
-                        copy: args.id(),
+                        copy: args_id,
                         kind,
                         stride,
                         step,
                         base: base_off,
                         records,
-                        epoch,
                         dst_offset,
-                        scratch: bounded.clone(),
+                        scratch: bounded,
                     });
+                    (BoundedRef::Window(w_idx), at)
+                } else {
+                    (BoundedRef::Owned(bounded), at)
                 }
-                let idx = (offset - base_off) / u64::from(step);
-                (bounded, dst_offset + idx * u64::from(stride))
             }
         };
+        #[cfg(feature = "diagnostics")]
+        let ind_pre_us = ind_pre.elapsed().as_micros() as u64;
         let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
+            DRAW | INDEXED => self.prepare_for_pipeline(list, p, kind == INDEXED, false),
+            MESH => self.prepare_for_pipeline(list, p, false, true),
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
+        #[cfg(feature = "diagnostics")]
+        let ind_post = std::time::Instant::now();
         if !ran {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::RecIndirectUs, ind_pre_us);
             why("prepare failed");
             return false;
         }
@@ -4795,13 +4949,18 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        let signature = &self.indirect_sigs[sig_idx].1;
+        let bounded = match &bounded_ref {
+            BoundedRef::Window(w_idx) => &self.windows[*w_idx].scratch,
+            BoundedRef::Owned(res) => res,
+        };
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
-                &signature,
+                signature,
                 max,
-                &bounded,
+                bounded,
                 at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
@@ -4815,6 +4974,11 @@ impl State {
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::RecIndirectUs,
+            ind_pre_us + ind_post.elapsed().as_micros() as u64,
+        );
         true
     }
 }

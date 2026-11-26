@@ -2428,6 +2428,7 @@ impl HostHeap {
     /// bypassing `self.kept` locking/retirement. Returns `(kept_resource, made_shadow, made_placed)`
     /// so the caller can keep the resource on the command list (deduplicated) and reuse
     /// `made_shadow` / `made_placed` without a second global lookup.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn make_at_dynamic(
         &self,
         index: u32,
@@ -2634,12 +2635,33 @@ impl HostHeap {
     /// `2` = tex_epoch). Brand-new misses pass through a lock-free 2-hit admission filter
     /// (`StageHeap::recent_miss`) so one-shot transient views render directly into `dst`
     /// without acquiring the stripe write lock or polluting the staging cache.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn copy_or_make_dynamic_probed(
         &self,
         index: u32,
         words: [u32; 3],
         probed_miss: Option<u8>,
         already_kept: impl FnOnce(usize) -> bool,
+    ) -> DynamicMade {
+        self.copy_or_make_dynamic_probed_with_shadow(
+            index,
+            words,
+            probed_miss,
+            already_kept,
+            crate::shadow::find,
+        )
+    }
+
+    /// Same as `copy_or_make_dynamic_probed`, but routes buffer shadow lookups through the
+    /// caller's per-command-list `find_shadow` cache instead of acquiring the global `SHADOWS`
+    /// RwLock on every stage-cache miss.
+    pub(crate) fn copy_or_make_dynamic_probed_with_shadow(
+        &self,
+        index: u32,
+        words: [u32; 3],
+        probed_miss: Option<u8>,
+        already_kept: impl FnOnce(usize) -> bool,
+        mut find_shadow: impl FnMut(u64, u64) -> Option<std::sync::Arc<crate::shadow::Shadow>>,
     ) -> DynamicMade {
         if self.sampler || words[0] != VIEW_TAG {
             let Some(view) = crate::descriptor::view_from_words(words) else {
@@ -2648,7 +2670,12 @@ impl HostHeap {
             };
             let is_texture = is_texture_view(&view);
             let view_kind = stage_view_kind(&view);
-            let (kept, shadow, placed) = self.make_at_dynamic(index, &view);
+            let (kept, shadow, placed) =
+                make_detailed_with_shadow(&view, self.cpu(index), None, &mut find_shadow);
+            if kept.is_none() {
+                null_for(&view, self.cpu(index));
+            }
+            let kept = kept.flatten();
             let resolved = placed.as_ref().unwrap_or(&view);
             let action = if let Some((shadow, address, len)) =
                 buffer_copy_with_hint(resolved, shadow)
@@ -2683,7 +2710,12 @@ impl HostHeap {
             };
             let is_texture = is_texture_view(&view);
             let view_kind = stage_view_kind(&view);
-            let (kept, shadow, placed) = self.make_at_dynamic(index, &view);
+            let (kept, shadow, placed) =
+                make_detailed_with_shadow(&view, self.cpu(index), None, &mut find_shadow);
+            if kept.is_none() {
+                null_for(&view, self.cpu(index));
+            }
+            let kept = kept.flatten();
             let resolved = placed.as_ref().unwrap_or(&view);
             let action = if let Some((shadow, address, len)) =
                 buffer_copy_with_hint(resolved, shadow)
@@ -2774,7 +2806,8 @@ impl HostHeap {
             if prev != key {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::StageCacheBypass, 1);
-                let (kept, made_shadow, made_placed) = make_detailed(&view, dst);
+                let (kept, made_shadow, made_placed) =
+                    make_detailed_with_shadow(&view, dst, None, &mut find_shadow);
                 let Some(kept_res) = kept else {
                     null_for(&view, dst);
                     return DynamicMade {
@@ -2823,6 +2856,7 @@ impl HostHeap {
             Buf(u64),
             Tex(u8, u64),
         }
+        let mut pre_placed: Option<View> = None;
         let pre_epoch = match &view {
             View::Shader(resource, _) | View::Unordered(resource, _, _) if is_texture => {
                 let addr = crate::resource::texture_memory(*resource as crate::object::This)
@@ -2835,7 +2869,9 @@ impl HostHeap {
             }
             View::Placed(..) => {
                 if let Some(resolved) = placed_texture(&view) {
-                    if let View::Shader(resource, _) | View::Unordered(resource, _, _) = &resolved {
+                    let ep = if let View::Shader(resource, _) | View::Unordered(resource, _, _) =
+                        &resolved
+                    {
                         let addr =
                             crate::resource::texture_memory(*resource as crate::object::This)
                                 .map_or(0, |(ptr, _)| ptr as u64);
@@ -2850,7 +2886,9 @@ impl HostHeap {
                             b as u8,
                             STAGE_TEX_EPOCHS[b].load(std::sync::atomic::Ordering::Acquire),
                         )
-                    }
+                    };
+                    pre_placed = Some(resolved);
+                    ep
                 } else if let Some((address, len)) = buffer_range(&view)
                     && len > 0
                 {
@@ -2915,7 +2953,8 @@ impl HostHeap {
             at
         };
         let slot = (stripe_idx * SLOTS_PER_STRIPE + local) as u32;
-        let (kept, made_shadow, made_placed) = make_detailed(&view, stage.cpu(slot));
+        let (kept, made_shadow, made_placed) =
+            make_detailed_with_shadow(&view, stage.cpu(slot), pre_placed, &mut find_shadow);
         let Some(kept_res) = kept else {
             drop(guard);
             null_for(&view, dst);
@@ -3638,13 +3677,14 @@ fn buffer_view_ok(
             .is_some_and(|end| end <= width)
 }
 
-fn buffer_srv(
+fn buffer_srv_with_shadow(
     address: u64,
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    find_shadow: &mut dyn FnMut(u64, u64) -> Option<std::sync::Arc<crate::shadow::Shadow>>,
 ) -> Option<(Kept, std::sync::Arc<crate::shadow::Shadow>)> {
-    let shadow = crate::shadow::find(address, len)?;
+    let shadow = find_shadow(address, len)?;
     let offset = shadow.offset(address);
     // SAFETY: a buffer view's union member.
     let structured = unsafe { desc.Anonymous.Buffer };
@@ -3714,13 +3754,14 @@ fn buffer_srv(
     Some((kept, shadow))
 }
 
-fn buffer_uav(
+fn buffer_uav_with_shadow(
     address: u64,
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    find_shadow: &mut dyn FnMut(u64, u64) -> Option<std::sync::Arc<crate::shadow::Shadow>>,
 ) -> Option<(Kept, std::sync::Arc<crate::shadow::Shadow>)> {
-    let shadow = crate::shadow::find(address, len)?;
+    let shadow = find_shadow(address, len)?;
     if !shadow.allow_uav() {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
@@ -3915,6 +3956,19 @@ fn make_detailed(
     Option<std::sync::Arc<crate::shadow::Shadow>>,
     Option<View>,
 ) {
+    make_detailed_with_shadow(view, at, None, &mut crate::shadow::find)
+}
+
+fn make_detailed_with_shadow(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    pre_placed: Option<View>,
+    find_shadow: &mut dyn FnMut(u64, u64) -> Option<std::sync::Arc<crate::shadow::Shadow>>,
+) -> (
+    Option<Kept>,
+    Option<std::sync::Arc<crate::shadow::Shadow>>,
+    Option<View>,
+) {
     let Some(host) = host() else {
         return (None, None, None);
     };
@@ -3922,7 +3976,7 @@ fn make_detailed(
     match view {
         &View::Constant(address, size) => {
             let aligned = size.next_multiple_of(256);
-            let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
+            let Some(shadow) = find_shadow(address, u64::from(size)) else {
                 return (None, None, None);
             };
             let gpu = shadow.gpu(address);
@@ -4003,7 +4057,7 @@ fn make_detailed(
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                match buffer_srv(data as u64, len, srv_desc(desc), at) {
+                match buffer_srv_with_shadow(data as u64, len, srv_desc(desc), at, find_shadow) {
                     Some((kept, shadow)) => (Some(kept), Some(shadow), None),
                     None => (None, None, None),
                 }
@@ -4016,7 +4070,13 @@ fn make_detailed(
             let Some(texture) = crate::resource::host_resource(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        match buffer_uav(data as u64, len, uav_desc(desc), at) {
+                        match buffer_uav_with_shadow(
+                            data as u64,
+                            len,
+                            uav_desc(desc),
+                            at,
+                            find_shadow,
+                        ) {
                             Some((kept, shadow)) => (Some(kept), Some(shadow), None),
                             None => (None, None, None),
                         }
@@ -4080,8 +4140,9 @@ fn make_detailed(
             (Some(None), None, None)
         }
         View::Placed(unordered, resource, desc) => {
-            if let Some(resolved) = placed_texture(view) {
-                let (kept, shadow, _) = make_detailed(&resolved, at);
+            if let Some(resolved) = pre_placed.or_else(|| placed_texture(view)) {
+                let (kept, shadow, _) =
+                    make_detailed_with_shadow(&resolved, at, None, find_shadow);
                 return (kept, shadow, Some(resolved));
             }
             const BUFFER: u32 = 1;
@@ -4099,9 +4160,9 @@ fn make_detailed(
                 return (None, None, None);
             }
             let made = if *unordered {
-                buffer_uav(address, len, uav_desc(words), at)
+                buffer_uav_with_shadow(address, len, uav_desc(words), at, find_shadow)
             } else {
-                buffer_srv(address, len, srv_desc(words), at)
+                buffer_srv_with_shadow(address, len, srv_desc(words), at, find_shadow)
             };
             match made {
                 Some((kept, shadow)) => (Some(kept), Some(shadow), None),
