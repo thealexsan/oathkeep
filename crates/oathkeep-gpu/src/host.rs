@@ -880,6 +880,7 @@ pub(crate) struct HostList {
     uav_dirty: std::sync::atomic::AtomicBool,
     indirect_uav_dirty: std::sync::atomic::AtomicBool,
     indirect_epoch: std::sync::atomic::AtomicU64,
+    state_clobbered: std::sync::atomic::AtomicBool,
     _alive: Counted,
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
@@ -940,6 +941,49 @@ fn record_prelude(host: &Host, mut plan: SendPreludePlan) -> Option<(ID3D12Comma
             }
             for (depth, twin, colour) in &plan.syncs {
                 record_twin_copy(list, &depth.texture, twin, *colour);
+                if let Some(plane) = &twin.plane {
+                    if *colour {
+                        list.ResourceBarrier(&[transition(
+                            &depth.texture,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        if !record_depth_to_plane(list, &depth.texture, &plane.texture) {
+                            crate::resource::PLANES[1].fetch_add(1, Ordering::Relaxed);
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &depth.texture,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        )]);
+                    } else {
+                        list.ResourceBarrier(&[
+                            transition(
+                                &depth.texture,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                            ),
+                            transition(
+                                &plane.texture,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            ),
+                        ]);
+                        record_plane_pass(list, &depth.texture, &plane.texture);
+                        list.ResourceBarrier(&[
+                            transition(
+                                &plane.texture,
+                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            ),
+                            transition(
+                                &depth.texture,
+                                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            ),
+                        ]);
+                    }
+                }
             }
             if !plan.prelude_copies.is_empty() {
                 // One all-resource UAV barrier ensures prior command lists' UAV writes
@@ -1209,8 +1253,37 @@ float plane(float4 p : SV_Position) : SV_Depth {
     return twin.Load(int4(int2(p.xy), 0, 0));
 }
 "#;
+const DEPTH_TO_STEPS: &str = r#"
+#define RS "DescriptorTable(SRV(t0), UAV(u0))"
+Texture2DArray<float> depth_tex : register(t0);
+RWTexture2DArray<uint> plane_uav : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void depth_to_plane(uint3 id : SV_DispatchThreadID) {
+    uint w, h, a;
+    plane_uav.GetDimensions(w, h, a);
+    if (id.x < w && id.y < h) {
+        float d = saturate(depth_tex.Load(int4(int2(id.xy), 0, 0)));
+        plane_uav[uint3(id.xy, 0)] = uint(round(d * 65535.0));
+    }
+}
+"#;
+const DEPTH_TO_FLOATS: &str = r#"
+#define RS "DescriptorTable(SRV(t0), UAV(u0))"
+Texture2DArray<float> depth_tex : register(t0);
+RWTexture2DArray<float> plane_uav : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void depth_to_plane(uint3 id : SV_DispatchThreadID) {
+    uint w, h, a;
+    plane_uav.GetDimensions(w, h, a);
+    if (id.x < w && id.y < h) {
+        plane_uav[uint3(id.xy, 0)] = depth_tex.Load(int4(int2(id.xy), 0, 0));
+    }
+}
+"#;
 
-const PLANE_VIEWS: u32 = 256;
+const PLANE_VIEWS: u32 = 512;
 
 struct PlanePass {
     views: ID3D12DescriptorHeap,
@@ -1219,6 +1292,7 @@ struct PlanePass {
     step: u32,
     next: AtomicU32,
     made: Mutex<Vec<(bool, i32, Option<PlanePipeline>)>>,
+    copy_back: Mutex<Vec<(bool, Option<PlanePipeline>)>>,
 }
 
 type PlanePipeline = (ID3D12RootSignature, ID3D12PipelineState);
@@ -1251,6 +1325,7 @@ fn plane_pass() -> Option<&'static PlanePass> {
                 views,
                 next: AtomicU32::new(0),
                 made: Mutex::default(),
+                copy_back: Mutex::default(),
             })
         }
     })
@@ -1368,6 +1443,139 @@ impl PlanePass {
             Ok((root, pipeline))
         }
     }
+
+    fn copy_back_pipeline(&self, steps: bool) -> Option<PlanePipeline> {
+        let mut made = self.copy_back.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, pipeline)) = made.iter().find(|m| m.0 == steps) {
+            return pipeline.clone();
+        }
+        let pipeline = match Self::make_copy_back(steps) {
+            Ok(pipeline) => Some(pipeline),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    steps,
+                    "no compute pipeline to copy depth back into its plane twin"
+                );
+                None
+            }
+        };
+        made.push((steps, pipeline.clone()));
+        pipeline
+    }
+
+    fn make_copy_back(steps: bool) -> windows::core::Result<PlanePipeline> {
+        use windows::core::s;
+        let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+        let source = if steps {
+            DEPTH_TO_STEPS
+        } else {
+            DEPTH_TO_FLOATS
+        };
+        let cs = compile(source, s!("depth_to_plane"), s!("cs_5_1"))?;
+        // SAFETY: root signature is embedded in `cs`; desc borrows live data.
+        unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &cs[..])?;
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: cs.as_ptr().cast(),
+                    BytecodeLength: cs.len(),
+                },
+                ..Default::default()
+            };
+            let pipeline: ID3D12PipelineState = device.CreateComputePipelineState(&desc)?;
+            Ok((root, pipeline))
+        }
+    }
+}
+
+fn record_depth_to_plane(
+    list: &ID3D12GraphicsCommandList,
+    depth: &ID3D12Resource,
+    plane: &ID3D12Resource,
+) -> bool {
+    let (Some(host), Some(pass)) = (host(), plane_pass()) else {
+        return false;
+    };
+    // SAFETY: live resources.
+    let (of, twin) = unsafe { (depth.GetDesc(), plane.GetDesc()) };
+    let steps = twin.Format.0 == 53;
+    let depth_srv_format = DXGI_FORMAT(match of.Format.0 {
+        44 => 46, // R24G8_TYPELESS -> R24_UNORM_X8_TYPELESS
+        19 => 21, // R32G8X24_TYPELESS -> R32_FLOAT_X8X24_TYPELESS
+        39 => 41, // R32_TYPELESS -> R32_FLOAT
+        53 => 56, // R16_TYPELESS -> R16_UNORM
+        other => other,
+    });
+    let Some((root, pipeline)) = pass.copy_back_pipeline(steps) else {
+        return false;
+    };
+    for slice in 0..u32::from(of.DepthOrArraySize) {
+        for mip in 0..u32::from(of.MipLevels) {
+            let pair = pass.next.fetch_add(1, Ordering::Relaxed) % (PLANE_VIEWS / 2);
+            let slot = pair * 2;
+            let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: depth_srv_format,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                        MostDetailedMip: mip,
+                        MipLevels: 1,
+                        FirstArraySlice: slice,
+                        ArraySize: 1,
+                        PlaneSlice: 0,
+                        ..Default::default()
+                    },
+                },
+            };
+            let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT(if steps { 57 } else { 41 }),
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                        MipSlice: mip,
+                        FirstArraySlice: slice,
+                        ArraySize: 1,
+                        PlaneSlice: 0,
+                    },
+                },
+            };
+            let (width, height) = ((of.Width >> mip).max(1) as u32, (of.Height >> mip).max(1));
+            let cpu_srv = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: pass.cpu + (slot * pass.step) as usize,
+            };
+            let cpu_uav = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: pass.cpu + ((slot + 1) * pass.step) as usize,
+            };
+            let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: pass.gpu + u64::from(slot * pass.step),
+            };
+            // SAFETY: open list, dedicated pair of descriptors in `pass.views`, live resources.
+            unsafe {
+                host.device
+                    .CreateShaderResourceView(depth, Some(&srv), cpu_srv);
+                host.device
+                    .CreateUnorderedAccessView(plane, None, Some(&uav), cpu_uav);
+                list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+                list.SetComputeRootSignature(&root);
+                list.SetPipelineState(&pipeline);
+                list.SetComputeRootDescriptorTable(0, gpu);
+                list.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
+                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(Some(plane.clone())),
+                        }),
+                    },
+                }]);
+            }
+        }
+    }
+    true
 }
 
 fn record_plane_pass(
@@ -1391,7 +1599,7 @@ fn record_plane_pass(
     };
     for slice in 0..u32::from(of.DepthOrArraySize) {
         for mip in 0..u32::from(of.MipLevels) {
-            let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS;
+            let slot = (pass.next.fetch_add(1, Ordering::Relaxed) % (PLANE_VIEWS / 2)) * 2;
             let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT(if steps { 57 } else { 41 }),
                 ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
@@ -1472,9 +1680,6 @@ fn record_twin_copy(
         (&twin.colour.texture, depth)
     };
     crate::resource::TWINS[2 + usize::from(colour)].fetch_add(1, Ordering::Relaxed);
-    if colour && twin.plane.is_some() {
-        crate::resource::PLANES[1].fetch_add(1, Ordering::Relaxed);
-    }
     let Some(through) = &twin.through else {
         // SAFETY: an open list and two live textures.
         unsafe { list.CopyResource(to, from) };
@@ -4010,6 +4215,7 @@ impl Host {
                 uav_dirty: std::sync::atomic::AtomicBool::new(true),
                 indirect_uav_dirty: std::sync::atomic::AtomicBool::new(true),
                 indirect_epoch: std::sync::atomic::AtomicU64::new(1),
+                state_clobbered: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -7378,6 +7584,7 @@ impl HostList {
         self.copy_seq.store(0, Ordering::Relaxed);
         self.state_seq.store(0, Ordering::Relaxed);
         self.gpu_write_seq.store(0, Ordering::Relaxed);
+        self.state_clobbered.store(false, Ordering::Relaxed);
         self.reset_gen.fetch_add(1, Ordering::Relaxed);
         let old_deferred = std::mem::take(&mut *self.deferred());
         let old_states =
@@ -7529,13 +7736,13 @@ impl HostList {
             (true, false) => u.behind[1] = Some(true),
             (false, _) => {}
         }
-        if copy && !colour && twin.plane.is_some() {
-            u.late = true;
-            crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
-        }
+        let inline_plane = copy && !colour && twin.plane.is_some();
         drop(twins);
         if copy {
             self.twin_copy(&depth, &twin, colour);
+            if inline_plane {
+                self.pass_plane(&depth, &twin);
+            }
         } else if colour {
             self.settle(&twin.colour, UNORDERED_ACCESS);
         }
@@ -7544,6 +7751,12 @@ impl HostList {
         }
         self.state_seq.fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    #[inline]
+    pub(crate) fn take_state_clobbered(&self) -> bool {
+        self.state_clobbered.load(Ordering::Relaxed)
+            && self.state_clobbered.swap(false, Ordering::AcqRel)
     }
 
     fn pass_plane(
@@ -7559,6 +7772,24 @@ impl HostList {
         self.settle(plane, PIXEL_SHADER_RESOURCE);
         record_plane_pass(&self.list, &depth.texture, &plane.texture);
         self.settle(plane, UNORDERED_ACCESS);
+        self.state_clobbered.store(true, Ordering::Release);
+    }
+
+    fn depth_to_plane(
+        &self,
+        depth: &std::sync::Arc<crate::resource::HostTexture>,
+        twin: &crate::resource::Twin,
+    ) {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+        let Some(plane) = &twin.plane else { return };
+        self.settle(depth, NON_PIXEL_SHADER_RESOURCE);
+        self.settle(plane, UNORDERED_ACCESS);
+        if record_depth_to_plane(&self.list, &depth.texture, &plane.texture) {
+            self.state_clobbered.store(true, Ordering::Release);
+        } else {
+            crate::resource::PLANES[1].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn twin_copy(
@@ -7579,6 +7810,9 @@ impl HostList {
         self.settle(to, COPY_DEST);
         record_twin_copy(&self.list, &depth.texture, twin, colour);
         self.settle(&twin.colour, UNORDERED_ACCESS);
+        if colour && twin.plane.is_some() {
+            self.depth_to_plane(depth, twin);
+        }
     }
 
     fn twins_to_depth(&self) {
@@ -7646,6 +7880,7 @@ impl HostList {
         let mut barriers = Vec::new();
         let mut copying = FastHashMap::default();
         for (depth, twin, colour) in &syncs {
+            const UNORDERED_ACCESS: u32 = 0x8;
             let (from, to) = if *colour {
                 (depth, &twin.colour)
             } else {
@@ -7665,6 +7900,25 @@ impl HostList {
                         barriers.push(transition(
                             &texture.texture,
                             host_state(state),
+                            host_state(real),
+                        ));
+                    }
+                }
+            }
+            if let Some(plane) = &twin.plane {
+                let key = std::sync::Arc::as_ptr(plane) as usize;
+                let real = plane.state.load(Ordering::Relaxed);
+                copying.insert(key, UNORDERED_ACCESS);
+                if real != UNORDERED_ACCESS {
+                    to_copy.push(transition(
+                        &plane.texture,
+                        host_state(real),
+                        host_state(UNORDERED_ACCESS),
+                    ));
+                    if !states.contains_key(&key) {
+                        barriers.push(transition(
+                            &plane.texture,
+                            host_state(UNORDERED_ACCESS),
                             host_state(real),
                         ));
                     }

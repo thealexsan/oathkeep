@@ -1669,82 +1669,91 @@ impl State {
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
-        if self.host_heaps != self.heaps {
-            let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
-            let mut heap_count = 0usize;
-            for &h in &self.heaps {
-                if h != 0
-                    && let Some(host) = crate::descriptor::heap(h as This).host()
-                {
-                    list.keep(&host.heap);
-                    heaps[heap_count] = Some(host.heap.clone());
-                    heap_count += 1;
-                }
-            }
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps[..heap_count]) };
-            self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
-        }
-        let tested = if !compute && self.depth_state == DEPTH_READ {
-            self.depth
-        } else {
-            0
-        };
-        TESTED_DEPTH.set((tested, false));
-        let root = p.root.as_raw() as usize;
-        if self.host_roots[usize::from(compute)] != root {
-            // SAFETY: an open list and a live root signature.
-            unsafe {
-                if compute {
-                    l.SetComputeRootSignature(&p.root);
-                } else {
-                    l.SetGraphicsRootSignature(&p.root);
-                }
-            }
-            self.host_roots[usize::from(compute)] = root;
-        }
-        if self.host_pipeline != p.pso.as_raw() as usize {
-            // SAFETY: an open list and a live pipeline.
-            unsafe { l.SetPipelineState(&p.pso) };
-            self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
-            list.keep(&p.pso);
-            list.keep(&p.root);
-        }
         let draw_writes = DrawWriteGuard::new(list);
         let mut bindless_writes = false;
-        for stage in &p.stages {
-            let t = stage.translated();
-            STORES.set(t.stores);
-            {
-                #[cfg(feature = "diagnostics")]
-                let _tables_scope = ScopeUs::start(crate::copystat::C::RecTablesUs);
-                self.tables_into(list, &stage.table_plans, &t.host.root_indexed_views, compute);
+        'bind_pass: for attempt in 0..2 {
+            if list.take_state_clobbered() {
+                self.replay(list);
             }
-            STORES.set(true);
-            if self.scratch_made.iter().any(|m| m.1 == u32::MAX) {
-                once!("a draw whose descriptor table found no free slots is dropped");
-                return false;
+            if self.host_heaps != self.heaps {
+                let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
+                let mut heap_count = 0usize;
+                for &h in &self.heaps {
+                    if h != 0
+                        && let Some(host) = crate::descriptor::heap(h as This).host()
+                    {
+                        list.keep(&host.heap);
+                        heaps[heap_count] = Some(host.heap.clone());
+                        heap_count += 1;
+                    }
+                }
+                // SAFETY: an open list and shader-visible heaps.
+                unsafe { l.SetDescriptorHeaps(&heaps[..heap_count]) };
+                self.host_heaps = self.heaps;
+                self.host_roots = [0; 2];
             }
-            let writes = (t.stores || !write_skip())
-                && !crate::pipeline::builder_quarantined(self.pipeline as This);
-            if writes && t.bindless_stores {
-                bindless_writes = true;
-            }
-            let memory = if stage.has_memory_srv {
-                #[cfg(feature = "diagnostics")]
-                let _mem_scope = ScopeUs::start(crate::copystat::C::RecMemoryReadyUs);
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
-                    once!(
-                        "a shader that reads title memory by address without a view heap to hold its views: the draw is dropped"
-                    );
-                    return false;
-                };
-                Some(ready)
+            let tested = if !compute && self.depth_state == DEPTH_READ {
+                self.depth
             } else {
-                None
+                0
             };
+            TESTED_DEPTH.set((tested, false));
+            let root = p.root.as_raw() as usize;
+            if self.host_roots[usize::from(compute)] != root {
+                // SAFETY: an open list and a live root signature.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootSignature(&p.root);
+                    } else {
+                        l.SetGraphicsRootSignature(&p.root);
+                    }
+                }
+                self.host_roots[usize::from(compute)] = root;
+            }
+            if self.host_pipeline != p.pso.as_raw() as usize {
+                // SAFETY: an open list and a live pipeline.
+                unsafe { l.SetPipelineState(&p.pso) };
+                self.host_pipeline = p.pso.as_raw() as usize;
+                list.used_pipeline(&p.name);
+                list.keep(&p.pso);
+                list.keep(&p.root);
+            }
+            bindless_writes = false;
+            for stage in &p.stages {
+                let t = stage.translated();
+                STORES.set(t.stores);
+                {
+                    #[cfg(feature = "diagnostics")]
+                    let _tables_scope = ScopeUs::start(crate::copystat::C::RecTablesUs);
+                    self.tables_into(list, &stage.table_plans, &t.host.root_indexed_views, compute);
+                }
+                STORES.set(true);
+                if self.scratch_made.iter().any(|m| m.1 == u32::MAX) {
+                    once!("a draw whose descriptor table found no free slots is dropped");
+                    return false;
+                }
+                let writes = (t.stores || !write_skip())
+                    && !crate::pipeline::builder_quarantined(self.pipeline as This);
+                if writes && t.bindless_stores {
+                    bindless_writes = true;
+                }
+                let memory = if stage.has_memory_srv {
+                    #[cfg(feature = "diagnostics")]
+                    let _mem_scope = ScopeUs::start(crate::copystat::C::RecMemoryReadyUs);
+                    let Some(ready) = self.memory_ready(list, compute, writes) else {
+                        once!(
+                            "a shader that reads title memory by address without a view heap to hold its views: the draw is dropped"
+                        );
+                        return false;
+                    };
+                    Some(ready)
+                } else {
+                    None
+                };
+                if attempt == 0 && list.take_state_clobbered() {
+                    self.replay(list);
+                    continue 'bind_pass;
+                }
             if let Some((param, dwords)) = stage.user_data {
                 let mut stack_values = [0u32; 64];
                 let mut heap_values = Vec::new();
@@ -1889,6 +1898,8 @@ impl State {
                     return false;
                 }
             }
+            }
+            break;
         }
         list.twins_written();
         draw_writes.commit();

@@ -1050,7 +1050,12 @@ impl TextureQueue {
         if no_unpromoted {
             let cap = max.min(self.ready_again.len() + self.ready_fresh.len());
             let mut order = Vec::with_capacity(cap);
-            for (&write, &index) in self.ready_again.iter().rev().take(max) {
+            let again_cap = if self.ready_fresh.is_empty() {
+                max
+            } else {
+                (max / 4).max(2).min(max)
+            };
+            for (&write, &index) in self.ready_again.iter().rev().take(again_cap) {
                 order.push((index, write));
             }
             if order.len() < max {
@@ -1066,6 +1071,17 @@ impl TextureQueue {
                         };
                         order.push((index, write));
                     }
+                }
+            }
+            if order.len() < max && again_cap < max {
+                for (&write, &index) in self
+                    .ready_again
+                    .iter()
+                    .rev()
+                    .skip(again_cap)
+                    .take(max - order.len())
+                {
+                    order.push((index, write));
                 }
             }
             return order;
@@ -1214,7 +1230,12 @@ impl TextureQueue {
         if no_unpromoted {
             let cap = max.min(self.ready_again.len() + self.ready_fresh.len());
             out.reserve(cap.saturating_sub(out.capacity()));
-            for (&write, &index) in self.ready_again.iter().rev().take(max) {
+            let again_cap = if self.ready_fresh.is_empty() {
+                max
+            } else {
+                (max / 4).max(2).min(max)
+            };
+            for (&write, &index) in self.ready_again.iter().rev().take(again_cap) {
                 out.push(self.make_due_slot(index, write));
             }
             if out.len() < max {
@@ -1230,6 +1251,17 @@ impl TextureQueue {
                         };
                         out.push(self.make_due_slot(index, write));
                     }
+                }
+            }
+            if out.len() < max && again_cap < max {
+                for (&write, &index) in self
+                    .ready_again
+                    .iter()
+                    .rev()
+                    .skip(again_cap)
+                    .take(max - out.len())
+                {
+                    out.push(self.make_due_slot(index, write));
                 }
             }
             return;
