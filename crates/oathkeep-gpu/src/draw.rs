@@ -163,7 +163,7 @@ struct Window {
 
 const WINDOW_MOST: u64 = 1024;
 const WINDOW_STEP_MAX: u64 = 4096;
-const MAX_WINDOWS: usize = 64;
+const MAX_WINDOWS: usize = 128;
 
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

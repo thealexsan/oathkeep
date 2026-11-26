@@ -6981,10 +6981,22 @@ impl HostList {
         self.indirect_epoch.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn is_uav_dirty(&self) -> bool {
+        self.uav_dirty.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn mark_uav_clean(&self) {
         self.uav_dirty.store(false, Ordering::Relaxed);
         self.indirect_uav_dirty.store(false, Ordering::Relaxed);
         self.indirect_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Clears pending UAV-dirty flags after a global UAV barrier that cannot
+    /// publish writes to an indirect-argument buffer (e.g. texture-only or
+    /// non-indirect buffer enhanced barriers), preserving cached indirect windows.
+    pub(crate) fn mark_uav_clean_keep_indirect(&self) {
+        self.uav_dirty.store(false, Ordering::Relaxed);
+        self.indirect_uav_dirty.store(false, Ordering::Relaxed);
     }
 
     pub(crate) fn take_uav_dirty(&self) -> bool {
@@ -7802,7 +7814,7 @@ impl HostList {
     ) -> Option<(ID3D12Resource, u64, bool, bool)> {
         const ALIGN: u64 = 256;
         const INIT_CAP: u64 = 256 << 10;
-        const MAX_GROW_CAP: u64 = 1 << 20;
+        const MAX_GROW_CAP: u64 = 4 << 20;
         let alloc_bytes = size.max(4).next_multiple_of(ALIGN);
         let mut pool = self.indirect_pool.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(buf) = pool.buffer.clone() {

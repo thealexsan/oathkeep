@@ -962,6 +962,66 @@ fn push_coalesced_span(out: &mut Vec<(usize, usize)>, a: usize, b: usize) {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline]
+fn read_into_zero_unmapped_skip_absent(src_addr: usize, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    let end = src_addr.saturating_add(dst.len());
+    let dst_ptr = dst.as_mut_ptr();
+    let all_mapped = std::cell::Cell::new(true);
+    crate::watch::split_absent_spans(
+        src_addr,
+        end,
+        |a, b| {
+            let off = a - src_addr;
+            let n = b - a;
+            // SAFETY: `split_absent_spans` invokes `on_present` and `on_absent` sequentially
+            // on non-overlapping subranges of `[src_addr, end)`, so `dst_ptr.add(off)..+n`
+            // is uniquely borrowed within `dst`.
+            let slice = unsafe { std::slice::from_raw_parts_mut(dst_ptr.add(off), n) };
+            if !crate::host::read_into_zero_unmapped(a as *const u8, slice) {
+                all_mapped.set(false);
+            }
+        },
+        |a, b| {
+            let off = a - src_addr;
+            let n = b - a;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: disjoint subrange inside `dst`, invoked sequentially by `split_absent_spans`.
+            unsafe { dst_ptr.add(off).write_bytes(0, n) };
+            all_mapped.set(false);
+        },
+    );
+    all_mapped.get()
+}
+
+#[inline]
+fn copy_mapped_skip_absent(dst: *mut u8, src_addr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = src_addr.saturating_add(len);
+    crate::watch::split_absent_spans(
+        src_addr,
+        end,
+        |a, b| {
+            // SAFETY: `[a, b)` lies within `[src_addr, end)` so `dst.add(a - src_addr)`
+            // covers `b - a` writable bytes inside `dst[..len]`.
+            let at = unsafe { dst.add(a - src_addr) };
+            crate::host::copy_mapped(at, a as *const u8, b - a, false);
+        },
+        |a, b| {
+            let n = b - a;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: inside the writable host mapping `dst[..len]`.
+            unsafe { dst.add(a - src_addr).write_bytes(0, n) };
+        },
+    );
+}
+
 fn scan_card_pages_chunk(
     pages: &[(usize, bool)],
     start: usize,
@@ -1011,7 +1071,7 @@ fn scan_card_pages_chunk(
             } else {
                 #[cfg(feature = "diagnostics")]
                 let t_rd = std::time::Instant::now();
-                let ok = crate::host::read_into_zero_unmapped(p_from as *const u8, &mut buf[..len]);
+                let ok = read_into_zero_unmapped_skip_absent(p_from, &mut buf[..len]);
                 #[cfg(feature = "diagnostics")]
                 {
                     let rd_us = t_rd.elapsed().as_micros() as u64;
@@ -5394,8 +5454,8 @@ impl Shadow {
                         let (p_lo, p_hi) = self.piece(p);
                         let a = off_from.max(p_lo);
                         let b = off_to.min(p_hi);
-                        let _ = crate::host::read_into_zero_unmapped(
-                            (start + a) as *const u8,
+                        let _ = read_into_zero_unmapped_skip_absent(
+                            start + a,
                             &mut buf[a - p_lo..b - p_lo],
                         );
                     }
@@ -5405,28 +5465,9 @@ impl Shadow {
             self.card_changed(off_from, off_to);
             return to - from;
         }
-        if self.watched.load(Ordering::Relaxed) == WATCHED_GUARDED {
-            crate::watch::split_absent_spans(
-                from,
-                to,
-                |a, b| {
-                    // SAFETY: inside the mapping (`[a, b)` lies within `[from, to)` <= `[start, end)`).
-                    let at = unsafe { self.data.add(a - start) };
-                    crate::host::copy_mapped(at, a as *const u8, b - a, false);
-                },
-                |a, b| {
-                    let n = b - a;
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the writable host shadow mapping.
-                    unsafe { self.data.add(a - start).write_bytes(0, n) };
-                },
-            );
-        } else {
-            // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-            let at = unsafe { self.data.add(off_from) };
-            crate::host::copy_mapped(at, from as *const u8, to - from, false);
-        }
+        // SAFETY: `off_from..off_to` lies inside the writable host shadow mapping.
+        let at = unsafe { self.data.add(off_from) };
+        copy_mapped_skip_absent(at, from, to - from);
         self.changed(off_from, off_to);
         self.card_changed(off_from, off_to);
         to - from
@@ -5522,8 +5563,8 @@ impl Shadow {
                         let (p_lo, p_hi) = self.piece(p);
                         let a = off_from.max(p_lo);
                         let b = off_to.min(p_hi);
-                        let _ = crate::host::read_into_zero_unmapped(
-                            (start + a) as *const u8,
+                        let _ = read_into_zero_unmapped_skip_absent(
+                            start + a,
                             &mut buf[a - p_lo..b - p_lo],
                         );
                     }
@@ -5677,13 +5718,13 @@ impl Shadow {
             return;
         };
         if !card.has_old.load(Ordering::Acquire) {
-            crate::host::copy_mapped(dst, (start + a) as *const u8, len, false);
+            copy_mapped_skip_absent(dst, start + a, len);
             return;
         }
         let old = card.old.lock().unwrap_or_else(|e| e.into_inner());
         if old.is_empty() {
             drop(old);
-            crate::host::copy_mapped(dst, (start + a) as *const u8, len, false);
+            copy_mapped_skip_absent(dst, start + a, len);
             return;
         }
         let mut cursor = a;
@@ -5708,7 +5749,7 @@ impl Shadow {
                     );
                 }
             } else {
-                crate::host::copy_mapped(seg_dst, (start + seg_lo) as *const u8, seg_len, false);
+                copy_mapped_skip_absent(seg_dst, start + seg_lo, seg_len);
             }
             cursor = seg_hi;
         }

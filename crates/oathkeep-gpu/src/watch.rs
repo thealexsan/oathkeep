@@ -101,6 +101,15 @@ fn hot_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("OATHKEEP_GUARD_HOT").is_none_or(|v| v != "0"))
 }
 
+/// Keeps repeatedly GPU-written blocks (`writing_gpu_back`) hot even when CPU-fault
+/// promotion (`OATHKEEP_GUARD_HOT=0`) is disabled, eliminating per-frame `VirtualProtect`
+/// and `alias_apply` ping-pong on active GPU readback buffers without promoting CPU-faulted
+/// buffers. Set `OATHKEEP_GPU_BACK_HOT=0` to disable.
+fn gpu_back_hot_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_GPU_BACK_HOT").is_none_or(|v| v != "0"))
+}
+
 fn hot_faults() -> u16 {
     static FAULTS: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
     *FAULTS.get_or_init(|| {
@@ -2304,7 +2313,7 @@ pub fn title_memory_committed(at: usize, len: usize) {
 }
 
 fn promote_opened_hot_sharded(opened_spans: &[(usize, usize)]) {
-    if !hot_enabled() || opened_spans.is_empty() {
+    if !gpu_back_hot_enabled() || opened_spans.is_empty() {
         return;
     }
     let frame = crate::frame::current();
@@ -2405,6 +2414,45 @@ pub(crate) fn writing_gpu_back(at: usize, len: usize) {
     if range_needs_open(first, last) {
         let (opened_spans, _) = open_and_aliases_block_spans_sharded(first, last);
         promote_opened_hot_sharded(&opened_spans);
+    } else if view_guard() {
+        dirty_clean_aliases_for_range_sharded(first, last);
+    }
+}
+
+/// Marks any clean alias blocks of `[first, last)` dirty without changing their
+/// hardware protection (`PAGE_READONLY` stays intact), used when `writing_gpu_back`
+/// writes into already-open (`g.hot`) blocks.
+fn dirty_clean_aliases_for_range_sharded(first: usize, last: usize) {
+    if first >= last {
+        return;
+    }
+    let mut aliased = Vec::new();
+    for_each_shard_span(first, last, |shard, a, b| {
+        let g = guards_read_shard(shard);
+        if !g.aliased.is_empty() {
+            aliased.extend(g.aliased.range(a..b).copied());
+        }
+    });
+    if aliased.is_empty() {
+        return;
+    }
+    let (_, other_runs) = crate::inplace::alias_spans_of_blocks(&aliased);
+    let mut any = false;
+    for (a, b) in other_runs {
+        for_each_shard_span(a, b, |shard, sa, sb| {
+            let needs = {
+                let g = guards_read_shard(shard);
+                g.clean.overlaps(sa, sb) || !g.alias_dirty.contains_range(sa, sb)
+            };
+            if needs {
+                let mut g = guards_write_shard(shard);
+                let _ = dirty_alias_block_spans(shard, &mut g, sa, sb);
+                any = true;
+            }
+        });
+    }
+    if any {
+        ALIAS_FAULT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 

@@ -2476,7 +2476,69 @@ const BARRIER_ACCESS_COMMON: u32 = 0;
 #[cfg(any(windows, test))]
 const BARRIER_ACCESS_UNORDERED_ACCESS: u32 = 0x10;
 #[cfg(any(windows, test))]
+const BARRIER_ACCESS_INDIRECT_ARGUMENT: u32 = 0x200;
+#[cfg(any(windows, test))]
 const BARRIER_ACCESS_NO_ACCESS: u32 = 0x8000_0000;
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BarrierGroupPlan {
+    need_uav: bool,
+    /// True if any entry transitions from non-UAV into UAV/COMMON (WAR hazard)
+    /// or hit a conservative fallback; false if every UAV-needing entry only
+    /// synchronizes prior UAV writes (`access_before` includes UAV and
+    /// `access_after` has neither UAV nor COMMON), allowing a skip when
+    /// `list.is_uav_dirty()` is false.
+    need_without_prior_uav: bool,
+    /// True if any barrier in the group can publish writes to an indirect
+    /// argument buffer (`GLOBAL` or `BUFFER` with `access_after` including
+    /// `INDIRECT_ARGUMENT` or `COMMON`, or conservative fallback). Texture-only
+    /// barriers never invalidate cached indirect argument windows.
+    affects_indirect: bool,
+    /// Up to 8 unique title texture handles when every UAV-needing entry is an
+    /// explicit (non-COMMON) `BARRIER_TYPE_TEXTURE` transition, allowing targeted
+    /// per-resource UAV barriers instead of a full-pipeline `UAV(NULL)` flush.
+    tex_targets: [usize; 8],
+    tex_target_len: usize,
+    tex_targets_exact: bool,
+}
+
+#[cfg(any(windows, test))]
+impl BarrierGroupPlan {
+    const FALLBACK: Self = Self {
+        need_uav: true,
+        need_without_prior_uav: true,
+        affects_indirect: true,
+        tex_targets: [0; 8],
+        tex_target_len: 0,
+        tex_targets_exact: false,
+    };
+
+    const NONE: Self = Self {
+        need_uav: false,
+        need_without_prior_uav: false,
+        affects_indirect: false,
+        tex_targets: [0; 8],
+        tex_target_len: 0,
+        tex_targets_exact: true,
+    };
+
+    fn push_tex_target(&mut self, res: usize) {
+        if !self.tex_targets_exact || res == 0 {
+            self.tex_targets_exact = false;
+            return;
+        }
+        if self.tex_targets[..self.tex_target_len].contains(&res) {
+            return;
+        }
+        if self.tex_target_len >= self.tex_targets.len() {
+            self.tex_targets_exact = false;
+            return;
+        }
+        self.tex_targets[self.tex_target_len] = res;
+        self.tex_target_len += 1;
+    }
+}
 
 #[cfg(any(windows, test))]
 #[inline]
@@ -2502,40 +2564,42 @@ fn barrier_layout_sane(layout: u32) -> bool {
 }
 
 #[cfg(any(windows, test))]
-fn barrier_groups_need_uav(count: u32, groups: *const u8) -> bool {
+fn barrier_groups_classify(count: u32, groups: *const u8) -> BarrierGroupPlan {
     const _: () = assert!(size_of::<BarrierGroup>() == 16);
     const _: () = assert!(size_of::<BarrierHeader>() == 16);
     const MAX_USER_ADDR: usize = 0x0000_8000_0000_0000;
     if groups.is_null() || count > 64 {
-        return true;
+        return BarrierGroupPlan::FALLBACK;
     }
     #[cfg(feature = "diagnostics")]
     static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // SAFETY: the title passes `count` valid `D3D12_BARRIER_GROUP` entries.
     let slice = unsafe { std::slice::from_raw_parts(groups.cast::<BarrierGroup>(), count as usize) };
+    let mut plan = BarrierGroupPlan::NONE;
     for g in slice {
         if g.count == 0 {
             continue;
         }
         if g.ptr.is_null() || g.count > 1024 {
-            return true;
+            return BarrierGroupPlan::FALLBACK;
         }
         let stride = match g.kind {
             BARRIER_TYPE_GLOBAL => 16usize,
             BARRIER_TYPE_TEXTURE => 64usize,
             BARRIER_TYPE_BUFFER => 40usize,
-            _ => return true,
+            _ => return BarrierGroupPlan::FALLBACK,
         };
         for j in 0..g.count as usize {
             // SAFETY: within `g.count` elements of the barrier array.
             let entry = unsafe { g.ptr.add(j * stride) };
             // SAFETY: all 3 D3D12 enhanced barrier structs start with `BarrierHeader`.
             let h = unsafe { std::ptr::read_unaligned(entry.cast::<BarrierHeader>()) };
+            let mut tex_res = 0usize;
             if g.kind == BARRIER_TYPE_BUFFER {
                 // SAFETY: `pResource` is at byte offset 16 in `D3D12_BUFFER_BARRIER`.
                 let res = unsafe { std::ptr::read_unaligned(entry.add(16).cast::<usize>()) };
                 if res >= MAX_USER_ADDR {
-                    return true;
+                    return BarrierGroupPlan::FALLBACK;
                 }
             } else if g.kind == BARRIER_TYPE_TEXTURE {
                 // SAFETY: `LayoutBefore` (16), `LayoutAfter` (20), `pResource` (24) in `D3D12_TEXTURE_BARRIER`.
@@ -2547,8 +2611,21 @@ fn barrier_groups_need_uav(count: u32, groups: *const u8) -> bool {
                     || !barrier_layout_sane(layout_before)
                     || !barrier_layout_sane(layout_after)
                 {
-                    return true;
+                    return BarrierGroupPlan::FALLBACK;
                 }
+                tex_res = res;
+            }
+            let active = h.sync_before != BARRIER_SYNC_NONE
+                && h.sync_after != BARRIER_SYNC_NONE
+                && h.sync_before != BARRIER_SYNC_SPLIT
+                && h.access_before != BARRIER_ACCESS_NO_ACCESS
+                && h.access_after != BARRIER_ACCESS_NO_ACCESS;
+            if active
+                && g.kind != BARRIER_TYPE_TEXTURE
+                && (h.access_after == BARRIER_ACCESS_COMMON
+                    || (h.access_after & BARRIER_ACCESS_INDIRECT_ARGUMENT) != 0)
+            {
+                plan.affects_indirect = true;
             }
             let need = barrier_header_needs_uav(h);
             #[cfg(feature = "diagnostics")]
@@ -2565,11 +2642,30 @@ fn barrier_groups_need_uav(count: u32, groups: *const u8) -> bool {
                 );
             }
             if need {
-                return true;
+                plan.need_uav = true;
+                if (h.access_after & BARRIER_ACCESS_UNORDERED_ACCESS) != 0
+                    || h.access_before == BARRIER_ACCESS_COMMON
+                    || h.access_after == BARRIER_ACCESS_COMMON
+                {
+                    plan.need_without_prior_uav = true;
+                }
+                if g.kind == BARRIER_TYPE_TEXTURE
+                    && h.access_before != BARRIER_ACCESS_COMMON
+                    && h.access_after != BARRIER_ACCESS_COMMON
+                {
+                    plan.push_tex_target(tex_res);
+                } else {
+                    plan.tex_targets_exact = false;
+                }
             }
         }
     }
-    false
+    plan
+}
+
+#[cfg(test)]
+fn barrier_groups_need_uav(count: u32, groups: *const u8) -> bool {
+    barrier_groups_classify(count, groups).need_uav
 }
 
 extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
@@ -2581,7 +2677,16 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
         if !list_obj.uav_barrier_needed {
             return;
         }
-        if !barrier_groups_need_uav(count, groups) {
+        let plan = barrier_groups_classify(count, groups);
+        if !plan.need_uav {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::WaitsForGroupsSkipped, 1);
+            return;
+        }
+        let Some(list) = ensure_host(&mut list_obj.host) else {
+            return;
+        };
+        if !plan.need_without_prior_uav && !list.is_uav_dirty() {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForGroupsSkipped, 1);
             return;
@@ -2593,16 +2698,66 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
                 return;
             }
         }
-        let Some(list) = ensure_host(&mut list_obj.host) else {
-            return;
-        };
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        if plan.tex_targets_exact && plan.tex_target_len > 0 {
+            use windows::core::Interface;
+            let mut targeted = BarrierBuf::new();
+            let mut all_resolved = true;
+            for &raw_res in &plan.tex_targets[..plan.tex_target_len] {
+                let title_res = raw_res as This;
+                let mut added = false;
+                if let Some(twin) = crate::resource::twin_resource(title_res) {
+                    list.keep(twin);
+                    targeted.push(Barrier {
+                        kind: 2,
+                        flags: 0,
+                        first: twin.as_raw().cast_const().cast(),
+                        second: 0,
+                        last: 0,
+                    });
+                    added = true;
+                }
+                if let Some(host_tex) = crate::resource::host_made(title_res) {
+                    list.keep(host_tex);
+                    targeted.push(Barrier {
+                        kind: 2,
+                        flags: 0,
+                        first: host_tex.as_raw().cast_const().cast(),
+                        second: 0,
+                        last: 0,
+                    });
+                    added = true;
+                }
+                if !added {
+                    all_resolved = false;
+                    break;
+                }
+            }
+            if all_resolved {
+                let slice = targeted.as_slice();
+                // SAFETY: identical layout; borrowed resource pointers, never
+                // released through this slice.
+                let host_barriers = unsafe {
+                    std::slice::from_raw_parts(
+                        slice.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
+                        slice.len(),
+                    )
+                };
+                // SAFETY: an open list and live host texture resources.
+                unsafe { list.list.ResourceBarrier(host_barriers) };
+                return;
+            }
+        }
         // SAFETY: the same layout; no resource named.
         let barrier =
             unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
-        list.mark_uav_clean();
+        if plan.affects_indirect {
+            list.mark_uav_clean();
+        } else {
+            list.mark_uav_clean_keep_indirect();
+        }
         list_obj.uav_barrier_needed = false;
     }
     #[cfg(not(windows))]
@@ -3163,5 +3318,123 @@ mod tests {
             ptr: (&buf_common as *const BufBarrier).cast(),
         };
         assert!(barrier_groups_need_uav(1, (&group_common as *const BarrierGroup).cast()));
+    }
+
+    #[test]
+    fn barrier_groups_classify_distinguishes_texture_targets_and_indirect() {
+        const SYNC_DRAW: u32 = 0x2;
+        const SYNC_COMPUTE: u32 = 0x800;
+        const ACCESS_RTV: u32 = 0x8;
+        const ACCESS_SRV: u32 = 0x80;
+
+        #[repr(C)]
+        struct TexBarrier {
+            h: BarrierHeader,
+            layout_before: u32,
+            layout_after: u32,
+            res: usize,
+            subresource: [u32; 6],
+            flags: u32,
+            _pad: u32,
+        }
+        #[repr(C)]
+        struct BufBarrier {
+            h: BarrierHeader,
+            res: usize,
+            offset: u64,
+            size: u64,
+        }
+
+        // Texture UAV -> RTV: needs UAV only if prior UAV dirty, does NOT affect indirect,
+        // and carries an exact texture target.
+        let tex_uav_to_rtv = TexBarrier {
+            h: BarrierHeader {
+                sync_before: SYNC_COMPUTE,
+                sync_after: SYNC_DRAW,
+                access_before: BARRIER_ACCESS_UNORDERED_ACCESS,
+                access_after: ACCESS_RTV,
+            },
+            layout_before: 7,
+            layout_after: 4,
+            res: 0x1000_2000,
+            subresource: [0; 6],
+            flags: 0,
+            _pad: 0,
+        };
+        let g_tex = BarrierGroup {
+            kind: BARRIER_TYPE_TEXTURE,
+            count: 1,
+            ptr: (&tex_uav_to_rtv as *const TexBarrier).cast(),
+        };
+        let plan = barrier_groups_classify(1, (&g_tex as *const BarrierGroup).cast());
+        assert!(plan.need_uav);
+        assert!(!plan.need_without_prior_uav);
+        assert!(!plan.affects_indirect);
+        assert!(plan.tex_targets_exact);
+        assert_eq!(&plan.tex_targets[..plan.tex_target_len], &[0x1000_2000]);
+
+        // Texture SRV -> UAV (WAR): needs UAV even without prior UAV write, still does not
+        // affect indirect, and keeps exact texture target.
+        let tex_srv_to_uav = TexBarrier {
+            h: BarrierHeader {
+                sync_before: SYNC_DRAW,
+                sync_after: SYNC_COMPUTE,
+                access_before: ACCESS_SRV,
+                access_after: BARRIER_ACCESS_UNORDERED_ACCESS,
+            },
+            ..tex_uav_to_rtv
+        };
+        let g_war = BarrierGroup {
+            kind: BARRIER_TYPE_TEXTURE,
+            count: 1,
+            ptr: (&tex_srv_to_uav as *const TexBarrier).cast(),
+        };
+        let plan_war = barrier_groups_classify(1, (&g_war as *const BarrierGroup).cast());
+        assert!(plan_war.need_uav);
+        assert!(plan_war.need_without_prior_uav);
+        assert!(!plan_war.affects_indirect);
+        assert!(plan_war.tex_targets_exact);
+
+        // Buffer UAV -> SRV: needs UAV only if prior UAV dirty, does NOT affect indirect.
+        let buf_srv = BufBarrier {
+            h: BarrierHeader {
+                sync_before: SYNC_COMPUTE,
+                sync_after: SYNC_DRAW,
+                access_before: BARRIER_ACCESS_UNORDERED_ACCESS,
+                access_after: ACCESS_SRV,
+            },
+            res: 0x2000_0000,
+            offset: 0,
+            size: 1024,
+        };
+        let g_buf_srv = BarrierGroup {
+            kind: BARRIER_TYPE_BUFFER,
+            count: 1,
+            ptr: (&buf_srv as *const BufBarrier).cast(),
+        };
+        let plan_buf_srv = barrier_groups_classify(1, (&g_buf_srv as *const BarrierGroup).cast());
+        assert!(plan_buf_srv.need_uav);
+        assert!(!plan_buf_srv.need_without_prior_uav);
+        assert!(!plan_buf_srv.affects_indirect);
+        assert!(!plan_buf_srv.tex_targets_exact);
+
+        // Buffer UAV -> INDIRECT_ARGUMENT: affects indirect windows!
+        let buf_ind = BufBarrier {
+            h: BarrierHeader {
+                sync_before: SYNC_COMPUTE,
+                sync_after: SYNC_DRAW,
+                access_before: BARRIER_ACCESS_UNORDERED_ACCESS,
+                access_after: BARRIER_ACCESS_INDIRECT_ARGUMENT,
+            },
+            ..buf_srv
+        };
+        let g_buf_ind = BarrierGroup {
+            kind: BARRIER_TYPE_BUFFER,
+            count: 1,
+            ptr: (&buf_ind as *const BufBarrier).cast(),
+        };
+        let plan_buf_ind = barrier_groups_classify(1, (&g_buf_ind as *const BarrierGroup).cast());
+        assert!(plan_buf_ind.need_uav);
+        assert!(plan_buf_ind.affects_indirect);
     }
 }

@@ -1150,7 +1150,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     made.clone()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn host_made<'a>(
     this: This,
 ) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
