@@ -1031,6 +1031,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 return 0;
             };
             if let Some(hb) = host_barrier(list, b) {
+                if b.kind == 1 {
+                    list.bump_state_seq();
+                }
                 // SAFETY: identical layout; borrowed resource pointer.
                 let hb = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(hb) };
                 // SAFETY: an open list and live resource.
@@ -1069,6 +1072,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 continue;
             }
             if let Some(hb) = host_barrier(list, b) {
+                if b.kind == 1 {
+                    list.bump_state_seq();
+                }
                 host.push(hb);
             }
         }

@@ -174,11 +174,26 @@ struct FreshTable {
     offset: u32,
     bindless_seq: u64,
     copy_seq: u64,
+    uav_done_seq: u64,
+    tex_state_seq: u64,
     deps: Vec<(u64, u64)>,
     has_gpu_active_cbv: bool,
     refresh_buffers: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
     uav_buffers: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
     textures: Vec<(usize, ResourceType)>,
+}
+
+const MIRRORED_FLAG_TEX: u8 = 1 << 0;
+const MIRRORED_FLAG_UAV_BUF: u8 = 1 << 1;
+const MIRRORED_FLAG_UAV_TEX: u8 = 1 << 2;
+const MIRRORED_FLAG_CBV_WRITTEN: u8 = 1 << 3;
+
+#[derive(Clone, Copy)]
+struct MirroredDone {
+    made_key: u64,
+    seq: u64,
+    aux: u64,
+    flags: u8,
 }
 
 #[derive(Default)]
@@ -249,6 +264,9 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     fresh_tables: DrawFastMap<(usize, u32, u128), FreshTable>,
+    mirrored_done: DrawFastMap<(usize, u32), MirroredDone>,
+    local_copy_seq: u64,
+    local_refreshed: DrawFastSet<(usize, u64, u64)>,
     cbv_scratch_cache: DrawFastMap<(u64, u64, u64), (u64, u64, ID3D12Resource, u64)>,
     kept_ptrs: DrawFastSet<usize>,
     kept_list_gen: u64,
@@ -292,6 +310,9 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.mirrored_done.clear();
+        self.local_refreshed.clear();
+        self.local_copy_seq = 0;
         self.kept_ptrs.clear();
         self.kept_list_gen = 0;
         self.root_srv_slots.clear();
@@ -300,11 +321,21 @@ impl State {
     }
 
     #[inline]
+    fn sync_list_gen(&mut self, list_gen: u64) {
+        if self.kept_list_gen != list_gen {
+            self.kept_ptrs.clear();
+            self.mirrored_done.clear();
+            self.local_refreshed.clear();
+            self.local_copy_seq = 0;
+            self.kept_list_gen = list_gen;
+        }
+    }
+
+    #[inline]
     fn is_kept_dynamic(&mut self, list: &HostList, raw: usize) -> bool {
         let list_gen = list.reset_gen();
         if self.kept_list_gen != list_gen {
-            self.kept_ptrs.clear();
-            self.kept_list_gen = list_gen;
+            self.sync_list_gen(list_gen);
             return false;
         }
         self.kept_ptrs.contains(&raw)
@@ -312,14 +343,49 @@ impl State {
 
     #[inline]
     fn keep_dynamic(&mut self, list: &HostList, resource: &ID3D12Resource) {
-        let list_gen = list.reset_gen();
-        if self.kept_list_gen != list_gen {
-            self.kept_ptrs.clear();
-            self.kept_list_gen = list_gen;
-        }
+        self.sync_list_gen(list.reset_gen());
         if self.kept_ptrs.insert(resource.as_raw() as usize) {
             list.keep(resource);
         }
+    }
+
+    #[inline]
+    fn refresh_shadow(
+        &mut self,
+        list: &HostList,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: u64,
+        len: u64,
+    ) {
+        self.sync_list_gen(list.reset_gen());
+        refresh_shadow_in(
+            &mut self.local_refreshed,
+            &mut self.local_copy_seq,
+            list,
+            shadow,
+            address,
+            len,
+        );
+    }
+}
+
+#[inline]
+fn refresh_shadow_in(
+    local_refreshed: &mut DrawFastSet<(usize, u64, u64)>,
+    local_copy_seq: &mut u64,
+    list: &HostList,
+    shadow: &std::sync::Arc<crate::shadow::Shadow>,
+    address: u64,
+    len: u64,
+) {
+    let cur_copy = list.copy_seq();
+    if *local_copy_seq != cur_copy {
+        local_refreshed.clear();
+        *local_copy_seq = cur_copy;
+    }
+    let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+    if local_refreshed.insert(key) {
+        shadow.refresh(list, address, len);
     }
 }
 
@@ -490,7 +556,7 @@ fn speculative_room_cached(force: bool) -> bool {
 
 struct ShadowSlots<T> {
     item: T,
-    slots: std::collections::HashMap<u32, (u64, u64)>,
+    slots: DrawFastMap<u32, (u64, u64)>,
     spans: Vec<(usize, usize)>,
     bytes: u64,
     dirty: bool,
@@ -498,9 +564,9 @@ struct ShadowSlots<T> {
 
 struct BufferSpanCache<T> {
     passes: u64,
-    slot_owner: std::collections::HashMap<u32, usize>,
-    slot_keys: std::collections::HashMap<u32, u64>,
-    shadows: std::collections::HashMap<usize, ShadowSlots<T>>,
+    slot_owner: DrawFastMap<u32, usize>,
+    slot_keys: DrawFastMap<u32, u64>,
+    shadows: DrawFastMap<usize, ShadowSlots<T>>,
     dirty_keys: Vec<usize>,
     bytes: u64,
     rebuilds: u64,
@@ -510,9 +576,9 @@ impl<T> Default for BufferSpanCache<T> {
     fn default() -> Self {
         Self {
             passes: 0,
-            slot_owner: std::collections::HashMap::new(),
-            slot_keys: std::collections::HashMap::new(),
-            shadows: std::collections::HashMap::new(),
+            slot_owner: DrawFastMap::default(),
+            slot_keys: DrawFastMap::default(),
+            shadows: DrawFastMap::default(),
             dirty_keys: Vec::new(),
             bytes: 0,
             rebuilds: 0,
@@ -547,7 +613,7 @@ impl<T> BufferSpanCache<T> {
         }
     }
 
-    fn retain_slots(&mut self, keep: &std::collections::HashSet<u32>, key_of: impl Fn(&T) -> usize) {
+    fn retain_slots(&mut self, keep: &DrawFastSet<u32>, key_of: impl Fn(&T) -> usize) {
         let stale: Vec<u32> = self
             .slot_owner
             .keys()
@@ -616,7 +682,7 @@ impl<T> BufferSpanCache<T> {
                     .entry(new_key)
                     .or_insert_with(|| ShadowSlots {
                         item,
-                        slots: std::collections::HashMap::new(),
+                        slots: DrawFastMap::default(),
                         spans: Vec::new(),
                         bytes: 0,
                         dirty: false,
@@ -641,7 +707,7 @@ impl<T> BufferSpanCache<T> {
         }
     }
 
-    fn ensure_spans(&mut self) -> (&std::collections::HashMap<usize, ShadowSlots<T>>, u64, usize) {
+    fn ensure_spans(&mut self) -> (&DrawFastMap<usize, ShadowSlots<T>>, u64, usize) {
         if self.dirty_keys.is_empty() {
             return (&self.shadows, self.bytes, 0);
         }
@@ -857,7 +923,7 @@ impl State {
             crate::copystat::add(crate::copystat::C::CbvScratchHits, 1);
             return Some((res.clone(), *gpu, write_seq, bindless_seq));
         }
-        shadow.refresh(list, address, len);
+        self.refresh_shadow(list, shadow, address, len);
         let (scratch, _, scratch_gpu) = if write_seq == 0 && bindless_seq == 0 {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::CbvScratchHoisted, 1);
@@ -890,7 +956,7 @@ impl State {
         let len = shadow.left(address).min(if srv { limit } else { 1 << 16 });
         let gpu = shadow.gpu(address);
         if srv || gpu % 256 == 0 {
-            shadow.refresh(list, address, len);
+            self.refresh_shadow(list, &shadow, address, len);
             if !srv && shadow.ever_written() {
                 list.uav_barrier_if_dirty();
             }
@@ -1356,7 +1422,7 @@ impl State {
                 let Some(shadow) = self.find_shadow_any(v.address, u64::from(v.size)) else {
                     continue;
                 };
-                shadow.refresh(list, v.address, u64::from(v.size));
+                self.refresh_shadow(list, &shadow, v.address, u64::from(v.size));
                 *view = D3D12_VERTEX_BUFFER_VIEW {
                     BufferLocation: shadow.gpu(v.address),
                     SizeInBytes: v.size,
@@ -1373,7 +1439,7 @@ impl State {
             let Some(shadow) = self.find_shadow_any(v.address, u64::from(v.size)) else {
                 return false;
             };
-            shadow.refresh(list, v.address, u64::from(v.size));
+            self.refresh_shadow(list, &shadow, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -1923,7 +1989,7 @@ impl State {
                     host.unmake_slot(index);
                 }
             } else if cache.slot_count() > 0 {
-                let keep: std::collections::HashSet<u32> = all.iter().copied().collect();
+                let keep: DrawFastSet<u32> = all.iter().copied().collect();
                 cache.retain_slots(&keep, key_of);
             }
             all
@@ -2084,17 +2150,11 @@ impl State {
                 .unwrap_or(1)
         });
         if every <= 1 {
-            for entry in shadows.values() {
-                if entry.item.is_in_place() {
-                    list.keep(&entry.item.buffer);
-                    continue;
-                }
-                for &(from, to) in &entry.spans {
-                    entry
-                        .item
-                        .refresh(list, from as u64, (to - from) as u64);
-                }
-            }
+            list.defer_refresh_batch(
+                shadows
+                    .values()
+                    .map(|entry| (&entry.item, entry.spans.as_slice())),
+            );
         } else {
             static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> =
                 std::sync::Mutex::new(None);
@@ -3214,6 +3274,70 @@ impl State {
         }
     }
 
+    #[inline]
+    fn mirrored_done_hit(
+        &mut self,
+        list: &HostList,
+        heap_id: usize,
+        host: &crate::descriptor::host::HostHeap,
+        index: u32,
+        made_key: u64,
+        want_kind: Option<ResourceType>,
+    ) -> bool {
+        if made_key == 0 {
+            return false;
+        }
+        self.sync_list_gen(list.reset_gen());
+        let Some(&done) = self.mirrored_done.get(&(heap_id, index)) else {
+            return false;
+        };
+        if done.made_key != made_key || host.made_key(index) != made_key {
+            return false;
+        }
+        if done.flags & MIRRORED_FLAG_TEX != 0 {
+            let have_uav = (done.flags & MIRRORED_FLAG_UAV_TEX) != 0;
+            if let Some(kind) = want_kind
+                && (kind == ResourceType::Uav) != have_uav
+            {
+                return false;
+            }
+            if done.seq != list.state_seq() {
+                return false;
+            }
+            if !have_uav && TESTED_DEPTH.get().0 == done.aux as usize && done.aux != 0 {
+                return false;
+            }
+            return true;
+        }
+        if done.flags & MIRRORED_FLAG_UAV_BUF != 0 {
+            if let Some(kind) = want_kind
+                && kind != ResourceType::Uav
+            {
+                return false;
+            }
+            if !(STORES.get() || !write_skip()) {
+                return false;
+            }
+            if done.seq == list.gpu_write_seq() && done.aux != 0 {
+                list.note_shadow_gpu_write(done.aux);
+                return true;
+            }
+            return false;
+        }
+        if let Some(kind) = want_kind
+            && kind == ResourceType::Uav
+        {
+            return false;
+        }
+        if done.seq == list.copy_seq() {
+            if done.flags & MIRRORED_FLAG_CBV_WRITTEN != 0 {
+                list.uav_barrier_if_dirty();
+            }
+            return true;
+        }
+        false
+    }
+
     fn table_entry_with_heap(
         &mut self,
         list: &HostList,
@@ -3225,17 +3349,35 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some((action, _, is_texture)) = host.lookup_mirrored_stage(index, handle) {
+        let heap_id = std::ptr::from_ref(heap) as usize;
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let made_key = if words[0] == crate::descriptor::VIEW_TAG {
+            (u64::from(words[2]) << 32) | u64::from(words[1])
+        } else {
+            0
+        };
+        if self.mirrored_done_hit(list, heap_id, host, index, made_key, Some(u.kind)) {
+            return;
+        }
+        if let Some((action, _, is_texture)) = host.lookup_mirrored_stage_words(index, words) {
+            let mut cache_entry: Option<MirroredDone> = None;
             match action {
                 crate::descriptor::host::StageAction::Buffer {
                     shadow,
                     address,
                     len,
                 } => {
-                    shadow.refresh(list, address, len);
+                    self.refresh_shadow(list, &shadow, address, len);
                     if u.kind == ResourceType::Uav {
                         if STORES.get() || !write_skip() {
                             shadow.gpu_writes(list, address, len);
+                            cache_entry = Some(MirroredDone {
+                                made_key,
+                                seq: list.gpu_write_seq(),
+                                aux: shadow.id(),
+                                flags: MIRRORED_FLAG_UAV_BUF,
+                            });
                         } else {
                             #[cfg(feature = "diagnostics")]
                             {
@@ -3243,15 +3385,50 @@ impl State {
                                 crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
                             }
                         }
+                    } else {
+                        cache_entry = Some(MirroredDone {
+                            made_key,
+                            seq: list.copy_seq(),
+                            aux: 0,
+                            flags: 0,
+                        });
                     }
                 }
                 crate::descriptor::host::StageAction::Texture { resource } => {
-                    readable_texture(list, resource, u.kind);
+                    let was_twin = readable_texture(list, resource, u.kind);
+                    if !was_twin && matches!(u.kind, ResourceType::Srv | ResourceType::Uav) {
+                        let flags = MIRRORED_FLAG_TEX
+                            | if u.kind == ResourceType::Uav {
+                                MIRRORED_FLAG_UAV_TEX
+                            } else {
+                                0
+                            };
+                        cache_entry = Some(MirroredDone {
+                            made_key,
+                            seq: list.state_seq(),
+                            aux: resource as u64,
+                            flags,
+                        });
+                    }
                 }
-                crate::descriptor::host::StageAction::None => {}
+                crate::descriptor::host::StageAction::None => {
+                    if u.kind != ResourceType::Uav {
+                        cache_entry = Some(MirroredDone {
+                            made_key,
+                            seq: list.copy_seq(),
+                            aux: 0,
+                            flags: 0,
+                        });
+                    }
+                }
             }
             if is_texture {
                 host.texture_slot_tabled(index, true);
+            }
+            if let Some(done) = cache_entry
+                && made_key != 0
+            {
+                self.mirrored_done.insert((heap_id, index), done);
             }
             return;
         }
@@ -3259,16 +3436,46 @@ impl State {
             if let View::Constant(address, size) = view {
                 let size_u64 = u64::from(size);
                 if let Some(shadow) = self.find_shadow(address, size_u64) {
-                    shadow.refresh(list, address, size_u64);
-                    if shadow.ever_written() {
+                    self.refresh_shadow(list, &shadow, address, size_u64);
+                    let ever_written = shadow.ever_written();
+                    if ever_written {
                         list.uav_barrier_if_dirty();
+                    }
+                    if made_key != 0 && host.made_key(index) == made_key {
+                        self.mirrored_done.insert(
+                            (heap_id, index),
+                            MirroredDone {
+                                made_key,
+                                seq: list.copy_seq(),
+                                aux: 0,
+                                flags: if ever_written {
+                                    MIRRORED_FLAG_CBV_WRITTEN
+                                } else {
+                                    0
+                                },
+                            },
+                        );
                     }
                 }
                 return;
             }
-            readable(list, u.kind, &view);
+            let done_info = readable_cached(list, u.kind, &view);
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
+            }
+            if let Some((flags, aux, seq)) = done_info
+                && made_key != 0
+                && host.made_key(index) == made_key
+            {
+                self.mirrored_done.insert(
+                    (heap_id, index),
+                    MirroredDone {
+                        made_key,
+                        seq,
+                        aux,
+                        flags,
+                    },
+                );
             }
         }
     }
@@ -3487,18 +3694,36 @@ impl State {
             let Some(index) = heap.index(handle) else {
                 continue;
             };
-            if let Some((action, kind, is_texture)) = host.lookup_mirrored_stage(index, handle) {
+            let heap_id = std::ptr::from_ref(heap) as usize;
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let made_key = if words[0] == crate::descriptor::VIEW_TAG {
+                (u64::from(words[2]) << 32) | u64::from(words[1])
+            } else {
+                0
+            };
+            if self.mirrored_done_hit(list, heap_id, host, index, made_key, None) {
+                continue;
+            }
+            if let Some((action, kind, is_texture)) = host.lookup_mirrored_stage_words(index, words) {
                 if let Some(kind) = kind {
+                    let mut cache_entry: Option<MirroredDone> = None;
                     match action {
                         crate::descriptor::host::StageAction::Buffer {
                             shadow,
                             address,
                             len,
                         } => {
-                            shadow.refresh(list, address, len);
+                            self.refresh_shadow(list, &shadow, address, len);
                             if kind == ResourceType::Uav {
                                 if STORES.get() || !write_skip() {
                                     shadow.gpu_writes(list, address, len);
+                                    cache_entry = Some(MirroredDone {
+                                        made_key,
+                                        seq: list.gpu_write_seq(),
+                                        aux: shadow.id(),
+                                        flags: MIRRORED_FLAG_UAV_BUF,
+                                    });
                                 } else {
                                     #[cfg(feature = "diagnostics")]
                                     {
@@ -3512,15 +3737,50 @@ impl State {
                                         );
                                     }
                                 }
+                            } else {
+                                cache_entry = Some(MirroredDone {
+                                    made_key,
+                                    seq: list.copy_seq(),
+                                    aux: 0,
+                                    flags: 0,
+                                });
                             }
                         }
                         crate::descriptor::host::StageAction::Texture { resource } => {
-                            readable_texture(list, resource, kind);
+                            let was_twin = readable_texture(list, resource, kind);
+                            if !was_twin && matches!(kind, ResourceType::Srv | ResourceType::Uav) {
+                                let flags = MIRRORED_FLAG_TEX
+                                    | if kind == ResourceType::Uav {
+                                        MIRRORED_FLAG_UAV_TEX
+                                    } else {
+                                        0
+                                    };
+                                cache_entry = Some(MirroredDone {
+                                    made_key,
+                                    seq: list.state_seq(),
+                                    aux: resource as u64,
+                                    flags,
+                                });
+                            }
                         }
-                        crate::descriptor::host::StageAction::None => {}
+                        crate::descriptor::host::StageAction::None => {
+                            if kind != ResourceType::Uav {
+                                cache_entry = Some(MirroredDone {
+                                    made_key,
+                                    seq: list.copy_seq(),
+                                    aux: 0,
+                                    flags: 0,
+                                });
+                            }
+                        }
                     }
                     if is_texture {
                         host.texture_slot_tabled(index, true);
+                    }
+                    if let Some(done) = cache_entry
+                        && made_key != 0
+                    {
+                        self.mirrored_done.insert((heap_id, index), done);
                     }
                 }
                 continue;
@@ -3529,15 +3789,45 @@ impl State {
                 if let View::Constant(address, size) = view {
                     let size_u64 = u64::from(size);
                     if let Some(shadow) = self.find_shadow(address, size_u64) {
-                        shadow.refresh(list, address, size_u64);
-                        if shadow.ever_written() {
+                        self.refresh_shadow(list, &shadow, address, size_u64);
+                        let ever_written = shadow.ever_written();
+                        if ever_written {
                             list.uav_barrier_if_dirty();
+                        }
+                        if made_key != 0 && host.made_key(index) == made_key {
+                            self.mirrored_done.insert(
+                                (heap_id, index),
+                                MirroredDone {
+                                    made_key,
+                                    seq: list.copy_seq(),
+                                    aux: 0,
+                                    flags: if ever_written {
+                                        MIRRORED_FLAG_CBV_WRITTEN
+                                    } else {
+                                        0
+                                    },
+                                },
+                            );
                         }
                     }
                 } else if let Some(kind) = view_kind(&view) {
-                    readable(list, kind, &view);
+                    let done_info = readable_cached(list, kind, &view);
                     if crate::descriptor::host::is_texture_view(&view) {
                         host.texture_slot_tabled(index, true);
+                    }
+                    if let Some((flags, aux, seq)) = done_info
+                        && made_key != 0
+                        && host.made_key(index) == made_key
+                    {
+                        self.mirrored_done.insert(
+                            (heap_id, index),
+                            MirroredDone {
+                                made_key,
+                                seq,
+                                aux,
+                                flags,
+                            },
+                        );
                     }
                 }
             }
@@ -3612,7 +3902,8 @@ impl State {
                 }
                 (heap_id, span, finalize_table_hash(h1, h2))
             };
-            if let Some(entry) = self.fresh_tables.get(&key)
+            self.sync_list_gen(list.reset_gen());
+            if let Some(entry) = self.fresh_tables.get_mut(&key)
                 && (entry.deps.is_empty()
                     || (list.bindless_write_seq() == entry.bindless_seq
                         && entry
@@ -3626,33 +3917,62 @@ impl State {
                 if entry.has_gpu_active_cbv {
                     list.uav_barrier_if_dirty();
                 }
-                if entry.copy_seq != list.copy_seq() {
+                let cur_copy_seq = list.copy_seq();
+                if entry.copy_seq != cur_copy_seq {
                     for (shadow, address, len) in &entry.refresh_buffers {
-                        shadow.refresh(list, *address, *len);
+                        refresh_shadow_in(
+                            &mut self.local_refreshed,
+                            &mut self.local_copy_seq,
+                            list,
+                            shadow,
+                            *address,
+                            *len,
+                        );
                     }
+                    entry.copy_seq = cur_copy_seq;
                 }
                 if !entry.uav_buffers.is_empty() {
                     let record_writes = STORES.get() || !write_skip();
-                    for (shadow, address, len) in &entry.uav_buffers {
-                        if record_writes {
-                            shadow.gpu_writes(list, *address, *len);
-                        } else {
-                            #[cfg(feature = "diagnostics")]
-                            {
-                                crate::copystat::add(
-                                    crate::copystat::C::GpuWritesLeftOut,
-                                    1,
-                                );
-                                crate::copystat::add(
-                                    crate::copystat::C::GpuWritesLeftOutBytes,
-                                    *len,
-                                );
+                    if record_writes {
+                        let cur_gpu_write_seq = list.gpu_write_seq();
+                        if entry.uav_done_seq == cur_gpu_write_seq {
+                            for (shadow, _, _) in &entry.uav_buffers {
+                                list.note_shadow_gpu_write(shadow.id());
                             }
+                        } else {
+                            for (shadow, address, len) in &entry.uav_buffers {
+                                shadow.gpu_writes(list, *address, *len);
+                            }
+                            entry.uav_done_seq = cur_gpu_write_seq;
+                        }
+                    } else {
+                        #[cfg(feature = "diagnostics")]
+                        for (_, _, len) in &entry.uav_buffers {
+                            crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
+                            crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, *len);
                         }
                     }
                 }
-                for &(resource, kind) in &entry.textures {
-                    readable_texture(list, resource, kind);
+                if !entry.textures.is_empty() {
+                    let cur_state_seq = list.state_seq();
+                    if entry.tex_state_seq != cur_state_seq {
+                        let mut any_twin = false;
+                        for &(resource, kind) in &entry.textures {
+                            if readable_texture(list, resource, kind) {
+                                any_twin = true;
+                            }
+                        }
+                        entry.tex_state_seq = if any_twin { u64::MAX } else { list.state_seq() };
+                    } else {
+                        let tested = TESTED_DEPTH.get().0;
+                        if tested != 0 {
+                            for &(resource, kind) in &entry.textures {
+                                if resource == tested {
+                                    let _ = readable_texture(list, resource, kind);
+                                }
+                            }
+                        }
+                    }
                 }
                 self.scratch_made.push((slot, offset));
                 continue;
@@ -3676,6 +3996,8 @@ impl State {
             let mut uav_buffers: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
                 Vec::new();
             let mut textures: Vec<(usize, ResourceType)> = Vec::new();
+            let mut any_twin_tex = false;
+            let record_uav_writes = STORES.get() || !write_skip();
             self.dynamic.push((heap_id, first, span));
             let title_first = heap.index(table);
             self.scratch_entries
@@ -3709,7 +4031,7 @@ impl State {
                     {
                         if shadow.can_bind_cbv(address, size) {
                             let gpu = shadow.gpu(address);
-                            shadow.refresh(list, address, size_u64);
+                            self.refresh_shadow(list, &shadow, address, size_u64);
                             refresh_buffers.push((shadow.clone(), address, size_u64));
                             if gpu_active {
                                 has_gpu_active_cbv = true;
@@ -3766,10 +4088,10 @@ impl State {
                             address,
                             len,
                         } => {
-                            shadow.refresh(list, address, len);
+                            self.refresh_shadow(list, &shadow, address, len);
                             if kind == ResourceType::Uav {
                                 refresh_buffers.push((shadow.clone(), address, len));
-                                if STORES.get() || !write_skip() {
+                                if record_uav_writes {
                                     shadow.gpu_writes(list, address, len);
                                 } else {
                                     #[cfg(feature = "diagnostics")]
@@ -3791,7 +4113,9 @@ impl State {
                         }
                         crate::descriptor::host::StageAction::Texture { resource } => {
                             textures.push((resource, kind));
-                            readable_texture(list, resource, kind);
+                            if readable_texture(list, resource, kind) {
+                                any_twin_tex = true;
+                            }
                         }
                         crate::descriptor::host::StageAction::None => {}
                     }
@@ -3812,12 +4136,24 @@ impl State {
                 t_make.elapsed().as_micros() as u64,
             );
             let offset = (first - trim) * 32;
+            let uav_done_seq = if uav_buffers.is_empty() || record_uav_writes {
+                list.gpu_write_seq()
+            } else {
+                u64::MAX
+            };
+            let tex_state_seq = if any_twin_tex {
+                u64::MAX
+            } else {
+                list.state_seq()
+            };
             self.fresh_tables.insert(
                 key,
                 FreshTable {
                     offset,
                     bindless_seq: list.bindless_write_seq(),
                     copy_seq: list.copy_seq(),
+                    uav_done_seq,
+                    tex_state_seq,
                     deps,
                     has_gpu_active_cbv,
                     refresh_buffers,
@@ -4258,9 +4594,9 @@ impl State {
                     len
                 };
                 let base_addr = arguments - (offset - base_off);
-                args.refresh(list, base_addr, len.max(refresh_len));
+                self.refresh_shadow(list, &args, base_addr, len.max(refresh_len));
                 if let Some((s, at)) = &counter {
-                    s.refresh(list, *at, 4);
+                    self.refresh_shadow(list, s, *at, 4);
                 }
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let bounded = if windowed && records > 1 {
@@ -4440,7 +4776,46 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     readable_with_hint(list, kind, view, None, None, None, None);
 }
 
-fn readable_texture(list: &HostList, resource: usize, kind: ResourceType) {
+fn readable_cached(list: &HostList, kind: ResourceType, view: &View) -> Option<(u8, u64, u64)> {
+    let placed = crate::descriptor::host::placed_texture(view);
+    let view = placed.as_ref().unwrap_or(view);
+    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy_with_hint(view, None)
+    {
+        shadow.refresh(list, address, len);
+        if kind == ResourceType::Uav {
+            if STORES.get() || !write_skip() {
+                shadow.gpu_writes(list, address, len);
+                return Some((MIRRORED_FLAG_UAV_BUF, shadow.id(), list.gpu_write_seq()));
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
+                crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
+            }
+            return None;
+        }
+        return Some((0, 0, list.copy_seq()));
+    }
+    match (view, kind) {
+        (View::Shader(resource, _), ResourceType::Srv) => {
+            let was_twin = readable_texture(list, *resource, ResourceType::Srv);
+            (!was_twin).then(|| (MIRRORED_FLAG_TEX, *resource as u64, list.state_seq()))
+        }
+        (View::Unordered(resource, _, _), ResourceType::Uav) => {
+            let was_twin = readable_texture(list, *resource, ResourceType::Uav);
+            (!was_twin).then(|| {
+                (
+                    MIRRORED_FLAG_TEX | MIRRORED_FLAG_UAV_TEX,
+                    *resource as u64,
+                    list.state_seq(),
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+fn readable_texture(list: &HostList, resource: usize, kind: ResourceType) -> bool {
     const UNORDERED_ACCESS: u32 = 0x8;
     match kind {
         ResourceType::Srv => {
@@ -4452,7 +4827,7 @@ fn readable_texture(list: &HostList, resource: usize, kind: ResourceType) {
             {
                 crate::texture::upload(list, resource as This, t);
             }
-            list.twin_use(resource as This, false, false);
+            let was_twin = list.twin_use(resource as This, false, false);
             let (tested, _) = TESTED_DEPTH.get();
             let state = if tested != 0 && tested == resource {
                 TESTED_DEPTH.set((tested, true));
@@ -4475,15 +4850,18 @@ fn readable_texture(list: &HostList, resource: usize, kind: ResourceType) {
                     );
                 }
             }
+            was_twin
         }
         ResourceType::Uav => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(resource as This);
-            if !list.twin_use(resource as This, true, true) {
+            let was_twin = list.twin_use(resource as This, true, true);
+            if !was_twin {
                 crate::list::ensure_state(list, resource as This, UNORDERED_ACCESS);
             }
+            was_twin
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -4529,13 +4907,13 @@ fn readable_with_hint(
             if let Some(sink) = textures {
                 sink.push((*resource, ResourceType::Srv));
             }
-            readable_texture(list, *resource, ResourceType::Srv);
+            let _ = readable_texture(list, *resource, ResourceType::Srv);
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             if let Some(sink) = textures {
                 sink.push((*resource, ResourceType::Uav));
             }
-            readable_texture(list, *resource, ResourceType::Uav);
+            let _ = readable_texture(list, *resource, ResourceType::Uav);
         }
         _ => {}
     }

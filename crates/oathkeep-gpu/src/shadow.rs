@@ -3609,6 +3609,11 @@ impl Shadow {
         shadow
     }
 
+    #[inline]
+    pub(crate) fn touch_used(&self, now: u64) {
+        self.used.store(now, Ordering::Relaxed);
+    }
+
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         self.used.store(crate::host::moment(), Ordering::Relaxed);
         if self.place.is_some() {

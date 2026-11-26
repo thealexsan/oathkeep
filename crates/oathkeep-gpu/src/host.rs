@@ -874,6 +874,8 @@ pub(crate) struct HostList {
     shadow_writes: Mutex<ShadowWrites>,
     bindless_write_seq: std::sync::atomic::AtomicU64,
     copy_seq: std::sync::atomic::AtomicU64,
+    state_seq: std::sync::atomic::AtomicU64,
+    gpu_write_seq: std::sync::atomic::AtomicU64,
     reset_gen: std::sync::atomic::AtomicU64,
     uav_dirty: std::sync::atomic::AtomicBool,
     indirect_uav_dirty: std::sync::atomic::AtomicBool,
@@ -899,6 +901,109 @@ struct PooledPrelude(Option<Prelude>);
 // each pooled prelude is exclusively owned while in flight and returned to the
 // pool only once its submission's GPU fence has completed.
 unsafe impl Send for PooledPrelude {}
+
+struct SendPreludePlan {
+    to_copy: Vec<D3D12_RESOURCE_BARRIER>,
+    syncs: Vec<(
+        std::sync::Arc<crate::resource::HostTexture>,
+        std::sync::Arc<crate::resource::Twin>,
+        bool,
+    )>,
+    barriers: Vec<D3D12_RESOURCE_BARRIER>,
+    prelude_copies: Vec<(ID3D12Resource, u64, ID3D12Resource, u64, u64)>,
+}
+
+// SAFETY: Raw COM pointers in `to_copy` / `barriers` borrow textures owned by
+// `runs` (which outlives `wide_run`), and `ID3D12Resource` COM references in
+// `prelude_copies` are free-threaded.
+unsafe impl Send for SendPreludePlan {}
+
+struct SendCmdList(Option<(ID3D12CommandList, PooledPrelude)>);
+
+// SAFETY: `ID3D12CommandList` is free-threaded once closed and moved back to
+// the submit thread.
+unsafe impl Send for SendCmdList {}
+
+fn record_prelude(host: &Host, mut plan: SendPreludePlan) -> Option<(ID3D12CommandList, PooledPrelude)> {
+    let Some(pooled) = take_prelude(host) else {
+        fail(format_args!("no host list for a state prelude"));
+    };
+    let (allocator, list) = pooled.0.as_ref().expect("pooled prelude");
+    // SAFETY: the pooled prelude is not executing (returned to the pool
+    // only after its submission's GPU fence completed); the textures and
+    // scratch buffers are live for the duration of the submission.
+    let recorded = unsafe {
+        allocator.Reset().and_then(|()| {
+            list.Reset(allocator, None)?;
+            if !plan.to_copy.is_empty() {
+                list.ResourceBarrier(&plan.to_copy);
+            }
+            for (depth, twin, colour) in &plan.syncs {
+                record_twin_copy(list, &depth.texture, twin, *colour);
+            }
+            if !plan.prelude_copies.is_empty() {
+                // One all-resource UAV barrier ensures prior command lists' UAV writes
+                // in the same ExecuteCommandLists are visible to our hoisted CBV copies.
+                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(None),
+                        }),
+                    },
+                }]);
+                let mut dsts: Vec<&ID3D12Resource> = Vec::new();
+                let mut i = 0;
+                while i < plan.prelude_copies.len() {
+                    let (src, src_off, dst, dst_off, len_ref) = &plan.prelude_copies[i];
+                    let mut len = *len_ref;
+                    let src_raw = src.as_raw();
+                    let dst_raw = dst.as_raw();
+                    let mut cur_src_end = *src_off + len;
+                    let mut cur_dst_end = *dst_off + len;
+                    let mut j = i + 1;
+                    while j < plan.prelude_copies.len() {
+                        let (nsrc, nsrc_off, ndst, ndst_off, nlen) = &plan.prelude_copies[j];
+                        if nsrc.as_raw() == src_raw
+                            && ndst.as_raw() == dst_raw
+                            && *nsrc_off == cur_src_end
+                            && *ndst_off == cur_dst_end
+                        {
+                            len += *nlen;
+                            cur_src_end += *nlen;
+                            cur_dst_end += *nlen;
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    list.CopyBufferRegion(dst, *dst_off, src, *src_off, len);
+                    if !dsts.iter().any(|d| d.as_raw() == dst_raw) {
+                        dsts.push(dst);
+                    }
+                    i = j;
+                }
+                for dst in dsts {
+                    plan.barriers.push(transition(
+                        dst,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                    ));
+                }
+            }
+            if !plan.barriers.is_empty() {
+                list.ResourceBarrier(&plan.barriers);
+            }
+            list.Close()
+        })
+    };
+    if let Err(e) = recorded {
+        fail(format_args!("a host state prelude did not record ({e})"));
+    }
+    let cmd: ID3D12CommandList = list.cast().ok()?;
+    Some((cmd, pooled))
+}
 
 static PRELUDE_POOL: Mutex<Vec<StoredPrelude>> = Mutex::new(Vec::new());
 
@@ -946,8 +1051,7 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States =
-    std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
+type States = FastHashMap<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
 
 struct TwinUse {
     depth: std::sync::Arc<crate::resource::HostTexture>,
@@ -3688,6 +3792,8 @@ impl Host {
                 shadow_writes: Mutex::default(),
                 bindless_write_seq: std::sync::atomic::AtomicU64::new(0),
                 copy_seq: std::sync::atomic::AtomicU64::new(0),
+                state_seq: std::sync::atomic::AtomicU64::new(0),
+                gpu_write_seq: std::sync::atomic::AtomicU64::new(0),
                 reset_gen: std::sync::atomic::AtomicU64::new(1),
                 uav_dirty: std::sync::atomic::AtomicBool::new(true),
                 indirect_uav_dirty: std::sync::atomic::AtomicBool::new(true),
@@ -6132,7 +6238,8 @@ impl Host {
             }
         }
         let mut preludes: Vec<PooledPrelude> = Vec::new();
-        for list in runs {
+        let mut plans: Vec<(usize, SendPreludePlan)> = Vec::new();
+        for (idx, list) in runs.iter().enumerate() {
             #[cfg(feature = "diagnostics")]
             let t_def = std::time::Instant::now();
             list.run_deferred(&mut batch);
@@ -6140,16 +6247,69 @@ impl Host {
             {
                 prep_run_deferred += t_def.elapsed().as_micros() as u64;
             }
-            firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let t_pre = std::time::Instant::now();
-            if let Some((prelude_cmd, pooled)) = list.prelude(self) {
-                lists.push(Some(prelude_cmd));
-                preludes.push(pooled);
+            if let Some(plan) = list.plan_prelude() {
+                plans.push((idx, plan));
             }
             #[cfg(feature = "diagnostics")]
             {
                 prep_prelude += t_pre.elapsed().as_micros() as u64;
+            }
+        }
+        let mut recorded_preludes: Vec<SendCmdList> =
+            (0..runs.len()).map(|_| SendCmdList(None)).collect();
+        if !plans.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            let t_pre = std::time::Instant::now();
+            if plans.len() >= 4 {
+                let workers = plans.len().min(4);
+                let mut buckets: Vec<Vec<(usize, SendPreludePlan)>> =
+                    (0..workers).map(|_| Vec::new()).collect();
+                for (i, item) in plans.into_iter().enumerate() {
+                    buckets[i % workers].push(item);
+                }
+                let host_ptr = std::ptr::from_ref(self) as usize;
+                let outs: Vec<std::sync::Arc<Mutex<Vec<(usize, SendCmdList)>>>> = (0..workers)
+                    .map(|_| std::sync::Arc::new(Mutex::new(Vec::new())))
+                    .collect();
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                    .into_iter()
+                    .zip(outs.iter().cloned())
+                    .map(|(part, out)| {
+                        Box::new(move || {
+                            // SAFETY: `self` (`Host`) is `'static`/live for the entire `wide_run`,
+                            // and `wide_run` joins all workers before returning.
+                            let host = unsafe { &*(host_ptr as *const Host) };
+                            let mut local = Vec::with_capacity(part.len());
+                            for (idx, plan) in part {
+                                local.push((idx, SendCmdList(record_prelude(host, plan))));
+                            }
+                            *out.lock().unwrap_or_else(|e| e.into_inner()) = local;
+                        }) as Box<dyn FnOnce() + Send>
+                    })
+                    .collect();
+                crate::shadow::wide_run(jobs);
+                for out in outs {
+                    for (idx, rec) in std::mem::take(&mut *out.lock().unwrap_or_else(|e| e.into_inner())) {
+                        recorded_preludes[idx] = rec;
+                    }
+                }
+            } else {
+                for (idx, plan) in plans {
+                    recorded_preludes[idx] = SendCmdList(record_prelude(self, plan));
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                prep_prelude += t_pre.elapsed().as_micros() as u64;
+            }
+        }
+        for (list, rec) in runs.iter().zip(recorded_preludes) {
+            firsts.push(lists.len());
+            if let Some((prelude_cmd, pooled)) = rec.0 {
+                lists.push(Some(prelude_cmd));
+                preludes.push(pooled);
             }
             lists.push(list.list.cast().ok());
         }
@@ -6801,6 +6961,18 @@ impl HostList {
         self.copy_seq.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn state_seq(&self) -> u64 {
+        self.state_seq.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn bump_state_seq(&self) {
+        self.state_seq.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn gpu_write_seq(&self) -> u64 {
+        self.gpu_write_seq.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn reset_gen(&self) -> u64 {
         self.reset_gen.load(Ordering::Relaxed)
     }
@@ -7011,6 +7183,8 @@ impl HostList {
         }
         self.bindless_write_seq.store(0, Ordering::Relaxed);
         self.copy_seq.store(0, Ordering::Relaxed);
+        self.state_seq.store(0, Ordering::Relaxed);
+        self.gpu_write_seq.store(0, Ordering::Relaxed);
         self.reset_gen.fetch_add(1, Ordering::Relaxed);
         let old_deferred = std::mem::take(&mut *self.deferred());
         let old_states =
@@ -7087,7 +7261,12 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                if before != wanted {
+                    self.state_seq.fetch_add(1, Ordering::Relaxed);
+                    Some((texture, before))
+                } else {
+                    None
+                }
             }
         }
     }
@@ -7107,6 +7286,7 @@ impl HostList {
         };
         drop(states);
         if let Some(before) = before {
+            self.state_seq.fetch_add(1, Ordering::Relaxed);
             let barrier = transition(
                 &copy.texture,
                 D3D12_RESOURCE_STATES(before as i32),
@@ -7169,6 +7349,7 @@ impl HostList {
         if colour && let Some(plane) = &twin.plane {
             self.settle(plane, UNORDERED_ACCESS);
         }
+        self.state_seq.fetch_add(1, Ordering::Relaxed);
         true
     }
 
@@ -7244,7 +7425,7 @@ impl HostList {
         }
     }
 
-    fn prelude(&self, host: &Host) -> Option<(ID3D12CommandList, PooledPrelude)> {
+    fn plan_prelude(&self) -> Option<SendPreludePlan> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let deferred = self.deferred();
@@ -7270,7 +7451,7 @@ impl HostList {
         }
         let mut to_copy = Vec::new();
         let mut barriers = Vec::new();
-        let mut copying = std::collections::HashMap::new();
+        let mut copying = FastHashMap::default();
         for (depth, twin, colour) in &syncs {
             let (from, to) = if *colour {
                 (depth, &twin.colour)
@@ -7306,84 +7487,12 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() && prelude_copies.is_empty() {
             return None;
         }
-        let Some(pooled) = take_prelude(host) else {
-            fail(format_args!("no host list for a state prelude"));
-        };
-        let (allocator, list) = pooled.0.as_ref().expect("pooled prelude");
-        // SAFETY: the pooled prelude is not executing (returned to the pool
-        // only after its submission's GPU fence completed); the textures and
-        // scratch buffers are live for the duration of the submission.
-        let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
-                if !to_copy.is_empty() {
-                    list.ResourceBarrier(&to_copy);
-                }
-                for (depth, twin, colour) in &syncs {
-                    record_twin_copy(list, &depth.texture, twin, *colour);
-                }
-                if !prelude_copies.is_empty() {
-                    // One all-resource UAV barrier ensures prior command lists' UAV writes
-                    // in the same ExecuteCommandLists are visible to our hoisted CBV copies.
-                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                                pResource: std::mem::ManuallyDrop::new(None),
-                            }),
-                        },
-                    }]);
-                    let mut dsts: Vec<&ID3D12Resource> = Vec::new();
-                    let mut i = 0;
-                    while i < prelude_copies.len() {
-                        let (src, src_off, dst, dst_off, len_ref) = &prelude_copies[i];
-                        let mut len = *len_ref;
-                        let src_raw = src.as_raw();
-                        let dst_raw = dst.as_raw();
-                        let mut cur_src_end = *src_off + len;
-                        let mut cur_dst_end = *dst_off + len;
-                        let mut j = i + 1;
-                        while j < prelude_copies.len() {
-                            let (nsrc, nsrc_off, ndst, ndst_off, nlen) = &prelude_copies[j];
-                            if nsrc.as_raw() == src_raw
-                                && ndst.as_raw() == dst_raw
-                                && *nsrc_off == cur_src_end
-                                && *ndst_off == cur_dst_end
-                            {
-                                len += *nlen;
-                                cur_src_end += *nlen;
-                                cur_dst_end += *nlen;
-                                j += 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        list.CopyBufferRegion(dst, *dst_off, src, *src_off, len);
-                        if !dsts.iter().any(|d| d.as_raw() == dst_raw) {
-                            dsts.push(dst);
-                        }
-                        i = j;
-                    }
-                    for dst in dsts {
-                        barriers.push(transition(
-                            dst,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_GENERIC_READ,
-                        ));
-                    }
-                }
-                if !barriers.is_empty() {
-                    list.ResourceBarrier(&barriers);
-                }
-                list.Close()
-            })
-        };
-        if let Err(e) = recorded {
-            fail(format_args!("a host state prelude did not record ({e})"));
-        }
-        let cmd: ID3D12CommandList = list.cast().ok()?;
-        Some((cmd, pooled))
+        Some(SendPreludePlan {
+            to_copy,
+            syncs,
+            barriers,
+            prelude_copies: prelude_copies.clone(),
+        })
     }
 
     #[cfg(feature = "diagnostics")]
@@ -7467,6 +7576,8 @@ impl HostList {
 
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         self.copy_seq.fetch_add(1, Ordering::Relaxed);
+        self.state_seq.fetch_add(1, Ordering::Relaxed);
+        self.gpu_write_seq.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         let end = (dst as usize).saturating_add(len);
@@ -7507,10 +7618,14 @@ impl HostList {
         let key = (ptr, address, len);
         if deferred.refreshed.insert(key) {
             if !deferred.gpu_written.is_empty() {
+                let before = deferred.gpu_written.len();
                 let end = address.saturating_add(len);
                 deferred.gpu_written.retain(|&(p, a, n)| {
                     p != ptr || a >= end || a.saturating_add(n) <= address
                 });
+                if deferred.gpu_written.len() != before {
+                    self.gpu_write_seq.fetch_add(1, Ordering::Relaxed);
+                }
             }
             if !shadow.unwatched() && !shadow.guarded() {
                 deferred.has_kernel_watch = true;
@@ -7518,6 +7633,56 @@ impl HostList {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
+        }
+    }
+
+    /// Enqueues a batch of shadow refreshes (e.g. from `heap_buffers`) under a single
+    /// `self.deferred` lock acquisition.
+    pub(crate) fn defer_refresh_batch<'a, I>(&self, items: I)
+    where
+        I: IntoIterator<Item = (&'a std::sync::Arc<crate::shadow::Shadow>, &'a [(usize, usize)])>,
+    {
+        let mut deferred = self.deferred();
+        let mut dropped_gpu_write = false;
+        let now = moment();
+        for (shadow, spans) in items {
+            if shadow.is_in_place() {
+                if let Ok(obj) = shadow.buffer.cast::<windows::core::IUnknown>() {
+                    deferred.kept.push(obj);
+                }
+                continue;
+            }
+            shadow.touch_used(now);
+            let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+            let needs_watch = !shadow.unwatched() && !shadow.guarded();
+            for &(from, to) in spans {
+                let len = (to - from).min(shadow.left(from as u64) as usize);
+                if len == 0 {
+                    continue;
+                }
+                let key = (ptr, from, len);
+                if deferred.refreshed.insert(key) {
+                    if !deferred.gpu_written.is_empty() {
+                        let before = deferred.gpu_written.len();
+                        let end = from.saturating_add(len);
+                        deferred.gpu_written.retain(|&(p, a, n)| {
+                            p != ptr || a >= end || a.saturating_add(n) <= from
+                        });
+                        if deferred.gpu_written.len() != before {
+                            dropped_gpu_write = true;
+                        }
+                    }
+                    if needs_watch {
+                        deferred.has_kernel_watch = true;
+                    }
+                    deferred
+                        .copies
+                        .push(Step::Refresh(shadow.clone(), from, len));
+                }
+            }
+        }
+        if dropped_gpu_write {
+            self.gpu_write_seq.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -7736,6 +7901,8 @@ impl HostList {
 
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         self.copy_seq.fetch_add(1, Ordering::Relaxed);
+        self.state_seq.fetch_add(1, Ordering::Relaxed);
+        self.gpu_write_seq.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
@@ -8174,79 +8341,96 @@ impl Batch {
                 false
             }
         };
-        if wide_refresh() && self.refreshes.len() >= 2 {
+        let total_units = self.refreshes.len() + self.pending_textures.len();
+        if wide_refresh() && total_units >= 2 {
             let started = std::time::Instant::now();
-            let before = PREPARING[0].load(Ordering::Relaxed);
-            let mut all: Vec<_> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, spans)| {
-                    let bytes: usize = spans.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
-                    (bytes, shadow, spans)
-                })
-                .collect();
-            all.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.2.len().cmp(&a.2.len())));
-            let chunks = all.len().min(24);
-            let mut buckets: Vec<(usize, Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>)> =
-                (0..chunks).map(|_| (0, Vec::new())).collect();
-            for (bytes, shadow, spans) in all {
-                let target = buckets
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|&(_, &(w, ref v))| (w, v.len()))
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                buckets[target].0 = buckets[target].0.saturating_add(bytes);
-                buckets[target].1.push((shadow, spans));
-            }
-            buckets.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
-                .into_iter()
-                .filter(|(_, part)| !part.is_empty())
-                .map(|(_, part)| {
-                    Box::new(move || {
-                        for (shadow, spans) in part {
-                            for (from, to) in spans {
-                                Self::update(&shadow, from, to);
+            let before_buf = PREPARING[0].load(Ordering::Relaxed);
+            let before_tex = PREPARING[2].load(Ordering::Relaxed);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(32);
+            if !self.refreshes.is_empty() {
+                let mut all: Vec<_> = self
+                    .refreshes
+                    .drain(..)
+                    .map(|(shadow, spans)| {
+                        let bytes: usize = spans.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
+                        (bytes, shadow, spans)
+                    })
+                    .collect();
+                all.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.2.len().cmp(&a.2.len())));
+                let chunks = all.len().min(24);
+                let mut buckets: Vec<(
+                    usize,
+                    Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
+                )> = (0..chunks).map(|_| (0, Vec::new())).collect();
+                for (bytes, shadow, spans) in all {
+                    let target = buckets
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|&(_, &(w, ref v))| (w, v.len()))
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    buckets[target].0 = buckets[target].0.saturating_add(bytes);
+                    buckets[target].1.push((shadow, spans));
+                }
+                buckets.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                for (_, part) in buckets {
+                    if !part.is_empty() {
+                        jobs.push(Box::new(move || {
+                            for (shadow, spans) in part {
+                                for (from, to) in spans {
+                                    Self::update(&shadow, from, to);
+                                }
                             }
+                        }));
+                    }
+                }
+            }
+            if !self.pending_textures.is_empty() {
+                let mut texs: Vec<_> = self.pending_textures.drain(..).collect();
+                texs.sort_unstable_by(|a, b| {
+                    b.1.saturating_sub(b.0).cmp(&a.1.saturating_sub(a.0))
+                });
+                if texs.len() <= 16 {
+                    for (_, _, staging) in texs {
+                        jobs.push(Box::new(move || staging.refresh()));
+                    }
+                } else {
+                    let mut tex_buckets: Vec<Vec<std::sync::Arc<crate::texture::Staging>>> =
+                        (0..16).map(|_| Vec::new()).collect();
+                    for (i, (_, _, staging)) in texs.into_iter().enumerate() {
+                        tex_buckets[i % 16].push(staging);
+                    }
+                    for part in tex_buckets {
+                        if !part.is_empty() {
+                            jobs.push(Box::new(move || {
+                                for staging in part {
+                                    staging.refresh();
+                                }
+                            }));
                         }
-                    }) as Box<dyn FnOnce() + Send>
-                })
-                .collect();
+                    }
+                }
+            }
             crate::shadow::wide_run(jobs);
-            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(
-                summed.saturating_sub(started.elapsed().as_micros() as u64),
-                Ordering::Relaxed,
-            );
+            let wall = started.elapsed().as_micros() as u64;
+            let sum_buf = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before_buf);
+            let sum_tex = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before_tex);
+            let total_sum = sum_buf.saturating_add(sum_tex);
+            if total_sum > wall {
+                let excess = total_sum - wall;
+                let cut_buf = (u128::from(excess) * u128::from(sum_buf) / u128::from(total_sum)) as u64;
+                let cut_tex = excess - cut_buf;
+                PREPARING[0].fetch_sub(cut_buf.min(sum_buf), Ordering::Relaxed);
+                PREPARING[2].fetch_sub(cut_tex.min(sum_tex), Ordering::Relaxed);
+            }
         } else {
             for (shadow, spans) in self.refreshes.drain(..) {
                 for (from, to) in spans {
                     Self::update(&shadow, from, to);
                 }
             }
-        }
-        if !self.pending_textures.is_empty() {
-            if self.pending_textures.len() >= 4 {
-                let started = std::time::Instant::now();
-                let before = PREPARING[2].load(Ordering::Relaxed);
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                    .pending_textures
-                    .drain(..)
-                    .map(|(_, _, staging)| {
-                        Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>
-                    })
-                    .collect();
-                crate::shadow::wide_run(jobs);
-                let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
-                PREPARING[2].fetch_sub(
-                    summed.saturating_sub(started.elapsed().as_micros() as u64),
-                    Ordering::Relaxed,
-                );
-            } else {
-                for (_, _, staging) in self.pending_textures.drain(..) {
-                    staging.refresh();
-                }
+            for (_, _, staging) in self.pending_textures.drain(..) {
+                staging.refresh();
             }
         }
         for work in self.after_textures.drain(..) {

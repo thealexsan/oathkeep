@@ -286,7 +286,7 @@ static SHAPES_STORE: std::sync::RwLock<ShapeStore> = std::sync::RwLock::new(Shap
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
 });
-const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 const KIND_SHIFT: u32 = 30;
 const GENERATIONS: u32 = (1 << KIND_SHIFT) - 1;

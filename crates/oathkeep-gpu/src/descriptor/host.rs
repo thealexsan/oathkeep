@@ -335,7 +335,7 @@ impl DynamicMade {
 }
 
 const STAGE_STRIPES: usize = 64;
-const SLOTS_PER_STRIPE: usize = 1024;
+const SLOTS_PER_STRIPE: usize = 4096;
 
 struct StageEntry {
     key: u64,
@@ -2430,18 +2430,17 @@ impl HostHeap {
     }
 
     /// Looks up a mirrored slot's cached `StageAction` directly from the CPU staging
-    /// cache when `made_keys[index]` already matches the title descriptor at `handle`.
+    /// cache when `made_keys[index]` already matches the pre-read title descriptor `words`.
     /// Bypasses `VIEWS` RwLock, `View::clone`, `shadow::find`, and `placed_texture` on hits.
-    pub(crate) fn lookup_mirrored_stage(
+    pub(crate) fn lookup_mirrored_stage_words(
         &self,
         index: u32,
-        handle: u64,
+        words: [u32; 3],
     ) -> Option<(StageAction, Option<oathkeep_shader::ResourceType>, bool)> {
         if self.sampler || index >= self.count {
             return None;
         }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let [tag, i, generation] = words;
         if tag != VIEW_TAG {
             return None;
         }
@@ -2465,6 +2464,20 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::StageCacheHits, 1);
         Some((entry.action.clone(), entry.view_kind, entry.is_texture))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn lookup_mirrored_stage(
+        &self,
+        index: u32,
+        handle: u64,
+    ) -> Option<(StageAction, Option<oathkeep_shader::ResourceType>, bool)> {
+        if self.sampler || index >= self.count {
+            return None;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        self.lookup_mirrored_stage_words(index, words)
     }
 
     /// Copies a cached CPU staging descriptor into dynamic slot `index` via
