@@ -96,6 +96,11 @@ pub(crate) struct Staging {
     /// (`title_memory_reading`) instead of taking `no_wait()` /
     /// `refresh_unlocked()` or the 30-frame partial-read throttle.
     exact: std::sync::atomic::AtomicBool,
+    /// Levels on demand: whether high mips were temporarily clamped under
+    /// VRAM pressure so the slot upgrades automatically once room returns.
+    clamped_mips: std::sync::atomic::AtomicBool,
+    /// Title resource pointer (`This as usize`) for aliased-mutation tracking.
+    resource: usize,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -507,6 +512,535 @@ pub(crate) fn let_go() -> [u64; 2] {
     [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
 }
 
+/// Last time (`coarse_ms`) a draw-bound or bake texture uploaded, so
+/// speculative background prefetch yields staging/VRAM bandwidth to visible
+/// draws.
+static LAST_DRAW_UPLOAD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// True when a draw-bound or bake texture uploaded within the last 50 ms.
+pub(crate) fn draw_active_recently() -> bool {
+    let last = LAST_DRAW_UPLOAD_MS.load(std::sync::atomic::Ordering::Relaxed);
+    last != 0 && crate::host::coarse_ms().saturating_sub(last) <= 50
+}
+
+/// Whether proactive LRU eviction of cold picked-by-index descriptor slots is
+/// enabled (`OATHKEEP_TEXTURE_LRU_EVICT=0` disables; on by default).
+fn lru_evict_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_LRU_EVICT").is_none_or(|v| v != "0"))
+}
+
+/// Tracked resident texture metadata for VRAM LRU eviction.
+#[derive(Clone, Copy, Debug)]
+struct LruEntry {
+    resource: usize,
+    start: u64,
+    bytes: u64,
+    last_used_ms: u64,
+    /// 0 when uploaded only via picked-by-index sweep; non-zero timestamp when
+    /// bound directly by a draw or decoration bake.
+    draw_bound_ms: u64,
+}
+
+/// Generic fence-deferred drop queue: ensures evicted GPU objects are never
+/// released until every submission that could have read them has finished plus
+/// `lag` safety submissions.
+#[cfg_attr(not(test), allow(dead_code))]
+struct FenceRetireQueue<T> {
+    pending: std::collections::VecDeque<(u64, T)>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<T> FenceRetireQueue<T> {
+    const fn new() -> Self {
+        Self { pending: std::collections::VecDeque::new() }
+    }
+
+    fn retire(&mut self, submitted_fence: u64, item: T) {
+        self.pending.push_back((submitted_fence, item));
+    }
+
+    fn drain_completed(&mut self, finished_fence: u64, lag: u64) -> Vec<T> {
+        let safe = finished_fence.saturating_sub(lag);
+        let mut ready = Vec::new();
+        while let Some(&(fence, _)) = self.pending.front()
+            && fence <= safe
+        {
+            if let Some((_, item)) = self.pending.pop_front() {
+                ready.push(item);
+            }
+        }
+        ready
+    }
+
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+/// LRU tracker for cold picked-by-index textures and cached view-heap slot
+/// mappings so VRAM eviction unpins cold descriptor slots cleanly before
+/// `resource::let_go_idle()` reclaims their host copies.
+#[derive(Default)]
+struct LruTracker {
+    entries: HashMap<u64, LruEntry>,
+    by_resource: HashMap<usize, u64>,
+    slots_by_start: HashMap<u64, Vec<u32>>,
+    scan_cursor: u32,
+}
+
+impl LruTracker {
+    const MAX_ENTRIES: usize = 65_536;
+
+    fn note_upload(&mut self, resource: usize, start: u64, bytes: u64, now_ms: u64, draw_bound: bool) {
+        if start == 0 || bytes == 0 {
+            return;
+        }
+        if let Some(old_start) = self.by_resource.insert(resource, start)
+            && old_start != start
+        {
+            self.entries.remove(&old_start);
+            self.slots_by_start.remove(&old_start);
+        }
+        let entry = self.entries.entry(start).or_insert(LruEntry {
+            resource,
+            start,
+            bytes,
+            last_used_ms: now_ms,
+            draw_bound_ms: 0,
+        });
+        entry.resource = resource;
+        entry.bytes = entry.bytes.max(bytes);
+        entry.last_used_ms = now_ms;
+        if draw_bound {
+            entry.draw_bound_ms = now_ms.max(1);
+        }
+        if self.entries.len() > Self::MAX_ENTRIES
+            && let Some((&oldest_start, &oldest_entry)) = self
+                .entries
+                .iter()
+                .filter(|(_, e)| e.draw_bound_ms == 0)
+                .min_by_key(|(_, e)| e.last_used_ms)
+        {
+            self.entries.remove(&oldest_start);
+            self.slots_by_start.remove(&oldest_start);
+            self.by_resource.remove(&oldest_entry.resource);
+        }
+    }
+
+    fn seed_from_heap(&mut self, resource: usize, start: u64, bytes: u64, slot: u32, now_ms: u64) {
+        if start == 0 || bytes == 0 {
+            return;
+        }
+        let slots = self.slots_by_start.entry(start).or_default();
+        if !slots.contains(&slot) {
+            slots.push(slot);
+        }
+        if !self.entries.contains_key(&start) && self.entries.len() < Self::MAX_ENTRIES {
+            // Seed discovered slots as slightly aged so already-resident cold
+            // textures from earlier scenes can be evicted without waiting a
+            // full fresh window when the card is already full.
+            let seeded_ms = now_ms.saturating_sub(5_000);
+            self.entries.insert(
+                start,
+                LruEntry { resource, start, bytes, last_used_ms: seeded_ms, draw_bound_ms: 0 },
+            );
+            self.by_resource.insert(resource, start);
+        }
+    }
+
+    fn forget_resource(&mut self, resource: usize) {
+        if let Some(start) = self.by_resource.remove(&resource) {
+            self.entries.remove(&start);
+            self.slots_by_start.remove(&start);
+        }
+    }
+
+    fn remove_evicted(&mut self, start: u64) {
+        if let Some(entry) = self.entries.remove(&start) {
+            self.by_resource.remove(&entry.resource);
+        }
+        self.slots_by_start.remove(&start);
+    }
+
+    /// Selects cold eviction candidates ordered by priority:
+    /// 1) unmapped dead textures first (zero visual impact),
+    /// 2) cold picked-only textures (oldest `last_used_ms` first),
+    /// 3) under Critical VRAM pressure only, long-idle draw-bound textures.
+    fn select_victims(
+        &self,
+        now_ms: u64,
+        reclaim_bytes: u64,
+        level: crate::residency::VramLevel,
+        is_staged: impl Fn(usize) -> bool,
+        is_host_written: impl Fn(usize) -> bool,
+        is_mapped: impl Fn(u64) -> bool,
+    ) -> Vec<(u64, usize, u64, bool)> {
+        let (min_idle_ms, draw_pin_ms) = match level {
+            crate::residency::VramLevel::Normal => (u64::MAX, u64::MAX),
+            crate::residency::VramLevel::High => (8_000, u64::MAX),
+            crate::residency::VramLevel::Critical => (4_000, 20_000),
+        };
+        // (tier, last_used_ms, start, resource, bytes, unmapped)
+        let mut candidates: Vec<(u8, u64, u64, usize, u64, bool)> = Vec::new();
+        for entry in self.entries.values() {
+            if is_staged(entry.resource) || is_host_written(entry.resource) {
+                continue;
+            }
+            let mapped = is_mapped(entry.start);
+            if !mapped {
+                candidates.push((0, entry.last_used_ms, entry.start, entry.resource, entry.bytes, true));
+                continue;
+            }
+            if reclaim_bytes == 0 {
+                continue;
+            }
+            let idle = now_ms.saturating_sub(entry.last_used_ms);
+            if idle < min_idle_ms {
+                continue;
+            }
+            if entry.draw_bound_ms == 0 {
+                candidates.push((1, entry.last_used_ms, entry.start, entry.resource, entry.bytes, false));
+            } else if now_ms.saturating_sub(entry.draw_bound_ms) >= draw_pin_ms {
+                candidates.push((2, entry.last_used_ms, entry.start, entry.resource, entry.bytes, false));
+            }
+        }
+        candidates.sort_unstable_by_key(|&(tier, last_used, start, ..)| (tier, last_used, start));
+        let mut out = Vec::new();
+        let mut planned = 0u64;
+        const MAX_VICTIMS_PER_SWEEP: usize = 512;
+        for (_, _, start, resource, bytes, unmapped) in candidates {
+            if out.len() >= MAX_VICTIMS_PER_SWEEP {
+                break;
+            }
+            if !unmapped && planned >= reclaim_bytes {
+                break;
+            }
+            planned = planned.saturating_add(bytes);
+            out.push((start, resource, bytes, unmapped));
+        }
+        out
+    }
+}
+
+static PICKED_LRU: Mutex<Option<LruTracker>> = Mutex::new(None);
+/// Cumulative LRU eviction counters: slots armed, slots unmade, bytes reclaimed.
+static LRU_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Records an uploaded picked-by-index texture in the LRU tracker.
+pub(crate) fn note_picked_upload(resource: This, copy: &crate::resource::HostTexture, staging: &Staging) {
+    let now = crate::host::now_ms();
+    let bytes = staging.bytes.max(staging.read as u64);
+    let _ = copy.serial;
+    let mut lru = PICKED_LRU.lock().unwrap_or_else(|e| e.into_inner());
+    lru.get_or_insert_with(LruTracker::default).note_upload(
+        resource as usize,
+        staging.memory as u64,
+        bytes,
+        now,
+        false,
+    );
+}
+
+fn note_draw_upload(resource: This, start: u64, bytes: u64) {
+    let now = crate::host::now_ms();
+    let mut lru = PICKED_LRU.lock().unwrap_or_else(|e| e.into_inner());
+    lru.get_or_insert_with(LruTracker::default).note_upload(resource as usize, start, bytes, now, true);
+}
+
+/// Tracked aliased or previously mutated picked textures so post-upload writes
+/// through secondary virtual mappings are caught even after `RECHECK_FRAMES`
+/// finishes.
+struct AliasedWatch {
+    resource: usize,
+    start: u64,
+    len: u64,
+    print: u64,
+    holds: std::sync::Weak<crate::resource::Holds>,
+}
+
+#[derive(Default)]
+struct AliasedMonitor {
+    entries: HashMap<u64, AliasedWatch>,
+    cursor: usize,
+}
+
+impl AliasedMonitor {
+    const MAX_WATCHED: usize = 1024;
+    const POLL_PER_SWEEP: usize = 128;
+
+    fn watch(
+        &mut self,
+        resource: usize,
+        start: u64,
+        len: u64,
+        print: u64,
+        holds: std::sync::Weak<crate::resource::Holds>,
+    ) {
+        if start == 0 || len == 0 {
+            return;
+        }
+        if !self.entries.contains_key(&start) && self.entries.len() >= Self::MAX_WATCHED {
+            if let Some(&drop_key) = self.entries.keys().next() {
+                self.entries.remove(&drop_key);
+            }
+        }
+        self.entries.insert(start, AliasedWatch { resource, start, len, print, holds });
+    }
+
+    fn forget_resource(&mut self, resource: usize) {
+        self.entries.retain(|_, w| w.resource != resource);
+    }
+}
+
+static WATCHED_ALIASED: Mutex<Option<AliasedMonitor>> = Mutex::new(None);
+static ALIASED_REFRESHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Polls watched aliased/mutating picked textures and wakes their descriptor
+/// slots via `descriptor::host::remapped` whenever their bytes change.
+fn poll_aliased_mutations() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let batch: Vec<(u64, u64, u64, std::sync::Weak<crate::resource::Holds>)> = {
+        let mut guard = WATCHED_ALIASED.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mon) = guard.as_mut() else { return };
+        if mon.entries.is_empty() {
+            return;
+        }
+        let keys: Vec<u64> = mon.entries.keys().copied().collect();
+        let n = keys.len();
+        let take = n.min(AliasedMonitor::POLL_PER_SWEEP);
+        let start_idx = mon.cursor % n;
+        mon.cursor = (start_idx + take) % n;
+        let mut out = Vec::with_capacity(take);
+        for offset in 0..take {
+            let key = keys[(start_idx + offset) % n];
+            if let Some(w) = mon.entries.get(&key) {
+                out.push((w.start, w.len, w.print, w.holds.clone()));
+            }
+        }
+        out
+    };
+    let mut dead = Vec::new();
+    let mut updated = Vec::new();
+    for (start, len, prev_print, weak_holds) in batch {
+        let Some(holds) = weak_holds.upgrade() else {
+            dead.push(start);
+            continue;
+        };
+        if !committed(start as *const u8, 1) {
+            dead.push(start);
+            continue;
+        }
+        let now_print = fingerprint(start, len);
+        if now_print != prev_print {
+            // Invalidate the cached digest so `unchanged()` cannot short-circuit
+            // the re-upload on the next texture pass.
+            *holds.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            crate::descriptor::host::remapped(start as usize, len as usize);
+            updated.push((start, now_print));
+            let total = ALIASED_REFRESHED.fetch_add(1, Relaxed) + 1;
+            if total == 1 || total.is_multiple_of(128) {
+                tracing::info!(
+                    refreshed = total,
+                    address = format_args!("{start:#x}"),
+                    bytes = len,
+                    "refreshed mutated picked texture backed by aliased pages"
+                );
+            }
+        }
+    }
+    if !dead.is_empty() || !updated.is_empty() {
+        let mut guard = WATCHED_ALIASED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mon) = guard.as_mut() {
+            for start in dead {
+                mon.entries.remove(&start);
+            }
+            for (start, new_print) in updated {
+                if let Some(w) = mon.entries.get_mut(&start) {
+                    w.print = new_print;
+                }
+            }
+        }
+    }
+}
+
+/// Incrementally indexes made view-heap texture slots under VRAM pressure and
+/// evicts cold picked-by-index slots via `HostHeap::texture_slot_gone`, whose
+/// `unmake` path retires D3D12 resources behind in-flight GPU fences so
+/// `resource::let_go_idle()` can safely reclaim VRAM without UAF or TDR.
+fn evict_cold_picked() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !lru_evict_enabled() {
+        return;
+    }
+    let plan = crate::residency::sample_vram();
+    let room_now = crate::resource::room_lately();
+    let level = if !room_now && plan.level != crate::residency::VramLevel::Critical {
+        crate::residency::VramLevel::Critical
+    } else {
+        plan.level
+    };
+    let reclaim_bytes = if level == crate::residency::VramLevel::Critical && plan.reclaim_bytes == 0 {
+        256 << 20
+    } else {
+        plan.reclaim_bytes
+    };
+    if level == crate::residency::VramLevel::Normal {
+        return;
+    }
+    let Some(heap_ptr) = crate::descriptor::lent_heap() else {
+        return;
+    };
+    let now_ms = crate::host::now_ms();
+    // Phase 1: Incrementally discover made view-heap texture slots (1 atomic
+    // load per empty slot) without touching `r.host.used`.
+    let scan_budget: u32 = if level == crate::residency::VramLevel::Critical { 262_144 } else { 131_072 };
+    let mut discovered: Vec<(usize, u64, u64, u32)> = Vec::new();
+    let start_cursor = {
+        let lru = PICKED_LRU.lock().unwrap_or_else(|e| e.into_inner());
+        lru.as_ref().map_or(0, |l| l.scan_cursor)
+    };
+    let next_cursor = crate::descriptor::with_heap(heap_ptr, |heap| {
+        let Some(host) = heap.host() else {
+            return start_cursor;
+        };
+        let count = host.count();
+        if count == 0 {
+            return 0;
+        }
+        let steps = scan_budget.min(count);
+        let mut cursor = start_cursor % count;
+        for _ in 0..steps {
+            let slot = cursor;
+            cursor += 1;
+            if cursor >= count {
+                cursor = 0;
+            }
+            if host.shows_none(slot) {
+                continue;
+            }
+            let Some(view) = heap.handle(slot).and_then(crate::descriptor::view) else {
+                continue;
+            };
+            match view {
+                crate::descriptor::View::Placed(false, res_desc, desc) if res_desc[0] != 1 => {
+                    let start = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
+                    if let Some(res) = crate::resource::placed_known(start, &res_desc)
+                        && let Some((2, bytes, mem)) = crate::resource::copy_state(res)
+                    {
+                        discovered.push((res as usize, mem, bytes, slot));
+                    }
+                }
+                crate::descriptor::View::Shader(res, _) if crate::resource::title_fills(res as This) => {
+                    if let Some((2, bytes, mem)) = crate::resource::copy_state(res as This) {
+                        discovered.push((res, mem, bytes, slot));
+                    }
+                }
+                _ => {}
+            }
+        }
+        cursor
+    })
+    .unwrap_or(start_cursor);
+
+    let staged_set: std::collections::HashSet<usize> = STAGING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|m| m.keys().copied().collect())
+        .unwrap_or_default();
+    let written_set: std::collections::HashSet<usize> = HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+
+    // Phase 2: Select coldest victims with their slot lists under `PICKED_LRU`,
+    // then drop the lock before touching `HostHeap`.
+    let victims: Vec<(u64, u64, Vec<u32>)> = {
+        let mut guard = PICKED_LRU.lock().unwrap_or_else(|e| e.into_inner());
+        let lru = guard.get_or_insert_with(LruTracker::default);
+        lru.scan_cursor = next_cursor;
+        for (res, start, bytes, slot) in discovered {
+            lru.seed_from_heap(res, start, bytes, slot, now_ms);
+        }
+        let chosen = lru.select_victims(
+            now_ms,
+            reclaim_bytes,
+            level,
+            |res| staged_set.contains(&res),
+            |res| written_set.contains(&res),
+            |start| committed(start as *const u8, 1),
+        );
+        chosen
+            .into_iter()
+            .filter_map(|(start, _, bytes, _)| {
+                let slots = lru.slots_by_start.get(&start)?.clone();
+                (!slots.is_empty()).then_some((start, bytes, slots))
+            })
+            .collect()
+    };
+
+    if victims.is_empty() {
+        return;
+    }
+
+    // Phase 3: Arm or complete fence-deferred slot eviction via
+    // `HostHeap::texture_slot_gone`.
+    let mut evicted_starts = Vec::new();
+    let (mut armed, mut unmade, mut freed_bytes) = (0u64, 0u64, 0u64);
+    let _ = crate::descriptor::with_view_heap(|host| {
+        for (start, bytes, slots) in &victims {
+            let mut all_gone = true;
+            let mut any_unmade = false;
+            for &slot in slots {
+                if host.shows_none(slot) {
+                    continue;
+                }
+                if host.texture_slot_gone(slot) {
+                    unmade += 1;
+                    any_unmade = true;
+                } else {
+                    armed += 1;
+                    all_gone = false;
+                }
+            }
+            if all_gone {
+                evicted_starts.push(*start);
+                if any_unmade {
+                    freed_bytes = freed_bytes.saturating_add(*bytes);
+                }
+            }
+        }
+    });
+
+    if !evicted_starts.is_empty() {
+        let mut guard = PICKED_LRU.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lru) = guard.as_mut() {
+            for start in evicted_starts {
+                lru.remove_evicted(start);
+            }
+        }
+    }
+
+    if armed > 0 || unmade > 0 {
+        let prev_unmade = LRU_STATS[1].fetch_add(unmade, Relaxed);
+        LRU_STATS[0].fetch_add(armed, Relaxed);
+        let total_bytes = LRU_STATS[2].fetch_add(freed_bytes, Relaxed) + freed_bytes;
+        if unmade > 0 && (prev_unmade == 0 || (prev_unmade + unmade) / 256 > prev_unmade / 256) {
+            tracing::info!(
+                level = ?level,
+                unmade_slots = unmade,
+                armed_slots = armed,
+                reclaimed_mib = freed_bytes >> 20,
+                total_reclaimed_mib = total_bytes >> 20,
+                "evicted cold picked-by-index texture slots to relieve VRAM pressure"
+            );
+        }
+    }
+}
+
 /// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
 /// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
 /// texture, kept so that an unchanged texture is not uploaded again, and
@@ -517,6 +1051,8 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    poll_aliased_mutations();
+    evict_cold_picked();
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -639,6 +1175,12 @@ pub(crate) fn forget(resource: usize) {
     let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(through) = through.as_mut() {
         through.remove(&resource);
+    }
+    if let Some(lru) = PICKED_LRU.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        lru.forget_resource(resource);
+    }
+    if let Some(mon) = WATCHED_ALIASED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        mon.forget_resource(resource);
     }
 }
 
@@ -766,6 +1308,12 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         staging.exact.store(true, Relaxed);
     }
     let picking = PICKING.get();
+    if picking.is_none() || baking {
+        LAST_DRAW_UPLOAD_MS.store(crate::host::coarse_ms().max(1), Relaxed);
+        note_draw_upload(resource, staging.memory as u64, staging.bytes.max(staging.read as u64));
+    } else {
+        note_picked_upload(resource, &copy, &staging);
+    }
     if picking.is_none() {
         // A draw samples it through a table: kept and checked from here on.
         staging.once.store(false, Relaxed);
@@ -871,7 +1419,8 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     };
     list.defer_texture(staging.clone());
     list.defer_host(move || {
-        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
+        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64)
+            || staging.clamped_mips.load(Relaxed);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
         // upload: its slots are made due again by the texture pass.
@@ -1191,7 +1740,7 @@ impl Staging {
                 held |= 1 << level;
             }
         }
-        if tail < mips.len() && there(0, self.layout.alignment.min(self.layout.slice_size)) {
+        if tail < mips.len() && there(0, self.layout.alignment.max(1).min(self.layout.slice_size)) {
             for level in tail..mips.len() {
                 if level as u64 >= first {
                     held |= 1 << level;
@@ -1199,6 +1748,12 @@ impl Staging {
             }
         }
         held
+    }
+
+    /// Whether `refresh()` has populated valid title bytes into this staging
+    /// buffer (false when pages were transiently unmapped during remap).
+    pub(crate) fn has_data(&self) -> bool {
+        self.last.lock().unwrap_or_else(|e| e.into_inner()).hash.is_some()
     }
 
     /// Forgets what the staging buffer was last filled from: the next
@@ -1220,10 +1775,37 @@ impl Staging {
     }
 
     /// The host copy holds what the staging buffer was filled from
-    /// ([`unchanged`]).
+    /// ([`unchanged`]). Also registers aliased-page or previously mutated
+    /// picked textures so later writes through secondary mappings are caught
+    /// cleanly even after `RECHECK_FRAMES` expires.
     fn note_held(&self) {
         let hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).hash;
-        *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash.map(|hash| (self.first, hash));
+        let prev = {
+            let mut slot = self.holds.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = *slot;
+            *slot = hash.map(|hash| (self.first, hash));
+            prev
+        };
+        let mutated = match (prev, hash) {
+            (Some((_, old)), Some(new)) => old != new,
+            _ => false,
+        };
+        if hash.is_some() && self.once.load(std::sync::atomic::Ordering::Relaxed) {
+            let start = self.memory as usize;
+            let end = start.saturating_add(self.read);
+            let aliased = mutated || !crate::inplace::shown_elsewhere(start & !0xffff, end).is_empty();
+            if aliased {
+                let print = fingerprint(start as u64, self.read as u64);
+                let mut guard = WATCHED_ALIASED.lock().unwrap_or_else(|e| e.into_inner());
+                guard.get_or_insert_with(AliasedMonitor::default).watch(
+                    self.resource,
+                    start as u64,
+                    self.read as u64,
+                    print,
+                    Arc::downgrade(&self.holds),
+                );
+            }
+        }
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
@@ -1354,7 +1936,8 @@ impl Staging {
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
-            if !exact && last.partial.is_some_and(|at| frame < at + 30) {
+            let partial_wait = if last.hash.is_none() || (hot_textures() && frame < last.hot_until) { 4 } else { 30 };
+            if !exact && last.partial.is_some_and(|at| frame < at + partial_wait) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -1366,12 +1949,16 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return false;
                 }
-                last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
+                let all_zero = read.iter().all(|&b| b == 0);
+                // Do not latch an initial all-zero read as a valid held hash;
+                // if previous non-zero data was cleared to zero, still detile
+                // so stale texels do not remain in VRAM.
+                if all_zero && last.hash.is_none() {
                     return false;
                 }
+                last.hash = Some(hash);
                 self.detile(read);
-                true
+                !all_zero
             });
             #[cfg(feature = "diagnostics")]
             if changed {
@@ -1498,7 +2085,15 @@ impl Staging {
             let judged = self.judgement();
             self.judged[0].store(judged[0], Relaxed);
             self.judged[1].store(judged[1], Relaxed);
-            let held = self.held_levels(judged);
+            let full_held = self.held_levels(judged);
+            let held = clamp_speculative_mips(
+                full_held,
+                self.layout.first_tail_mip,
+                self.layout.mips.len(),
+                self.once.load(Relaxed),
+                crate::residency::vram_level(),
+            );
+            self.clamped_mips.store(held != full_held, Relaxed);
             self.detiled.store(held, Relaxed);
             held
         } else {
@@ -1558,31 +2153,95 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     Some((at as u64, len as u64))
 }
 
+/// Clamps high mip levels for speculative on-demand textures under VRAM
+/// pressure so visible surfaces receive mip-tail / lower mips instead of
+/// starving on `neutral()`. Never drops every available mip.
+fn clamp_speculative_mips(
+    held: u32,
+    first_tail_mip: u32,
+    mips_len: usize,
+    speculative: bool,
+    vram: crate::residency::VramLevel,
+) -> u32 {
+    if held == 0 || !speculative || mips_len <= 1 {
+        return held;
+    }
+    match vram {
+        crate::residency::VramLevel::Normal => held,
+        crate::residency::VramLevel::High => {
+            // Defer mip 0 (~75% of texture VRAM) when smaller mips are mapped.
+            let without_top = held & !1u32;
+            if without_top != 0 { without_top } else { held }
+        }
+        crate::residency::VramLevel::Critical => {
+            // Keep the packed mip tail plus one level above it so surfaces stay
+            // textured with minimal tile usage until VRAM recovers.
+            let keep_from = first_tail_mip.saturating_sub(1).min(mips_len.saturating_sub(1) as u32).min(31);
+            let mask = !((1u32 << keep_from) - 1);
+            let clamped = held & mask;
+            if clamped != 0 {
+                clamped
+            } else {
+                // Fall back to the smallest mapped level so we never return 0.
+                1u32 << (31 - held.leading_zeros())
+            }
+        }
+    }
+}
+
+/// Byte windows `(offset, len)` hashed by [`fingerprint`]: covers the whole
+/// texture up to 48 KiB, otherwise the first 16 KiB (packed mip tail) plus 8
+/// evenly distributed 4 KiB windows across the remainder (48 KiB total budget)
+/// so mutations in any mip level are detected cleanly.
+fn fingerprint_windows(len: usize) -> Vec<(usize, usize)> {
+    const HEAD: usize = 16 << 10;
+    const SLICE: usize = 4 << 10;
+    const SLICES: usize = 8;
+    const WHOLE: usize = HEAD + SLICES * SLICE;
+    if len == 0 {
+        return Vec::new();
+    }
+    if len <= WHOLE {
+        return vec![(0, len)];
+    }
+    let mut out = Vec::with_capacity(1 + SLICES);
+    out.push((0, HEAD));
+    let tail_start = HEAD;
+    let tail_end = len - SLICE;
+    let span = tail_end - tail_start;
+    for i in 0..SLICES {
+        let raw = if i + 1 == SLICES {
+            tail_end
+        } else {
+            tail_start + span * i / (SLICES - 1)
+        };
+        let aligned = if i + 1 == SLICES { raw } else { (raw & !0xfff).clamp(tail_start, tail_end) };
+        out.push((aligned, SLICE));
+    }
+    out
+}
+
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
-/// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
-/// (a texture streams in whole mips; the small ones lie first). Read
-/// through the kernel, so pages not there count as zeros.
+/// it up to 48 KiB, else of 16 KiB at its start plus 8 evenly-spaced 4 KiB
+/// windows spanning the rest of the mip chain. Read through the kernel, so
+/// pages not there count as zeros.
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
-    const WINDOW: usize = 16 << 10;
+    const MAX_WINDOW: usize = 48 << 10;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     let len = len as usize;
+    let windows = fingerprint_windows(len);
     let mut print = 0u128;
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        read.resize(3 * WINDOW, 0);
-        let mut take = |from: usize, bytes: usize| {
+        if read.len() < MAX_WINDOW {
+            read.resize(MAX_WINDOW, 0);
+        }
+        for (from, bytes) in windows {
             read[..bytes].fill(0);
             crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
             print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
-        };
-        if len <= 3 * WINDOW {
-            take(0, len);
-        } else {
-            take(0, WINDOW);
-            take((len / 2) & !0xfff, WINDOW);
-            take(len - WINDOW, WINDOW);
         }
     });
     let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
@@ -1892,7 +2551,8 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         None => {
             let speculative = PICKING.get().is_some() && !BAKING.get();
             if crate::residency::upload_refused()
-                || (speculative && !crate::residency::allow_staging_growth(false))
+                || (speculative
+                    && !crate::residency::allow_speculative_staging(total, draw_active_recently()))
             {
                 crate::residency::note_staging_deferred();
                 return None;
@@ -1939,6 +2599,8 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
+        clamped_mips: std::sync::atomic::AtomicBool::new(false),
+        resource: resource as usize,
     });
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -2052,6 +2714,114 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+
+    #[test]
+    fn lru_eviction_orders_unmapped_then_cold_picked_and_protects_active_draws() {
+        use super::LruTracker;
+        use crate::residency::VramLevel;
+
+        let mut lru = LruTracker::default();
+        // 1: cold picked-only texture (oldest)
+        lru.note_upload(1, 0x1000_0000, 4 << 20, 1_000, false);
+        // 2: newer picked-only texture
+        lru.note_upload(2, 0x2000_0000, 4 << 20, 3_000, false);
+        // 3: recently draw-bound texture (must be protected under High)
+        lru.note_upload(3, 0x3000_0000, 8 << 20, 500, true);
+        // 4: unmapped dead picked texture (highest eviction priority even if fresh)
+        lru.note_upload(4, 0x4000_0000, 2 << 20, 14_500, false);
+        // 5: currently staged texture (must NEVER be evicted)
+        lru.note_upload(5, 0x5000_0000, 4 << 20, 100, false);
+        // 6: host-written texture (must NEVER be evicted)
+        lru.note_upload(6, 0x6000_0000, 4 << 20, 100, false);
+
+        let now = 15_000;
+        let victims = lru.select_victims(
+            now,
+            6 << 20,
+            VramLevel::High,
+            |res| res == 5,
+            |res| res == 6,
+            |start| start != 0x4000_0000,
+        );
+        // Expected order: unmapped #4 (2 MiB) + coldest picked #1 (4 MiB) = 6 MiB.
+        assert_eq!(victims.iter().map(|v| v.1).collect::<Vec<_>>(), vec![4, 1]);
+        assert!(victims[0].3);
+        assert!(!victims[1].3);
+
+        // Under Critical pressure after draw pin window (20s) expires, #3 becomes eligible
+        // only after all colder picked-only textures (#1, #2).
+        let crit = lru.select_victims(
+            30_000,
+            20 << 20,
+            VramLevel::Critical,
+            |res| res == 5,
+            |res| res == 6,
+            |start| start != 0x4000_0000,
+        );
+        assert_eq!(crit.iter().map(|v| v.1).collect::<Vec<_>>(), vec![4, 1, 2, 3]);
+    }
+
+    #[test]
+    fn fence_retire_queue_defers_drops_until_gpu_fence_and_lag_complete() {
+        use super::FenceRetireQueue;
+        let mut q = FenceRetireQueue::new();
+        q.retire(10, "tex_a");
+        q.retire(12, "tex_b");
+        q.retire(20, "tex_c");
+
+        // At finished=15 with lag=4 (safe=11), only tex_a (fence 10) may drop.
+        assert_eq!(q.drain_completed(15, 4), vec!["tex_a"]);
+        assert_eq!(q.len(), 2);
+        // At finished=15 with lag=4 again, tex_b (fence 12) stays pinned.
+        assert!(q.drain_completed(15, 4).is_empty());
+        // At finished=16 with lag=4 (safe=12), tex_b drops while tex_c stays pinned.
+        assert_eq!(q.drain_completed(16, 4), vec!["tex_b"]);
+        assert_eq!(q.len(), 1);
+        // At finished=24 with lag=4 (safe=20), tex_c drops cleanly.
+        assert_eq!(q.drain_completed(24, 4), vec!["tex_c"]);
+        assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn clamp_speculative_mips_preserves_mip_tail_under_vram_pressure() {
+        use super::clamp_speculative_mips;
+        use crate::residency::VramLevel;
+
+        let all_9 = (1u32 << 9) - 1; // mips 0..=8, first_tail_mip = 6
+        // Draw-bound textures always keep every mapped level.
+        assert_eq!(clamp_speculative_mips(all_9, 6, 9, false, VramLevel::Critical), all_9);
+        // Normal VRAM keeps every mapped level.
+        assert_eq!(clamp_speculative_mips(all_9, 6, 9, true, VramLevel::Normal), all_9);
+        // High VRAM defers mip 0 while keeping mips 1..=8.
+        assert_eq!(clamp_speculative_mips(all_9, 6, 9, true, VramLevel::High), all_9 & !1);
+        // Critical VRAM keeps mip tail + one level above it (mips 5..=8).
+        assert_eq!(clamp_speculative_mips(all_9, 6, 9, true, VramLevel::Critical), 0b1_1110_0000);
+        // Never returns 0 when only mip 0 is mapped.
+        assert_eq!(clamp_speculative_mips(1, 6, 9, true, VramLevel::Critical), 1);
+    }
+
+    #[test]
+    fn fingerprint_detects_mid_mip_mutations_within_48k_budget() {
+        use super::{fingerprint, fingerprint_windows};
+
+        // Total hashed bytes stays <= 48 KiB even for an 8 MiB texture, while
+        // spanning head, quarter-points, middle, and tail.
+        let windows = fingerprint_windows(8 << 20);
+        let total: usize = windows.iter().map(|&(_, len)| len).sum();
+        assert!(total <= 48 << 10);
+        assert_eq!(windows.len(), 9);
+        assert_eq!(windows.first().copied(), Some((0, 16 << 10)));
+        assert_eq!(windows.last().copied(), Some(((8 << 20) - (4 << 10), 4 << 10)));
+
+        // Mutating a byte in the ~25% region of a 256 KiB texture changes its fingerprint.
+        let mut buf = vec![0x33u8; 256 << 10];
+        let before = fingerprint(buf.as_ptr() as u64, buf.len() as u64);
+        assert_ne!(before, 0);
+        let probe_at = fingerprint_windows(buf.len())[2].0 + 17;
+        buf[probe_at] ^= 0xff;
+        let after = fingerprint(buf.as_ptr() as u64, buf.len() as u64);
+        assert_ne!(before, after);
     }
 }
 
