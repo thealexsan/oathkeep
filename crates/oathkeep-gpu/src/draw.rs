@@ -239,6 +239,8 @@ type DrawFastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault
 
 type ShadowCacheEntry = (u64, u64, u64, u64, std::sync::Arc<crate::shadow::Shadow>);
 
+const DYN_CHUNK_SLOTS: u32 = 256;
+
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
@@ -274,9 +276,13 @@ pub(crate) struct State {
     local_tex_state_seq: u64,
     local_tex_copy_seq: u64,
     cbv_scratch_cache: DrawFastMap<(u64, u64, u64), (u64, u64, ID3D12Resource, u64)>,
+    direct_cbv_cache: DrawFastMap<(u64, u32), (u64, std::sync::Arc<crate::shadow::Shadow>)>,
+    direct_cbv_copy_seq: u64,
+    direct_cbv_shadow_gen: u64,
     kept_ptrs: DrawFastSet<usize>,
     kept_list_gen: u64,
     dynamic: Vec<(usize, u32, u32)>,
+    dyn_chunk: (usize, u32, u32),
     root_srv_slots: DrawFastMap<(usize, u64), RootSlot>,
     root_uav_slots: DrawFastMap<(usize, u64), RootSlot>,
     tables_gone: bool,
@@ -303,8 +309,40 @@ impl Drop for State {
 }
 
 impl State {
+    #[inline]
+    fn alloc_dynamic(
+        &mut self,
+        heap_id: usize,
+        host: &crate::descriptor::host::HostHeap,
+        n: u32,
+    ) -> Option<u32> {
+        if n == 0 {
+            return None;
+        }
+        if self.dyn_chunk.0 == heap_id && self.dyn_chunk.2 >= n {
+            let first = self.dyn_chunk.1;
+            self.dyn_chunk.1 += n;
+            self.dyn_chunk.2 -= n;
+            return Some(first);
+        }
+        if n <= DYN_CHUNK_SLOTS / 2
+            && let Some(chunk_start) = host.dynamic(DYN_CHUNK_SLOTS)
+        {
+            self.dynamic.push((heap_id, chunk_start, DYN_CHUNK_SLOTS));
+            self.dyn_chunk = (heap_id, chunk_start + n, DYN_CHUNK_SLOTS - n);
+            return Some(chunk_start);
+        }
+        let first = host.dynamic(n)?;
+        self.dynamic.push((heap_id, first, n));
+        Some(first)
+    }
+
     pub(crate) fn tables_done(&mut self) {
         self.cbv_scratch_cache.clear();
+        self.direct_cbv_cache.clear();
+        self.direct_cbv_copy_seq = 0;
+        self.direct_cbv_shadow_gen = 0;
+        self.dyn_chunk = (0, 0, 0);
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }
@@ -341,17 +379,12 @@ impl State {
             self.local_tex_ready.clear();
             self.local_tex_state_seq = 0;
             self.local_tex_copy_seq = 0;
+            self.direct_cbv_cache.clear();
+            self.direct_cbv_copy_seq = 0;
+            self.direct_cbv_shadow_gen = 0;
             self.windows.clear();
             self.windows_epoch = 0;
             self.kept_list_gen = list_gen;
-        }
-    }
-
-    #[inline]
-    fn keep_dynamic(&mut self, list: &HostList, resource: &ID3D12Resource) {
-        self.sync_list_gen(list.reset_gen());
-        if self.kept_ptrs.insert(resource.as_raw() as usize) {
-            list.keep(resource);
         }
     }
 
@@ -1660,6 +1693,7 @@ impl State {
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         let _bind_scope = ScopeUs::start(crate::copystat::C::RecBindUs);
+        self.sync_list_gen(list.reset_gen());
         let l = &list.list;
         {
             #[cfg(feature = "diagnostics")]
@@ -1971,10 +2005,9 @@ impl State {
             *index
         } else {
             let shadow = address.and_then(|a| find(self, a).map(|s| (a, s)));
-            let Some(index) = host.dynamic(1) else {
+            let Some(index) = self.alloc_dynamic(key.0, host, 1) else {
                 return false;
             };
-            self.dynamic.push((key.0, index, 1));
             if let Some((a, s)) = &shadow {
                 // SAFETY: a live buffer.
                 let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -2033,10 +2066,9 @@ impl State {
             *index
         } else {
             let shadow = address.and_then(|a| self.find_shadow(a, 1).map(|s| (a, s)));
-            let Some(index) = host.dynamic(1) else {
+            let Some(index) = self.alloc_dynamic(key.0, host, 1) else {
                 return false;
             };
-            self.dynamic.push((key.0, index, 1));
             match &shadow {
                 Some((a, s)) => {
                     // SAFETY: a live buffer.
@@ -4150,7 +4182,7 @@ impl State {
                 self.scratch_made.push((slot, offset));
                 continue;
             }
-            let Some(first) = host.dynamic(span) else {
+            let Some(first) = self.alloc_dynamic(heap_id, host, span) else {
                 if let Some(v) = owned_used_k.take() {
                     self.scratch_used_k = v;
                 }
@@ -4174,13 +4206,22 @@ impl State {
             let mut textures: Vec<(usize, ResourceType)> = Vec::new();
             let mut any_twin_tex = false;
             let record_uav_writes = STORES.get() || !write_skip();
-            self.dynamic.push((heap_id, first, span));
             let title_first = heap.index(table);
             let plan_entries = plan.map_or(&[][..], |p| p.entries.as_slice());
             let mut entry_cursor = 0usize;
             #[cfg(feature = "diagnostics")]
             let t_make = std::time::Instant::now();
-            self.sync_list_gen(list.reset_gen());
+            let frame_now = crate::frame::current();
+            let cur_copy_seq = list.copy_seq();
+            let cur_shadow_gen = crate::shadow::generation();
+            if self.direct_cbv_copy_seq != cur_copy_seq
+                || self.direct_cbv_shadow_gen != cur_shadow_gen
+            {
+                self.direct_cbv_cache.clear();
+                self.direct_cbv_copy_seq = cur_copy_seq;
+                self.direct_cbv_shadow_gen = cur_shadow_gen;
+            }
+            let allow_direct_cbv = direct_cbv();
             let mut premade = std::mem::take(&mut self.scratch_dyn_made);
             let kept_ptrs = &self.kept_ptrs;
             #[cfg(feature = "diagnostics")]
@@ -4211,23 +4252,61 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     let t_cbv = std::time::Instant::now();
                     let size_u64 = u64::from(size);
+                    if allow_direct_cbv
+                        && let Some((gpu, shadow)) = self.direct_cbv_cache.get(&(address, size))
+                        && !shadow.is_dead()
+                    {
+                        if !refresh_buffers.iter().any(|(s, a, l)| {
+                            std::sync::Arc::ptr_eq(s, shadow) && *a == address && *l == size_u64
+                        }) {
+                            refresh_buffers.push((shadow.clone(), address, size_u64));
+                        }
+                        if shadow.ever_written() {
+                            has_gpu_active_cbv = true;
+                            list.uav_barrier_if_dirty();
+                        }
+                        host.constant_at_dynamic(index, *gpu, size);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            cbv_ns += t_cbv.elapsed().as_nanos() as u64;
+                        }
+                        continue;
+                    }
                     let existing = self.find_shadow_existing(address, size_u64);
                     let gpu_active = existing
                         .as_ref()
                         .is_some_and(|s| s.is_gpu_active(list, address, size_u64));
-                    if (direct_cbv() || gpu_active)
+                    if (allow_direct_cbv || gpu_active)
                         && let Some(shadow) =
                             existing.or_else(|| self.find_shadow(address, size_u64))
                     {
                         if shadow.can_bind_cbv(address, size) {
                             let gpu = shadow.gpu(address);
-                            self.refresh_shadow(list, &shadow, address, size_u64);
-                            refresh_buffers.push((shadow.clone(), address, size_u64));
+                            refresh_shadow_in(
+                                &mut self.local_refreshed,
+                                &mut self.local_copy_seq,
+                                list,
+                                &shadow,
+                                address,
+                                size_u64,
+                            );
+                            if !refresh_buffers.iter().any(|(s, a, l)| {
+                                std::sync::Arc::ptr_eq(s, &shadow)
+                                    && *a == address
+                                    && *l == size_u64
+                            }) {
+                                refresh_buffers.push((shadow.clone(), address, size_u64));
+                            }
                             if gpu_active {
                                 has_gpu_active_cbv = true;
                                 list.uav_barrier_if_dirty();
                             }
-                            self.keep_dynamic(list, &shadow.buffer);
+                            if self.kept_ptrs.insert(shadow.buffer.as_raw() as usize) {
+                                list.keep(&shadow.buffer);
+                            }
+                            if allow_direct_cbv {
+                                self.direct_cbv_cache.insert((address, size), (gpu, shadow));
+                            }
                             host.constant_at_dynamic(index, gpu, size);
                             #[cfg(feature = "diagnostics")]
                             {
@@ -4244,7 +4323,9 @@ impl State {
                             if !deps.iter().any(|&(id, _)| id == sid) {
                                 deps.push((sid, write_seq));
                             }
-                            self.keep_dynamic(list, &scratch);
+                            if self.kept_ptrs.insert(scratch.as_raw() as usize) {
+                                list.keep(&scratch);
+                            }
                             host.constant_at_dynamic(index, scratch_gpu, size);
                             #[cfg(feature = "diagnostics")]
                             {
@@ -4306,8 +4387,10 @@ impl State {
                 }
                 #[cfg(feature = "diagnostics")]
                 let t_post = std::time::Instant::now();
-                if let Some(res) = made.kept {
-                    self.keep_dynamic(list, &res);
+                if let Some(res) = made.kept
+                    && self.kept_ptrs.insert(res.as_raw() as usize)
+                {
+                    list.keep(&res);
                 }
                 let kind = used_kind.or_else(|| {
                     self.scratch_selected
@@ -4330,30 +4413,44 @@ impl State {
                                 address,
                                 len,
                             );
+                            let need_refresh_push = !refresh_buffers.iter().any(|(s, a, l)| {
+                                std::sync::Arc::ptr_eq(s, &shadow) && *a == address && *l == len
+                            });
                             if kind == ResourceType::Uav {
-                                refresh_buffers.push((shadow.clone(), address, len));
-                                if record_uav_writes {
-                                    shadow.gpu_writes(list, address, len);
-                                } else {
-                                    #[cfg(feature = "diagnostics")]
-                                    {
-                                        crate::copystat::add(
-                                            crate::copystat::C::GpuWritesLeftOut,
-                                            1,
-                                        );
-                                        crate::copystat::add(
-                                            crate::copystat::C::GpuWritesLeftOutBytes,
-                                            len,
-                                        );
-                                    }
+                                if need_refresh_push {
+                                    refresh_buffers.push((shadow.clone(), address, len));
                                 }
-                                uav_buffers.push((shadow, address, len));
-                            } else {
+                                let is_new_uav = !uav_buffers.iter().any(|(s, a, l)| {
+                                    std::sync::Arc::ptr_eq(s, &shadow)
+                                        && *a == address
+                                        && *l == len
+                                });
+                                if is_new_uav {
+                                    if record_uav_writes {
+                                        shadow.gpu_writes(list, address, len);
+                                    } else {
+                                        #[cfg(feature = "diagnostics")]
+                                        {
+                                            crate::copystat::add(
+                                                crate::copystat::C::GpuWritesLeftOut,
+                                                1,
+                                            );
+                                            crate::copystat::add(
+                                                crate::copystat::C::GpuWritesLeftOutBytes,
+                                                len,
+                                            );
+                                        }
+                                    }
+                                    uav_buffers.push((shadow, address, len));
+                                }
+                            } else if need_refresh_push {
                                 refresh_buffers.push((shadow, address, len));
                             }
                         }
                         crate::descriptor::host::StageAction::Texture { resource } => {
-                            textures.push((resource, kind));
+                            if !textures.contains(&(resource, kind)) {
+                                textures.push((resource, kind));
+                            }
                             if readable_texture_in(
                                 &mut self.local_tex_ready,
                                 &mut self.local_tex_state_seq,
@@ -4372,7 +4469,7 @@ impl State {
                     && title.saturating_add(k) < host.count()
                     && made.is_texture
                 {
-                    host.texture_slot_tabled(title + k, kind.is_some());
+                    host.texture_slot_tabled_at(title + k, kind.is_some(), frame_now);
                     if kind.is_some() && !host.made_key_matches_words(title + k, words) {
                         host.mirror(title + k, table + u64::from(k) * 32, true);
                     }

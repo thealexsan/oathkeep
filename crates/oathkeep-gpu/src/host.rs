@@ -2826,6 +2826,11 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+#[inline]
+pub(crate) fn wake_relay() {
+    RELAY_MOVED.notify_one();
+}
+
 fn land() {
     let landed = std::mem::take(&mut line().landed);
     for (lists, order) in landed {
@@ -3074,9 +3079,10 @@ fn relay_worker() {
         let action = {
             let mut line = line();
             loop {
+                let urgent_waiters = line.waiters > 0 || crate::fence::has_waiters();
                 if line.line.is_empty() {
                     if let Some((oldest_copy, isolated)) = oldest_pending {
-                        if line.waiters > 0 {
+                        if urgent_waiters {
                             break RelayAction::DrainAllPending;
                         }
                         break RelayAction::WaitCopyOnly(oldest_copy, isolated);
@@ -3096,7 +3102,7 @@ fn relay_worker() {
                 let n = landable(&fences, completed);
                 if n == 0 {
                     if let Some((oldest_copy, isolated)) = oldest_pending {
-                        if line.waiters > 0 {
+                        if urgent_waiters {
                             break RelayAction::DrainAllPending;
                         }
                         break RelayAction::Wait3dAndCopy(
@@ -3146,8 +3152,9 @@ fn relay_worker() {
                         .any(|&i| !flight.lists[i].host().deferred().backs.is_empty()),
                 });
                 let elapsed_ms = defer_since.map_or(0, |t| t.elapsed().as_millis() as u64);
+                let urgent_waiters = line.waiters > 0 || crate::fence::has_waiters();
                 if should_defer_landing(
-                    line.waiters > 0,
+                    urgent_waiters,
                     has_urgent,
                     max_busy_fence,
                     completed,
@@ -3168,7 +3175,7 @@ fn relay_worker() {
                 }
                 defer_count = 0;
                 defer_since = None;
-                let has_waiters = line.waiters > 0;
+                let has_waiters = urgent_waiters;
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
                 line.in_hand = items
@@ -5458,7 +5465,7 @@ impl Host {
         // Otherwise, attach `Late::Write`/`Late::Signal` to the newest pending copy slot so
         // strict GPU-writeback-before-signal visibility is preserved without stalling the
         // relay thread on a later 3D flight.
-        let must_drain = has_waiters;
+        let must_drain = has_waiters || crate::fence::has_waiters();
         let had_flights;
         {
             let flights: Vec<&Flight> = items
@@ -5538,12 +5545,17 @@ impl Host {
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
+        let has_sync = items
+            .iter()
+            .any(|item| matches!(item, Late::Write(..) | Late::Signal(..)));
         if let Some(f) = fetch.as_mut()
             && f.has_pending()
-            && (must_drain || !had_flights)
         {
-            let n = f.pending_order.len();
-            self.drain_pending_slots(f, n, must_drain, false);
+            let urgent_now = must_drain || crate::fence::has_waiters();
+            if urgent_now || !had_flights || has_sync {
+                let n = f.pending_order.len();
+                self.drain_pending_slots(f, n, urgent_now, false);
+            }
         }
         let defer_sync_slot = fetch
             .as_ref()
@@ -6299,22 +6311,56 @@ impl Host {
                 prep_prelude += t_pre.elapsed().as_micros() as u64;
             }
         }
-        let recorded_preludes = {
+        let mut recorded_preludes: Vec<SendCmdList> =
+            (0..runs.len()).map(|_| SendCmdList(None)).collect();
+        if !plans.is_empty() {
             #[cfg(feature = "diagnostics")]
-            let t_flush = std::time::Instant::now();
-            let (recorded_preludes, prelude_only_us) =
-                batch.flush_with_preludes(Some(self), plans, runs.len());
-            crate::watch::ask_once_end();
+            let t_pre = std::time::Instant::now();
+            if plans.len() >= 4 {
+                let workers = plans.len().min(4);
+                let mut buckets: Vec<Vec<(usize, SendPreludePlan)>> =
+                    (0..workers).map(|_| Vec::new()).collect();
+                for (i, item) in plans.into_iter().enumerate() {
+                    buckets[i % workers].push(item);
+                }
+                let host_ptr = std::ptr::from_ref(self) as usize;
+                let outs: Vec<std::sync::Arc<Mutex<Vec<(usize, SendCmdList)>>>> = (0..workers)
+                    .map(|_| std::sync::Arc::new(Mutex::new(Vec::new())))
+                    .collect();
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                    .into_iter()
+                    .zip(outs.iter().cloned())
+                    .map(|(part, out)| {
+                        Box::new(move || {
+                            // SAFETY: `self` (`Host`) is `'static`/live for the entire `wide_run`,
+                            // and `wide_run` joins all workers before returning.
+                            let host = unsafe { &*(host_ptr as *const Host) };
+                            let mut local = Vec::with_capacity(part.len());
+                            for (idx, plan) in part {
+                                local.push((idx, SendCmdList(record_prelude(host, plan))));
+                            }
+                            *out.lock().unwrap_or_else(|e| e.into_inner()) = local;
+                        }) as Box<dyn FnOnce() + Send>
+                    })
+                    .collect();
+                crate::shadow::wide_run(jobs);
+                for out in outs {
+                    for (idx, rec) in
+                        std::mem::take(&mut *out.lock().unwrap_or_else(|e| e.into_inner()))
+                    {
+                        recorded_preludes[idx] = rec;
+                    }
+                }
+            } else {
+                for (idx, plan) in plans {
+                    recorded_preludes[idx] = SendCmdList(record_prelude(self, plan));
+                }
+            }
             #[cfg(feature = "diagnostics")]
             {
-                let flush_us = t_flush.elapsed().as_micros() as u64;
-                prep_prelude += prelude_only_us;
-                prep_batch_flush += flush_us.saturating_sub(prelude_only_us);
+                prep_prelude += t_pre.elapsed().as_micros() as u64;
             }
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = prelude_only_us;
-            recorded_preludes
-        };
+        }
         for (list, rec) in runs.iter().zip(recorded_preludes) {
             firsts.push(lists.len());
             if let Some((prelude_cmd, pooled)) = rec.0 {
@@ -6322,6 +6368,16 @@ impl Host {
                 preludes.push(pooled);
             }
             lists.push(list.list.cast().ok());
+        }
+        {
+            #[cfg(feature = "diagnostics")]
+            let t_flush = std::time::Instant::now();
+            batch.flush();
+            crate::watch::ask_once_end();
+            #[cfg(feature = "diagnostics")]
+            {
+                prep_batch_flush += t_flush.elapsed().as_micros() as u64;
+            }
         }
         {
             #[cfg(feature = "diagnostics")]
@@ -8416,43 +8472,7 @@ impl Batch {
         }
     }
 
-    fn run_wide_capped(jobs: Vec<Box<dyn FnOnce() + Send>>) {
-        if jobs.is_empty() {
-            return;
-        }
-        if !wide_refresh() || jobs.len() < 2 {
-            for job in jobs {
-                job();
-            }
-            return;
-        }
-        let started = std::time::Instant::now();
-        let before_buf = PREPARING[0].load(Ordering::Relaxed);
-        let before_tex = PREPARING[2].load(Ordering::Relaxed);
-        crate::shadow::wide_run(jobs);
-        let wall = started.elapsed().as_micros() as u64;
-        let sum_buf = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before_buf);
-        let sum_tex = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before_tex);
-        let total_sum = sum_buf.saturating_add(sum_tex);
-        if total_sum > wall {
-            let excess = total_sum - wall;
-            let cut_buf = (u128::from(excess) * u128::from(sum_buf) / u128::from(total_sum)) as u64;
-            let cut_tex = excess - cut_buf;
-            PREPARING[0].fetch_sub(cut_buf.min(sum_buf), Ordering::Relaxed);
-            PREPARING[2].fetch_sub(cut_tex.min(sum_tex), Ordering::Relaxed);
-        }
-    }
-
     fn flush(&mut self) {
-        let _ = self.flush_with_preludes(None, Vec::new(), 0);
-    }
-
-    fn flush_with_preludes(
-        &mut self,
-        host: Option<&Host>,
-        plans: Vec<(usize, SendPreludePlan)>,
-        run_count: usize,
-    ) -> (Vec<SendCmdList>, u64) {
         self.index.clear();
         self.last_refresh_key = 0;
         self.refresh_min = 0;
@@ -8482,104 +8502,56 @@ impl Batch {
                 false
             }
         };
-        let mut recorded_preludes: Vec<SendCmdList> =
-            (0..run_count).map(|_| SendCmdList(None)).collect();
         let total_units = self.refreshes.len() + self.pending_textures.len();
-        let prelude_only = total_units == 0 && !plans.is_empty();
-        let prelude_only_start = prelude_only.then(std::time::Instant::now);
-
-        // Fix AE1: restore run94's full `pre_guard_batch` coverage over ALL guarded, non-pending,
-        // non-in-place shadows, and overlap ONLY `record_prelude` (pure D3D12 COM recording with
-        // zero `VirtualProtect` / `GUARDS` locks) with `pre_guard_batch` before running ALL
-        // refreshes + `pending_textures` in one unified wave.
-        let mut guarded_shadows = 0usize;
-        for (shadow, _) in &self.refreshes {
-            if shadow.guarded() && !shadow.writes_pending() && !shadow.is_in_place() {
-                guarded_shadows += 1;
-            }
-        }
-        let use_pre_guard =
-            guarded_shadows >= 2 || (wide_refresh() && guarded_shadows == 1 && !plans.is_empty());
-        let guarded_ranges: Vec<(usize, usize)> = if use_pre_guard {
-            let mut ranges = Vec::new();
+        // Pre-guard all dirty watched-guarded refresh ranges in a single coalesced pass
+        // before spawning `wide_run`, so adjacent spans across shadows merge into maximal
+        // `VirtualProtect` calls and sibling-view `alias_apply` runs ONCE per flush instead of
+        // per-shadow across competing worker threads.
+        if self.refreshes.len() >= 2 {
+            let mut guarded_ranges: Vec<(usize, usize)> = Vec::new();
             for (shadow, spans) in &self.refreshes {
                 if shadow.guarded() && !shadow.writes_pending() && !shadow.is_in_place() {
-                    ranges.extend_from_slice(spans);
+                    guarded_ranges.extend_from_slice(spans);
                 }
             }
-            ranges
-        } else {
-            Vec::new()
-        };
-
-        let mut prelude_jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(4);
-        let mut prelude_outs: Vec<std::sync::Arc<Mutex<Vec<(usize, SendCmdList)>>>> = Vec::new();
-        if let Some(host) = host
-            && !plans.is_empty()
-        {
-            let workers = plans.len().min(4);
-            let mut buckets: Vec<Vec<(usize, SendPreludePlan)>> =
-                (0..workers).map(|_| Vec::new()).collect();
-            for (i, item) in plans.into_iter().enumerate() {
-                buckets[i % workers].push(item);
-            }
-            let host_ptr = std::ptr::from_ref(host) as usize;
-            prelude_outs = (0..workers)
-                .map(|_| std::sync::Arc::new(Mutex::new(Vec::new())))
-                .collect();
-            for (part, out) in buckets.into_iter().zip(prelude_outs.iter().cloned()) {
-                prelude_jobs.push(Box::new(move || {
-                    // SAFETY: `host` is live for the entire `flush_with_preludes` call, and
-                    // `wide_run_two_stage` / `run_wide_capped` joins all workers before returning.
-                    let host = unsafe { &*(host_ptr as *const Host) };
-                    let mut local = Vec::with_capacity(part.len());
-                    for (idx, plan) in part {
-                        local.push((idx, SendCmdList(record_prelude(host, plan))));
-                    }
-                    *out.lock().unwrap_or_else(|e| e.into_inner()) = local;
-                }));
+            if !guarded_ranges.is_empty() {
+                crate::watch::pre_guard_batch(&guarded_ranges);
             }
         }
-
-        let mut refresh_jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(40);
-        let all_refreshes: Vec<_> = self.refreshes.drain(..).collect();
-        Self::push_refresh_jobs(all_refreshes, &mut refresh_jobs);
-        if !self.pending_textures.is_empty() {
-            let mut texs: Vec<_> = self.pending_textures.drain(..).collect();
-            texs.sort_unstable_by(|a, b| {
-                b.1.saturating_sub(b.0).cmp(&a.1.saturating_sub(a.0))
-            });
-            if texs.len() <= 16 {
-                for (_, _, staging) in texs {
-                    refresh_jobs.push(Box::new(move || staging.refresh()));
-                }
-            } else {
-                let mut tex_buckets: Vec<Vec<std::sync::Arc<crate::texture::Staging>>> =
-                    (0..16).map(|_| Vec::new()).collect();
-                for (i, (_, _, staging)) in texs.into_iter().enumerate() {
-                    tex_buckets[i % 16].push(staging);
-                }
-                for part in tex_buckets {
-                    if !part.is_empty() {
-                        refresh_jobs.push(Box::new(move || {
-                            for staging in part {
-                                staging.refresh();
-                            }
-                        }));
-                    }
-                }
-            }
-        }
-
-        if !guarded_ranges.is_empty() && !prelude_jobs.is_empty() && wide_refresh() {
+        if wide_refresh() && total_units >= 2 {
             let started = std::time::Instant::now();
             let before_buf = PREPARING[0].load(Ordering::Relaxed);
             let before_tex = PREPARING[2].load(Ordering::Relaxed);
-            crate::shadow::wide_run_two_stage(
-                prelude_jobs,
-                || crate::watch::pre_guard_batch(&guarded_ranges),
-                refresh_jobs,
-            );
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(32);
+            let all_refreshes: Vec<_> = self.refreshes.drain(..).collect();
+            Self::push_refresh_jobs(all_refreshes, &mut jobs);
+            if !self.pending_textures.is_empty() {
+                let mut texs: Vec<_> = self.pending_textures.drain(..).collect();
+                texs.sort_unstable_by(|a, b| {
+                    b.1.saturating_sub(b.0).cmp(&a.1.saturating_sub(a.0))
+                });
+                if texs.len() <= 16 {
+                    for (_, _, staging) in texs {
+                        jobs.push(Box::new(move || staging.refresh()));
+                    }
+                } else {
+                    let mut tex_buckets: Vec<Vec<std::sync::Arc<crate::texture::Staging>>> =
+                        (0..16).map(|_| Vec::new()).collect();
+                    for (i, (_, _, staging)) in texs.into_iter().enumerate() {
+                        tex_buckets[i % 16].push(staging);
+                    }
+                    for part in tex_buckets {
+                        if !part.is_empty() {
+                            jobs.push(Box::new(move || {
+                                for staging in part {
+                                    staging.refresh();
+                                }
+                            }));
+                        }
+                    }
+                }
+            }
+            crate::shadow::wide_run(jobs);
             let wall = started.elapsed().as_micros() as u64;
             let sum_buf = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before_buf);
             let sum_tex = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before_tex);
@@ -8593,23 +8565,15 @@ impl Batch {
                 PREPARING[2].fetch_sub(cut_tex.min(sum_tex), Ordering::Relaxed);
             }
         } else {
-            if !guarded_ranges.is_empty() {
-                crate::watch::pre_guard_batch(&guarded_ranges);
-            }
-            prelude_jobs.append(&mut refresh_jobs);
-            Self::run_wide_capped(prelude_jobs);
-        }
-        for out in prelude_outs {
-            for (idx, rec) in
-                std::mem::take(&mut *out.lock().unwrap_or_else(|e| e.into_inner()))
-            {
-                if let Some(slot) = recorded_preludes.get_mut(idx) {
-                    *slot = rec;
+            for (shadow, spans) in self.refreshes.drain(..) {
+                for (from, to) in spans {
+                    Self::update(&shadow, from, to);
                 }
             }
+            for (_, _, staging) in self.pending_textures.drain(..) {
+                staging.refresh();
+            }
         }
-        let prelude_only_us =
-            prelude_only_start.map_or(0, |t| t.elapsed().as_micros() as u64);
 
         if !self.pending_gpu_writes.is_empty() {
             self.pending_gpu_min = 0;
@@ -8631,7 +8595,6 @@ impl Batch {
         if ahead {
             crate::watch::ask_ahead_done();
         }
-        (recorded_preludes, prelude_only_us)
     }
 }
 

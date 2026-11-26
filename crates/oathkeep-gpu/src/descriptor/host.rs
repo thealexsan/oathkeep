@@ -10,6 +10,7 @@ const MADE_LOCK_STRIPES: usize = 64;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
+    device: ID3D12Device,
     cpu: usize,
     gpu: u64,
     step: u32,
@@ -1612,6 +1613,7 @@ impl HostHeap {
             .flatten();
         let h = HostHeap {
             heap,
+            device: host.device.clone(),
             cpu,
             gpu,
             step,
@@ -2166,6 +2168,11 @@ impl HostHeap {
 
     pub(crate) fn texture_slot_tabled(&self, index: u32, read: bool) {
         self.tabled_in(index, read, crate::frame::current());
+    }
+
+    #[inline]
+    pub(crate) fn texture_slot_tabled_at(&self, index: u32, read: bool, frame: u64) {
+        self.tabled_in(index, read, frame);
     }
 
     fn tabled_in(&self, index: u32, read: bool, frame: u64) {
@@ -3062,15 +3069,15 @@ impl HostHeap {
         }
     }
 
+    #[inline]
     pub(crate) fn constant_at_dynamic(&self, index: u32, gpu: u64, size: u32) {
-        let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
             SizeInBytes: size.next_multiple_of(256),
         };
         // SAFETY: dynamic slot owned by the caller's command list; backing buffer is kept on the list.
         unsafe {
-            host.device
+            self.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
         };
     }
