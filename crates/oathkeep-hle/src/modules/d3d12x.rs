@@ -1,3 +1,7 @@
+//! `d3d12_xs.dll`: virtual memory setup, device creation, root signature
+//! serialization. The device and everything it creates live in
+//! `oathkeep-gpu`.
+
 use std::ffi::c_void;
 
 use oathkeep_gpu::device;
@@ -5,6 +9,8 @@ use oathkeep_gpu::object::{HRESULT, Iid, Object};
 
 use crate::{HleExport, HleModule};
 
+/// Device creation; first hands the device the title's general allocator
+/// (`XMemAlloc`, which honours the title's hooks) for resource memory.
 extern "system" fn create_device(
     adapter: *const c_void,
     parameters: *const u32,
@@ -13,11 +19,14 @@ extern "system" fn create_device(
 ) -> HRESULT {
     oathkeep_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     oathkeep_gpu::resource::use_page_mapper(super::xmem::map_alias);
+    oathkeep_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
     #[cfg(windows)]
     oathkeep_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)
 }
 
+/// A host GPU failure ends the run like a crash: reported to the crash log,
+/// then the process ends as the console ends a title.
 #[cfg(windows)]
 fn host_gpu_failed(what: &str) -> ! {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
@@ -28,10 +37,26 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
+/// Translates `container` into the cache ([`use_shader_cache`]) ahead of
+/// any run: whether it was there already, or why it does not translate.
+pub fn precompile(container: &[u8]) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        oathkeep_gpu::shader_cache::precompile(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("no host".into())
+    }
+}
+
+/// The fork's offline warm-up (`victory translate --warm`), by
+/// [`precompile`]: whether it was translated now.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        oathkeep_gpu::shader_cache::warm(container)
+        oathkeep_gpu::shader_cache::precompile(container).map(|was_there| !was_there)
     }
     #[cfg(not(windows))]
     {
@@ -40,6 +65,9 @@ pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     }
 }
 
+/// Keeps the host's translations of the title's shaders in `dir` (a
+/// folder of the cache) across runs, and its compiled pipelines beside it
+/// (`pipelines`).
 pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(windows)]
     {
@@ -71,10 +99,12 @@ pub(crate) fn module() -> HleModule {
                 name: "D3D12SerializeVersionedRootSignature",
                 address: oathkeep_gpu::root::serialize_versioned as *const () as usize,
             },
+            // The AMD upscaler's (Series S).
             HleExport {
                 name: "D3D12CreateRootSignatureDeserializer",
                 address: oathkeep_gpu::root::create_deserializer as *const () as usize,
             },
+            // A data import: the title reads the id at this address.
             HleExport {
                 name: "IID_ID3D12Device",
                 address: (&raw const device::IID) as usize,

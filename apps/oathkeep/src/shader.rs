@@ -1,3 +1,5 @@
+//! Survey shader containers: bitcode, console additions and native code.
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -7,14 +9,17 @@ use oathkeep_game::sgd5;
 use oathkeep_shader::gfx10::{self, Instruction};
 use oathkeep_shader::{Container, DxilProgram, FourCC, HwStage, ShaderError, native_programs};
 
+/// Files above this size are skipped (read whole into memory for now).
 pub(crate) const MAX_FILE: u64 = 2 << 30;
 
+/// A shader container in a file: as is, or packed in an SGD5 record.
 pub(crate) enum Source<'a> {
     Raw { offset: usize, data: &'a [u8] },
     Packed(sgd5::Record<'a>),
 }
 
 impl Source<'_> {
+    /// The container bytes; `None` if a packed record is corrupt.
     pub(crate) fn bytes(&self) -> Option<Cow<'_, [u8]>> {
         match self {
             Source::Raw { data, .. } => Some(Cow::Borrowed(data)),
@@ -30,6 +35,8 @@ impl Source<'_> {
     }
 }
 
+/// The packed records of SGD5 data, and every container stored as is (the
+/// executable keeps some records uncompressed), found by its magic.
 pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     let mut out: Vec<Source<'_>> = Vec::new();
     if sgd5::is_sgd5(data) {
@@ -94,10 +101,11 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 };
                 found_here += 1;
                 t.containers += 1;
-                let dxil = container.part(FourCC::DXIL);
+                let dxil = container.part(FourCC::DXIL).or(container.part(FourCC::ACCC));
                 t.with_dxil_part += usize::from(dxil.is_some());
                 let program = dxil.and_then(|p| DxilProgram::parse(p.data).ok());
                 let mut listing = Vec::new();
+                // Independent of the bitcode: titles may strip it.
                 let native = match dxil.map(|p| native_programs(p.data)) {
                     Some(Ok(programs)) if !programs.is_empty() => {
                         t.with_native += 1;
@@ -105,6 +113,11 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                         for n in &programs {
                             *t.native_stages.entry(n.stage).or_default() += 1;
                             list.push(format!("{:?} {} B", n.stage, n.code.len()));
+                            if disasm {
+                                listing.push(format!("    {:?} stage I/O: {:?}", n.stage, n.io));
+                                listing.extend(n.layout.iter().map(|p| format!("    {p:?}")));
+                                listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
+                            }
                             match gfx10::decode(&n.code) {
                                 Ok(insts) => {
                                     t.decoded += 1;
@@ -114,9 +127,6 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                         *t.unnamed.entry(key).or_default() += 1;
                                     }
                                     if disasm {
-                                        listing
-                                            .extend(n.layout.iter().map(|p| format!("    {p:?}")));
-                                        listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
                                         listing.extend(
                                             insts.iter().map(|i| format_instruction(i, n.wave64)),
                                         );
@@ -161,7 +171,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
                 if verbose {
-                    println!("{}{}: {line}", path.display(), source.label());
+                    // As a run's log and a replay name it (`hash=`).
+                    let hash = blake3::hash(&bytes).to_hex();
+                    println!("{}{} #{}: {line}", path.display(), source.label(), &hash[..16]);
                     for l in &listing {
                         println!("{l}");
                     }

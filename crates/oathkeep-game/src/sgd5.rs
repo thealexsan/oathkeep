@@ -1,17 +1,33 @@
+//! `SGD5`: the engine's shader file. Each record holds one shader container,
+//! deflate-packed. The header tables are not decoded yet, so records are
+//! found by their marker and cross-checked by their sizes:
+//!
+//! ```text
+//! u8 name length (with NUL), name, NUL, u8 kind,
+//! u32 n, u32 0x000DDCE7, u32 n, u32 unpacked size, raw deflate (n - 12 bytes)
+//! ```
+
 pub const MAGIC: &[u8; 4] = b"SGD5";
 const MARKER: [u8; 4] = 0x000D_DCE7_u32.to_le_bytes();
+/// Containers are at most a few MiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: usize = 64 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Record<'a> {
+    /// Offset of the marker in the file.
     pub offset: usize,
+    /// Like `PS_<name>_<hash>_Wrapped`; `None` if the bytes before the
+    /// record do not read as one.
     pub name: Option<&'a str>,
+    /// Record type, meaning unknown (0x32 most shaders, 0x41 mesh shaders
+    /// and some material families, 0x3c compute, 0x40, 0x42).
     pub kind: u8,
     packed: &'a [u8],
     unpacked_size: usize,
 }
 
 impl Record<'_> {
+    /// The container, or `None` if the stream is corrupt.
     pub fn unpack(&self) -> Option<Vec<u8>> {
         let mut state = zlib_rs::Inflate::new(false, 15);
         let mut out = Vec::new();
@@ -63,10 +79,13 @@ impl Record<'_> {
     }
 }
 
+/// An SGD5 file, or a file holding one (an archive: records are found by
+/// their marker, so no index is needed).
 pub fn is_sgd5(file: &[u8]) -> bool {
     memchr::memmem::find(file, MAGIC).is_some()
 }
 
+/// Every record in an SGD5 file, in file order.
 pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     memchr::memmem::find_iter(file, &MARKER).filter_map(|at| record(file, at))
 }
@@ -91,11 +110,13 @@ fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
     })
 }
 
+/// The printable name that ends at `nul` and follows its length byte.
 fn name_before(file: &[u8], nul: usize) -> Option<&str> {
     let run = file[..nul]
         .iter()
         .rposition(|b| !b.is_ascii_graphic())
         .map_or(0, |p| p + 1);
+    // From 32 characters on, the length byte is printable too.
     (run.saturating_sub(1)..nul)
         .find(|&l| usize::from(file[l]) == nul - l)
         .and_then(|l| std::str::from_utf8(&file[l + 1..nul]).ok())
@@ -134,6 +155,7 @@ mod tests {
             0x32,
             b"first container",
         ));
+        // A marker whose sizes disagree is not a record.
         file.extend_from_slice(&[9, 0, 0, 0, 0xE7, 0xDC, 0x0D, 0, 8, 0, 0, 0]);
         file.extend(record_bytes(&long, 0x41, &[7; 300]));
 
@@ -146,6 +168,7 @@ mod tests {
         assert_eq!(found[1].name, Some(long.as_str()));
         assert_eq!(found[1].unpack(), Some(vec![7; 300]));
 
+        // The same file inside an archive.
         let mut archive = vec![0x5A; 0x1000];
         archive.extend_from_slice(&file);
         assert!(is_sgd5(&archive));
@@ -156,7 +179,7 @@ mod tests {
     #[test]
     fn corrupt_stream_does_not_unpack() {
         let mut file = record_bytes("CS_x", 0x3c, &[1; 64]);
-        file[27] = 0xFF;
+        file[27] = 0xFF; // first packed byte: reserved block type
         let r = records(&file).next().unwrap();
         assert_eq!(r.unpack(), None);
     }
@@ -173,16 +196,19 @@ mod tests {
         let r = records(&good).next().unwrap();
         assert_eq!(r.unpack(), Some(payload.clone()));
 
+        // Oversized stream (declared unpacked_size smaller than actual output).
         let mut smaller = good.clone();
         smaller[r.offset + 8..r.offset + 12]
             .copy_from_slice(&((payload.len() - 1) as u32).to_le_bytes());
         assert_eq!(records(&smaller).next().unwrap().unpack(), None);
 
+        // Under-filled stream (declared unpacked_size larger than actual output).
         let mut larger = good.clone();
         larger[r.offset + 8..r.offset + 12]
             .copy_from_slice(&((payload.len() + 1) as u32).to_le_bytes());
         assert_eq!(records(&larger).next().unwrap().unpack(), None);
 
+        // Truncated raw deflate stream.
         let mut truncated = good[..good.len() - 1].to_vec();
         let new_n = (truncated.len() - r.offset) as u32;
         truncated[r.offset - 4..r.offset].copy_from_slice(&new_n.to_le_bytes());

@@ -1,3 +1,4 @@
+//! A title DLL that cannot be loaded is named in the error.
 #![cfg(windows)]
 
 #[test]

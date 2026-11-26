@@ -8,6 +8,23 @@ It runs unmodified x86-64 console executables directly on a Windows host by prov
 
 > **Legal & Clean-Room Notice:** This repository contains **zero** copyrighted software, executables, keys, shaders, textures, audio, archives, or extracted data. You must supply your own legally obtained console software. Oathkeep is an independent open-source interoperability project and is not affiliated with, endorsed by, or connected to any console manufacturer, game developer, or publisher. See [docs/asset-policy.md](docs/asset-policy.md).
 
+<!-- oathkeep:progress:start -->
+## Compatibility & Performance Progress (95%)
+
+Live dashboard: [thealexsan.github.io/oathkeep](https://thealexsan.github.io/oathkeep/) • Auto-generated from [docs/progress.toml](docs/progress.toml) via `cargo xtask progress`.
+
+![Oathkeep Compatibility and Performance Progress](docs/progress.svg)
+
+| Run | Commit | FPS | Frame | GPU | Preparing | Status |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| diag-fps-swarm2b | `3a0890d` | 5.4 | 184.0 ms | 0.0-33.8 ms (145.7s TIMEOUT_CLEAN; 0 crashes/TDRs/OOMs, 0 failed Wave64 shaders, 0 refused dynamic tables) | 116.9-239.4 ms (planning 1.1-5.5 ms, flights 0.1-0.2 ms, sweep 0.1-0.6 ms, refreshes 62-80 ms, heap views 67-98 ms slots + 68-86 ms textures) | Post-revert Round 2 baseline verified clean! Peak 5.4 fps (184.0 ms/f) in-world, 0/11,093 refused dynamic tables, 0 exploding triangles, intact ceiling/lighting/interiors on frame-1602/1618/1634/1658, and both Wave64 LDS compute shaders bound cleanly; merging perf/commit-reduction into main before Round 3 FPS PRs |
+| diag-fps-swarm2 | `289d0ea` | 3.1 | 320.1 ms | 1.8-64.3 ms (145.2s TIMEOUT_CLEAN, 0 crashes/TDRs/OOMs, 0 failed Wave64 shaders) | 128.2-443.9 ms (sweep 41-54->0.1 ms, guards 91.1->16.6-42.9 ms, waiting-for-flights 52.7->0.1 ms; regressed by 5d52155 41-107 ms card-plan + 3.4s thin) | Round 2 capture verified Wave64 LDS fixes (5dc3b25986622949 & 6f225b641c5b0708 compiled/bound cleanly), async sweep (41-54->0.1 ms), and race-free watch.rs (guards 91->16-43 ms), with 1:1 late frames (frame-1661..1677); caught & immediately reverted 5d52155 card-plan/thin regression and CAPPED_DYNAMIC=131072 table exhaustion (290 refused -> early-frame stretched tris), and shipped oathkeep launch + scripts/launch.ps1 shader-warming preloader |
+| diag-fps-swarm1 | `d1e5000` | 3.9 | 256.1 ms | 17.2-43.1 ms (145.3s TIMEOUT_CLEAN, peak VRAM 6,838/7,161 MB, 0 crashes/TDRs/OOMs) | 99.2 ms (-37% vs 157.4 ms; snapshots 13.6 ms, copy-back 35.0 ms, land::rest 0.92 ms, heap buffers 2.0-16.2 ms) | Round 1 4-worker FPS swarm verified clean (95ccbe8..d1e5000): peak 3.9 fps (256.1 ms/f), steady 2.9-3.9 fps, preparing -37%, copy-back -39%, land::rest -96% (25.6->0.92 ms via bury recycler), snapshots -45%, DXGI VRAM -310 MB (6,838/7,161 MB), windows commit -586 MB (no-length -1,124 MB, 0 slot mismatches), crisp 1:1 in-world visuals (frame-1915..1939); exposed Round 2 blockers: 91.1 ms GUARDS lock wait from batched yields, 52.6 ms BEHIND_PLACED stall, ~200 ms CPU recording/thin-list gap, and 512 KiB window-count growth (3,810 windows) |
+| diag-visual-holereuse | `487d82a` | 2.9 | 347.8 ms | 17.7-100.1 ms (150.8s TIMEOUT_CLEAN, peak VRAM 7,148/7,161 MB, 0 crashes/TDRs/OOMs) | 157.4 ms (2324-3044 draws/f, staging 57-112 MB, tiles 305/320 MB reused) | Zero-VRAM-growth hole reuse (pool::NO_GROW + tiles no_grow + 5/6-block staging cap + reuse-only admission) admitted 24,000+ textures into existing pool holes with 0 extra VRAM heaps and 0 staging spikes; secondary NPC faces, background patrons, and interior walls/posters textured and lit (frame-1928..1998). |
+| diag-visual-vramfix2 | `301d66f` | 3.4 | 295.1 ms | 54.8 ms (146.1s TIMEOUT_CLEAN, peak VRAM 6,874/7,164 MB, 0 crashes/TDRs) | 70.8 ms (3062 draws/f, heap buffers 9.9 ms, copy-back 32.4 ms) | VRAM overshoot & Wave64 shader 02384a60fda6f2d0 verified fixed! Peak DXGI VRAM 6,874/7,164 MB (down from 7,602 MB crash), pool::TEXTURES 4,928->4,224 MB, tiles 512->256 MB, 18,785 idle textures freed (3,461 MB), 0 non-RT dropped shaders, 0 capped-view-heap hits; foreground character/hair/wall posters/outdoor vehicles crisp, secondary NPC faces & dark interiors remaining before 20-30+ FPS swarm |
+| diag-visual-merged | `b6b9b0e` | 3.0 | 335.3 ms | 0.0-110.5 ms (149.1s TIMEOUT_CLEAN, 0 exceptions/TDRs/refusals) | 135.1-210.5 ms (all 4 visual-artifact swarm workers merged; 0 depth-plane misses, 0 CBV/buffer-view/0x1c8/0x218/0x1a8 warnings, 6b82bc7d22016cb5 translated) | 4-worker visual swarm verified in-world (frame-2100..2148): crisp foreground character/hair/eyes/DOF/outdoor vehicles, 0 depth-plane misses (79/81->0/0), 10330 aligned view copies (0 refused); 3 visual blockers isolated for final polish: VRAM LRU eviction under levels-on-demand (35132 waiting), 1M descriptor heap cap (1245184 requested, 737855 direct), and 1 Wave64 compute shader (02384a60fda6f2d0) |
+<!-- oathkeep:progress:end -->
+
 ## Requirements
 
 - **OS:** Windows 10 (19041+) or Windows 11, x64
@@ -42,17 +59,17 @@ powershell -ExecutionPolicy Bypass -File scripts\setup-agility-sdk.ps1
 
 Windows 11 ships SM 6.6 inbox and does not require this step.
 
-### 4. Launch a title
+### 4. Launch a title (with automatic shader warming & preloading)
 
 ```powershell
-# Safe default profile (recommended for 8 GB NVIDIA GPUs and first-run stability):
+# Recommended: pre-translates shaders, pre-warms D3D12 pipelines, and launches with Pareto 8 GB profile:
+powershell -ExecutionPolicy Bypass -File scripts\launch.ps1 -Exe "<path-to-your-title-exe>"
+
+# Pre-warm caches only (without launching the title yet):
+powershell -ExecutionPolicy Bypass -File scripts\launch.ps1 -Exe "<path-to-your-title-exe>" -NoLaunch
+
+# Direct launch without pre-warming (`play.ps1`):
 powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Exe "<path-to-your-title-exe>"
-
-# Faster GPU scheduling profile (late waits + card buffers):
-powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Exe "<path-to-your-title-exe>" -Profile fast
-
-# 8 GB VRAM profile (enables levels-on-demand texture budgeting):
-powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Exe "<path-to-your-title-exe>" -Profile nvidia8gb
 ```
 
 Caches and saves are stored outside the repository under `%LOCALAPPDATA%\oathkeep\cache` and `%LOCALAPPDATA%\oathkeep\data` (overridable via `-Cache` / `-Data` or `oathkeep.toml`).

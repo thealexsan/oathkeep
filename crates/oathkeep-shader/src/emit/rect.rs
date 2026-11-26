@@ -1,13 +1,52 @@
+//! The geometry shader that completes the console's rectangle lists (list
+//! topology 17, pipeline topology type 19). A rectangle comes as three
+//! vertices, three corners of a screen-aligned rectangle; the hardware
+//! draws the whole rectangle and continues every vertex shader output
+//! linearly into the fourth corner. The host has no such topology: the
+//! draw goes out as a triangle list with this shader behind the translated
+//! vertex shader, so vertex counts, vertex numbers, indices and indirect
+//! arguments stay the title's, and each rectangle arrives here as one
+//! triangle.
+//!
+//! Which vertex is the corner between the other two varies:
+//! the title's full-screen rectangles come as top left, bottom left, bottom
+//! right (the second), its tiled lighting as top left, bottom left, top
+//! right (the first). The corner is the vertex that shares x with one of
+//! the others and y with the other; the fourth vertex lies opposite it,
+//! `a + b - corner` for the position and every float output. That holds
+//! for three vertices with one positive w (then it is the same in clip
+//! space and on the screen, whatever the interpolation mode); three that
+//! differ in w, or are not such corners, stay the triangle they make.
+//!
+//! Flat values are the first vertex's: both triangles start with it (the
+//! halves on either side of the diagonal through it, turning as the three
+//! vertices do), which is the vertex the host takes a flat input from, and
+//! the fourth vertex's integer outputs are the first vertex's.
+//!
+//! shortcut: that the console takes a rectangle's flat values from its
+//! first vertex follows from the hardware's provoking-vertex setting for
+//! triangles; it is not measured on a rectangle.
+
 use super::bitcode::{Attr, Bin, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Geometry, Shader};
 use crate::ShaderError;
 use crate::dxbc::{Container, FourCC};
 
+/// Vertices emitted per rectangle: two triangles.
 const VERTICES: u32 = 6;
 
+/// The scalars a geometry shader may emit per invocation (vertices times
+/// output components).
 const MAX_SCALARS: u32 = 1024;
 
+/// The geometry shader (a DXIL container) for rectangle lists drawn with
+/// the translated vertex shader `vs` and, if the pipeline has one, the
+/// translated pixel shader `ps` (both as [`super::HostShader::dxil`]). Its
+/// inputs and outputs are the vertex shader's outputs, register for
+/// register, so it links with both. A pixel shader that declares a
+/// primitive id gets the rectangle's number, which the host leaves to the
+/// geometry stage when there is one.
 pub fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, ShaderError> {
     let sig = |dxil: &[u8], fourcc| -> Result<Vec<SigElement>, ShaderError> {
         let c = Container::parse(dxil)?;
@@ -24,6 +63,8 @@ pub fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, ShaderError
     build(outputs, &wanted)
 }
 
+/// [`rect_list_gs`] from the vertex shader's outputs and the pixel
+/// shader's inputs.
 fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u8>, ShaderError> {
     let unsupported = |what| ShaderError::Unsupported { offset: 0, what };
     if outputs.iter().any(|e| e.row.is_none()) {
@@ -33,11 +74,11 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         .iter()
         .position(|e| e.kind == 3 && e.comp == 9 && e.cols == 4)
     else {
-        return Err(unsupported(
-            "a rectangle list without a four-component position",
-        ));
+        return Err(unsupported("a rectangle list without a four-component position"));
     };
     for e in &mut outputs {
+        // Interpolation as `emit_program` declares a vertex shader's
+        // outputs; a geometry shader's inputs carry the same modes.
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
             (0 | 6 | 7, 9) => 2,
@@ -51,12 +92,14 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         max_vertices: VERTICES,
     });
     s.inputs = outputs.clone();
+    // The primitive id the pixel shader declares, as one more output.
     let wanted = ps_inputs
         .iter()
         .find(|e| e.kind == 10 && e.row.is_some())
         .filter(|_| !outputs.iter().any(|o| o.kind == 10));
     let primitive = match wanted {
         Some(e) => {
+            // Alone in its columns, and in a row of constant elements.
             let clash = outputs.iter().any(|o| {
                 let overlap = o.col < e.col + e.cols && e.col < o.col + o.cols;
                 o.row == e.row && (o.interp != 1 || overlap)
@@ -84,6 +127,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
     s.outputs = outputs;
     let b = s.entry;
 
+    // Every input of the three vertices: [element][column][vertex].
     let mut corners: Vec<Vec<[V; 3]>> = Vec::new();
     for id in 0..s.inputs.len() {
         let mut columns = Vec::new();
@@ -93,6 +137,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         corners.push(columns);
     }
 
+    // One positive w, and no two vertices in one place.
     let (x, y, w) = (
         corners[position][0],
         corners[position][1],
@@ -110,6 +155,8 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         let apart = not(&mut s, together);
         plain = both(&mut s, plain, apart);
     }
+    // corner[i]: vertex i is the corner between the other two (the first
+    // that shares x with one of them and y with the other).
     let mut corner: Vec<V> = Vec::new();
     for i in 0..3 {
         let (a, c) = ((i + 1) % 3, (i + 2) % 3);
@@ -125,11 +172,15 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         corner.push(here);
     }
 
+    // What the six emitted vertices carry: [element][column][vertex].
     let mut emitted: Vec<Vec<[V; 6]>> = Vec::new();
     for (id, columns) in corners.iter().enumerate() {
         let float = s.inputs[id].comp == 9;
         let mut out = Vec::new();
         for &[p0, p1, p2] in columns {
+            // The fourth vertex: `a + b - corner`. Integers (flat), and
+            // three vertices without a corner, keep the first vertex's
+            // value; the second triangle of the latter is then empty.
             let mut fourth = p0;
             if float {
                 for (k, (a, c, at)) in [(p1, p2, p0), (p2, p0, p1), (p0, p1, p2)]
@@ -141,6 +192,8 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
                     fourth = s.m.select(b, corner[k], opposite, fourth);
                 }
             }
+            // Corner first: (v0, v1, v3), (v0, v3, v2). Second: (v0, v1,
+            // v2), (v0, v2, v3). Third: (v0, v1, v2), (v0, v3, v1).
             let third = s.m.select(b, corner[0], fourth, p2);
             let fifth = s.m.select(b, corner[1], p2, fourth);
             let sixth = s.m.select(b, corner[0], p2, p1);
@@ -150,6 +203,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         emitted.push(out);
     }
 
+    // The rectangle's number: the triangle's, three vertices a rectangle.
     let mut number = None;
     if let Some(id) = primitive {
         let n = s.op(b, "primitiveID.i32", Attr::ReadNone, s.t.i32, 108, &[]);
@@ -178,6 +232,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
             s.op(b, "storeOutput.i32", Attr::NoUnwind, s.t.void, 5, &args);
         }
         s.op(b, "emitStream", Attr::NoUnwind, s.t.void, 97, &[stream]);
+        // The strip ends after the first triangle.
         if vertex == 2 {
             s.op(b, "cutStream", Attr::NoUnwind, s.t.void, 98, &[stream]);
         }
@@ -186,17 +241,24 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
     Ok(s.finish())
 }
 
+/// Column `col` of input `id` at vertex `vertex` of the triangle.
 fn load(s: &mut Shader, id: usize, col: u8, vertex: u32) -> V {
     let (name, ty) = if s.inputs[id].comp == 9 {
         ("loadInput.f32", s.t.f32)
     } else {
         ("loadInput.i32", s.t.i32)
     };
-    let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), s.m.i32(vertex)];
+    let args = [
+        s.m.i32(id as u32),
+        s.m.i32(0),
+        s.m.i8(col),
+        s.m.i32(vertex),
+    ];
     let entry = s.entry;
     s.op(entry, name, Attr::ReadNone, ty, 4, &args)
 }
 
+/// Two floats are equal.
 fn same(s: &mut Shader, a: V, b: V) -> V {
     let entry = s.entry;
     s.m.cmp(entry, pred::OEQ, a, b)
@@ -236,6 +298,7 @@ mod tests {
         }
     }
 
+    /// A position, a float interpolant and an integer one.
     fn outputs() -> Vec<SigElement> {
         vec![
             element("SV_Position", 0, 3, 9, 0, 4),
@@ -244,14 +307,21 @@ mod tests {
         ]
     }
 
+    /// The stage is a geometry shader of triangles in and six strip
+    /// vertices out, with the vertex shader's outputs on both sides and
+    /// the primitive id the pixel shader declares; the validator, where
+    /// there is one, accepts it.
     #[test]
     fn the_rectangle_stage_is_a_geometry_shader() {
         let wanted = [element("SV_PrimitiveID", 0, 10, 5, 3, 1)];
         let gs = build(outputs(), &wanted).unwrap();
         let c = Container::parse(&gs).unwrap();
+        // Program version: geometry (2), shader model 6.6.
         assert_eq!(c.part(FourCC::DXIL).unwrap().data[..4], [0x66, 0, 2, 0]);
         let psv = c.part(FourCC::PSV0).unwrap().data;
+        // Triangles in, triangle strips out, stream 0, a position.
         assert_eq!(psv[4..17], [3, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 1]);
+        // Geometry stage, six vertices, three inputs, four outputs.
         assert_eq!(psv[28..34], [2, 0, 6, 0, 3, 4]);
         let sig = |fourcc| super::super::signature(c.part(fourcc).unwrap().data).unwrap();
         let (ins, outs) = (sig(FourCC::ISG1), sig(FourCC::OSG1));
@@ -272,6 +342,8 @@ mod tests {
         }
     }
 
+    /// Refused with a reason: no position, a primitive id in a register a
+    /// vertex output has, more components than six vertices may carry.
     #[test]
     fn rectangle_stages_that_cannot_be_made_are_refused() {
         assert!(build(outputs()[1..].to_vec(), &[]).is_err());
@@ -282,6 +354,8 @@ mod tests {
         assert!(build(many, &[]).is_err());
     }
 
+    /// A vertex shader that passes a position and a float4 through, and a
+    /// pixel shader that writes the float4.
     #[cfg(windows)]
     fn pass_through() -> (super::super::HostShader, super::super::HostShader) {
         let position = SigElement {
@@ -318,6 +392,7 @@ mod tests {
             usage: 15,
             ..element("SV_Target", 0, 16, 9, 0, 4)
         }];
+        // Vertex: output id from input id. Pixel: target 0 from input 1.
         for (s, copies) in [(&mut vs, &[(0, 0), (1, 1)][..]), (&mut ps, &[(1, 0)][..])] {
             let b = s.entry;
             for &(from, to) in copies {
@@ -347,6 +422,11 @@ mod tests {
         )
     }
 
+    /// Three corners of the whole target, the corner between the other two
+    /// first (as the tiled lighting sends its tiles), second (as
+    /// full-screen rectangles come) or third: with the stage every texel
+    /// is drawn and the interpolant continues into the fourth corner's
+    /// half; without it part of the target is not drawn.
     #[test]
     #[cfg(windows)]
     fn rectangles_are_drawn_whole() {
@@ -364,6 +444,7 @@ mod tests {
         }
         let gs = rect_list_gs(&vs.dxil, Some(&ps.dxil[..])).unwrap();
         let root = host.root_signature(&vs, &ps).unwrap();
+        // Position (z 0.5, w 1) and an interpolant that is the position.
         let vertex = |(x, y): (f32, f32)| [x, y, 0.5, 1.0, x, y, 0.0, 1.0];
         for (name, corners) in [
             ("corner first", [(-1.0, 1.0), (-1.0, -1.0), (1.0, 1.0)]),
@@ -397,10 +478,7 @@ mod tests {
             }
             let half = draw(None);
             let missing = half.iter().zip(&whole).filter(|(a, b)| a != b).count();
-            assert!(
-                missing >= 24,
-                "{name}: only {missing} texels need the stage"
-            );
+            assert!(missing >= 24, "{name}: only {missing} texels need the stage");
         }
     }
 }

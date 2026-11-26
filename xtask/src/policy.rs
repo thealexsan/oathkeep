@@ -3,11 +3,12 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-const MAX_FILE_SIZE: usize = 512 * 1024;
+const MAX_FILE_SIZE: usize = 640 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "svg", "html", "css",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -226,7 +227,7 @@ mod tests {
             "extension not allowed"
         );
         assert!(
-            !check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(),
+            !check("a.rs", &vec![b'a'; 700 * 1024]).is_empty(),
             "too big"
         );
     }

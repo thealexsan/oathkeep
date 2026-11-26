@@ -1,3 +1,19 @@
+//! Pipeline states. Both descriptions start as on PC: the root signature,
+//! then the shader stages (five for graphics, one for compute); streams
+//! carry the rest of the graphics state as subobjects of the standard
+//! types.
+//!
+//! Host pipelines are made on a pipeline's first draw, not at creation:
+//! The title creates some 60,000 pipelines in its first 20
+//! seconds and draws with a few dozen (decision 0007, step 3). Shader
+//! containers are shared by content hash and translated once, on first
+//! use (decision 0003).
+//!
+//! shortcut: only vertex plus pixel pipelines from streams and compute
+//! pipelines get host pipelines; mesh, tessellation and geometry stages,
+//! and the plain graphics description, keep their containers only. The 32-byte
+//! packet after the header stays zero: titles only copy it inline, which
+//! our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::collections::HashMap;
@@ -28,6 +44,7 @@ pub(crate) struct Bytecode {
 #[repr(C)]
 pub(crate) struct GraphicsHead {
     root: This,
+    /// Vertex, pixel, domain, hull, geometry.
     stages: [Bytecode; 5],
 }
 
@@ -37,10 +54,16 @@ pub(crate) struct ComputeHead {
     stage: Bytecode,
 }
 
+/// A shader container a title passed, shared by every pipeline with the
+/// same bytes.
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
+    /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Its part in the stand-in for the indirect light.
+    #[cfg(windows)]
+    pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -51,11 +74,17 @@ impl std::fmt::Debug for Shader {
     }
 }
 
+/// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
-static KEPT: [std::sync::atomic::AtomicU64; 4] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// For the memory lines: containers kept and their bytes, translations
+/// kept and the bytes of their host code. None of them is ever let go.
+static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// What the shader table and the pipeline library keep in memory:
+/// containers and their bytes, translations and their bytes, the bytes of
+/// the library's file (kept whole while the library lives) and what its
+/// last save wrote.
 #[cfg(windows)]
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn kept() -> [u64; 7] {
@@ -71,6 +100,7 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -85,25 +115,42 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
+                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
             })
         })
         .clone()
 }
 
+/// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: oathkeep_shader::emit::HostShader,
+    /// A compute program's threads in a group.
+    pub(crate) threads: Option<[u32; 3]>,
     pub(crate) used: Vec<oathkeep_shader::UsedResource>,
+    pub(crate) tables: crate::draw::TablePlan,
+    /// Whether the shader's code can store to buffer memory ([`stores`]);
+    /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store through raw addresses ([`stores_by_address`]).
+    pub(crate) stores_by_address: bool,
+    /// Whether it stores through a view it picks from the heap by an index,
+    /// once asked (`crate::picked`).
+    pub(crate) picks: std::sync::atomic::AtomicU8,
 }
 
 #[cfg(windows)]
 impl Shader {
+    /// The translation, made on first use; a shader that does not
+    /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
+                // `OATHKEEP_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
+                // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("OATHKEEP_SHADER_SAVE") {
                     let dir = std::path::PathBuf::from(dir);
                     let _ = std::fs::create_dir_all(&dir);
@@ -115,10 +162,7 @@ impl Shader {
                 }
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    KEPT[3].fetch_add(
-                        t.host.dxil.len() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -142,16 +186,33 @@ impl Shader {
 }
 
 #[cfg(windows)]
+impl Shader {
+    /// The console programs of the container; `None` if they are not known.
+    pub(crate) fn programs(&self) -> Option<Vec<oathkeep_shader::NativeProgram>> {
+        use oathkeep_shader::{Container, FourCC};
+        let c = Container::parse(&self.container).ok()?;
+        let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
+        oathkeep_shader::native_programs(part.data).ok()
+    }
+}
+
+#[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use oathkeep_shader::{Container, FourCC, HwStage};
+    // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
+    let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => oathkeep_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let threads = programs.iter().find_map(|p| match &p.io {
+        oathkeep_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
+        _ => None,
+    });
+    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -162,23 +223,61 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    Ok(Translated {
+        host,
+        threads,
+        used,
+        tables,
+        stores,
+        stores_by_address,
+        picks: Default::default(),
+    })
 }
 
+/// The compute pipelines of the console's ray-tracing structure builder
+/// (`XboxBvhBuilder.dll`; its programs are the ones with a spilled
+/// user-data table) run **all or none**. Its stages feed each other
+/// through memory: a stage that runs on what a dropped stage never wrote
+/// computes its store offsets from garbage. The structures lie in plain
+/// title memory, between the title's own objects, and a root view has no
+/// size, so those stores land on the neighbours (run 98, with 14 of 35
+/// stages translated: the title died within a second of the first builder
+/// submission, on pointers that had become bounding-box bit patterns).
+///
+/// So a builder dispatch runs only while every builder pipeline the title
+/// has created has a host pipeline; the first builder dispatch makes them
+/// all on the spot instead of over the next frames (a stage "still being
+/// made" would be a dropped stage). While one cannot be made the builder
+/// is off; it is looked at again when the title creates another. A stage
+/// that could not be bound stops the stages after it for the rest of that
+/// frame and the next ([`builder_rests`]); it turned the builder off for the
+/// rest of the run at first.
+///
+/// shortcut: and only with `OATHKEEP_BVH_BUILDER=1`, until a run has shown
+/// the whole builder and the host side of title memory by address
+/// (`memory.rs`) working on a card; nothing reads the structures before
+/// the programs that walk them translate.
 #[cfg(windows)]
 struct Builder {
     pipelines: Vec<Arc<make::Pending>>,
+    /// Every one of `pipelines` has a host pipeline.
     whole: bool,
-    off: bool,
+    /// One could not be made, of so many (0: none).
+    off: usize,
+    /// No stage runs before this frame.
+    rests: u64,
 }
 
 #[cfg(windows)]
 static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     pipelines: Vec::new(),
     whole: false,
-    off: false,
+    off: 0,
+    rests: 0,
 });
 
+/// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
     use oathkeep_shader::{Container, FourCC};
@@ -194,54 +293,65 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
         .is_some_and(|programs| programs.iter().any(oathkeep_shader::spill::is_spilled))
 }
 
+/// `OATHKEEP_BVH_QUARANTINE=1`: what the structure builder's stages store
+/// stays in the host's copies and is not copied back into title memory. A
+/// check for a first run of the whole builder: a stage that stores where
+/// it should not can then not reach the title's own objects (run 98), and
+/// the programs that walk the structures read the host's copies anyway.
+/// shortcut: not a way to run: the title also reads results back (sizes,
+/// counters) and gets none, and a copy's pages are overwritten from title
+/// memory when the title writes them.
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this)
-        && *ON.get_or_init(|| std::env::var_os("OATHKEEP_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    is_builder(this) && *ON.get_or_init(|| std::env::var_os("OATHKEEP_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
+/// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
+/// A stage of the builder was dropped after all: none runs for the rest of
+/// this frame and the next (what it fed is not there).
 #[cfg(windows)]
-pub(crate) fn builder_off(why: &'static str) {
+pub(crate) fn builder_rests(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if !b.off {
-        b.off = true;
-        tracing::warn!(
-            why,
-            "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none"
-        );
+    b.rests = crate::frame::current() + 2;
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+        tracing::warn!(why, "the ray-tracing structure builder rests for this frame and the next: its stages run all or none");
     }
 }
 
+/// At a dispatch of a builder pipeline: whether the builder runs (see
+/// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("OATHKEEP_BVH_BUILDER").is_some_and(|v| v == "1"))
-    {
+    if !*ALLOWED.get_or_init(|| std::env::var_os("OATHKEEP_BVH_BUILDER").is_some_and(|v| v == "1")) {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if b.off {
+    if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
         return false;
     }
     if b.whole {
         return true;
     }
-    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
-    if missing > 0 {
-        b.off = true;
+    let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
+    if !missing.is_empty() {
+        b.off = b.pipelines.len();
         tracing::warn!(
-            missing,
+            missing = missing.len(),
             of = b.pipelines.len(),
+            which = ?missing,
             "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
         );
         return false;
     }
+    b.off = 0;
     tracing::info!(
         pipelines = b.pipelines.len(),
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
@@ -250,6 +360,13 @@ pub(crate) fn builder_runs() -> bool {
     true
 }
 
+/// Whether a console program can store to buffer memory: it has a buffer,
+/// typed-buffer, scalar-memory, flat or global store or atomic, or code
+/// that is not all known (an instruction of those kinds outside our table,
+/// an indirect jump, code that does not decode). Stores to textures
+/// (image instructions) and to the program's own scratch memory do not
+/// count: neither reaches a buffer's host copy. After upstream #413,
+/// which leaves scalar-memory stores out and counts image stores.
 #[cfg(windows)]
 fn stores(program: &oathkeep_shader::NativeProgram) -> bool {
     use oathkeep_shader::gfx10::{Encoding, decode};
@@ -272,19 +389,42 @@ fn stores(program: &oathkeep_shader::NativeProgram) -> bool {
     })
 }
 
+/// Whether a console program can store to memory through raw addresses
+/// (`crate::memory`): a flat or global store or atomic, or code that does
+/// not decode. The programs that only walk ray-tracing structures do not,
+/// whatever they store through views.
+#[cfg(windows)]
+fn stores_by_address(program: &oathkeep_shader::NativeProgram) -> bool {
+    use oathkeep_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        matches!(i.encoding, Encoding::Flat | Encoding::Global)
+            && i.name()
+                .is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
+    })
+}
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
     packet: [u32; 8],
+    /// Each used stage's container.
     shaders: Vec<Arc<Shader>>,
+    /// Whether a list has bound it yet (its shaders are logged then).
     bound: std::sync::atomic::AtomicBool,
+    /// What its host pipeline is made from, and the host pipeline once made
+    /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
+/// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
 
 fn pipeline<'a>(this: This) -> &'a Pipeline {
@@ -292,6 +432,8 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+/// List method: logs each pipeline's shaders the first time a list binds
+/// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
     if this.is_null() {
         return;
@@ -306,6 +448,9 @@ pub(crate) fn bound(this: This) {
     }
 }
 
+/// The host pipeline of a title pipeline; `None` if one of its shaders does
+/// not translate, the host refuses it, or it is still being made (its first
+/// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
@@ -314,14 +459,18 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Draws and dispatches dropped since the last [`take_drops`], by reason
+/// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
+/// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
@@ -363,6 +512,8 @@ pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
 
+/// Counts a draw or dispatch of `this` intentionally skipped or dropped
+/// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_drop(this: This) {
     let why = if this.is_null() {
@@ -378,24 +529,26 @@ pub(crate) fn note_drop(this: This) {
     }
 }
 
+/// Counts a draw or dispatch dropped for `why` (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     crate::capture::op(0, || format!("DROPPED {why}"));
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops
-        .get_or_insert_with(HashMap::new)
-        .entry(why)
-        .or_default() += 1;
+    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }
 
+/// The drops counted since the last call, most first (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn take_drops() -> Vec<(String, u64)> {
     let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
+    // Frame reports only show the first 40 reasons. Keep ties ordered so
+    // a HashMap iteration order change cannot change which reasons appear.
     drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     drops
 }
 
+/// The stage's container, if it has one.
 fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     if code.code.is_null() || code.size == 0 {
         return None;
@@ -416,11 +569,14 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
+    known::note(host.key(), &shaders, host.graphics.as_deref());
+    #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
     if builder {
+        // Another stage: the group is looked at again at its next dispatch.
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
@@ -438,27 +594,41 @@ fn hand_out(
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
 
+/// Device method (`ID3D12Device::CreateGraphicsPipelineState`, slot 0x50).
+/// Captures both the shader stages and the full graphics pipeline state from
+/// `D3D12_GRAPHICS_PIPELINE_STATE_DESC`.
 pub(crate) extern "system" fn create_graphics(
     _: This,
     desc: *const GraphicsHead,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
-    let Some(desc) = (unsafe { desc.as_ref() }) else {
+    // SAFETY: the title passes a full D3D12_GRAPHICS_PIPELINE_STATE_DESC (null is tolerated).
+    let Some(head) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    let stages = GRAPHICS_STAGES.iter().zip(&desc.stages);
+    let stages = GRAPHICS_STAGES.iter().zip(&head.stages);
     let shaders = stages.filter_map(|(s, c)| copy(s, c)).collect();
+    #[cfg(windows)]
+    let graphics = {
+        use windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC;
+        const _: () = assert!(
+            offset_of!(GraphicsHead, stages) == offset_of!(D3D12_GRAPHICS_PIPELINE_STATE_DESC, VS)
+        );
+        // SAFETY: `CreateGraphicsPipelineState` passes a `D3D12_GRAPHICS_PIPELINE_STATE_DESC`.
+        let full = unsafe { &*desc.cast::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>() };
+        Some(Box::new(unsafe { host::GraphicsState::from_graphics_desc(full) }))
+    };
     hand_out(
         shaders,
         #[cfg(windows)]
-        None,
+        graphics,
         iid,
         out,
     )
 }
 
+/// Device method.
 pub(crate) extern "system" fn create_compute(
     _: This,
     desc: *const ComputeHead,
@@ -478,6 +648,10 @@ pub(crate) extern "system" fn create_compute(
     )
 }
 
+/// Device method 0x1f0: the plain compute description plus console
+/// extensions `(desc, extension count, extensions, iid, out)`.
+/// shortcut: the extensions (console shader settings) are ignored, as is
+/// the rest of the description.
 pub(crate) extern "system" fn create_compute_x(
     this: This,
     desc: *const ComputeHead,
@@ -489,12 +663,17 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// A pipeline described as a stream: its size and the subobjects, each a
+/// type then its data, padded to 8 bytes.
 #[repr(C)]
 pub(crate) struct StreamDesc {
     size: usize,
     stream: *const u8,
 }
 
+/// A subobject type's size (type included), and the stage it is if it is a
+/// shader. The console numbers amplification and mesh shaders 23 and 24
+/// (PC: 24 and 25); its own types from 25 on are not sized yet.
 fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
     let stage = |name| Some((24, Some(name)));
     match kind {
@@ -520,6 +699,8 @@ fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
     }
 }
 
+/// Device method: a pipeline from a stream; the shaders are kept, and the
+/// graphics state for the host pipeline.
 pub(crate) extern "system" fn create_stream(
     _: This,
     desc: *const StreamDesc,
@@ -577,36 +758,46 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Pipeline>(this)
 }
 
+/// IUnknown 3, object 4, device child 1, pipeline 3.
 static FUNCTIONS: Table<24> = {
     let mut f = object::d3d12_object(object::missing_table::<PIPELINE, 24>());
     f[0] = query as *const ();
     f[2] = release as *const ();
-    f[7] = object::parent_device as *const ();
+    f[7] = object::parent_device as *const (); // 0x38
     Table(f)
 };
 
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+pub mod known;
+#[cfg(windows)]
 mod library;
 #[cfg(windows)]
 mod make;
 
+/// Lets the pipeline library's mapped file go from memory when no pipeline
+/// has loaded for a while (`library::trim`); called by the host's sweep.
 #[cfg(windows)]
 pub(crate) fn trim_library() {
     library::trim();
 }
 
+/// The pipeline library's part of the report when the host device is
+/// removed (`library::removal_note`).
 #[cfg(windows)]
 pub(crate) fn library_removal_note() -> String {
     library::removal_note()
 }
 
+/// Keeps compiled host pipelines, and the list of title pipelines to start
+/// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]
 pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     library::use_pipeline_cache(dir);
 }
 
+/// Saves the pipeline cache now if anything was added (at the end of a run).
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
@@ -638,44 +829,87 @@ mod tests {
     #[test]
     fn pipelines_keep_their_shaders() {
         let (vs, ps) = ([1u8, 2, 3], [4u8; 5]);
-        let none = || Bytecode {
-            code: std::ptr::null(),
-            size: 0,
-        };
-        let desc = GraphicsHead {
-            root: std::ptr::null(),
-            stages: [
-                Bytecode {
-                    code: vs.as_ptr(),
-                    size: vs.len(),
+        #[cfg(windows)]
+        let mut full = {
+            use windows::Win32::Graphics::Direct3D12::*;
+            use windows::Win32::Graphics::Dxgi::Common::*;
+            let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                VS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: vs.as_ptr().cast(),
+                    BytecodeLength: vs.len(),
                 },
-                Bytecode {
-                    code: ps.as_ptr(),
-                    size: ps.len(),
+                PS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: ps.as_ptr().cast(),
+                    BytecodeLength: ps.len(),
                 },
-                none(),
-                none(),
-                none(),
-            ],
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                DSVFormat: DXGI_FORMAT_D32_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 0, Quality: 0 },
+                SampleMask: u32::MAX,
+                ..Default::default()
+            };
+            d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            d.RTVFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM; // trailing stale format
+            d
         };
+        #[cfg(windows)]
+        let desc_ptr = (&raw const full).cast::<GraphicsHead>();
+        #[cfg(not(windows))]
+        let desc = {
+            let none = || Bytecode {
+                code: std::ptr::null(),
+                size: 0,
+            };
+            GraphicsHead {
+                root: std::ptr::null(),
+                stages: [
+                    Bytecode { code: vs.as_ptr(), size: vs.len() },
+                    Bytecode { code: ps.as_ptr(), size: ps.len() },
+                    none(),
+                    none(),
+                    none(),
+                ],
+            }
+        };
+        #[cfg(not(windows))]
+        let desc_ptr = &raw const desc;
         let mut p = std::ptr::null();
         assert_eq!(
-            create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            create_graphics(std::ptr::null(), desc_ptr, &PIPELINE_IIDS[0], &mut p),
             S_OK
         );
         assert_eq!(
             shaders(p),
             [("vertex", vs.to_vec()), ("pixel", ps.to_vec())]
         );
+        #[cfg(windows)]
+        {
+            let g = pipeline(p).host.graphics.as_deref().expect("plain graphics state kept");
+            assert_eq!(g.topology.0, 3);
+            assert_eq!(g.targets.NumRenderTargets, 1);
+            assert_eq!(g.targets.RTFormats[0].0, 28);
+            assert_eq!(g.targets.RTFormats[1].0, 0, "trailing RTV format zeroed");
+            assert_eq!(g.depth_format.0, 40);
+            assert_eq!(g.samples.Count, 1, "SampleDesc.Count 0 normalized to 1");
+        }
+        // A second pipeline with the same pixel shader shares its container.
         let mut q = std::ptr::null();
-        create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q);
+        create_graphics(std::ptr::null(), desc_ptr, &PIPELINE_IIDS[0], &mut q);
         assert!(Arc::ptr_eq(
             &pipeline(p).shaders[1],
             &pipeline(q).shaders[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+        #[cfg(windows)]
+        let _ = &mut full;
     }
 
+    /// The stream layout the title builds (title+0x86f090): root
+    /// signature, five shader slots (the first a mesh shader), blend, sample
+    /// mask, rasterizer, depth-stencil 1, sample description, input layout,
+    /// topology, render target and depth formats: 0x2b0 bytes.
     #[test]
     fn streams_yield_their_shaders() {
         let (ms, ps) = ([9u8; 7], [4u8; 5]);
@@ -703,6 +937,7 @@ mod tests {
         put(0x20, ms.len() as u64);
         put(0x30, ps.as_ptr() as u64);
         put(0x38, ps.len() as u64);
+        // Topology type 3 (triangles), one render target of format 28.
         put(0x278, 14 | 3 << 32);
         put(0x280, 15 | 28 << 32);
         put(0x2a0, 1 << 32);

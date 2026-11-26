@@ -1,0 +1,426 @@
+[meta]
+updated = "2026-11-26"
+commit = "main"
+branch = "main"
+target_fps = "20-30+ FPS (1:1 visuals)"
+current_fps = "5.4 fps peak in-world (184.0 ms/f; 1.5-5.4 fps across diag-fps-swarm2b, 145.7s TIMEOUT_CLEAN; 0 refused dynamic tables, 0 exploding tris, intact ceiling/interiors)"
+current_frame_ms = "184.0-655.0 ms in diag-fps-swarm2b (planning 1.1-5.5 ms, waiting for flights 0.1-0.2 ms, sweep 0.1-0.6 ms, lists' steps 122-137 ms)"
+current_gpu_ms = "0.0-33.8 ms (145.7s TIMEOUT_CLEAN; 0 crashes/TDRs/OOMs, 0 failed Wave64 shaders, 0 refused PSOs)"
+current_preparing_ms = "116.9-239.4 ms in diag-fps-swarm2b (refreshes 62-80 ms, heap views 67-98 ms slots + 68-86 ms textures)"
+headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
+eta = "~20-30 min (merged clean Round 2 + shader-warming launcher to main; next: main-based PRs for Round 3 FPS targeting refreshes/heap views/card steps)"
+pages_url = "https://thealexsan.github.io/oathkeep/"
+
+[[subsystems]]
+name = "PE32+ Loader & CPU"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 4, 3]
+note = "Native x86-64 loading, TLS redirection, console CPU emulation"
+
+[[subsystems]]
+name = "Win32 / GDK HLE"
+cells = [4, 4, 4, 4, 4, 4, 4, 3, 3, 3]
+note = "System libraries, threading, memory commit, input, saves"
+
+[[subsystems]]
+name = "DirectStorage & VFS"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 3, 3]
+note = "Async streaming, BCPack decode, read-only title mount"
+
+[[subsystems]]
+name = "Audio (XMA / Opus)"
+cells = [4, 4, 4, 4, 4, 3, 3, 3, 2, 2]
+note = "XMA2 & Opus decode pipelines active"
+
+[[subsystems]]
+name = "D3D12.x Command Host"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 3, 3]
+note = "Async relay queue, bindless heaps, indirect mesh/compute"
+
+[[subsystems]]
+name = "RDNA 2 -> DXIL Core"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 4, 3]
+note = "SM 6.6 dynamic resources, mesh/compute/pixel translation"
+
+[[subsystems]]
+name = "Wave64 -> Wave32"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 4, 3]
+note = "2561af95 verified 0.36 ms/frame (down from 297 ms TDR); zero TDR"
+
+[[subsystems]]
+name = "DP4A / ML Compute"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 4, 3]
+note = "VERIFIED in diag-run61: all 9 ML shaders 0.15-0.63 ms in VRAM (155.3 -> 17.0 ms dispatch, 4.8x total GPU speedup)"
+
+[[subsystems]]
+name = "Pipeline Cache & Queue"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 4, 3]
+note = "host-pipelines.bin warmed to 258.8 MB (1082 added, only 5 being made at 4772 draws/frame)"
+
+[[subsystems]]
+name = "Shadow & Page Sync"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 4, 3]
+note = "9dcae23 verified in diag-run74: WHY_READ=0, WHY_STALE=0, 0.0 ms GPU wait (LATE_WAIT=3+RELAY=2), page faults -75%, private commit 12.4-13.3 GB, peak 10.9 fps (91.7 ms/f)"
+
+[[subsystems]]
+name = "Texture Streaming"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 3, 3]
+note = "Zero-VRAM hole reuse + 5/6-block staging cap + tiled reuse verified on 8 GB GPU (24,000+ textures admitted under !room)"
+
+[[subsystems]]
+name = "Display & Input"
+cells = [4, 4, 4, 4, 4, 4, 4, 4, 3, 3]
+note = "1080p presentation, XInput + keyboard fallback, Agility SDK 620"
+
+[[milestones]]
+label = "Executable boot & HLE init"
+state = "done"
+level = 4
+detail = "verified"
+
+[[milestones]]
+label = "Intro & menus interactive"
+state = "done"
+level = 4
+detail = "30-35 fps"
+
+[[milestones]]
+label = "World entry & full 3D render"
+state = "done"
+level = 4
+detail = "verified"
+
+[[milestones]]
+label = "Zero-TDR lighting (2561af95)"
+state = "done"
+level = 4
+detail = "0.36 ms/frame"
+
+[[milestones]]
+label = "CPU preparing <15 ms"
+state = "active"
+level = 3
+detail = "59.7 ms -> <15 ms"
+
+[[milestones]]
+label = "All 9 ML DP4A shaders fast"
+state = "done"
+level = 4
+detail = "0.15-0.63 ms (VRAM verified)"
+
+[[milestones]]
+label = "1:1 console visuals verified"
+state = "done"
+level = 4
+detail = "verified (all NPC faces & interior walls textured/lit)"
+
+[[milestones]]
+label = "Playable first mission (20-30+ FPS)"
+state = "pending"
+level = 0
+detail = "target"
+
+[[runs]]
+label = "diag-run52c"
+commit = "f78ba1b"
+fps = 4.9
+frame_ms = 204.0
+gpu_ms = "~130 ms"
+preparing_ms = "78 ms"
+status = "World entry baseline (cold PSOs)"
+
+[[runs]]
+label = "diag-run54b"
+commit = "a9461b1"
+fps = 6.2
+frame_ms = 161.0
+gpu_ms = "127 ms"
+preparing_ms = "76 ms"
+status = "Baseline GPU timing (9 ML shaders 83 ms)"
+
+[[runs]]
+label = "diag-run56-gpu"
+commit = "542b511"
+fps = 5.4
+frame_ms = 185.0
+gpu_ms = "118 ms"
+preparing_ms = "75 ms"
+status = "DP4A sped 5/9 ML shaders; 4/9 regressed"
+
+[[runs]]
+label = "diag-run59b"
+commit = "40200b5"
+fps = 5.8
+frame_ms = 172.1
+gpu_ms = "27.7 ms (no ML)"
+preparing_ms = "59.7 ms"
+status = "Zero TDR; 2561af95 0.36 ms/frame; ask_once 4.5 ms"
+
+[[runs]]
+label = "diag-run60"
+commit = "4a14eaa"
+fps = 2.7
+frame_ms = 376.1
+gpu_ms = "168.7 ms (135.6 ms ML)"
+preparing_ms = "108.2 ms (cold)"
+status = "Zero TDR; all 9/9 ML shaders dumped for DP4A diff"
+
+[[runs]]
+label = "diag-run61"
+commit = "15e6154"
+fps = 3.7
+frame_ms = 270.7
+gpu_ms = "35.2 ms timed (ML <=0.63 ms)"
+preparing_ms = "103.3 ms (cold)"
+status = "ML VRAM fix verified (4.8x GPU speedup, GPU 33% busy); CPU-bound now"
+
+[[runs]]
+label = "diag-run62"
+commit = "eb5ce1e"
+fps = 6.1
+frame_ms = 162.8
+gpu_ms = "47.9 ms (4772 draws, 55% busy)"
+preparing_ms = "106.7 ms (warm 5 PSOs left)"
+status = "Uninstrumented 4772 draws/frame (12x more draws); host-pipelines.bin 258.8 MB; heap_buffers 18.1 ms; next: guard churn + copy-queue stall"
+
+[[runs]]
+label = "diag-run63-warm"
+commit = "bc99622"
+fps = 5.4
+frame_ms = 183.9
+gpu_ms = "49.3 ms (3467 draws, 54-59% busy)"
+preparing_ms = "125.3 ms (0 PSOs left, run_deferred 10.4 ms)"
+status = "run_deferred -43%, copy queue -51% (19.3 ms), copy-back -33% (42.3 ms), fallbacks -85% (35); remaining: GUARDS 55.9 ms (0xae00000 29.5 ms), mirror 18.6 ms, 1519 indirect clamps on GPU"
+
+[[runs]]
+label = "diag-run66"
+commit = "2912eee"
+fps = 7.9
+frame_ms = 126.9
+gpu_ms = "34.3 ms (2984 draws, 54% busy, uav_emitted 3)"
+preparing_ms = "82.1 ms (batch_flush 53.7 ms, read_fast 10.3 ms)"
+status = "Fixes D/E/F verified: 64-shard GUARDS (read_fast -85%), dispatch indirect windowing (uav_emitted 1079->3, GPU -20 ms), copy_hot 147->11 ms"
+
+[[runs]]
+label = "diag-run67"
+commit = "2912eee"
+fps = 9.2
+frame_ms = 109.0
+gpu_ms = "27.4 ms wait (3615 draws, 68-78% busy, 0.0 ms present stall)"
+preparing_ms = "69.6 ms (batch_flush 37.3-43.6 ms, heap_buffers 5.3-7.3 ms)"
+status = "LATE_WAIT=3 + RELAY=2 + GUARD_HOT=0 + BAKE_TEXTURES_MS=4: scan_card 81.3->3.6 ms (0xae00000 28.5->5.3 ms); next: barrier_groups (842/f), GetWriteWatch (31.5 ms) + 211 MB copies, WHY_READ relay stall (28 ms)"
+
+[[runs]]
+label = "diag-run72"
+commit = "42be757"
+fps = 8.5
+frame_ms = 117.8
+gpu_ms = "50.6-67.8 ms WHY_READ wait (2751 draws)"
+preparing_ms = "36.6-68.5 ms (batch_flush 29.1 ms, moves 33.3 ms)"
+status = "Fixes L1-L4 verified: WHY_STALE=0, page faults -75% (2887/f), private commit 12.4-12.56 GB; diagnosed LOOSE shadow_cache aliasing (WHY_READ) & dynamic descriptor refusals"
+
+[[runs]]
+label = "diag-run74"
+commit = "9dcae23"
+fps = 10.9
+frame_ms = 91.7
+gpu_ms = "0.0 ms wait (LATE_WAIT=3 + RELAY=2, 72-75% busy, 13.3-16.6 ms async copy-back)"
+preparing_ms = "44.2-53.9 ms (batch_flush 21.5-27.3 ms, heap_buffers 7.1-9.6 ms)"
+status = "New peak 10.9 fps! Fixes M1+M2 verified: WHY_READ=0, WHY_STALE=0, 0.0 ms GPU wait; next: eliminate dynamic descriptor exhaustion (128-1359 refused) & cut recording (176-232 ms) + batch_flush (21.5 ms)"
+
+[[runs]]
+label = "diag-run76"
+commit = "45708fb"
+fps = 10.6
+frame_ms = 94.4
+gpu_ms = "0.0 ms wait (82-94% busy; 2.8k-4.7k mid-list gpu_copy_scratch barriers/f)"
+preparing_ms = "45.7-66.0 ms (batch_flush 23.8-36.9 ms, guards 20.7-34.1 ms)"
+status = "Fix O1+O2 verified: dynamic slot refusals 576->0, dropped indirects 1313->0, uncacheable 9161->0, fresh_tables hits 6-8x (1656-4438), cbv_scratch hits 1519-5517; next: prelude-hoist gpu_copy_scratch + multi-buffer scratch ring + batch_flush"
+
+[[runs]]
+label = "diag-run78"
+commit = "8e04090"
+fps = 11.9
+frame_ms = 83.8
+gpu_ms = "0.0 ms wait (50-74% busy, down from 93-97%; 95-98% cbv_scratch hoisted to prelude)"
+preparing_ms = "46.5-72.4 ms (batch_flush 25.3-42.7 ms, guards 23.8-45.8 ms, moves shadow 33.2-72.2 ms)"
+status = "New peak 11.9 fps (heavy scene +48% to 7.4 fps)! Fix P1a/P1b/P1c/P2b verified: bindless_wr -96% (1526->52-97), inline barriers -98% (2622->57-97), GPU busy 93-97%->50-74%; now 100% CPU-bound -> next: cut guards/alias_apply + batch_flush + recording make_at"
+
+[[runs]]
+label = "diag-run79"
+commit = "1b671a8"
+fps = 15.7
+frame_ms = 63.6
+gpu_ms = "0.0-1.4 ms wait (71-99% busy)"
+preparing_ms = "36.6-60.3 ms (batch_flush 16.0-25.7 ms, moves shadow 13.6-18.6 ms, sparse reads 0.3 ms)"
+status = "New peak 15.7 fps (+32%, steady 10.4-15.7 fps)! Fix Q1-Q4 verified: copies MB -60% (116->44 MB), moves shadow -60% (33-72->13.6-18.6 ms), sparse reads 0.3 ms (-99%), submit kernel -77% (20.1->4.7 ms), GUARD_HOT=0 beats GUARD_HOT=1 (15.7 vs 6.9 fps); next: Fix R1-R4 CPU staging descriptor cache + indirect scratch growth"
+
+[[runs]]
+label = "diag-run81"
+commit = "2fff334"
+fps = 17.3
+frame_ms = 57.7
+gpu_ms = "0.0 ms wait (71-98% busy)"
+preparing_ms = "36.2-57.4 ms (batch_flush 16.4-27.6 ms, moves shadow 11.3-29.7 ms, rec 134.9 ms)"
+status = "New peak 17.3 fps (57.7 ms/f, +10% over run79)! Fix R1-R4 verified across all 3D intervals: between-submissions 30.7->23.4 ms, indirect miss_step -20%, 0 refusals/crashes"
+
+[[runs]]
+label = "diag-run82"
+commit = "perf/commit-reduction"
+fps = 15.9
+frame_ms = 62.7
+gpu_ms = "0.0 ms wait (53-99% busy)"
+preparing_ms = "36.5-53.1 ms (batch_flush 15.3-20.3 ms, moves shadow 12.1-17.5 ms, rec 121.6-129.2 ms, make_at 32.5-34.1 ms)"
+status = "Fix S1-S3 verified: heavy scenes +16-43% (8.9->12.7, 10.9->11.9, 6.8->7.9 fps), lowest rec/make_at/batch_flush yet; stage_cache counter exposed 3.6k-7.3k misses/f from global SHADOW_GEN bumps + PrepOtherUs 6.4-10.9 ms -> next: Fix T"
+
+[[runs]]
+label = "diag-run88"
+commit = "56618a9"
+fps = 17.4
+frame_ms = 57.3
+gpu_ms = "0.0-1.5 ms wait (75-98% busy)"
+preparing_ms = "29.5-64.9 ms (batch_flush 12.4-27.9 ms, moves 12.5-66.2 ms)"
+status = "Fix X1-X3 verified: new peak 17.4 fps (57.3 ms/f), heavy-scene prep -28%, batch_flush -43%, moves -48%, rec -26%; 0 crashes/TDRs/refusals"
+
+[[runs]]
+label = "diag-run89b"
+commit = "cafadfe"
+fps = 18.3
+frame_ms = 54.5
+gpu_ms = "0.0 ms wait (67-84% busy)"
+preparing_ms = "33.0-45.9 ms (batch_flush 12.4-22.5 ms, moves 12.8-34.8 ms)"
+status = "Fix Y1-Y4 verified: NEW PEAK 18.3 fps (54.5 ms/f), heavy scenes +17-38% (10.0->13.8, 9.3->11.9, 8.4->9.8 fps), 0 crashes/TDRs/refusals; next: Fix Z (batched CopyDescriptors, parallel GpuWrite flush, CARD_BUFFERS_MIN_KB=512, alias_apply hot-skip)"
+
+[[runs]]
+label = "diag-run90"
+commit = "perf/commit-reduction"
+fps = 16.6
+frame_ms = 60.4
+gpu_ms = "0.0 ms wait (67-86% busy)"
+preparing_ms = "34.8-46.6 ms (run_deferred 1.5-1.9 ms, snapshots 1.3-1.6 ms, back 13.6-18.4 ms)"
+status = "Fix Z1-Z4 verified: run_deferred -68% (5.0->1.6 ms), snapshots -53% (3.0->1.4 ms), copy-back -30% (24->16 ms), compared MB -56% (33->14.4 MB), heavy 3D scenes +18-32% (drw=3958 9.8->11.6, drw=3449 11.7->13.8, drw=2473 10.4->13.7 fps); next: Fix AA (2-hit stage-cache admission filter + parallel card stale_under_flights + 128 KB card threshold)"
+
+[[runs]]
+label = "diag-run92"
+commit = "ad52400"
+fps = 17.9
+frame_ms = 55.8
+gpu_ms = "0.0 ms wait (0 hangs/TDRs in 130s at default 512 KiB)"
+preparing_ms = "35.0-51.8 ms (batch_flush 18.2-27.6 ms, stale 4.8-6.0 ms, pre_prep sweep 1.7-5.2 ms)"
+status = "Fix AA1-AA4 verified clean (isolated MIN_KB=128 hang from run91): 17.9 fps peak, drw=5788 batch_flush -39% (30->18.2 ms), stale -57% (11.4->4.9 ms), make_at -45% (77.2->42.3 ms), stage_cache 62% 1-shot bypass, pre_prep exposed WHY_SYNC sweep stall (1.7-5.2 ms/f, lock_wait 0.00 ms) -> next: Fix AB"
+
+[[runs]]
+label = "diag-run93"
+commit = "perf/commit-reduction"
+fps = 18.8
+frame_ms = 53.2
+gpu_ms = "0.0-1.7 ms wait (0 hangs/TDRs/refusals in 135.6s at default 512 KiB)"
+preparing_ms = "30.0-54.0 ms (batch_flush 14.5-27.1 ms, guards 10.9-26.4 ms, stale 4.2-7.6 ms, sweep 0.43-1.72 ms)"
+status = "Fix AB1-AB4 verified clean: NEW ALL-TIME PEAK 18.8 fps (53.2 ms/f, drw=994), steady 11.3-17.2 fps (17.2 fps drw=1135, 16.9 fps drw=1510, 14.3 fps drw=3140), pre_prep sweep cut to 0.43-1.72 ms, make_at cbv -50% (4.0-7.9 ms), tables non-make_at cut; next: Fix AC (throttle !behind sweep, cut batch_flush/alias_apply + indirect 45-132 ms + make_at miss/post -> 20-30+ FPS)"
+
+[[runs]]
+label = "diag-run94"
+commit = "a24cbeb"
+fps = 16.8
+frame_ms = 59.4
+gpu_ms = "0.0-2.6 ms wait (0 hangs/TDRs/refusals in 130.3s at default 512 KiB)"
+preparing_ms = "27.5-45.5 ms NEW LOW (batch_flush 14.5-24.8 ms, guards 4.6-15.3 ms, stale 4.2-8.5 ms, sweep 0.08-0.60 ms)"
+status = "Fix AC1-AC4 verified clean: pre_prep sweep -85% (0.08-0.60 ms), guards -55% (4.6-15.3 ms), alias_apply -65% (1.19-5.21 ms), watches -50% (6.72-17.84 ms), make_at miss -50% (3.16-11.17 ms), true indirect 4.56-11.39 ms, NEW ALL-TIME LOW 27.5 ms preparing & 79.1 ms rec (11.7-16.8 fps steady); exposed next 3 blockers: 13.2-18.1 ms card copy-back (20.8 MB), 14.5-24.8 ms batch_flush, and 10.8-13.7 ms post-present gap -> next: Fix AD"
+
+[[runs]]
+label = "diag-run98"
+commit = "c059f27"
+fps = 17.5
+frame_ms = 57.2
+gpu_ms = "0.0 ms median wait (80-93% busy; hit unhandled 0xc0000005 at ~125s)"
+preparing_ms = "31.2-53.4 ms (43.9 ms median: batch_flush 22.9 ms, stale 5.8 ms, guards 8.6 ms, cfu 0.8 ms)"
+status = "Fix AF1-AF2 peak 17.5 fps (57.2 ms/f), but late crash at ~125s traced to AF1/AF2/AG2 races (subsequently reverted & fixed in f73fd1a + 61ccefc)"
+
+[[runs]]
+label = "diag-run105"
+commit = "61ccefc"
+fps = 16.6
+frame_ms = 60.3
+gpu_ms = "0.0 ms median wait (0 hangs/TDRs/exceptions/refusals in 130.2s)"
+preparing_ms = "31.3-56.3 ms (46.2 ms median: batch_flush 17.9-29.4 ms, stale 4.5-7.6 ms, prelude 3.2-5.3 ms, ask_once 3.1-3.9 ms)"
+status = "100% CLEAN 130.2s baseline! Fixed relay hot-hash race (f73fd1a) + VEH guard-page TOCTOU in watch.rs::handle_write_fault (61ccefc). Zero CPU exceptions, zero GPU hangs, zero refusals, 7.7-16.6 fps steady 3D (12.8 median / 16.6 peak)"
+
+[[runs]]
+label = "diag-run106"
+commit = "77f2abc"
+fps = 15.7
+frame_ms = 63.7
+gpu_ms = "0.0 ms median wait (0 hangs/TDRs/exceptions/refusals in 130.3s)"
+preparing_ms = "32.3-51.1 ms (batch_flush 18.6-25.5 ms, stale 6.0-8.2 ms, prelude 2.5-4.3 ms, ask_once 3.1-3.3 ms)"
+status = "Fix AH1+AH2+AH3a verified clean! Heavy 4010-draw scene +61% (7.7->12.4 fps, 130.2->80.6 ms/f), moves -32% (36.5->24.7 / 17.9->12.8 ms), guards -29%, rec -10%; pinned down visual root causes: refused mesh PSO R8_UINT RTV (format=62) + R32G32B32_FLOAT (element=12) null SRV"
+
+[[runs]]
+label = "diag-run107"
+commit = "perf/commit-reduction"
+fps = 10.4
+frame_ms = 96.1
+gpu_ms = "6.6-15.1 ms (0 hangs/TDRs/exceptions/refusals in 130.4s)"
+preparing_ms = "34.6-80.5 ms (4096+ per-view aligned shadows added copy/alloc overhead)"
+status = "Visual Fixes 1+2 verified! Integer-RTV blend sanitization fixed mesh PSO f5e50eb2108c425b (0 refused PSOs) and shadow::find_aligned fixed R32G32B32_FLOAT (element=12) SRVs & static unaligned CBVs (0 warnings). Exploding stretched triangles and 2x2 stippling completely gone in 31 captured in-world 3D frames (crisp characters, hair, eyes, stitching, DOF, lighting); remaining: dark faces/interiors (32.6k due textures / SSS check) + phase-window aligned shadows to recover 12.4-15.7+ fps"
+
+[[runs]]
+label = "diag-run109"
+commit = "7f206eb"
+fps = 9.0
+frame_ms = 111.6
+gpu_ms = "0.0-10.2 ms (130.5s TIMEOUT_CLEAN, 0 exceptions/TDRs/refusals)"
+preparing_ms = "55.2-145.1 ms (align=256 CBVs still created 2048 overlapping 64 KiB windows -> replace with CBV slab/skip next)"
+status = "Visual Fixes 3+4 + Worker 1 phase-windowing verified clean! Inline pass_plane + compute depth-to-plane copy-back eliminated both depth-twin counters (0 not given back, 0 used before pass) and fresh texture queue anti-starvation landed cleanly; ruled out both texture backlog (diag-run108: 39.5k uploaded) and depth-twin sync for zero-specular dark faces; next: integrate Worker 3 CPU perf + Worker 4 face/wall pass diagnosis + fix align=256 CBV window explosion"
+
+[[runs]]
+label = "diag-visual-merged"
+commit = "b6b9b0e"
+fps = 3.0
+frame_ms = 335.3
+gpu_ms = "0.0-110.5 ms (149.1s TIMEOUT_CLEAN, 0 exceptions/TDRs/refusals)"
+preparing_ms = "135.1-210.5 ms (all 4 visual-artifact swarm workers merged; 0 depth-plane misses, 0 CBV/buffer-view/0x1c8/0x218/0x1a8 warnings, 6b82bc7d22016cb5 translated)"
+status = "4-worker visual swarm verified in-world (frame-2100..2148): crisp foreground character/hair/eyes/DOF/outdoor vehicles, 0 depth-plane misses (79/81->0/0), 10330 aligned view copies (0 refused); 3 visual blockers isolated for final polish: VRAM LRU eviction under levels-on-demand (35132 waiting), 1M descriptor heap cap (1245184 requested, 737855 direct), and 1 Wave64 compute shader (02384a60fda6f2d0)"
+
+[[runs]]
+label = "diag-visual-vramfix2"
+commit = "301d66f"
+fps = 3.4
+frame_ms = 295.1
+gpu_ms = "54.8 ms (146.1s TIMEOUT_CLEAN, peak VRAM 6,874/7,164 MB, 0 crashes/TDRs)"
+preparing_ms = "70.8 ms (3062 draws/f, heap buffers 9.9 ms, copy-back 32.4 ms)"
+status = "VRAM overshoot & Wave64 shader 02384a60fda6f2d0 verified fixed! Peak DXGI VRAM 6,874/7,164 MB (down from 7,602 MB crash), pool::TEXTURES 4,928->4,224 MB, tiles 512->256 MB, 18,785 idle textures freed (3,461 MB), 0 non-RT dropped shaders, 0 capped-view-heap hits; foreground character/hair/wall posters/outdoor vehicles crisp, secondary NPC faces & dark interiors remaining before 20-30+ FPS swarm"
+
+[[runs]]
+label = "diag-visual-holereuse"
+commit = "487d82a"
+fps = 2.9
+frame_ms = 347.8
+gpu_ms = "17.7-100.1 ms (150.8s TIMEOUT_CLEAN, peak VRAM 7,148/7,161 MB, 0 crashes/TDRs/OOMs)"
+preparing_ms = "157.4 ms (2324-3044 draws/f, staging 57-112 MB, tiles 305/320 MB reused)"
+status = "Zero-VRAM-growth hole reuse (pool::NO_GROW + tiles no_grow + 5/6-block staging cap + reuse-only admission) admitted 24,000+ textures into existing pool holes with 0 extra VRAM heaps and 0 staging spikes; secondary NPC faces, background patrons, and interior walls/posters textured and lit (frame-1928..1998)."
+
+[[runs]]
+label = "diag-fps-swarm1"
+commit = "d1e5000"
+fps = 3.9
+frame_ms = 256.1
+gpu_ms = "17.2-43.1 ms (145.3s TIMEOUT_CLEAN, peak VRAM 6,838/7,161 MB, 0 crashes/TDRs/OOMs)"
+preparing_ms = "99.2 ms (-37% vs 157.4 ms; snapshots 13.6 ms, copy-back 35.0 ms, land::rest 0.92 ms, heap buffers 2.0-16.2 ms)"
+status = "Round 1 4-worker FPS swarm verified clean (95ccbe8..d1e5000): peak 3.9 fps (256.1 ms/f), steady 2.9-3.9 fps, preparing -37%, copy-back -39%, land::rest -96% (25.6->0.92 ms via bury recycler), snapshots -45%, DXGI VRAM -310 MB (6,838/7,161 MB), windows commit -586 MB (no-length -1,124 MB, 0 slot mismatches), crisp 1:1 in-world visuals (frame-1915..1939); exposed Round 2 blockers: 91.1 ms GUARDS lock wait from batched yields, 52.6 ms BEHIND_PLACED stall, ~200 ms CPU recording/thin-list gap, and 512 KiB window-count growth (3,810 windows)"
+
+[[runs]]
+label = "diag-fps-swarm2"
+commit = "289d0ea"
+fps = 3.1
+frame_ms = 320.1
+gpu_ms = "1.8-64.3 ms (145.2s TIMEOUT_CLEAN, 0 crashes/TDRs/OOMs, 0 failed Wave64 shaders)"
+preparing_ms = "128.2-443.9 ms (sweep 41-54->0.1 ms, guards 91.1->16.6-42.9 ms, waiting-for-flights 52.7->0.1 ms; regressed by 5d52155 41-107 ms card-plan + 3.4s thin)"
+status = "Round 2 capture verified Wave64 LDS fixes (5dc3b25986622949 & 6f225b641c5b0708 compiled/bound cleanly), async sweep (41-54->0.1 ms), and race-free watch.rs (guards 91->16-43 ms), with 1:1 late frames (frame-1661..1677); caught & immediately reverted 5d52155 card-plan/thin regression and CAPPED_DYNAMIC=131072 table exhaustion (290 refused -> early-frame stretched tris), and shipped oathkeep launch + scripts/launch.ps1 shader-warming preloader"
+
+[[runs]]
+label = "diag-fps-swarm2b"
+commit = "3a0890d"
+fps = 5.4
+frame_ms = 184.0
+gpu_ms = "0.0-33.8 ms (145.7s TIMEOUT_CLEAN; 0 crashes/TDRs/OOMs, 0 failed Wave64 shaders, 0 refused dynamic tables)"
+preparing_ms = "116.9-239.4 ms (planning 1.1-5.5 ms, flights 0.1-0.2 ms, sweep 0.1-0.6 ms, refreshes 62-80 ms, heap views 67-98 ms slots + 68-86 ms textures)"
+status = "Post-revert Round 2 baseline verified clean! Peak 5.4 fps (184.0 ms/f) in-world, 0/11,093 refused dynamic tables, 0 exploding triangles, intact ceiling/lighting/interiors on frame-1602/1618/1634/1658, and both Wave64 LDS compute shaders bound cleanly; merging perf/commit-reduction into main before Round 3 FPS PRs"

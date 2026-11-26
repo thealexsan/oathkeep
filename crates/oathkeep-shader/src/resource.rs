@@ -1,22 +1,53 @@
+//! Resource tracking (decision 0003): where each descriptor a program uses
+//! comes from, in terms of the root signature.
+//!
+//! Root parameters arrive in user SGPRs ([`RootParam`]): a descriptor table
+//! as the 32-bit heap address of its range (the code sets the high half to
+//! 0), a root descriptor as a 64-bit buffer address, root constants as
+//! themselves. A root signature with dynamic resources (SM 6.6) adds the
+//! 32-bit base addresses of both heaps; a descriptor is then loaded from
+//! one of them at an index the code computes (from a root constant, say). The code loads table descriptors from heap memory with
+//! `s_load_dword*`, and builds a buffer descriptor around a root
+//! descriptor's address itself. Each descriptor operand and each scalar
+//! memory address is traced through the SSA values back to those
+//! parameters, by data flow: copies, phis that agree, and additions.
+
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Bool, LaneExit, Meets, Structured};
 
+/// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
 
+/// A byte address: a root parameter's, plus a constant and at most one
+/// value the program computes (an index times a stride, say).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Address {
+    /// Index into the layout, or [`CODE`].
     pub param: usize,
+    /// Added modulo 2^32 (with carry into the high half of a root
+    /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
 }
 
+/// [`Address::param`] of the program's own code: a constant table the
+/// compiler appends after the code and reads through `s_getpc_b64`; the
+/// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
 
+/// [`Address::param`] of title memory at an address no root parameter
+/// gives: one the code computes from root constants, reads out of a
+/// descriptor or loads from other memory (compute programs only: the
+/// ray-tracing structure builder and the programs that walk its
+/// structures). Offset and computed term are not used: lowering takes the
+/// 64-bit address from the instruction's operands.
 pub const MEMORY: usize = usize::MAX - 1;
 
+/// The reasons an address traces to no root parameter for which the
+/// address is then taken as it stands ([`MEMORY`]).
 const RAW: [&str; 5] = [
     "an address not from a root parameter",
     "an address from a root parameter that is no address",
@@ -27,32 +58,38 @@ const RAW: [&str; 5] = [
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
-    Loaded {
-        load: Site,
-        first: u8,
-    },
+    /// Dwords `first..` of what the scalar load at `load` reads (see
+    /// [`Resources::scalar`] for its address).
+    Loaded { load: Site, first: u8 },
+    /// A buffer descriptor built around an address: `bits` OR-ed into
+    /// dword 1 (stride, swizzle), dwords 2 and 3 as given.
     Built {
         address: Address,
         bits: u32,
         words: [u32; 2],
     },
+    /// Fixed in the code (an immediate sampler, say).
     Constant(Vec<u32>),
-    Phi {
-        block: usize,
-        args: Vec<Source>,
-    },
-    Select {
-        scc: Value,
-        args: Vec<Source>,
-    },
-    Fetched {
-        load: Site,
-        first: u8,
-    },
-    Lanes {
-        mask: Value,
-        args: Vec<Source>,
-    },
+    /// Chosen by control flow: one source per predecessor of `block`, in
+    /// [`crate::ir::Block::preds`] order.
+    Phi { block: usize, args: Vec<Source> },
+    /// Chosen by SCC (`scc`, the value an `s_cselect` or `s_cmov` of each
+    /// dword reads): the source when it is set, then when it is clear.
+    Select { scc: Value, args: Vec<Source> },
+    /// Dwords `first..` of what the vector load at `load` (`global_load_*`)
+    /// reads, each lane at its own address (see [`Resources::scalar`]); the
+    /// dwords past that load come from loads of the bytes that follow. A
+    /// descriptor that differs between lanes.
+    Fetched { load: Site, first: u8 },
+    /// Picked per lane by `v_cndmask_b32` reading the lane mask whose low
+    /// dword is `mask`: the source where the lane's bit is set, then where it
+    /// is clear.
+    Lanes { mask: Value, args: Vec<Source> },
+    /// Per-lane dwords chosen by control flow (VGPRs joined where lanes
+    /// that took different paths meet): one source per predecessor of
+    /// `block`, in [`crate::ir::Block::preds`] order, `None` on an edge no
+    /// lane that accesses the descriptor takes. A descriptor that differs
+    /// between lanes.
     LanePhi {
         block: usize,
         args: Vec<Option<Source>>,
@@ -60,6 +97,7 @@ pub enum Source {
 }
 
 impl Source {
+    /// The sources this one picks from (itself unless a phi).
     pub fn leaves(&self) -> Vec<&Source> {
         match self {
             Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } => {
@@ -75,6 +113,7 @@ impl Source {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
+    /// Image, buffer or `s_buffer_load` resource.
     Resource,
     Sampler,
 }
@@ -86,6 +125,8 @@ pub struct Descriptor {
     pub source: Source,
 }
 
+/// A view-heap descriptor whose byte address can be evaluated when binding
+/// the draw, using a table base and a root constant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RootIndexedView {
     pub table_slot: u8,
@@ -97,28 +138,69 @@ pub struct RootIndexedView {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resources {
+    /// Scalar values saved to a constant VGPR lane and restored within one
+    /// block, even if that VGPR is also used in ordinary vector operations.
+    pub(crate) restored_lanes: std::collections::HashMap<Site, Moved>,
+    /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
+    /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
+    /// Direct descriptor sources with a draw-evaluable index.
     pub root_indexed_views: Vec<RootIndexedView>,
+    /// User SGPRs holding root parameters: value on entry, layout index,
+    /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
+    /// Scalar loads of one descriptor the code keeps per lane in VGPRs
+    /// ([`Tracer::lane_copies`]): they read one address, so their dwords
+    /// stand in for each other.
     pub lane_copied: Vec<Site>,
     pub waterfall: Waterfall,
+    /// Every `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`: where
+    /// its nodes are.
     pub bvh: Vec<(Site, BvhNodes)>,
 }
 
+/// Where a ray-tracing node test ([`crate::bvh`]) reads its nodes. Its
+/// descriptor operand names a range of memory, not a texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BvhNodes {
+    /// A buffer of the host: the descriptor is loaded from a table (it is
+    /// among [`Resources::descriptors`]), and node pointers count from the
+    /// buffer's start. Its flags are not known to the shader: boxes are
+    /// sorted and triangles return barycentrics, as every descriptor
+    /// the title builds asks.
     Resource,
+    /// Title memory by address: the code makes the descriptor from numbers
+    /// (the title: the whole address space, or one structure's address in
+    /// dword 0). Dwords 1 and 3, which hold its flags.
     Memory { word1: u32, word3: u32 },
 }
 
+/// Waterfall loops over descriptors that differ between lanes: each pass
+/// reads the first active lane's descriptor with `v_readfirstlane_b32`,
+/// compares it with every lane's own (`v_cmp_eq`), and runs the access with
+/// the lanes that match. Their accesses take each lane's own descriptor
+/// ([`Source::Fetched`], [`Source::Lanes`]), so the first lane's dwords are
+/// each lane's own too: the compares hold in every lane and one pass serves
+/// all lanes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Waterfall {
+    /// The compares, true in every lane.
     pub compares: Vec<Site>,
+    /// The `v_readfirstlane_b32` results they compare, each the lane's own
+    /// source dword.
     pub reads: Vec<Value>,
+    /// Descriptor loads at a table offset among `reads` (the console
+    /// compiler's form): each lane loads its own entry.
     pub loads: Vec<Site>,
 }
 
+/// Traces every descriptor and scalar address of `p`, which runs as
+/// `stage`, to the root parameters in `layout`. Fails on the first one it
+/// cannot trace. `lanes`, `p` as one lane runs it, tells which paths the
+/// lanes that access a per-lane descriptor took and which writes they ran;
+/// without it, per-lane descriptors chosen by control flow are refused and
+/// per-lane writes are taken to run in every lane.
 pub fn track(
     p: &Program,
     layout: &[RootParam],
@@ -137,13 +219,20 @@ pub fn track(
             .collect(),
         ..Resources::default()
     };
+    // Group accesses in the same loop so a shared mask can select several
+    // descriptors together.
     let mut first_lane_at = std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>)>::new();
+    // The console compiler's waterfall reads the first lane's table offset
+    // and loads that entry: accesses, offset reads and loads by block.
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
-        t.at.set(Some(b));
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
+            t.at.set(Some(site));
+            if let Some(value) = t.restored(inst, Some(b)) {
+                out.restored_lanes.insert(site, value);
+            }
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
@@ -151,7 +240,10 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
+                // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
+                // is the same in every lane: its loop is lowered as it stands
+                // and needs no proof.
                 if !t.kept_per_lane(inst, op) {
                     first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 }
@@ -166,6 +258,13 @@ pub fn track(
             };
             match &inst.fields {
                 Fields::Image { rsrc, .. } if inst.name().starts_with("image_bvh") => {
+                    // The ray and node test names no texture. A descriptor
+                    // whose flag dwords the code sets as numbers and whose
+                    // type is a ray-tracing structure is a range of title
+                    // memory (the title: all of it, or from one structure's
+                    // address on), and the node's address is among the
+                    // operands; any other descriptor must be a resource of
+                    // the host.
                     let word = |k: u8| match *rsrc {
                         Operand::Scalar { code, dwords } if k < dwords => {
                             inst.read(Reg::S(code + k)).map(|v| t.origin(v))
@@ -190,6 +289,8 @@ pub fn track(
                         descriptor(s, Role::Sampler)?;
                     }
                 }
+                // Cache invalidations name a buffer's address space but do
+                // not read its descriptor; the host has no cache to drop.
                 Fields::Buffer { rsrc, .. } if !inst.name().ends_with("_inv") => {
                     descriptor(rsrc, Role::Resource)?
                 }
@@ -238,22 +339,27 @@ pub fn track(
             }
         }
     }
+    // What follows traces no access of one block.
     t.at.set(None);
+    // The proof needs the per-lane form. Without it nothing is emitted, and
+    // its failure is the one to report, so the reads stay unproven here.
     if t.lanes.is_none() {
         return Ok(out);
     }
     for (block, (accesses, mut reads)) in first_lane_at {
         reads.sort_unstable();
         reads.dedup();
-        let proof =
-            t.waterfall(block, &accesses, &reads)
-                .map_err(|what| ShaderError::Unsupported {
-                    offset: t.inst((block, accesses[0])).machine.offset,
-                    what,
-                })?;
+        let proof = t
+            .waterfall(block, &accesses, &reads)
+            .map_err(|what| ShaderError::Unsupported {
+                offset: t.inst((block, accesses[0])).machine.offset,
+                what,
+            })?;
         out.waterfall.compares.extend(proof.compares);
         out.waterfall.reads.extend(proof.reads);
     }
+    // Unproven, an offset read stays the first lane's (one uniform entry),
+    // which is what the hardware reads outside a waterfall loop.
     for (block, (accesses, mut reads, loads)) in offset_at {
         reads.sort_unstable();
         reads.dedup();
@@ -274,12 +380,15 @@ pub fn track(
     Ok(out)
 }
 
+/// A dword after copy propagation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Term {
     Const(u32),
     Value(Value),
 }
 
+/// A 32-bit sum: optional root parameter (as its first dword), constant,
+/// optional computed term.
 struct Sum {
     base: Option<Value>,
     offset: u32,
@@ -290,22 +399,35 @@ struct Tracer<'a> {
     p: &'a Program,
     layout: &'a [RootParam],
     stage: HwStage,
+    /// Defining instruction per value (phis and inputs have none).
     defs: Vec<Option<Site>>,
+    /// Block and index of each phi value.
     phis: Vec<Option<(usize, usize)>>,
+    /// Register per input value.
     inputs: Vec<Option<Reg>>,
     origin: Vec<Term>,
+    /// See [`Resources::lane_copied`].
     lane_copied: std::cell::RefCell<Vec<Site>>,
     lanes: Option<&'a Structured>,
+    /// While set, [`Self::sum`] keeps the first-lane read of an index as
+    /// the computed term instead of what the lanes hold.
     read_first_lane: std::cell::Cell<bool>,
+    /// What the conditions asked of `lanes` so far came down to: the proofs
+    /// of one program ask about the same blocks and masks again and again.
     meets: std::cell::RefCell<Meets>,
+    /// Reverse-postorder index per block.
     rpo: Vec<usize>,
-    at: std::cell::Cell<Option<usize>>,
+    /// The instruction site of the access being traced ([`Self::live`]).
+    at: std::cell::Cell<Option<Site>>,
 }
 
+/// What lanes are known to satisfy: each [`Bool`] where its flag is set,
+/// its negation where not.
 type Known = Vec<(Bool, bool)>;
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
+/// VGPR values followed for one dword of a descriptor kept per lane.
 const MAX_COPIES: usize = 64;
 
 impl<'a> Tracer<'a> {
@@ -369,6 +491,8 @@ impl<'a> Tracer<'a> {
         Ok(t)
     }
 
+    /// Optimistic copy propagation: a move's result is its source's
+    /// origin, a phi's the one origin its arguments agree on.
     fn propagate_copies(&self, n: usize) -> Result<Vec<Term>, ShaderError> {
         let mut o: Vec<Option<Term>> = vec![None; n];
         for &(_, v) in &self.p.inputs {
@@ -396,7 +520,7 @@ impl<'a> Tracer<'a> {
                 }
                 for inst in &block.insts {
                     for (k, &(_, v)) in inst.writes.iter().enumerate() {
-                        let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
+                        let new = match copy_source(inst, k).or_else(|| self.restored(inst, None)) {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
                             None => Some(Term::Value(v)),
@@ -422,6 +546,9 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// Whether some lane can satisfy all of `conditions` ([`Bools::meet`]).
+    ///
+    /// [`Bools::meet`]: crate::structure::Bools::meet
     fn meet(&self, lanes: &Structured, conditions: &[(Bool, bool)]) -> bool {
         lanes
             .bools
@@ -440,6 +567,7 @@ impl<'a> Tracer<'a> {
         self.origin[v.0 as usize]
     }
 
+    /// The origin of a one-dword operand as `inst` reads it.
     fn term(&self, inst: &Inst, op: &Operand) -> Option<Term> {
         match *op {
             Operand::Scalar { code: NULL, .. } => Some(Term::Const(0)),
@@ -450,6 +578,7 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// Layout index and dword of the root parameter `reg` holds on entry.
     fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
         let Reg::S(code) = reg else { return None };
         self.layout.iter().enumerate().find_map(|(i, p)| {
@@ -459,6 +588,7 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// The SOP2 operands of `v` if an instruction with one of `names` wrote it.
     fn sop2(&self, v: Value, names: &[&str]) -> Option<(&'a Inst, [Term; 2])> {
         let inst = self.def(v)?;
         if !names.contains(&inst.name()) || inst.writes.first()?.1 != v {
@@ -545,6 +675,11 @@ impl<'a> Tracer<'a> {
                 dynamic: None,
             };
         }
+        // Paths that each add an index to a table in the code and meet before one
+        // load: the join itself is the computed term. Lowering gives every
+        // `s_getpc_b64` its own offset in the code as its value, so the join is the
+        // byte in the code whichever table a path took ([`Self::address`] adds no
+        // base to it).
         if let Some(pc) = self.code_join(v) {
             return Sum {
                 base: Some(pc),
@@ -552,6 +687,14 @@ impl<'a> Tracer<'a> {
                 dynamic: Some(v),
             };
         }
+        // An address computed in VGPRs and taken from the first lane (a
+        // table in the code indexed by a value held per lane, or a table
+        // offset held per lane, the console's waterfall): the sum of what
+        // the lanes hold. Loads at one offset in different loops (each with
+        // its own `v_readfirstlane_b32`) then have one address, which is
+        // what tells lowering that they read one descriptor. With
+        // `read_first_lane` a first-lane read of an index alone stays the
+        // computed term ([`Self::first_lane_offset`]).
         if let Some(lane) = self.first_lane(v) {
             let per_lane = self.sum(self.vorigin(lane));
             return if per_lane.base.is_some() || !self.read_first_lane.get() {
@@ -578,6 +721,12 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// For a join `v` whose every incoming value adds to an `s_getpc_b64` low
+    /// dword: the first of those (one level of joins only). The paths may add
+    /// to different ones: two tables in the code, one picked by control flow
+    /// (the title's fog reconstruction reads its sample offsets from
+    /// one of two tables, by the sample's number; refused, the lit frame was
+    /// multiplied by a fog transmittance nothing had written).
     fn code_join(&self, v: Value) -> Option<Value> {
         let (b, i) = self.phis[v.0 as usize]?;
         let mut base = None;
@@ -594,16 +743,19 @@ impl<'a> Tracer<'a> {
         base
     }
 
+    /// `t` is the high dword of an `s_getpc_b64`, or `s_addc_u32`s of one:
+    /// the carry may be added in steps (the counter's high dword plus 0
+    /// where the table's offset is added, then plus the index's high dword).
     fn code_high(&self, t: Term) -> bool {
         self.code_high_in(t, 4)
     }
 
+    /// [`Self::code_high`], at most `depth` additions deep.
     fn code_high_in(&self, t: Term, depth: u32) -> bool {
         let Term::Value(x) = t else { return false };
-        if self
-            .def(x)
-            .is_some_and(|i| i.name() == "s_getpc_b64" && i.writes.get(1).is_some_and(|w| w.1 == x))
-        {
+        if self.def(x).is_some_and(|i| {
+            i.name() == "s_getpc_b64" && i.writes.get(1).is_some_and(|w| w.1 == x)
+        }) {
             return true;
         }
         depth > 0
@@ -612,10 +764,13 @@ impl<'a> Tracer<'a> {
             })
     }
 
+    /// The `s_getpc_b64` low dword among the terms `v` adds up (`depth`
+    /// additions deep; joins are not followed).
     fn code_base(&self, v: Value, depth: u32) -> Option<Value> {
         if self.getpc(v).is_some() {
             return Some(v);
         }
+        // Computed in VGPRs and taken from the first lane.
         if let Some(lane) = self.first_lane(v) {
             return match self.vorigin(lane) {
                 Term::Value(x) => self.code_base(x, depth),
@@ -635,6 +790,7 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// `t` is `high` or an `s_addc_u32` of it.
     fn is_high(&self, t: Term, high: Value) -> bool {
         match t {
             Term::Value(x) => {
@@ -647,6 +803,7 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// The VGPR value `v_readfirstlane_b32` reads to write the scalar `v`.
     fn first_lane(&self, v: Value) -> Option<Value> {
         let inst = self.def(v)?;
         if inst.name() != "v_readfirstlane_b32" || inst.writes.first()?.1 != v {
@@ -664,12 +821,15 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// The `s_getpc_b64` writing `lo` as its low dword.
     fn getpc(&self, lo: Value) -> Option<&'a Inst> {
         let inst = self.def(lo)?;
         (inst.name() == "s_getpc_b64" && inst.writes.first().is_some_and(|w| w.1 == lo))
             .then_some(inst)
     }
 
+    /// The operands of a VALU addition (`v_add_co_u32`, `v_add_nc_u32`)
+    /// writing `v`, through VGPR copies of scalars.
     fn vadd(&self, v: Value) -> Option<[Term; 2]> {
         let inst = self.def(v)?;
         let Fields::Valu(f) = &inst.fields else {
@@ -694,6 +854,7 @@ impl<'a> Tracer<'a> {
         ])
     }
 
+    /// The origin of a VALU operand.
     fn vterm(&self, inst: &Inst, op: &Operand) -> Option<Term> {
         match *op {
             Operand::Vector { reg, .. } => Some(self.vorigin(inst.read(Reg::V(reg))?)),
@@ -701,6 +862,7 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// A VGPR value's origin through `v_mov_b32` copies.
     fn vorigin(&self, v: Value) -> Term {
         if let Some(inst) = self.def(v)
             && inst.name() == "v_mov_b32"
@@ -716,6 +878,9 @@ impl<'a> Tracer<'a> {
         self.origin(v)
     }
 
+    /// The address of an access that traces to no root parameter (`why`
+    /// says how it failed): title memory at the address as it stands, in a
+    /// compute program.
     fn by_address(&self, why: &'static str) -> Result<Address, &'static str> {
         if self.stage == HwStage::Cs && RAW.contains(&why) {
             Ok(Address {
@@ -728,6 +893,8 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// A global memory address: an SGPR pair plus a VGPR offset, or a VGPR
+    /// pair.
     fn flat_address(
         &self,
         inst: &Inst,
@@ -771,7 +938,13 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// The address `lo` and `hi` hold, plus `extra` (an instruction's
+    /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+        // The high half as the lanes that read through the address hold
+        // it, where that is a constant or what a register held on entry
+        // (the code clears a table address's high half inside a branch
+        // and uses the address after the join).
         let hi = match self.live(hi) {
             t @ Term::Const(_) => t,
             Term::Value(v) if self.inputs[v.0 as usize].is_some() => Term::Value(v),
@@ -783,16 +956,15 @@ impl<'a> Tracer<'a> {
         }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
+            // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
             if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
                 return Err("an address with an untracked high half");
             }
+            // A join of paths into tables in the code is the byte in the code
+            // already: each path's `s_getpc_b64` counts as its own offset.
             let joined = s.dynamic.is_some_and(|d| self.code_join(d).is_some());
-            let first = if joined {
-                0
-            } else {
-                pc.machine.offset as u32 + 4
-            };
+            let first = if joined { 0 } else { pc.machine.offset as u32 + 4 };
             return Ok(Address {
                 param: CODE,
                 offset: first.wrapping_add(s.offset).wrapping_add(extra.offset),
@@ -812,6 +984,8 @@ impl<'a> Tracer<'a> {
             }
             _ => return Err("an address from a root parameter that is no address"),
         };
+        // shortcut: with a computed term, a high half that adds anything to the
+        // base's is taken as the carry of that term (offsets below 4 GB).
         let dynamic = s.dynamic.or(extra.dynamic);
         if !self.high_half(hi, high)
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
@@ -825,6 +999,7 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// `hi` is `high` (0 for a table), possibly plus a carry.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
         hi == want
@@ -833,12 +1008,16 @@ impl<'a> Tracer<'a> {
             ))
     }
 
+    /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
+    /// `v_add_co_ci_u32` with `high` as an operand.
     fn carried(&self, hi: Term, high: Value) -> bool {
         let Term::Value(v) = hi else { return false };
         if v == high {
             return true;
         }
+        // A join ([`Self::code_join`]): every path carries into the table's high half.
         if let Some((b, i)) = self.phis[v.0 as usize] {
+            // A path may carry into another table's high half ([`Self::code_join`]).
             let high_of = |t: Term| self.is_high(t, high) || self.code_high(t);
             return self.p.blocks[b].phis[i].args.iter().all(|&a| {
                 let t = self.vorigin(a);
@@ -848,6 +1027,7 @@ impl<'a> Tracer<'a> {
                 let Term::Value(x) = t else {
                     return false;
                 };
+                // Computed in VGPRs and taken from the first lane.
                 let x = match self.first_lane(x).map(|lane| self.vorigin(lane)) {
                     Some(Term::Value(y)) => y,
                     Some(Term::Const(_)) => return false,
@@ -903,6 +1083,7 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// The terms of the additions that compute `v`.
     fn leaves(&self, v: Value) -> Box<dyn Iterator<Item = Value> + '_> {
         match self.sop2(v, &["s_add_u32", "s_add_i32"]) {
             Some((_, terms)) => Box::new(terms.into_iter().flat_map(move |t| match t {
@@ -938,18 +1119,35 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, at `at`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, at: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
-        let words = (0..dwords)
+        let mut words = (0..dwords)
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        // A byte access through a buffer descriptor made raw reads what the
+        // descriptor's view does with a raw host view (Oathkeep upstream 0b35b7f).
+        if !inst.name().contains("format")
+            && let Some(raw) = self.made_raw(&words)
+        {
+            words = raw.to_vec();
+        }
+        // Only the lanes that reach and run the access read the descriptor.
+        let mut known = Vec::new();
+        if let Some(l) = self.lanes {
+            known.push((l.reach[at.0], true));
+            if let Some(guard) = l.guards[at.0][at.1] {
+                known.push((guard, true));
+            }
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
+    /// The source of a descriptor's words; `joins` are the phi blocks
+    /// being resolved, `known` holds in every lane that reads them.
     fn classify(
         &self,
         words: &[Term],
@@ -967,9 +1165,12 @@ impl<'a> Tracer<'a> {
             Term::Const(_) => None,
         };
         if let Some(sources) = words.iter().map(read).collect::<Option<Vec<_>>>() {
+            // One descriptor the code keeps per lane: the lanes agree.
             if let Some(source) = self.lane_copies(words) {
                 return Ok(source);
             }
+            // Read from the first active lane, as a waterfall loop does: the
+            // dwords each lane holds.
             let lanes: Vec<Term> = sources.into_iter().map(Term::Value).collect();
             return self.per_lane(&lanes, joins, known);
         }
@@ -1022,6 +1223,15 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// The one edge into the join `block` that lanes satisfying `known`
+    /// can have taken, if the lanes' paths ([`Structured`]) rule out every
+    /// other: the console compiler loads a descriptor (or clears an
+    /// address's high half) inside a branch that skips code when no lane
+    /// is left for it, and uses it after the join, where only lanes that
+    /// ran the branch are left (the title's
+    /// `CS_Alpha_Schedule`: the registers' values from before the branch,
+    /// which the join also sees, are what a wave with no such lane holds).
+    /// None at loop headers and without the lanes' paths.
     fn only_edge(&self, block: usize, known: &mut Known) -> Option<usize> {
         let lanes = self.lanes?;
         let preds = &self.p.blocks[block].preds;
@@ -1053,6 +1263,9 @@ impl<'a> Tracer<'a> {
         only
     }
 
+    /// Whether lowering can make a handle for `source` in any block: its
+    /// heap index comes from root parameters and constants alone (a table
+    /// offset the code computes exists only where the load is).
     fn anywhere(&self, source: &Source) -> bool {
         match source {
             Source::Constant(_) => true,
@@ -1075,11 +1288,16 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// `t` as the lanes that reach the access being traced hold it: through
+    /// joins they can have entered by one edge only ([`Self::only_edge`]).
     fn live(&self, mut t: Term) -> Term {
         let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
             return t;
         };
-        let mut known = vec![(lanes.reach[at], true)];
+        let mut known = vec![(lanes.reach[at.0], true)];
+        if let Some(guard) = lanes.guards[at.0][at.1] {
+            known.push((guard, true));
+        }
         for _ in 0..MAX_JOINS {
             let Term::Value(v) = t else { break };
             let Some((block, i)) = self.phis[v.0 as usize] else {
@@ -1093,6 +1311,8 @@ impl<'a> Tracer<'a> {
         t
     }
 
+    /// Words that phis of one block join, traced per predecessor (words
+    /// defined before the join hold on every edge).
     fn phi(
         &self,
         words: &[Term],
@@ -1112,6 +1332,7 @@ impl<'a> Tracer<'a> {
         if joins.contains(&block) {
             return Err("a descriptor that changes in a loop");
         }
+        // Each level multiplies the sources by the predecessor count.
         if joins.len() >= MAX_JOINS {
             return Err("a descriptor joined too often");
         }
@@ -1131,6 +1352,11 @@ impl<'a> Tracer<'a> {
             .collect::<Result<_, _>>();
         let source = match args {
             Ok(args) => Ok(Source::Phi { block, args }),
+            // An edge holds no descriptor. With only one edge the lanes
+            // that read the descriptor can have come by, it is what the
+            // registers hold on that one (a wave that took another edge
+            // has no lane left that reads it), if that can be named where
+            // it is read.
             Err(e) => match self.only_edge(block, known) {
                 Some(j) => match self.classify(&edge(j), joins, known) {
                     Ok(source) if self.anywhere(&source) => Ok(source),
@@ -1143,6 +1369,8 @@ impl<'a> Tracer<'a> {
         source.map(Some)
     }
 
+    /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
+    /// per outcome (other words are the same for both).
     fn select(
         &self,
         words: &[Term],
@@ -1162,6 +1390,8 @@ impl<'a> Tracer<'a> {
         if picks.iter().flatten().any(|p| p.0 != scc) {
             return Err("a descriptor chosen by several conditions");
         }
+        // Each level doubles the sources; selects count like joins (a
+        // marker no block index reaches).
         if joins.len() >= MAX_JOINS {
             return Err("a descriptor joined too often");
         }
@@ -1190,6 +1420,8 @@ impl<'a> Tracer<'a> {
         Ok(Some(Source::Select { scc, args: args? }))
     }
 
+    /// For `v` written by `s_cselect_b32`/`_b64` or `s_cmov_b32`/`_b64`:
+    /// the SCC it reads and the dword it is when SCC is set, then clear.
     fn picked(&self, v: Value) -> Option<(Value, Term, Term)> {
         let inst = self.def(v)?;
         let Fields::Sop { dst, src, .. } = &inst.fields else {
@@ -1201,6 +1433,9 @@ impl<'a> Tracer<'a> {
             "s_cselect_b64" | "s_cmov_b64" => true,
             _ => return None,
         };
+        // A dword of a 32- or 64-bit operand: 64-bit inline integers are
+        // sign-extended; 64-bit literals and float constants are not
+        // followed.
         let dword = |op: &Operand| match *op {
             Operand::Scalar { code: NULL, .. } => Some(Term::Const(0)),
             Operand::Scalar { code, .. } => Some(self.origin(inst.read(Reg::S(code + k))?)),
@@ -1225,6 +1460,7 @@ impl<'a> Tracer<'a> {
         Some((inst.read(Reg::Scc)?, set, clear))
     }
 
+    /// `v` as some other dword with constant bits set.
     fn set_bits(&self, v: Value) -> Option<(Term, u32)> {
         if let Some((_, [x, Term::Const(bits)] | [Term::Const(bits), x])) =
             self.sop2(v, &["s_or_b32"])
@@ -1248,6 +1484,47 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// The words of a buffer descriptor that `words` makes raw, as the
+    /// FidelityFX upscaler's compiler does before byte accesses: the stride
+    /// (dword 1 bits 16-29) cleared, the record count times max(stride, 1),
+    /// out-of-bounds checking by bytes (dword 3 bits 28-29 set). The bounds
+    /// are then the view's size in bytes either way.
+    fn made_raw(&self, words: &[Term]) -> Option<[Term; 4]> {
+        let [w0, Term::Value(w1), Term::Value(w2), Term::Value(w3)] = *words else {
+            return None;
+        };
+        // `x op c` with `c` either side.
+        let with = |v: Value, name: &str, c: u32| match self.sop2(v, &[name])?.1 {
+            [x, Term::Const(k)] | [Term::Const(k), x] if k == c => Some(x),
+            _ => None,
+        };
+        let d1 = with(w1, "s_and_b32", 0xC000_FFFF)?;
+        let Term::Value(m3) = with(w3, "s_or_b32", 0x3000_0000)? else {
+            return None;
+        };
+        let d3 = with(m3, "s_and_b32", 0xCFFF_FFFF)?;
+        let [a, b] = self.sop2(w2, &["s_mul_i32"])?.1;
+        let max = |t: Term| match t {
+            Term::Value(s) => with(s, "s_max_u32", 1),
+            Term::Const(_) => None,
+        };
+        let (d2, field) = match (max(a), max(b)) {
+            (_, Some(f)) => (a, f),
+            (Some(f), None) => (b, f),
+            (None, None) => return None,
+        };
+        let Term::Value(field) = field else {
+            return None;
+        };
+        // s_bfe_u32: offset 16, width 14.
+        let (_, [x, Term::Const(0x000E_0010)]) = self.sop2(field, &["s_bfe_u32"])? else {
+            return None;
+        };
+        (x == d1).then_some([w0, d1, d2, d3])
+    }
+
+
+    /// For a `v_readfirstlane_b32` result: the VGPR value it reads.
     fn first_lane_source(&self, v: Value) -> Option<Value> {
         let inst = self.def(v)?;
         let Fields::Valu(f) = &inst.fields else {
@@ -1262,6 +1539,10 @@ impl<'a> Tracer<'a> {
         inst.read(Reg::V(reg))
     }
 
+    /// The `v_readfirstlane_b32` result the scalar load at `load` adds to
+    /// its address as a table offset (the console's waterfall,
+    /// `s_load_dwordx8 .., s[4:5], s20`): `track` proves the waterfall from
+    /// it, and lowering reads it per lane there.
     fn first_lane_offset(&self, load: Site) -> Option<Value> {
         let inst = self.inst(load);
         let Fields::Smem {
@@ -1282,6 +1563,8 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// Whether the descriptor operand `op` of `inst` is one the code keeps
+    /// per lane ([`Self::lane_copies`]).
     fn kept_per_lane(&self, inst: &Inst, op: &Operand) -> bool {
         let Operand::Scalar { code, dwords } = *op else {
             return false;
@@ -1292,6 +1575,8 @@ impl<'a> Tracer<'a> {
             .is_some_and(|words| self.lane_copies(&words).is_some())
     }
 
+    /// The `v_readfirstlane_b32` results the descriptor operand `op` of
+    /// `inst` is, when every dword is one.
     fn first_lane_words(&self, inst: &Inst, op: &Operand) -> Option<Vec<Value>> {
         let Operand::Scalar { code, dwords } = *op else {
             return None;
@@ -1304,6 +1589,7 @@ impl<'a> Tracer<'a> {
             .collect()
     }
 
+    /// `t` through VGPR copies (of VGPRs or of scalars) and copies.
     fn lane_term(&self, mut t: Term) -> Term {
         for _ in 0..MAX_JOINS * 2 {
             let Term::Value(v) = t else { break };
@@ -1316,6 +1602,7 @@ impl<'a> Tracer<'a> {
         t
     }
 
+    /// Whether `t` is a value each lane holds its own of (one in VGPRs).
     fn varies(&self, t: Term) -> bool {
         let Term::Value(v) = t else { return false };
         let reg = match (self.inputs[v.0 as usize], self.phis[v.0 as usize]) {
@@ -1329,6 +1616,8 @@ impl<'a> Tracer<'a> {
         matches!(reg, Some(Reg::V(_)))
     }
 
+    /// [`Self::lane_term`], where every lane in `known` runs each VGPR copy
+    /// it follows.
     fn lane_value(&self, mut t: Term, known: &Known) -> Result<Term, &'static str> {
         for _ in 0..MAX_JOINS * 2 {
             let Term::Value(v) = t else { break };
@@ -1346,6 +1635,8 @@ impl<'a> Tracer<'a> {
         Ok(t)
     }
 
+    /// One copy of [`Self::vorigin`]: what the `v_mov_b32` writing `v`
+    /// reads, or `v`'s origin.
     fn vstep(&self, v: Value) -> Term {
         if let Some(inst) = self.def(v)
             && inst.name() == "v_mov_b32"
@@ -1361,6 +1652,8 @@ impl<'a> Tracer<'a> {
         self.origin(v)
     }
 
+    /// A VALU operand as `inst` reads it: a VGPR's value itself, other
+    /// operands' origins.
     fn raw(&self, inst: &Inst, op: &Operand) -> Option<Term> {
         match *op {
             Operand::Vector { reg, .. } => Some(Term::Value(inst.read(Reg::V(reg))?)),
@@ -1368,6 +1661,9 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// Fails unless every lane in `known` that reaches the vector
+    /// instruction at `site` runs it: one with its EXEC bit clear there
+    /// keeps what the registers held before.
     fn runs(&self, site: Site, known: &Known) -> Result<(), &'static str> {
         let Some(lanes) = self.lanes else {
             return Ok(());
@@ -1383,6 +1679,11 @@ impl<'a> Tracer<'a> {
         Ok(())
     }
 
+    /// The source of descriptor dwords each lane holds its own of (a
+    /// waterfall loop reads them from the first active lane): the same in
+    /// every lane, loaded per lane from memory a heap address points to, or
+    /// picked per lane between such sources, by a lane mask or by the path
+    /// the lane took. `known` holds in every lane that accesses them.
     fn per_lane(
         &self,
         words: &[Term],
@@ -1426,6 +1727,9 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// Dwords of `global_load_dword*` that line up: `first..` of one load,
+    /// then the bytes that follow (an image descriptor takes two
+    /// `global_load_dwordx4`).
     fn fetched(&self, words: &[Term], known: &Known) -> Result<Option<Source>, &'static str> {
         let at = |w: &Term| -> Option<(Site, usize)> {
             let Term::Value(v) = *w else { return None };
@@ -1475,6 +1779,8 @@ impl<'a> Tracer<'a> {
         }))
     }
 
+    /// Words that `v_cndmask_b32` picks by one lane mask, traced per outcome
+    /// (other words are the same for both).
     fn lane_select(
         &self,
         words: &[Term],
@@ -1505,6 +1811,7 @@ impl<'a> Tracer<'a> {
             return Err("a descriptor joined too often");
         }
         joins.push(usize::MAX);
+        // Each side holds where the lane's bit of the mask is set, or clear.
         let bit = self.lanes.and_then(|l| l.masks.get(&mask).copied());
         let side = |set: bool| -> Vec<Term> {
             words
@@ -1536,6 +1843,9 @@ impl<'a> Tracer<'a> {
         Ok(Some(Source::Lanes { mask, args: args? }))
     }
 
+    /// For `v` written by a plain `v_cndmask_b32`: the low dword of the
+    /// lane mask it reads, and the dword it is where the lane's bit is set
+    /// (src1), then clear (src0).
     fn lane_picked(&self, v: Value) -> Option<(Value, Term, Term)> {
         let inst = self.def(v)?;
         let Fields::Valu(f) = &inst.fields else {
@@ -1562,6 +1872,13 @@ impl<'a> Tracer<'a> {
         Some((mask, self.raw(inst, &set)?, self.raw(inst, &clear)?))
     }
 
+    /// Per-lane words that phis of one block join, as an if/else on a
+    /// per-lane condition leaves them: traced on each edge into the block
+    /// that lanes in `known` can take (other words hold on every edge).
+    /// Lanes take their own paths ([`Structured`]), so each gets the value
+    /// of the edge it came by; an edge they cannot take is `None` (a flow
+    /// block's phi joins an arm's dwords with what lanes that skipped the
+    /// arm held before, which only they read).
     fn lane_phi(
         &self,
         words: &[Term],
@@ -1583,11 +1900,15 @@ impl<'a> Tracer<'a> {
         }
         let preds = &self.p.blocks[block].preds;
         if preds.iter().any(|&q| self.rpo[q] >= self.rpo[block]) {
+            // shortcut: what a lane holds after some passes is not traced.
             return Err("a descriptor read from the first lane of a phi at a loop header");
         }
         let Some(lanes) = self.lanes else {
             return Err("a descriptor read from the first lane of a phi, without the lanes' paths");
         };
+        // The other words must be there before the join: defined in a
+        // block that dominates it, which (both dominating the access) is
+        // one the join does not reach.
         for w in words {
             if let Term::Value(v) = *w
                 && phi_of(w).is_none()
@@ -1640,6 +1961,8 @@ impl<'a> Tracer<'a> {
         Ok(Some(Source::LanePhi { block, args }))
     }
 
+    /// Whether a path leads from block `from` to block `to` (to `from`
+    /// itself only through a back edge).
     fn reaches(&self, from: usize, to: usize) -> bool {
         let mut seen = vec![false; self.p.blocks.len()];
         let mut stack = self.p.blocks[from].exit.successors();
@@ -1655,6 +1978,15 @@ impl<'a> Tracer<'a> {
         false
     }
 
+    /// Prove a single-block waterfall at the descriptor access. In each
+    /// iteration the access serves exactly the matching lanes, and the
+    /// back edge keeps exactly the other lanes active. Otherwise, why not.
+    ///
+    // shortcut: only the accesses are proven. Any other per-lane work in the
+    // loop is taken to run once for each lane, as the access does; a body
+    // whose effect adds up over the passes a lane waits through (a counter
+    // before the mask is narrowed) would differ. Compilers put nothing but
+    // the reads, the compares and the access in these loops.
     fn waterfall(
         &self,
         b: usize,
@@ -1679,6 +2011,9 @@ impl<'a> Tracer<'a> {
             lanes.mask_bits(low?, high)
         };
         let exec = |inst: &Inst| mask(inst.read(Reg::S(EXEC)), inst.read(Reg::S(EXEC + 1)));
+        // The reads belong to this loop's own block: a loop around this one
+        // (one per operand, as LLVM nests them for a per-lane image and
+        // sampler) is not followed.
         if reads
             .iter()
             .any(|v| self.defs[v.0 as usize].is_none_or(|at| at.0 != b))
@@ -1724,6 +2059,8 @@ impl<'a> Tracer<'a> {
             if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
                 continue;
             }
+            // The first lane's dwords on one side, the lane's own on the
+            // other.
             let pair = |first: &Operand, own: &Operand| -> Option<Vec<Value>> {
                 let (&Operand::Scalar { code, .. }, &Operand::Vector { reg, .. }) = (first, own)
                 else {
@@ -1755,8 +2092,7 @@ impl<'a> Tracer<'a> {
                 } else {
                     continue;
                 };
-                let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1)))
-                else {
+                let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1))) else {
                     continue;
                 };
                 if meet(&[reach, (selected, true), (matched, false)]) {
@@ -1776,10 +2112,13 @@ impl<'a> Tracer<'a> {
         {
             return Err(SELECT);
         }
+        // The access must take every match.
         required.extend([reach, (selected, false)]);
         if meet(&required) {
             return Err(SELECT);
         }
+        // The retry must keep exactly the lanes that were eligible but did
+        // not perform the access.
         if meet(&[reach, (retry, true), (remaining, false)])
             || meet(&[reach, (retry, true), (selected, true)])
             || meet(&[reach, (remaining, true), (selected, false), (retry, false)])
@@ -1789,6 +2128,7 @@ impl<'a> Tracer<'a> {
         Ok(out)
     }
 
+    /// Consecutive dwords of one scalar load.
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
             return None;
@@ -1810,6 +2150,19 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// A descriptor the code keeps per lane: every dword of `words` is the
+    /// first lane (`v_readfirstlane_b32`) of a VGPR that `v_mov_b32` filled
+    /// from SGPRs. The console compiler does this to a descriptor loaded on
+    /// both sides of a per-lane branch: the join is per lane, so it lives in
+    /// VGPRs, and the instruction that needs it in SGPRs runs in a loop over
+    /// the distinct values (the first lane's, the lanes holding the same,
+    /// then the rest). When every scalar those moves copy is the same dword
+    /// of loads from one constant address, the lanes agree and the
+    /// descriptor is any of those loads.
+    // shortcut: what else the VGPRs held (numbers, on paths or in lanes that
+    // never read them as a descriptor) is ignored, and a move is taken to
+    // leave either its source or what a move before it wrote; a descriptor
+    // read per lane from memory (`global_load_*`) refuses.
     fn lane_copies(&self, words: &[Term]) -> Option<Source> {
         let mut loads: Vec<Site> = Vec::new();
         let mut first = None;
@@ -1829,6 +2182,7 @@ impl<'a> Tracer<'a> {
                 if !load.name().starts_with("s_load_") {
                     continue;
                 }
+                // Dword k of the operand is dword `first + k` of each load.
                 let dword = load.writes.iter().position(|x| x.1 == c)?;
                 let f = dword.checked_sub(k)?;
                 if *first.get_or_insert(f) != f {
@@ -1859,6 +2213,8 @@ impl<'a> Tracer<'a> {
         if a.dynamic.is_some() || loads.iter().any(|&l| address(l) != Some(a)) {
             return None;
         }
+        // The handle is made where the descriptor is used, from the load's
+        // operands: take a load whose base is the root parameter's own SGPR.
         loads.sort_unstable();
         let load = *loads.iter().find(|&&l| self.base_from_entry(l))?;
         self.lane_copied.borrow_mut().extend(&loads);
@@ -1868,6 +2224,10 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// The scalars (as origins) that `v_mov_b32` copies put in VGPR value
+    /// `v`, through joins, moves between VGPRs and per-lane selects; a move
+    /// keeps what it wrote over in the lanes it does not run. False if the
+    /// VGPR may hold something read per lane from memory.
     fn scalar_copies(&self, v: Value, out: &mut Vec<Term>) -> bool {
         let (mut seen, mut work) = (Vec::new(), vec![v]);
         while let Some(v) = work.pop() {
@@ -1882,6 +2242,7 @@ impl<'a> Tracer<'a> {
                 work.extend(&self.p.blocks[b].phis[i].args);
                 continue;
             }
+            // An entry value, or a number some instruction computed.
             let Some(inst) = self.def(v) else { continue };
             if inst.name().starts_with("global_load_") {
                 return false;
@@ -1906,6 +2267,7 @@ impl<'a> Tracer<'a> {
                     _ => {}
                 }
             }
+            // Lanes outside EXEC keep the old value.
             if let Some(Operand::Vector { reg, .. }) = f.dst {
                 work.extend(inst.read(Reg::V(reg)));
             }
@@ -1913,6 +2275,9 @@ impl<'a> Tracer<'a> {
         true
     }
 
+    /// The load at `site` has a constant offset and takes its base from a
+    /// root parameter's SGPR through moves alone: a value that exists
+    /// wherever the descriptor is used.
     fn base_from_entry(&self, site: Site) -> bool {
         let inst = self.inst(site);
         let Fields::Smem {
@@ -1942,37 +2307,64 @@ impl<'a> Tracer<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Moved {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Moved {
     Const(u32),
     Value(Value),
 }
 
+fn plain_lane(v: &crate::gfx10::Valu) -> bool {
+    v.abs == 0
+        && v.neg == 0
+        && v.opsel == 0
+        && !v.clamp
+        && v.omod == 0
+        && v.sdwa.is_none()
+        && v.dpp.is_none()
+}
+
 impl Tracer<'_> {
-    fn restored(&self, inst: &Inst) -> Option<Moved> {
+    /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
+    /// lane, found by following the VGPR's `v_writelane_b32` writes.
+    fn restored(&self, inst: &Inst, block: Option<usize>) -> Option<Moved> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
         };
-        if inst.name() != "v_readlane_b32" {
+        if inst.name() != "v_readlane_b32" || !plain_lane(v) {
             return None;
         }
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
+        let lane = lane_of(lane)?;
+        if lane >= if self.p.wave64 { 64 } else { 32 } {
+            return None;
+        }
+        self.spilled(inst.read(Reg::V(reg))?, lane, block, &mut Vec::new())
             .ok()
             .flatten()
     }
 
-    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
+    /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
+    /// `seen` (already being resolved), `Err` if not a spilled SGPR.
+    fn spilled(
+        &self,
+        v: Value,
+        lane: u32,
+        block: Option<usize>,
+        seen: &mut Vec<Value>,
+    ) -> Result<Option<Moved>, ()> {
         if let Some((b, i)) = self.phis[v.0 as usize] {
+            if block.is_some() {
+                return Err(());
+            }
             if seen.contains(&v) {
                 return Ok(None);
             }
             seen.push(v);
             let mut found = None;
             for &a in &self.p.blocks[b].phis[i].args {
-                if let Some(m) = self.spilled(a, lane, seen)? {
+                if let Some(m) = self.spilled(a, lane, block, seen)? {
                     if found.is_some_and(|f| f != m) {
                         return Err(());
                     }
@@ -1981,18 +2373,26 @@ impl Tracer<'_> {
             }
             return Ok(found);
         }
-        let inst = self.def(v).ok_or(())?;
+        let site = self.defs[v.0 as usize].ok_or(())?;
+        if block.is_some_and(|b| site.0 != b) {
+            return Err(());
+        }
+        let inst = self.inst(site);
         let Fields::Valu(w) = &inst.fields else {
             return Err(());
         };
         let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
             return Err(());
         };
-        if inst.name() != "v_writelane_b32" {
+        if inst.name() != "v_writelane_b32" || !plain_lane(w) {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        let written = lane_of(*at).ok_or(())?;
+        if written >= if self.p.wave64 { 64 } else { 32 } {
+            return Err(());
+        }
+        if written != lane {
+            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, block, seen);
         }
         match *value {
             Operand::Scalar { code, .. } if code != NULL => {
@@ -2007,6 +2407,7 @@ impl Tracer<'_> {
     }
 }
 
+/// A lane select given as a constant.
 fn lane_of(op: Operand) -> Option<u32> {
     match op {
         Operand::Const(c) => inline(c),
@@ -2015,12 +2416,19 @@ fn lane_of(op: Operand) -> Option<u32> {
     }
 }
 
+/// What dword `k` of a move's result copies.
 fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     let Fields::Sop { src, imm, .. } = &inst.fields else {
         return None;
     };
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
+    }
+    // A mask of S0 bits from bit S1, as the upscaler's compiler makes an
+    // immediate sampler's word.
+    if let ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, &src[..]) {
+        let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
+        return Some(Moved::Const(((1u32 << w) - 1) << at));
     }
     let src = src.first()?;
     match (inst.name(), *src) {
@@ -2030,8 +2438,16 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { .. }) => Some(Moved::Const(0)),
         ("s_mov_b32", Operand::Literal(x)) => Some(Moved::Const(x)),
         ("s_mov_b32", Operand::Const(c)) => inline(c).map(Moved::Const),
+        // shortcut: only the one-operand ways the compiler makes a constant
+        // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
+        // shortcut: a literal below 2^31, whose high dword is 0 whether the
+        // hardware extends it with zeros or with its sign.
+        ("s_mov_b64", Operand::Literal(x)) if x >> 31 == 0 => {
+            Some(Moved::Const(if k == 0 { x } else { 0 }))
+        }
+        // 64-bit inline integers are sign-extended.
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
             Some(Moved::Const(if k == 0 {
@@ -2044,6 +2460,7 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     }
 }
 
+/// The 32-bit value of an inline constant operand.
 pub(crate) fn inline(code: u8) -> Option<u32> {
     let float = |f: f32| Some(f.to_bits());
     match code {
@@ -2075,6 +2492,7 @@ pub(crate) mod tests {
         track(&p, layout, stage, lanes(&p).as_ref()).unwrap()
     }
 
+    /// `p` as one lane runs it, if it structures.
     fn lanes(p: &Program) -> Option<Structured> {
         crate::structure::structure(p).ok()
     }
@@ -2102,15 +2520,15 @@ pub(crate) mod tests {
     fn table_descriptors_are_loaded_from_their_range() {
         let r = track_words(
             &[
-                0xBE82_0309,
-                0xBE89_0380,
-                0xBE83_0380,
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xBE83_0380, // s_mov_b32 s3, 0
                 0xF408_0204,
-                0xFA00_0000,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[8:9], null
                 0xF40C_0001,
-                0xFA00_0000,
+                0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
                 0xF080_0F08,
-                0x0040_0002,
+                0x0040_0002, // image_sample v[0:3], v[2:3], s[0:7], s[8:11]
                 S_ENDPGM,
             ],
             &[param(Table, 8, 1), param(Table, 9, 1)],
@@ -2144,13 +2562,13 @@ pub(crate) mod tests {
         let r = track_words(
             &[
                 0x8801_FF0B,
-                0x0010_0000,
-                0xBE80_030A,
-                0xBE82_03C1,
+                0x0010_0000, // s_or_b32 s1, s11, 0x100000
+                0xBE80_030A, // s_mov_b32 s0, s10
+                0xBE82_03C1, // s_mov_b32 s2, -1
                 0xBE83_03FF,
-                0x1101_4FAC,
+                0x1101_4FAC, // s_mov_b32 s3, 0x11014fac
                 0xF430_0000,
-                0xFA00_0000,
+                0xFA00_0000, // s_buffer_load_dwordx16 s[0:15], s[0:3], null
                 S_ENDPGM,
             ],
             &[param(Descriptor, 10, 2)],
@@ -2172,13 +2590,15 @@ pub(crate) mod tests {
 
     #[test]
     fn heap_indices_from_root_constants_in_a_merged_stage() {
+        // User data starts at s8: the constant (index 6) is s14, the heap
+        // (index 10) s18.
         let code = [
-            0x8F08_850E,
-            0xBE93_0380,
+            0x8F08_850E, // s_lshl_b32 s8, s14, 5
+            0xBE93_0380, // s_mov_b32 s19, 0
             0xF408_0209,
-            0x1000_0000,
+            0x1000_0000, // s_load_dwordx4 s[8:11], s[18:19], s8
             0xE000_2000,
-            0x8002_0400,
+            0x8002_0400, // buffer_load_format_x v4, v0, s[8:11], 0 idxen
             S_ENDPGM,
         ];
         let r = track_words(
@@ -2189,6 +2609,7 @@ pub(crate) mod tests {
         let index = r.params.iter().find(|p| p.1 == 0).unwrap().0;
         let shift = r.scalar[0].1.dynamic.unwrap();
         assert_eq!(r.scalar[0].1.param, 1);
+        // The computed term is the shifted constant, not the constant itself.
         assert_ne!(shift, index);
         assert_eq!(
             r.descriptors[0].source,
@@ -2222,12 +2643,12 @@ pub(crate) mod tests {
         let r = track_words(
             &[
                 0xD761_0000,
-                0x0001_0609,
+                0x0001_0609, // v_writelane_b32 v0, s9, 3
                 0xD760_0002,
-                0x0001_0700,
-                0xBE83_0380,
+                0x0001_0700, // v_readlane_b32 s2, v0, 3
+                0xBE83_0380, // s_mov_b32 s3, 0
                 0xF40C_0001,
-                0xFA00_0020,
+                0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
                 S_ENDPGM,
             ],
             &[param(Table, 9, 1)],
@@ -2236,21 +2657,109 @@ pub(crate) mod tests {
         assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
     }
 
+    /// A VGPR a wave reduction used is free again after it: from the first
+    /// save on it holds parked scalars alone (an upscaler program parks a
+    /// constant buffer's descriptor that way).
+    #[test]
+    fn a_vgpr_used_before_holds_spilled_sgprs_from_its_first_save() {
+        let before = [
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0x7E02_0300, // v_mov_b32 v1, v0
+        ];
+        let park = [
+            0xD761_0000,
+            0x0001_0609, // v_writelane_b32 v0, s9, 3
+            0xD760_0002,
+            0x0001_0700, // v_readlane_b32 s2, v0, 3
+            0xBE83_0380, // s_mov_b32 s3, 0
+        ];
+        let load = [
+            0xF40C_0001,
+            0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+            S_ENDPGM,
+        ];
+        let words = [&before[..], &park, &load].concat();
+        let r = track_words(&words, &[param(Table, 9, 1)], HwStage::Ps);
+        assert_eq!(r.scalar, [((0, 5), at(0, 0x20))]);
+        // Still lane reads: a lane restored before it is saved, and a
+        // register with an ordinary use after the first save.
+        let restored_first = [&before[..], &park[2..4], &park[..2], &load].concat();
+        let used_after = [&before[..], &park, &before[1..], &load].concat();
+        for words in [restored_first, used_after] {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 8).unwrap();
+            let insts = p.blocks.iter().flat_map(|b| &b.insts);
+            assert_eq!(insts.filter(|i| i.name() == "v_readlane_b32").count(), 1);
+        }
+    }
+
+    /// Two lanes hold a pair (a lane mask, say) and later one of them a
+    /// scalar, as in a water volume program that parks more than the lanes
+    /// of one VGPR hold: the pair still moves as one.
+    #[test]
+    fn a_lane_spilled_to_again_later_does_not_split_an_earlier_pair() {
+        let pair = [
+            0xD761_0000u32,
+            0x0001_0004, // v_writelane_b32 v0, s4, 0
+            0xD761_0000,
+            0x0001_0205, // v_writelane_b32 v0, s5, 1
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xD760_0004,
+            0x0001_0100, // v_readlane_b32 s4, v0, 0
+            0xD760_0005,
+            0x0001_0300, // v_readlane_b32 s5, v0, 1
+        ];
+        let scalar = [
+            0xD761_0000u32,
+            0x0001_0006, // v_writelane_b32 v0, s6, 0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xD760_0006,
+            0x0001_0100, // v_readlane_b32 s6, v0, 0
+            S_ENDPGM,
+        ];
+        let moves = |words: &[u32]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 8).unwrap();
+            let names: Vec<_> = p.blocks[0].insts.iter().map(|i| i.name()).collect();
+            assert!(!names.iter().any(|n| n.contains("lane")));
+            names.iter().filter(|n| **n == "s_mov_b64").count()
+        };
+        assert_eq!(moves(&[&pair[..], &scalar].concat()), 2);
+        // A restore both saves reach keeps the lane one scalar.
+        let joined = [
+            &pair[..4],
+            &[0xBF84_0002], // s_cbranch_scc0 past the second save
+            &scalar[..2],
+            &pair[4..],
+            &scalar[2..],
+        ]
+        .concat();
+        assert_eq!(moves_anywhere(&joined), 0);
+    }
+
+    fn moves_anywhere(words: &[u32]) -> usize {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 8).unwrap();
+        let insts = p.blocks.iter().flat_map(|b| &b.insts);
+        insts.filter(|i| i.name() == "s_mov_b64").count()
+    }
+
     #[test]
     fn descriptors_joined_by_control_flow_are_traced_per_edge() {
         let r = track_words(
             &[
-                0xBE82_0309,
-                0xBE83_0380,
-                0xBF06_8001,
-                0xBF85_0003,
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_0003, // s_cbranch_scc1 -> 0x1c
                 0xF408_0001,
-                0xFA00_0000,
-                0xBF82_0002,
+                0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+                0xBF82_0002, // s_branch -> 0x24
                 0xF408_0001,
-                0xFA00_0010,
+                0xFA00_0010, // 0x1c: s_load_dwordx4 s[0:3], s[2:3], 0x10
                 0xF420_0100,
-                0xFA00_0000,
+                0xFA00_0000, // 0x24: s_buffer_load_dword s4, s[0:3], null
                 S_ENDPGM,
             ],
             &[param(Table, 9, 1)],
@@ -2275,27 +2784,30 @@ pub(crate) mod tests {
         );
     }
 
+    /// Two paths add an index to one table in the code and meet before one load
+    /// (hair `CS_InterpolateStrands`): the join is the computed term, counted
+    /// from the `s_getpc_b64`.
     #[test]
     fn two_paths_into_one_code_table_load() {
         let r = track_words(
             &[
-                0xBE82_1F00,
+                0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
                 0x8002_FF02,
-                0x0000_0040,
-                0x8203_8003,
-                0xBF06_8001,
-                0xBF85_0005,
+                0x0000_0040, // s_add_u32 s2, s2, 0x40
+                0x8203_8003, // s_addc_u32 s3, s3, 0
+                0xBF06_8001, // 0x10: s_cmp_eq_u32 s1, 0
+                0xBF85_0005, // 0x14: s_cbranch_scc1 -> 0x2c
                 0xD70F_0457,
-                0x0000_054A,
+                0x0000_054A, // 0x18: v_add_co_u32 v87, s4, v74, s2
                 0xD528_0458,
-                0x0010_0680,
-                0xBF82_0004,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+                0xBF82_0004, // 0x28: s_branch -> 0x3c
                 0xD70F_0457,
-                0x0000_054B,
+                0x0000_054B, // 0x2c: v_add_co_u32 v87, s4, v75, s2
                 0xD528_0458,
-                0x0010_0680,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
                 0xDC34_8000,
-                0x577D_0057,
+                0x577D_0057, // 0x3c: global_load_dwordx2 v[87:88], v[87:88], null
                 S_ENDPGM,
             ],
             &[],
@@ -2304,25 +2816,28 @@ pub(crate) mod tests {
         assert_eq!(r.scalar.len(), 1);
         let a = r.scalar[0].1;
         assert_eq!((a.param, a.offset), (CODE, 0));
-        assert!(
-            a.dynamic.is_some(),
-            "the join is the computed term, the byte in the code"
-        );
+        assert!(a.dynamic.is_some(), "the join is the computed term, the byte in the code");
     }
 
+    /// An address into a table in the code computed per lane and taken from
+    /// the first lane (`avgLuminanceCompute` `ColorDownsample`): the per-lane
+    /// sum carries the `s_getpc_b64` base, so the first-lane read is looked
+    /// through and the lane's index is the computed term. (A first-lane read
+    /// of an index alone stays the computed term itself; see
+    /// `the_console_waterfall_over_a_first_lane_offset_is_one`.)
     #[test]
     fn a_code_table_address_taken_from_the_first_lane() {
         let r = track_words(
             &[
-                0xBE82_1F00,
+                0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
                 0xD70F_0457,
-                0x0000_054A,
+                0x0000_054A, // v_add_co_u32 v87, s4, v74, s2
                 0xD528_0458,
-                0x0010_0680,
-                0x7E0C_0557,
-                0x7E0E_0558,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+                0x7E0C_0557, // v_readfirstlane_b32 s6, v87
+                0x7E0E_0558, // v_readfirstlane_b32 s7, v88
                 0xF400_0203,
-                0xFA00_0000,
+                0xFA00_0000, // s_load_dword s8, s[6:7], 0x0
                 S_ENDPGM,
             ],
             &[],
@@ -2336,10 +2851,24 @@ pub(crate) mod tests {
 
     #[test]
     fn a_descriptor_kept_per_lane_is_its_load_and_needs_no_waterfall() {
-        let mut words = vec![0xBE82_0309, 0xBE83_0380, 0xF40C_0001, 0xFA00_0000];
+        // The console compiler's way with a descriptor it joins per lane:
+        // the dwords go to VGPRs and come back from the first lane. Every
+        // lane holds the one load's dwords, so the descriptor is that load
+        // (`lane_copied`), and no waterfall is asked for.
+        let mut words = vec![
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+        ];
+        // v_mov_b32 v10.., s0..; v_readfirstlane_b32 s16.., v10..
         words.extend((0..8).map(|k| 0x7E00_0200 | (10 + k) << 17 | k));
         words.extend((0..8).map(|k| 0x7E00_0400 | (16 + k) << 17 | (0x100 + 10 + k)));
-        words.extend([0xF000_1700, 0x0004_0D06, S_ENDPGM]);
+        words.extend([
+            0xF000_1700,
+            0x0004_0D06, // image_load v[13:15], v6, s[16:23]
+            S_ENDPGM,
+        ]);
         let r = track_words(&words, &[param(Table, 9, 1)], HwStage::Ps);
         let load = (0, 2);
         assert_eq!(r.scalar, [(load, at(0, 0))]);
@@ -2351,18 +2880,22 @@ pub(crate) mod tests {
 
     #[test]
     fn loads_at_one_first_lane_offset_have_one_address() {
+        // Two loads of the table entry at the offset v4 holds, each with
+        // its own first-lane read, as the console compiler loads a
+        // descriptor again wherever it needs it: one address, by which
+        // lowering knows them for the same descriptor.
         let r = track_words(
             &[
-                0xBE82_0309,
-                0xBE83_0380,
-                0x7E08_0504,
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0x7E08_0504, // v_readfirstlane_b32 s4, v4
                 0xF40C_0201,
-                0x0800_0000,
-                0x7E0A_0504,
+                0x0800_0000, // s_load_dwordx8 s[8:15], s[2:3], s4
+                0x7E0A_0504, // v_readfirstlane_b32 s5, v4
                 0xF40C_0401,
-                0x0A00_0000,
+                0x0A00_0000, // s_load_dwordx8 s[16:23], s[2:3], s5
                 0xF000_1700,
-                0x0004_0D06,
+                0x0004_0D06, // image_load v[13:15], v6, s[16:23]
                 S_ENDPGM,
             ],
             &[param(Table, 9, 1)],
@@ -2381,19 +2914,22 @@ pub(crate) mod tests {
 
     #[test]
     fn descriptors_selected_by_scc_are_traced_per_outcome() {
+        // Two buffer descriptors loaded from the table at s9 and one
+        // picked with s_cselect_b64 per half, as the compiler makes a
+        // conditional choice of resources without a branch.
         let r = track_words(
             &[
-                0xBE8C_0309,
-                0xBE8D_0380,
+                0xBE8C_0309, // s_mov_b32 s12, s9
+                0xBE8D_0380, // s_mov_b32 s13, 0
                 0xF408_0006,
-                0xFA00_0000,
+                0xFA00_0000, // s_load_dwordx4 s[0:3], s[12:13], null
                 0xF408_0106,
-                0xFA00_0010,
-                0xBF06_800E,
-                0x8588_0400,
-                0x858A_0602,
+                0xFA00_0010, // s_load_dwordx4 s[4:7], s[12:13], 0x10
+                0xBF06_800E, // s_cmp_eq_u32 s14, 0
+                0x8588_0400, // s_cselect_b64 s[8:9], s[0:1], s[4:5]
+                0x858A_0602, // s_cselect_b64 s[10:11], s[2:3], s[6:7]
                 0xF420_0404,
-                0xFA00_0000,
+                0xFA00_0000, // s_buffer_load_dword s16, s[8:11], null
                 S_ENDPGM,
             ],
             &[param(Table, 9, 1)],
@@ -2402,6 +2938,7 @@ pub(crate) mod tests {
         let Source::Select { args, .. } = &r.descriptors[0].source else {
             panic!("{:?}", r.descriptors)
         };
+        // SCC set picks the first operand.
         assert_eq!(
             args[..],
             [
@@ -2418,20 +2955,92 @@ pub(crate) mod tests {
         assert_eq!(r.scalar, [((0, 2), at(0, 0)), ((0, 3), at(0, 0x10))]);
     }
 
+    /// The FidelityFX upscaler's byte accesses make a loaded buffer
+    /// descriptor raw first (stride cleared, records times stride, bounds
+    /// in bytes): the access reads the loaded descriptor. Any other change
+    /// still fails.
+    #[test]
+    fn a_descriptor_made_raw_is_the_loaded_one() {
+        let words = |mask: u32| -> Vec<u8> {
+            [
+                0xBE88_0304, // s_mov_b32 s8, s4
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xF408_0204,
+                0xFA00_0160, // s_load_dwordx4 s[8:11], s[8:9], 0x160
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x938C_FF09,
+                0x000E_0010, // s_bfe_u32 s12, s9, 0x000e0010
+                0x848C_810C, // s_max_u32 s12, s12, 1
+                0x8709_FF09,
+                mask, // s_and_b32 s9, s9, mask
+                0x870B_FF0B,
+                0xCFFF_FFFF, // s_and_b32 s11, s11, 0xcfffffff
+                0x930A_0C0A, // s_mul_i32 s10, s10, s12
+                0x880B_FF0B,
+                0x3000_0000, // s_or_b32 s11, s11, 0x30000000
+                0xE078_1000,
+                0x8002_0007, // buffer_store_dwordx4 v[0:3], v7, s[8:11], 0 offen
+                S_ENDPGM,
+            ]
+            .iter()
+            .flat_map(|w: &u32| w.to_le_bytes())
+            .collect()
+        };
+        let run = |mask| {
+            let p = crate::ir::build(&words(mask), false, 256).unwrap();
+            track(&p, &[param(Table, 4, 1)], HwStage::Cs, lanes(&p).as_ref())
+        };
+        assert!(run(0xC000_FFFF).is_ok());
+        assert_eq!(
+            run(0xC000_FFFE).unwrap_err(),
+            ShaderError::Unsupported {
+                offset: 0x3c,
+                what: "a descriptor changed after loading"
+            }
+        );
+    }
+
+    /// Immediate sampler words the upscaler's compiler makes with a bit
+    /// mask and a 64-bit move of a literal.
+    #[test]
+    fn sampler_words_from_bit_masks_and_wide_literals_are_constants() {
+        let code: Vec<u8> = [
+            0xB010_3092, // s_movk_i32 s16, 0x3092
+            0x9211_8C8C, // s_bfm_b32 s17, 12, 12
+            0xBE92_04FF,
+            0x1850_0000, // s_mov_b64 s[18:19], 0x18500000
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table, 4, 1)];
+        let t = Tracer::new(&p, &layout, HwStage::Cs, None).unwrap();
+        let block = &p.blocks[0];
+        let value = |n: usize, k: usize| t.origin(block.insts[n].writes[k].1);
+        assert_eq!(value(1, 0), Term::Const(0x00FF_F000));
+        assert_eq!(value(2, 0), Term::Const(0x1850_0000));
+        assert_eq!(value(2, 1), Term::Const(0));
+    }
+
+
     #[test]
     fn a_selection_that_mixes_two_descriptors_fails() {
+        // The high half picked from the first load whatever SCC is: when
+        // clear, the descriptor is half of one load and half of the other.
         let code: Vec<u8> = [
-            0xBE8C_0309,
-            0xBE8D_0380,
+            0xBE8C_0309, // s_mov_b32 s12, s9
+            0xBE8D_0380, // s_mov_b32 s13, 0
             0xF408_0006,
-            0xFA00_0000,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[12:13], null
             0xF408_0106,
-            0xFA00_0010,
-            0xBF06_800E,
-            0x8588_0400,
-            0x858A_0202,
+            0xFA00_0010, // s_load_dwordx4 s[4:7], s[12:13], 0x10
+            0xBF06_800E, // s_cmp_eq_u32 s14, 0
+            0x8588_0400, // s_cselect_b64 s[8:9], s[0:1], s[4:5]
+            0x858A_0202, // s_cselect_b64 s[10:11], s[2:3], s[2:3]
             0xF420_0404,
-            0xFA00_0000,
+            0xFA00_0000, // s_buffer_load_dword s16, s[8:11], null
             S_ENDPGM,
         ]
         .iter()
@@ -2450,7 +3059,7 @@ pub(crate) mod tests {
 
     #[test]
     fn untraceable_addresses_fail_with_a_reason() {
-        let code: Vec<u8> = [0xF408_0001, 0xFA00_0000, S_ENDPGM]
+        let code: Vec<u8> = [0xF408_0001, 0xFA00_0000, S_ENDPGM] // s_load_dwordx4 s[0:3], s[2:3]
             .iter()
             .flat_map(|w: &u32| w.to_le_bytes())
             .collect();
@@ -2465,271 +3074,294 @@ pub(crate) mod tests {
         );
     }
 
+    /// A waterfall loop over an image descriptor each lane loads from the
+    /// table at s0 (wave32, assembled with llvm-mc for gfx1030): lane i
+    /// reads entry i with two `global_load_dwordx4`, the loop reads the
+    /// first active lane's descriptor into s[12:19], samples with the lanes
+    /// whose descriptor it is, and repeats for the others. The sampler comes
+    /// from the table at s1; the result goes to LDS so the sample is needed.
     pub(crate) const WATERFALL_FETCHED_WAVE32: &[u32] = &[
-        0xBE84_0300,
-        0xBE85_0380,
-        0xBE86_0301,
-        0xBE87_0380,
-        0x3402_0085,
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0x3402_0085, // v_lshlrev_b32 v1, 5, v0
         0xDC38_8000,
-        0x0404_0001,
+        0x0404_0001, // global_load_dwordx4 v[4:7], v1, s[4:5]
         0xDC38_8010,
-        0x0804_0001,
+        0x0804_0001, // global_load_dwordx4 v[8:11], v1, s[4:5] offset:16
         0xF408_0203,
-        0xFA00_0000,
-        0x7E04_0D00,
-        0x7E06_0302,
-        0xBF8C_0070,
-        0xBE94_037E,
-        0x7E18_0504,
-        0x7E1A_0505,
-        0x7E1C_0506,
-        0x7E1E_0507,
-        0x7E20_0508,
-        0x7E22_0509,
-        0x7E24_050A,
-        0x7E26_050B,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0xBE94_037E, // s_mov_b32 s20, exec_lo
+        0x7E18_0504, // 0x3c: v_readfirstlane_b32 s12, v4
+        0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+        0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+        0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+        0x7E20_0508, // v_readfirstlane_b32 s16, v8
+        0x7E22_0509, // v_readfirstlane_b32 s17, v9
+        0x7E24_050A, // v_readfirstlane_b32 s18, v10
+        0x7E26_050B, // v_readfirstlane_b32 s19, v11
         0xD4E2_0015,
-        0x0002_080C,
+        0x0002_080C, // v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
         0xD4E2_0016,
-        0x0002_0C0E,
-        0x8715_1615,
+        0x0002_0C0E, // v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
+        0x8715_1615, // s_and_b32 s21, s21, s22
         0xD4E2_0016,
-        0x0002_1010,
-        0x8715_1615,
+        0x0002_1010, // v_cmp_eq_u64_e64 s22, s[16:17], v[8:9]
+        0x8715_1615, // s_and_b32 s21, s21, s22
         0xD4E2_0016,
-        0x0002_1412,
-        0x8715_1615,
-        0xBE95_3C15,
-        0xBF80_0000,
+        0x0002_1412, // v_cmp_eq_u64_e64 s22, s[18:19], v[10:11]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+        0xBF80_0000, // s_nop 0
         0xF09C_0F08,
-        0x0043_0C02,
-        0xBF8C_3F70,
-        0x897E_157E,
-        0xBF89_FFE6,
-        0xBEFE_0314,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+        0xBF89_FFE6, // s_cbranch_execnz -> 0x3c
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
         0xD834_0000,
-        0x0000_0C00,
-        0xBF81_0000,
+        0x0000_0C00, // ds_write_b32 v0, v12
+        0xBF81_0000, // s_endpgm
     ];
 
+    /// [`WATERFALL_FETCHED_WAVE32`] in wave64: 64-bit lane masks.
     pub(crate) const WATERFALL_FETCHED_WAVE64: &[u32] = &[
-        0xBE84_0300,
-        0xBE85_0380,
-        0xBE86_0301,
-        0xBE87_0380,
-        0x3402_0085,
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0x3402_0085, // v_lshlrev_b32 v1, 5, v0
         0xDC38_8000,
-        0x0404_0001,
+        0x0404_0001, // global_load_dwordx4 v[4:7], v1, s[4:5]
         0xDC38_8010,
-        0x0804_0001,
+        0x0804_0001, // global_load_dwordx4 v[8:11], v1, s[4:5] offset:16
         0xF408_0203,
-        0xFA00_0000,
-        0x7E04_0D00,
-        0x7E06_0302,
-        0xBF8C_0070,
-        0xBE94_047E,
-        0x7E18_0504,
-        0x7E1A_0505,
-        0x7E1C_0506,
-        0x7E1E_0507,
-        0x7E20_0508,
-        0x7E22_0509,
-        0x7E24_050A,
-        0x7E26_050B,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0xBE94_047E, // s_mov_b64 s[20:21], exec
+        0x7E18_0504, // 0x3c: v_readfirstlane_b32 s12, v4
+        0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+        0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+        0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+        0x7E20_0508, // v_readfirstlane_b32 s16, v8
+        0x7E22_0509, // v_readfirstlane_b32 s17, v9
+        0x7E24_050A, // v_readfirstlane_b32 s18, v10
+        0x7E26_050B, // v_readfirstlane_b32 s19, v11
         0xD4E2_0016,
-        0x0002_080C,
+        0x0002_080C, // v_cmp_eq_u64_e64 s[22:23], s[12:13], v[4:5]
         0xD4E2_0018,
-        0x0002_0C0E,
-        0x8796_1816,
+        0x0002_0C0E, // v_cmp_eq_u64_e64 s[24:25], s[14:15], v[6:7]
+        0x8796_1816, // s_and_b64 s[22:23], s[22:23], s[24:25]
         0xD4E2_0018,
-        0x0002_1010,
-        0x8796_1816,
+        0x0002_1010, // v_cmp_eq_u64_e64 s[24:25], s[16:17], v[8:9]
+        0x8796_1816, // s_and_b64 s[22:23], s[22:23], s[24:25]
         0xD4E2_0018,
-        0x0002_1412,
-        0x8796_1816,
-        0xBE96_2416,
-        0xBF80_0000,
+        0x0002_1412, // v_cmp_eq_u64_e64 s[24:25], s[18:19], v[10:11]
+        0x8796_1816, // s_and_b64 s[22:23], s[22:23], s[24:25]
+        0xBE96_2416, // s_and_saveexec_b64 s[22:23], s[22:23]
+        0xBF80_0000, // s_nop 0
         0xF09C_0F08,
-        0x0043_0C02,
-        0xBF8C_3F70,
-        0x89FE_167E,
-        0xBF89_FFE6,
-        0xBEFE_0414,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x89FE_167E, // s_xor_b64 exec, exec, s[22:23]
+        0xBF89_FFE6, // s_cbranch_execnz -> 0x3c
+        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
         0xD834_0000,
-        0x0000_0C00,
-        0xBF81_0000,
+        0x0000_0C00, // ds_write_b32 v0, v12
+        0xBF81_0000, // s_endpgm
     ];
 
+    /// The same waterfall over one of two image descriptors loaded from the
+    /// table at s0, picked per lane by `v_cndmask_b32` (lanes below 16 take
+    /// the first).
     pub(crate) const WATERFALL_PICKED_WAVE32: &[u32] = &[
-        0xBE84_0300,
-        0xBE85_0380,
-        0xBE86_0301,
-        0xBE87_0380,
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
         0xF40C_0602,
-        0xFA00_0000,
+        0xFA00_0000, // s_load_dwordx8 s[24:31], s[4:5], 0x0
         0xF40C_0802,
-        0xFA00_0020,
+        0xFA00_0020, // s_load_dwordx8 s[32:39], s[4:5], 0x20
         0xF408_0203,
-        0xFA00_0000,
-        0x7E04_0D00,
-        0x7E06_0302,
-        0x7D88_0090,
-        0xBF8C_C07F,
-        0x7E08_0218,
-        0x0208_0820,
-        0x7E0A_0219,
-        0x020A_0A21,
-        0x7E0C_021A,
-        0x020C_0C22,
-        0x7E0E_021B,
-        0x020E_0E23,
-        0x7E10_021C,
-        0x0210_1024,
-        0x7E12_021D,
-        0x0212_1225,
-        0x7E14_021E,
-        0x0214_1426,
-        0x7E16_021F,
-        0x0216_1627,
-        0xBE94_037E,
-        0x7E18_0504,
-        0x7E1A_0505,
-        0x7E1C_0506,
-        0x7E1E_0507,
-        0x7E20_0508,
-        0x7E22_0509,
-        0x7E24_050A,
-        0x7E26_050B,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E08_0218, // v_mov_b32 v4, s24
+        0x0208_0820, // v_cndmask_b32 v4, s32, v4, vcc_lo
+        0x7E0A_0219, // v_mov_b32 v5, s25
+        0x020A_0A21, // v_cndmask_b32 v5, s33, v5, vcc_lo
+        0x7E0C_021A, // v_mov_b32 v6, s26
+        0x020C_0C22, // v_cndmask_b32 v6, s34, v6, vcc_lo
+        0x7E0E_021B, // v_mov_b32 v7, s27
+        0x020E_0E23, // v_cndmask_b32 v7, s35, v7, vcc_lo
+        0x7E10_021C, // v_mov_b32 v8, s28
+        0x0210_1024, // v_cndmask_b32 v8, s36, v8, vcc_lo
+        0x7E12_021D, // v_mov_b32 v9, s29
+        0x0212_1225, // v_cndmask_b32 v9, s37, v9, vcc_lo
+        0x7E14_021E, // v_mov_b32 v10, s30
+        0x0214_1426, // v_cndmask_b32 v10, s38, v10, vcc_lo
+        0x7E16_021F, // v_mov_b32 v11, s31
+        0x0216_1627, // v_cndmask_b32 v11, s39, v11, vcc_lo
+        0xBE94_037E, // s_mov_b32 s20, exec_lo
+        0x7E18_0504, // 0x7c: v_readfirstlane_b32 s12, v4
+        0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+        0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+        0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+        0x7E20_0508, // v_readfirstlane_b32 s16, v8
+        0x7E22_0509, // v_readfirstlane_b32 s17, v9
+        0x7E24_050A, // v_readfirstlane_b32 s18, v10
+        0x7E26_050B, // v_readfirstlane_b32 s19, v11
         0xD4E2_0015,
-        0x0002_080C,
+        0x0002_080C, // v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
         0xD4E2_0016,
-        0x0002_0C0E,
-        0x8715_1615,
+        0x0002_0C0E, // v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
+        0x8715_1615, // s_and_b32 s21, s21, s22
         0xD4E2_0016,
-        0x0002_1010,
-        0x8715_1615,
+        0x0002_1010, // v_cmp_eq_u64_e64 s22, s[16:17], v[8:9]
+        0x8715_1615, // s_and_b32 s21, s21, s22
         0xD4E2_0016,
-        0x0002_1412,
-        0x8715_1615,
-        0xBE95_3C15,
-        0xBF80_0000,
+        0x0002_1412, // v_cmp_eq_u64_e64 s22, s[18:19], v[10:11]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+        0xBF80_0000, // s_nop 0
         0xF09C_0F08,
-        0x0043_0C02,
-        0xBF8C_3F70,
-        0x897E_157E,
-        0xBF89_FFE6,
-        0xBEFE_0314,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+        0xBF89_FFE6, // s_cbranch_execnz -> 0x7c
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
         0xD834_0000,
-        0x0000_0C00,
-        0xBF81_0000,
+        0x0000_0C00, // ds_write_b32 v0, v12
+        0xBF81_0000, // s_endpgm
     ];
 
+    /// The waterfall loop of [`WATERFALL_PICKED_WAVE32`] over one of two
+    /// image descriptors loaded from the table at s0, chosen by control flow
+    /// as the compiler lowers an if/else on a per-lane condition: lanes below
+    /// 16 move the first into v[4:11], the others the second, each arm
+    /// skipped when no lane takes it. The sample goes to the buffer at dword
+    /// 16 of the table, at lane * 4.
     pub(crate) const WATERFALL_JOINED_WAVE32: &[u32] = &[
-        0xBE84_0300,
-        0xBE85_0380,
-        0xBE86_0301,
-        0xBE87_0380,
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
         0xF40C_0602,
-        0xFA00_0000,
+        0xFA00_0000, // s_load_dwordx8 s[24:31], s[4:5], 0x0
         0xF40C_0802,
-        0xFA00_0020,
+        0xFA00_0020, // s_load_dwordx8 s[32:39], s[4:5], 0x20
         0xF408_0203,
-        0xFA00_0000,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
         0xF408_0A02,
-        0xFA00_0040,
-        0x7E04_0D00,
-        0x7E06_0302,
-        0x3420_0082,
-        0x7D88_0090,
-        0xBF8C_C07F,
-        0xBE94_3C6A,
-        0x8914_147E,
-        0xBF88_0008,
-        0x7E08_0218,
-        0x7E0A_0219,
-        0x7E0C_021A,
-        0x7E0E_021B,
-        0x7E10_021C,
-        0x7E12_021D,
-        0x7E14_021E,
-        0x7E16_021F,
-        0xBE94_3D14,
-        0x897E_147E,
-        0xBF88_0008,
-        0x7E08_0220,
-        0x7E0A_0221,
-        0x7E0C_0222,
-        0x7E0E_0223,
-        0x7E10_0224,
-        0x7E12_0225,
-        0x7E14_0226,
-        0x7E16_0227,
-        0x887E_147E,
-        0xBE97_037E,
-        0x7E18_0504,
-        0x7E1A_0505,
-        0x7E1C_0506,
-        0x7E1E_0507,
-        0x7E20_0508,
-        0x7E22_0509,
-        0x7E24_050A,
-        0x7E26_050B,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        0x8914_147E, // s_xor_b32 s20, exec_lo, s20
+        0xBF88_0008, // s_cbranch_execz -> 0x70
+        0x7E08_0218, // v_mov_b32 v4, s24
+        0x7E0A_0219, // v_mov_b32 v5, s25
+        0x7E0C_021A, // v_mov_b32 v6, s26
+        0x7E0E_021B, // v_mov_b32 v7, s27
+        0x7E10_021C, // v_mov_b32 v8, s28
+        0x7E12_021D, // v_mov_b32 v9, s29
+        0x7E14_021E, // v_mov_b32 v10, s30
+        0x7E16_021F, // v_mov_b32 v11, s31
+        0xBE94_3D14, // 0x70: s_or_saveexec_b32 s20, s20
+        0x897E_147E, // s_xor_b32 exec_lo, exec_lo, s20
+        0xBF88_0008, // s_cbranch_execz -> 0x9c
+        0x7E08_0220, // v_mov_b32 v4, s32
+        0x7E0A_0221, // v_mov_b32 v5, s33
+        0x7E0C_0222, // v_mov_b32 v6, s34
+        0x7E0E_0223, // v_mov_b32 v7, s35
+        0x7E10_0224, // v_mov_b32 v8, s36
+        0x7E12_0225, // v_mov_b32 v9, s37
+        0x7E14_0226, // v_mov_b32 v10, s38
+        0x7E16_0227, // v_mov_b32 v11, s39
+        0x887E_147E, // 0x9c: s_or_b32 exec_lo, exec_lo, s20
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0x7E18_0504, // 0xa4: v_readfirstlane_b32 s12, v4
+        0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+        0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+        0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+        0x7E20_0508, // v_readfirstlane_b32 s16, v8
+        0x7E22_0509, // v_readfirstlane_b32 s17, v9
+        0x7E24_050A, // v_readfirstlane_b32 s18, v10
+        0x7E26_050B, // v_readfirstlane_b32 s19, v11
         0xD4E2_0015,
-        0x0002_080C,
+        0x0002_080C, // v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
         0xD4E2_0016,
-        0x0002_0C0E,
-        0x8715_1615,
+        0x0002_0C0E, // v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
+        0x8715_1615, // s_and_b32 s21, s21, s22
         0xD4E2_0016,
-        0x0002_1010,
-        0x8715_1615,
+        0x0002_1010, // v_cmp_eq_u64_e64 s22, s[16:17], v[8:9]
+        0x8715_1615, // s_and_b32 s21, s21, s22
         0xD4E2_0016,
-        0x0002_1412,
-        0x8715_1615,
-        0xBE95_3C15,
-        0xBF80_0000,
+        0x0002_1412, // v_cmp_eq_u64_e64 s22, s[18:19], v[10:11]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+        0xBF80_0000, // s_nop 0
         0xF09C_0F08,
-        0x0043_0C02,
-        0xBF8C_3F70,
-        0x897E_157E,
-        0xBF89_FFE6,
-        0xBEFE_0317,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+        0xBF89_FFE6, // s_cbranch_execnz -> 0xa4
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
         0xE070_1000,
-        0x800A_0C10,
-        0xBF81_0000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
     ];
 
+    /// The console compiler's waterfall (the title's ray-tracing
+    /// resolve and others): each lane holds its entry's byte offset in the
+    /// table at s0 (v7 = (lane & 1) * 32); the loop reads the first active
+    /// lane's offset, narrows EXEC to the lanes with the same one
+    /// (`v_cmpx_eq_u32`), loads that entry with `s_load_dwordx8` and samples,
+    /// then drops those lanes (`s_andn2_wrexec_b32`). The sample goes to the
+    /// buffer at dword 16 of the table, at lane * 4.
     pub(crate) const WATERFALL_INDEXED_WAVE32: &[u32] = &[
-        0xBE84_0300,
-        0xBE85_0380,
-        0xBE86_0301,
-        0xBE87_0380,
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
         0xF408_0203,
-        0xFA00_0000,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
         0xF408_0A02,
-        0xFA00_0040,
-        0x7E04_0D00,
-        0x7E06_0302,
-        0x3420_0082,
-        0x360E_0081,
-        0x340E_0E85,
-        0xBF8C_C07F,
-        0xBE97_037E,
-        0xBE95_037E,
-        0x7E28_0507,
-        0x7DA4_0E14,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        0x7E28_0507, // 0x40: v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
         0xF40C_0302,
-        0x2800_0000,
-        0xBF8C_C07F,
+        0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
         0xF09C_0F08,
-        0x0043_0C02,
-        0xBF8C_3F70,
-        0xBE95_4715,
-        0xBF89_FFF6,
-        0xBEFE_0317,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF6, // s_cbranch_execnz -> 0x40
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
         0xE070_1000,
-        0x800A_0C10,
-        0xBF81_0000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
     ];
 
     #[test]
@@ -2750,209 +3382,222 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.loads, [load]);
     }
 
+    /// [`WATERFALL_JOINED_WAVE32`] with other sources on each path: lanes
+    /// below 16 load table entry (lane & 1) with two `global_load_dwordx4`,
+    /// the others pick per lane with `v_cndmask_b32` (lanes below 24 the
+    /// first entry, the rest the second).
     pub(crate) const WATERFALL_JOINED_MIXED_WAVE32: &[u32] = &[
-        0xBE84_0300,
-        0xBE85_0380,
-        0xBE86_0301,
-        0xBE87_0380,
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
         0xF40C_0602,
-        0xFA00_0000,
+        0xFA00_0000, // s_load_dwordx8 s[24:31], s[4:5], 0x0
         0xF40C_0802,
-        0xFA00_0020,
+        0xFA00_0020, // s_load_dwordx8 s[32:39], s[4:5], 0x20
         0xF408_0203,
-        0xFA00_0000,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
         0xF408_0A02,
-        0xFA00_0040,
-        0x7E04_0D00,
-        0x7E06_0302,
-        0x3420_0082,
-        0x3602_0081,
-        0x3402_0285,
-        0x7D88_0090,
-        0xBF8C_C07F,
-        0xBE94_3C6A,
-        0x8914_147E,
-        0xBF88_0004,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x3602_0081, // v_and_b32 v1, 1, v0
+        0x3402_0285, // v_lshlrev_b32 v1, 5, v1
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        0x8914_147E, // s_xor_b32 s20, exec_lo, s20
+        0xBF88_0004, // s_cbranch_execz -> 0x68
         0xDC38_8000,
-        0x0404_0001,
+        0x0404_0001, // global_load_dwordx4 v[4:7], v1, s[4:5]
         0xDC38_8010,
-        0x0804_0001,
-        0xBE94_3D14,
-        0x897E_147E,
-        0xBF88_0011,
-        0x7D88_0098,
-        0x7E08_0218,
-        0x0208_0820,
-        0x7E0A_0219,
-        0x020A_0A21,
-        0x7E0C_021A,
-        0x020C_0C22,
-        0x7E0E_021B,
-        0x020E_0E23,
-        0x7E10_021C,
-        0x0210_1024,
-        0x7E12_021D,
-        0x0212_1225,
-        0x7E14_021E,
-        0x0214_1426,
-        0x7E16_021F,
-        0x0216_1627,
-        0x887E_147E,
-        0xBE97_037E,
-        0xBF8C_3F70,
-        0x7E18_0504,
-        0x7E1A_0505,
-        0x7E1C_0506,
-        0x7E1E_0507,
-        0x7E20_0508,
-        0x7E22_0509,
-        0x7E24_050A,
-        0x7E26_050B,
+        0x0804_0001, // global_load_dwordx4 v[8:11], v1, s[4:5] offset:16
+        0xBE94_3D14, // 0x68: s_or_saveexec_b32 s20, s20
+        0x897E_147E, // s_xor_b32 exec_lo, exec_lo, s20
+        0xBF88_0011, // s_cbranch_execz -> 0xb8
+        0x7D88_0098, // v_cmp_gt_u32 vcc_lo, 24, v0
+        0x7E08_0218, // v_mov_b32 v4, s24
+        0x0208_0820, // v_cndmask_b32 v4, s32, v4, vcc_lo
+        0x7E0A_0219, // v_mov_b32 v5, s25
+        0x020A_0A21, // v_cndmask_b32 v5, s33, v5, vcc_lo
+        0x7E0C_021A, // v_mov_b32 v6, s26
+        0x020C_0C22, // v_cndmask_b32 v6, s34, v6, vcc_lo
+        0x7E0E_021B, // v_mov_b32 v7, s27
+        0x020E_0E23, // v_cndmask_b32 v7, s35, v7, vcc_lo
+        0x7E10_021C, // v_mov_b32 v8, s28
+        0x0210_1024, // v_cndmask_b32 v8, s36, v8, vcc_lo
+        0x7E12_021D, // v_mov_b32 v9, s29
+        0x0212_1225, // v_cndmask_b32 v9, s37, v9, vcc_lo
+        0x7E14_021E, // v_mov_b32 v10, s30
+        0x0214_1426, // v_cndmask_b32 v10, s38, v10, vcc_lo
+        0x7E16_021F, // v_mov_b32 v11, s31
+        0x0216_1627, // v_cndmask_b32 v11, s39, v11, vcc_lo
+        0x887E_147E, // 0xb8: s_or_b32 exec_lo, exec_lo, s20
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E18_0504, // 0xc4: v_readfirstlane_b32 s12, v4
+        0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+        0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+        0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+        0x7E20_0508, // v_readfirstlane_b32 s16, v8
+        0x7E22_0509, // v_readfirstlane_b32 s17, v9
+        0x7E24_050A, // v_readfirstlane_b32 s18, v10
+        0x7E26_050B, // v_readfirstlane_b32 s19, v11
         0xD4E2_0015,
-        0x0002_080C,
+        0x0002_080C, // v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
         0xD4E2_0016,
-        0x0002_0C0E,
-        0x8715_1615,
+        0x0002_0C0E, // v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
+        0x8715_1615, // s_and_b32 s21, s21, s22
         0xD4E2_0016,
-        0x0002_1010,
-        0x8715_1615,
+        0x0002_1010, // v_cmp_eq_u64_e64 s22, s[16:17], v[8:9]
+        0x8715_1615, // s_and_b32 s21, s21, s22
         0xD4E2_0016,
-        0x0002_1412,
-        0x8715_1615,
-        0xBE95_3C15,
-        0xBF80_0000,
+        0x0002_1412, // v_cmp_eq_u64_e64 s22, s[18:19], v[10:11]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+        0xBF80_0000, // s_nop 0
         0xF09C_0F08,
-        0x0043_0C02,
-        0xBF8C_3F70,
-        0x897E_157E,
-        0xBF89_FFE6,
-        0xBEFE_0317,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+        0xBF89_FFE6, // s_cbranch_execnz -> 0xc4
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
         0xE070_1000,
-        0x800A_0C10,
-        0xBF81_0000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
     ];
 
+    /// A waterfall loop whose descriptor changes on each pass: v[4:11] holds
+    /// the first table entry on entry and the second after every pass, so
+    /// the first lane's dwords are phis of the loop header.
     pub(crate) const WATERFALL_LOOPED_WAVE32: &[u32] = &[
-        0xBE84_0300,
-        0xBE85_0380,
-        0xBE86_0301,
-        0xBE87_0380,
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
         0xF40C_0602,
-        0xFA00_0000,
+        0xFA00_0000, // s_load_dwordx8 s[24:31], s[4:5], 0x0
         0xF40C_0802,
-        0xFA00_0020,
+        0xFA00_0020, // s_load_dwordx8 s[32:39], s[4:5], 0x20
         0xF408_0203,
-        0xFA00_0000,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
         0xF408_0A02,
-        0xFA00_0040,
-        0x7E04_0D00,
-        0x7E06_0302,
-        0x3420_0082,
-        0x7E08_0218,
-        0x7E0A_0219,
-        0x7E0C_021A,
-        0x7E0E_021B,
-        0x7E10_021C,
-        0x7E12_021D,
-        0x7E14_021E,
-        0x7E16_021F,
-        0xBF8C_C07F,
-        0xBE97_037E,
-        0x7E18_0504,
-        0x7E1A_0505,
-        0x7E1C_0506,
-        0x7E1E_0507,
-        0x7E20_0508,
-        0x7E22_0509,
-        0x7E24_050A,
-        0x7E26_050B,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x7E08_0218, // v_mov_b32 v4, s24
+        0x7E0A_0219, // v_mov_b32 v5, s25
+        0x7E0C_021A, // v_mov_b32 v6, s26
+        0x7E0E_021B, // v_mov_b32 v7, s27
+        0x7E10_021C, // v_mov_b32 v8, s28
+        0x7E12_021D, // v_mov_b32 v9, s29
+        0x7E14_021E, // v_mov_b32 v10, s30
+        0x7E16_021F, // v_mov_b32 v11, s31
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0x7E18_0504, // 0x64: v_readfirstlane_b32 s12, v4
+        0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+        0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+        0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+        0x7E20_0508, // v_readfirstlane_b32 s16, v8
+        0x7E22_0509, // v_readfirstlane_b32 s17, v9
+        0x7E24_050A, // v_readfirstlane_b32 s18, v10
+        0x7E26_050B, // v_readfirstlane_b32 s19, v11
         0xD4E2_0015,
-        0x0002_080C,
+        0x0002_080C, // v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
         0xD4E2_0016,
-        0x0002_0C0E,
-        0x8715_1615,
+        0x0002_0C0E, // v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
+        0x8715_1615, // s_and_b32 s21, s21, s22
         0xD4E2_0016,
-        0x0002_1010,
-        0x8715_1615,
+        0x0002_1010, // v_cmp_eq_u64_e64 s22, s[16:17], v[8:9]
+        0x8715_1615, // s_and_b32 s21, s21, s22
         0xD4E2_0016,
-        0x0002_1412,
-        0x8715_1615,
-        0xBE95_3C15,
-        0xBF80_0000,
+        0x0002_1412, // v_cmp_eq_u64_e64 s22, s[18:19], v[10:11]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+        0xBF80_0000, // s_nop 0
         0xF09C_0F08,
-        0x0043_0C02,
-        0xBF8C_3F70,
-        0x897E_157E,
-        0x7E08_0220,
-        0x7E0A_0221,
-        0x7E0C_0222,
-        0x7E0E_0223,
-        0x7E10_0224,
-        0x7E12_0225,
-        0x7E14_0226,
-        0x7E16_0227,
-        0xBF89_FFDE,
-        0xBEFE_0317,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+        0x7E08_0220, // v_mov_b32 v4, s32
+        0x7E0A_0221, // v_mov_b32 v5, s33
+        0x7E0C_0222, // v_mov_b32 v6, s34
+        0x7E0E_0223, // v_mov_b32 v7, s35
+        0x7E10_0224, // v_mov_b32 v8, s36
+        0x7E12_0225, // v_mov_b32 v9, s37
+        0x7E14_0226, // v_mov_b32 v10, s38
+        0x7E16_0227, // v_mov_b32 v11, s39
+        0xBF89_FFDE, // s_cbranch_execnz -> 0x64
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
         0xE070_1000,
-        0x800A_0C10,
-        0xBF81_0000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
     ];
 
+    /// A waterfall loop over one of two buffer descriptors (four dwords)
+    /// loaded from the table at s0, chosen by nested if/else: lanes below 16
+    /// move the first into v[4:7], lanes from 16 to 23 the second, and the
+    /// others keep what v[4:7] held. Only lanes below 24 (the same mask)
+    /// run the loop, which loads dword `lane` of the chosen buffer, and
+    /// store it to the buffer at dword 16 of the table.
     pub(crate) const WATERFALL_JOINED_BUFFER_WAVE32: &[u32] = &[
-        0xBE84_0300,
-        0xBE85_0380,
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0602,
-        0xFA00_0000,
+        0xFA00_0000, // s_load_dwordx4 s[24:27], s[4:5], 0x0
         0xF408_0802,
-        0xFA00_0020,
+        0xFA00_0020, // s_load_dwordx4 s[32:35], s[4:5], 0x20
         0xF408_0A02,
-        0xFA00_0040,
-        0x3420_0082,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
         0xD4C4_001E,
-        0x0002_0098,
-        0x7D88_0090,
-        0xBF8C_C07F,
-        0xBE94_3C6A,
-        0x8914_147E,
-        0xBF88_0004,
-        0x7E08_0218,
-        0x7E0A_0219,
-        0x7E0C_021A,
-        0x7E0E_021B,
-        0xBE94_3D14,
-        0x897E_147E,
-        0xBF88_0007,
-        0xBE9F_3C1E,
-        0xBF88_0004,
-        0x7E08_0220,
-        0x7E0A_0221,
-        0x7E0C_0222,
-        0x7E0E_0223,
-        0x887E_1F7E,
-        0x887E_147E,
-        0xBE97_3C1E,
-        0xBF88_0013,
-        0xBE9D_037E,
-        0x7E18_0504,
-        0x7E1A_0505,
-        0x7E1C_0506,
-        0x7E1E_0507,
+        0x0002_0098, // v_cmp_gt_u32_e64 s30, 24, v0
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        0x8914_147E, // s_xor_b32 s20, exec_lo, s20
+        0xBF88_0004, // s_cbranch_execz -> 0x50
+        0x7E08_0218, // 0x40: v_mov_b32 v4, s24
+        0x7E0A_0219, // v_mov_b32 v5, s25
+        0x7E0C_021A, // v_mov_b32 v6, s26
+        0x7E0E_021B, // v_mov_b32 v7, s27
+        0xBE94_3D14, // 0x50: s_or_saveexec_b32 s20, s20
+        0x897E_147E, // s_xor_b32 exec_lo, exec_lo, s20
+        0xBF88_0007, // s_cbranch_execz -> 0x78
+        0xBE9F_3C1E, // s_and_saveexec_b32 s31, s30
+        0xBF88_0004, // s_cbranch_execz -> 0x74
+        0x7E08_0220, // 0x64: v_mov_b32 v4, s32
+        0x7E0A_0221, // v_mov_b32 v5, s33
+        0x7E0C_0222, // v_mov_b32 v6, s34
+        0x7E0E_0223, // v_mov_b32 v7, s35
+        0x887E_1F7E, // 0x74: s_or_b32 exec_lo, exec_lo, s31
+        0x887E_147E, // 0x78: s_or_b32 exec_lo, exec_lo, s20
+        0xBE97_3C1E, // s_and_saveexec_b32 s23, s30
+        0xBF88_0013, // s_cbranch_execz -> 0xd0
+        0xBE9D_037E, // s_mov_b32 s29, exec_lo
+        0x7E18_0504, // 0x88: v_readfirstlane_b32 s12, v4
+        0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+        0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+        0x7E1E_0507, // v_readfirstlane_b32 s15, v7
         0xD4E2_0015,
-        0x0002_080C,
+        0x0002_080C, // v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
         0xD4E2_0016,
-        0x0002_0C0E,
-        0x8715_1615,
-        0xBE95_3C15,
+        0x0002_0C0E, // v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
+        0x8715_1615, // s_and_b32 s21, s21, s22
+        0xBE95_3C15, // s_and_saveexec_b32 s21, s21
         0xE030_1000,
-        0x8003_0C10,
-        0xBF8C_3F70,
-        0x897E_157E,
-        0xBF89_FFF1,
-        0xBEFE_031D,
+        0x8003_0C10, // buffer_load_dword v12, v16, s[12:15], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+        0xBF89_FFF1, // s_cbranch_execnz -> 0x88
+        0xBEFE_031D, // s_mov_b32 exec_lo, s29
         0xE070_1000,
-        0x800A_0C10,
-        0x887E_177E,
-        0xBF81_0000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0x887E_177E, // 0xd0: s_or_b32 exec_lo, exec_lo, s23
+        0xBF81_0000, // s_endpgm
     ];
 
     fn waterfall(words: &[u32], wave64: bool) -> Result<Resources, ShaderError> {
@@ -2977,14 +3622,18 @@ pub(crate) mod tests {
             let Source::Fetched { load, first: 0 } = image.source else {
                 panic!("{:?}", image.source)
             };
+            // The first of the two loads: entry v0 * 32 of the table at s0.
             let a = r.scalar.iter().find(|s| s.0 == load).unwrap().1;
             assert_eq!((a.param, a.offset), (0, 0));
             assert!(a.dynamic.is_some());
+            // The sampler is the same for every lane.
             let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler);
             assert!(matches!(
                 sampler.unwrap().source,
                 Source::Loaded { first: 0, .. }
             ));
+            // Four 64-bit compares of the first lane's dwords with the lane's
+            // own; the eight reads become the lane's own dwords.
             assert_eq!(r.waterfall.compares.len(), 4);
             assert_eq!(r.waterfall.reads.len(), 8);
         }
@@ -2997,6 +3646,8 @@ pub(crate) mod tests {
         let Source::Lanes { args, .. } = &image.source else {
             panic!("{:?}", image.source)
         };
+        // Lanes with their bit set take the first load (offset 0), the
+        // others the second (0x20).
         let offsets: Vec<u32> = args
             .iter()
             .map(|a| match *a {
@@ -3012,6 +3663,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_first_lane_read_outside_a_loop_is_no_waterfall() {
+        // The waterfall without its back edge: the s_cbranch_execnz is an
+        // s_nop, so lanes the first one does not match never get a pass.
         let mut words = WATERFALL_FETCHED_WAVE32.to_vec();
         let back = words.iter().position(|&w| w == 0xBF89_FFE6).unwrap();
         words[back] = 0xBF80_0000;
@@ -3028,6 +3681,7 @@ pub(crate) mod tests {
         );
     }
 
+    /// Why resource tracking refuses `words`.
     fn refusal(words: &[u32], wave64: bool) -> &'static str {
         match waterfall(words, wave64) {
             Err(ShaderError::Unsupported { what, .. }) => what,
@@ -3040,12 +3694,15 @@ pub(crate) mod tests {
     const BAD_RETRY: &str = "a waterfall loop whose retry does not keep the lanes still waiting";
     const SPLIT: &str = "a waterfall loop nested in another or split over blocks";
 
+    /// The index of `word` in `words`.
     fn word_at(words: &[u32], word: u32) -> usize {
         words.iter().position(|&w| w == word).unwrap()
     }
 
     #[test]
     fn a_first_lane_read_without_its_compare_is_no_waterfall() {
+        // The loop without the compare of dwords 0 and 1: nothing makes
+        // the first lane's dwords the lane's own there.
         let mut words = WATERFALL_FETCHED_WAVE32.to_vec();
         let cmp = word_at(&words, 0x0002_080C);
         words[cmp - 1..=cmp].copy_from_slice(&[0xBF80_0000, 0xBF80_0000]);
@@ -3054,18 +3711,23 @@ pub(crate) mod tests {
 
     #[test]
     fn a_compare_that_does_not_mask_the_access_is_no_waterfall() {
+        // The compares are all there, but their result never narrows EXEC:
+        // every lane samples with the first lane's descriptor (reported by
+        // ifBars on upstream PR #566).
         let mut words = WATERFALL_JOINED_WAVE32.to_vec();
         let save = word_at(&words, 0xBE95_3C15);
-        words[save] = 0xBE95_037E;
+        words[save] = 0xBE95_037E; // s_mov_b32 s21, exec_lo
         assert_eq!(refusal(&words, false), NOT_SELECTED);
     }
 
     #[test]
     fn an_access_under_a_further_mask_is_no_waterfall() {
+        // The access runs for the matching lanes that VCC also holds, yet
+        // the retry removes every matching lane.
         let mut words = WATERFALL_JOINED_WAVE32.to_vec();
         let nop = word_at(&words, 0xBE95_3C15) + 1;
         assert_eq!(words[nop], 0xBF80_0000);
-        words[nop] = 0x877E_6A7E;
+        words[nop] = 0x877E_6A7E; // s_and_b32 exec_lo, exec_lo, vcc_lo
         assert_eq!(refusal(&words, false), NOT_SELECTED);
     }
 
@@ -3073,23 +3735,26 @@ pub(crate) mod tests {
     fn a_loop_that_drops_unmatched_lanes_is_no_waterfall() {
         let mut words = WATERFALL_JOINED_WAVE32.to_vec();
         let retry = word_at(&words, 0x897E_157E);
-        words[retry] = 0xBEFE_0380;
+        words[retry] = 0xBEFE_0380; // s_mov_b32 exec_lo, 0
         assert_eq!(refusal(&words, false), BAD_RETRY);
     }
 
     #[test]
     fn a_retry_that_keeps_other_lanes_than_those_waiting_is_no_waterfall() {
+        // The retry keeps the lanes of VCC that did not just sample, not
+        // the waiting ones: lanes 16 and up never sample on the console.
         let mut words = WATERFALL_JOINED_WAVE32.to_vec();
         let retry = word_at(&words, 0x897E_157E);
-        words[retry] = 0x8A7E_7E6A;
+        words[retry] = 0x8A7E_7E6A; // s_andn2_b32 exec_lo, vcc_lo, exec_lo
         assert_eq!(refusal(&words, false), BAD_RETRY);
     }
 
     #[test]
     fn a_wave64_retry_of_one_half_is_no_waterfall() {
+        // Only the low half of EXEC loses the lanes just served.
         let mut words = WATERFALL_FETCHED_WAVE64.to_vec();
         let retry = word_at(&words, 0x89FE_167E);
-        words[retry] = 0x897E_167E;
+        words[retry] = 0x897E_167E; // s_xor_b32 exec_lo, exec_lo, s22
         assert_eq!(refusal(&words, true), BAD_RETRY);
     }
 
@@ -3099,7 +3764,7 @@ pub(crate) mod tests {
         let sample = word_at(&words, 0xF09C_0F08);
         let restore = word_at(&words, 0xBEFE_0317);
         let image = [words[sample], words[sample + 1]];
-        words[sample..sample + 2].fill(0xBF80_0000);
+        words[sample..sample + 2].fill(0xBF80_0000); // Keep the branch offsets.
         words.splice(restore + 1..restore + 1, image);
         assert_eq!(refusal(&words, false), NO_LOOP);
     }
@@ -3108,10 +3773,13 @@ pub(crate) mod tests {
     fn a_wave64_access_with_exec_hi_overwritten_is_no_waterfall() {
         let mut words = WATERFALL_FETCHED_WAVE64.to_vec();
         let save = word_at(&words, 0xBE96_2416);
-        words[save + 1] = 0xBEFF_03C1;
+        words[save + 1] = 0xBEFF_03C1; // s_mov_b32 exec_hi, -1
         assert_eq!(refusal(&words, true), NOT_SELECTED);
     }
 
+    /// The waterfall with `v_cmpx_eq` narrowing EXEC itself, and the retry
+    /// as `todo & !EXEC` (`folded`: in one `s_andn2_wrexec`), as LLVM's
+    /// AMDGPU backend writes it for GFX10 and later.
     pub(crate) fn cmpx_waterfall(wave64: bool, folded: bool) -> Vec<u32> {
         let (base, todo, restore): (&[u32], u32, u32) = if wave64 {
             (WATERFALL_FETCHED_WAVE64, 0xBE94_047E, 0xBEFE_0414)
@@ -3121,14 +3789,24 @@ pub(crate) mod tests {
         let reads = word_at(base, 0x7E18_0504);
         let sample = word_at(base, 0xF09C_0F08);
         let mut w = base[..=word_at(base, todo)].to_vec();
+        // s_mov_b32 s21, exec_lo / s_mov_b64 s[22:23], exec
         w.push(if wave64 { 0xBE96_047E } else { 0xBE95_037E });
-        w.extend(&base[reads..reads + 8]);
-        w.extend([0x7DE4_080C, 0x7DE4_0C0E, 0x7DE4_1010, 0x7DE4_1412]);
-        w.extend(&base[sample..sample + 2]);
+        w.extend(&base[reads..reads + 8]); // v_readfirstlane_b32 s12..s19
+        w.extend([
+            0x7DE4_080C, // v_cmpx_eq_u64 s[12:13], v[4:5]
+            0x7DE4_0C0E, // v_cmpx_eq_u64 s[14:15], v[6:7]
+            0x7DE4_1010, // v_cmpx_eq_u64 s[16:17], v[8:9]
+            0x7DE4_1412, // v_cmpx_eq_u64 s[18:19], v[10:11]
+        ]);
+        w.extend(&base[sample..sample + 2]); // image_sample_lz
         match (wave64, folded) {
+            // s_andn2_wrexec_b32 s21, s21; s_cbranch_execnz
             (false, true) => w.extend([0xBE95_4715, 0xBF89_FFF0]),
+            // s_andn2_b32 s21, s21, exec_lo; s_mov_b32 exec_lo, s21
             (false, false) => w.extend([0x8A15_7E15, 0xBEFE_0315, 0xBF89_FFEF]),
+            // s_andn2_wrexec_b64 s[22:23], s[22:23]
             (true, true) => w.extend([0xBE96_3A16, 0xBF89_FFF0]),
+            // s_andn2_b64 s[22:23], s[22:23], exec; s_mov_b64 exec, s[22:23]
             (true, false) => w.extend([0x8A96_7E16, 0xBEFE_0416, 0xBF89_FFEF]),
         }
         w.extend(&base[word_at(base, restore)..]);
@@ -3151,82 +3829,93 @@ pub(crate) mod tests {
     fn a_v_cmpx_waterfall_whose_retry_drops_lanes_is_none() {
         let mut words = cmpx_waterfall(false, false);
         let retry = word_at(&words, 0x8A15_7E15);
-        words[retry] = 0x8A15_7E6A;
+        words[retry] = 0x8A15_7E6A; // s_andn2_b32 s21, vcc_lo, exec_lo
         assert_eq!(refusal(&words, false), BAD_RETRY);
     }
 
     #[test]
     fn a_waterfall_nested_in_another_is_refused_by_name() {
+        // An image whose resource and sampler are both per lane, with one
+        // loop per operand, the one for the sampler inside the one for the
+        // resource (what the SelectionDAG legalisation in LLVM would give).
+        // The console gives each lane its own pair. Refused for now: the
+        // access of the inner loop reads the first-lane dwords of the outer
+        // loop, which another block holds.
         let words = [
-            0xBE84_0300,
-            0xBE85_0380,
-            0xBE86_0301,
-            0xBE87_0380,
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
             0xF408_0A02,
-            0xFA00_0040,
-            0x7E04_0D00,
-            0x7E06_0302,
-            0x3420_0082,
-            0x3602_0081,
-            0x3402_0285,
-            0x3622_0080,
-            0x3422_2284,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0x3602_0081, // v_and_b32 v1, 1, v0
+            0x3402_0285, // v_lshlrev_b32 v1, 5, v1
+            0x3622_0080, // v_and_b32 v17, 0, v0
+            0x3422_2284, // v_lshlrev_b32 v17, 4, v17
             0xDC38_8000,
-            0x0404_0001,
+            0x0404_0001, // global_load_dwordx4 v[4:7], v1, s[4:5]
             0xDC38_8010,
-            0x0804_0001,
+            0x0804_0001, // global_load_dwordx4 v[8:11], v1, s[4:5] offset:16
             0xDC38_8000,
-            0x1406_0011,
-            0xBF8C_0070,
-            0xBE94_037E,
-            0x7E18_0504,
+            0x1406_0011, // global_load_dwordx4 v[20:23], v17, s[6:7]
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xBE94_037E, // s_mov_b32 s20, exec_lo
+            // L1, the loop over the resource:
+            0x7E18_0504, // v_readfirstlane_b32 s12, v4
             0x7E1A_0505,
             0x7E1C_0506,
             0x7E1E_0507,
             0x7E20_0508,
             0x7E22_0509,
             0x7E24_050A,
-            0x7E26_050B,
+            0x7E26_050B, // v_readfirstlane_b32 s19, v11
             0xD4E2_0015,
-            0x0002_080C,
+            0x0002_080C, // v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
             0xD4E2_0016,
-            0x0002_0C0E,
-            0x8715_1615,
+            0x0002_0C0E, // v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
+            0x8715_1615, // s_and_b32 s21, s21, s22
             0xD4E2_0016,
-            0x0002_1010,
-            0x8715_1615,
+            0x0002_1010, // v_cmp_eq_u64_e64 s22, s[16:17], v[8:9]
+            0x8715_1615, // s_and_b32 s21, s21, s22
             0xD4E2_0016,
-            0x0002_1412,
-            0x8715_1615,
-            0xBE95_3C15,
-            0xBE9A_037E,
-            0x7E10_0514,
-            0x7E12_0515,
-            0x7E14_0516,
-            0x7E16_0517,
+            0x0002_1412, // v_cmp_eq_u64_e64 s22, s[18:19], v[10:11]
+            0x8715_1615, // s_and_b32 s21, s21, s22
+            0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+            0xBE9A_037E, // s_mov_b32 s26, exec_lo
+            // L2, the loop over the sampler:
+            0x7E10_0514, // v_readfirstlane_b32 s8, v20
+            0x7E12_0515, // v_readfirstlane_b32 s9, v21
+            0x7E14_0516, // v_readfirstlane_b32 s10, v22
+            0x7E16_0517, // v_readfirstlane_b32 s11, v23
             0xD4E2_0018,
-            0x0002_2808,
+            0x0002_2808, // v_cmp_eq_u64_e64 s24, s[8:9], v[20:21]
             0xD4E2_0019,
-            0x0002_2C0A,
-            0x8718_1918,
-            0xBE98_3C18,
+            0x0002_2C0A, // v_cmp_eq_u64_e64 s25, s[10:11], v[22:23]
+            0x8718_1918, // s_and_b32 s24, s24, s25
+            0xBE98_3C18, // s_and_saveexec_b32 s24, s24
             0xF09C_0F08,
-            0x0043_0C02,
-            0x897E_187E,
-            0xBF89_FFF2,
-            0xBEFE_031A,
-            0x897E_157E,
-            0xBF89_FFDA,
-            0xBEFE_0314,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            0x897E_187E, // s_xor_b32 exec_lo, exec_lo, s24
+            0xBF89_FFF2, // s_cbranch_execnz L2
+            0xBEFE_031A, // s_mov_b32 exec_lo, s26
+            0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+            0xBF89_FFDA, // s_cbranch_execnz L1
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
             0xE070_1000,
-            0x800A_0C10,
-            0xBF81_0000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            0xBF81_0000, // s_endpgm
         ];
         assert_eq!(refusal(&words, false), SPLIT);
     }
 
     #[test]
     fn descriptors_read_from_the_first_lane_of_lds_fail_naming_it() {
+        // The waterfall over descriptors each lane read from LDS:
+        // ds_read_b128 v[4:7], v1 and ds_read_b128 v[8:11], v1 offset:16
+        // in place of the global loads.
         let mut words = WATERFALL_FETCHED_WAVE32.to_vec();
         words[5..9].copy_from_slice(&[0xDBFC_0000, 0x0400_0001, 0xDBFC_0010, 0x0800_0001]);
         let err = waterfall(&words, false).unwrap_err();
@@ -3242,12 +3931,14 @@ pub(crate) mod tests {
         );
     }
 
+    /// The block of `p` at byte `offset`.
     fn block_at(words: &[u32], offset: usize) -> usize {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
         p.blocks.iter().position(|b| b.offset == offset).unwrap()
     }
 
+    /// The table offset of what the scalar load of `s` reads.
     fn table_offset(r: &Resources, s: &Source) -> u32 {
         match *s {
             Source::Loaded { load, first: 0 } => {
@@ -3266,6 +3957,11 @@ pub(crate) mod tests {
             .iter()
             .find(|d| matches!(d.source, Source::LanePhi { .. }))
             .unwrap();
+        // The join after the else arm: lanes that ran it (lanes from 16 on)
+        // take the second entry (0x20); the others come through the flow
+        // block, whose join gives lanes that ran the then arm the first one
+        // (0). No lane that skipped the then arm comes that way, so the
+        // dwords they held before (the inputs) are not traced.
         let Source::LanePhi { block, args } = &image.source else {
             unreachable!()
         };
@@ -3282,8 +3978,10 @@ pub(crate) mod tests {
             panic!("{args:?}")
         };
         assert_eq!(table_offset(&r, then), 0);
+        // The loop's compares are of the joined dwords; still recognised.
         assert_eq!(r.waterfall.compares.len(), 4);
         assert_eq!(r.waterfall.reads.len(), 8);
+        // Without the lanes' paths the join is refused.
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
         let layout = [param(Table, 0, 1), param(Table, 1, 1)];
@@ -3320,12 +4018,14 @@ pub(crate) mod tests {
         else {
             panic!("{args:?}")
         };
+        // The then arm loads each lane's entry from the table at s0.
         let [None, Some(Source::Fetched { load, first: 0 })] = flow[..] else {
             panic!("{flow:?}")
         };
         let a = r.scalar.iter().find(|s| s.0 == load).unwrap().1;
         assert_eq!((a.param, a.offset), (0, 0));
         assert!(a.dynamic.is_some());
+        // The else arm picks the first entry where vcc is set.
         let offsets: Vec<u32> = picked.iter().map(|s| table_offset(&r, s)).collect();
         assert_eq!(offsets, [0, 0x20]);
         assert_eq!(r.waterfall.compares.len(), 4);
@@ -3348,6 +4048,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_per_lane_descriptor_some_lanes_do_not_write_fails() {
+        // The else arm of WATERFALL_JOINED_WAVE32 not skipped (its
+        // s_cbranch_execz an s_nop): it runs with EXEC clear in the lanes
+        // of the then arm, which keep the first entry; the second is not
+        // every lane's.
         let mut words = WATERFALL_JOINED_WAVE32.to_vec();
         let skip = words.iter().rposition(|&w| w == 0xBF88_0008).unwrap();
         words[skip] = 0xBF80_0000;
@@ -3373,6 +4077,8 @@ pub(crate) mod tests {
             .iter()
             .find(|d| matches!(d.source, Source::LanePhi { .. }))
             .unwrap();
+        // The outer join: lanes from the else arm's inner join, or (below
+        // 16) through the flow block.
         let Source::LanePhi { block, args } = &buffer.source else {
             unreachable!()
         };
@@ -3391,6 +4097,8 @@ pub(crate) mod tests {
             panic!("{flow:?}")
         };
         assert_eq!(table_offset(&r, then), 0);
+        // Lanes from 24 on skip the inner arm and keep the inputs, but do
+        // not load: that edge is not traced.
         assert_eq!(*inner, block_at(words, 0x74));
         let [None, Some(other)] = &nested[..] else {
             panic!("{nested:?}")
@@ -3398,5 +4106,46 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn a_guarded_access_excludes_dead_lane_edges_at_a_join() {
+        // Lanes failing `v_cmp_gt_u32` clear EXEC and take `s_cbranch_execz`
+        // directly to the join block without initializing the immediate
+        // sampler `s[8:11]`. The join's `image_sample_lz` is guarded by EXEC,
+        // so only the arm where `s[8:11]` was built can execute it.
+        let code: Vec<u8> = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000,    // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00,    // v_cvt_f32_u32 v2, v0
+            0x7E06_0302,    // v_mov_b32 v3, v2
+            0x7D88_0090,    // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBF8C_C07F,    // s_waitcnt lgkmcnt(0)
+            0x877E_6A7E,    // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0004,    // s_cbranch_execz -> join (skips 4 dwords)
+            0xBE88_0380,    // s_mov_b32 s8, 0
+            0xBE89_0380,    // s_mov_b32 s9, 0
+            0xBE8A_0380,    // s_mov_b32 s10, 0
+            0xBE8B_0380,    // s_mov_b32 s11, 0
+            0xF09C_0F08,
+            0x0043_0C02,    // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let structured = lanes(&p).expect("structured form");
+        assert!(structured.guards[2][0].is_some(), "join access must carry an EXEC guard");
+        let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap();
+        assert!(
+            r.descriptors
+                .iter()
+                .any(|d| d.role == Role::Sampler && d.source == Source::Constant(vec![0; 4])),
+            "guarded join should resolve the immediate sampler from the live arm: {:?}",
+            r.descriptors
+        );
     }
 }

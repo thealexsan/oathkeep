@@ -1,3 +1,6 @@
+//! Turns a title's image into something the Windows loader maps but does
+//! not run. Pure byte manipulation, so it is testable on any host.
+
 use oathkeep_pe::layout::{self, dir, dll_flags, file_flags};
 use oathkeep_pe::{ImageInfo, PeError};
 
@@ -9,19 +12,35 @@ pub enum PrepareError {
     Patch(&'static str),
 }
 
+/// A patched copy of an image plus everything we need from the original.
 #[derive(Debug, Clone)]
 pub struct PreparedImage {
+    /// Parsed from the *original* bytes: imports, TLS callbacks and entry
+    /// point as the title expects them.
     pub info: ImageInfo,
+    /// The patched bytes to hand to the Windows loader.
     pub bytes: Vec<u8>,
+    /// BLAKE3 of the original bytes: identifies the exact build.
     pub original_hash: blake3::Hash,
 }
 
 impl PreparedImage {
+    /// File name for the patched copy, unique per original build.
     pub fn file_name(&self) -> String {
-        format!("oathkeep-image-{}.dll", &self.original_hash.to_hex()[..16])
+        format!("victory-image-{}.dll", &self.original_hash.to_hex()[..16])
     }
 }
 
+/// Produces the patched copy. The changes are:
+///
+/// * `IMAGE_FILE_DLL` set, entry point cleared: the OS maps it like a DLL
+///   and calls nothing;
+/// * import directory points to its empty terminator and the bound-import
+///   directory is cleared: we bind the original slots using `info.imports`;
+/// * TLS callback pointer cleared: the OS still allocates static TLS for
+///   the image, but callbacks only run when we call them (after binding);
+///   its base relocation is made a no-op so the 0 survives a rebase;
+/// * `FORCE_INTEGRITY` cleared, checksum zeroed: the copy is unsigned.
 pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
     let info = ImageInfo::parse(original)?;
     let mut bytes = original.to_vec();
@@ -45,6 +64,9 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         dll_characteristics,
     )?;
 
+    // Windows 10 assigns static TLS to the prepared DLL when its empty
+    // import table is present. The parser has already walked one descriptor
+    // per module up to the null terminator, regardless of the recorded Size.
     if let Some(at) = layout::data_directory_offset(&bytes, dir::IMPORT) {
         let rva = layout::read_u32(&bytes, at).ok_or(PrepareError::Patch("no import RVA"))?;
         if rva != 0 {
@@ -72,10 +94,14 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
             at as usize + layout::TLS64_ADDRESS_OF_CALLBACKS,
             0,
         )?;
+        // The field's base relocation would turn the 0 into `delta` whenever
+        // the loader maps the copy away from its preferred base (Wine always
+        // does for DYNAMIC_BASE images), and the loader then reads callbacks
+        // from there. Make that entry a no-op.
         let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
         for (entry, target) in dir64_relocations(&bytes, &info) {
             if target == field_rva {
-                write_u16(&mut bytes, entry, 0)?;
+                write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
             }
         }
     }
@@ -87,8 +113,11 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
     })
 }
 
+/// Size of an IMAGE_IMPORT_DESCRIPTOR in the PE file.
 const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
 
+/// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
+/// RVA it patches). Empty if the image has no readable relocation table.
 fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     const DIR64: u16 = 10;
     let mut out = Vec::new();
@@ -170,6 +199,7 @@ mod tests {
                 "the cleared callback pointer must not be relocated"
             );
         }
+        // Nothing else moved: same sections, same size.
         assert_eq!(patched.sections.len(), prepared.info.sections.len());
         assert_eq!(prepared.bytes.len(), original.len());
     }
@@ -179,6 +209,7 @@ mod tests {
         let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         let info = ImageInfo::parse(&original).unwrap();
         let directory = layout::data_directory_offset(&original, dir::IMPORT).unwrap();
+        // This linker layout counts the descriptors for real modules only.
         let descriptor_bytes = u32::try_from(info.imports.len()).unwrap() * IMPORT_DESCRIPTOR_SIZE;
         write_u32(&mut original, directory + 4, descriptor_bytes).unwrap();
         let prepared = prepare(&original).unwrap();
@@ -213,6 +244,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_assigns_static_tls_to_a_prepared_dll() {
+        // Model a title DLL using our own linked image. Loading a DLL leaves
+        // its assigned index intact; the executable-specific redirect resets it.
         let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         let flags =
             layout::file_header_offset(&original).unwrap() + layout::FILE_HEADER_CHARACTERISTICS;

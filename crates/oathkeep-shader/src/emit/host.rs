@@ -1,3 +1,6 @@
+//! Host D3D12 checks for emitted shaders: pipeline creation and, for
+//! tests, drawing a full-screen triangle and reading the target back.
+
 use std::ffi::CString;
 
 use windows::Win32::Graphics::Direct3D::*;
@@ -14,6 +17,7 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
+/// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
     match c.part(fourcc) {
@@ -59,10 +63,13 @@ fn err(e: windows::core::Error) -> String {
 }
 
 impl Host {
+    /// The default adapter, or WARP with `warp` (or `OATHKEEP_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("OATHKEEP_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
+            // `OATHKEEP_D3D12_DEBUG`: the debug layer, whose messages a
+            // refused pipeline's error then carries.
             if std::env::var_os("OATHKEEP_D3D12_DEBUG").is_some() {
                 let mut debug: Option<ID3D12Debug> = None;
                 if D3D12GetDebugInterface(&mut debug).is_ok()
@@ -79,14 +86,17 @@ impl Host {
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                // A machine without a graphics card gives the software
+                // adapter as its default device (a hosted test runner,
+                // whose first adapter is a display stub that cannot make a
+                // device): that is no hardware device, and the tests that
+                // ask for one skip it, as they do where there is none.
                 if let Some(made) = &device {
                     let factory: IDXGIFactory4 =
                         CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                    if let Ok(adapter) =
-                        factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
+                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
                         && let Ok(desc) = adapter.GetDesc1()
-                        && (desc.Flags & 2 != 0
-                            || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
+                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
                     {
                         return Err("the default device is the software adapter".to_owned());
                     }
@@ -113,6 +123,9 @@ impl Host {
         }
     }
 
+    /// The root signature translated shaders expect: user data per stage
+    /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
+    /// indexed.
     pub fn root_signature(
         &self,
         vs: &HostShader,
@@ -124,6 +137,8 @@ impl Host {
         ])
     }
 
+    /// The root signature for these stages: user data of stage k is root
+    /// parameter k, root views follow.
     pub fn root_signature_for(
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
@@ -142,6 +157,7 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
+        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV.
         let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
@@ -169,12 +185,24 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        // Older runtimes may not recognize OPTIONS19; that means no support.
+        let aniso_point_mip_supported = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool();
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
                 let [u, v, w] = d.address.map(|a| D3D12_TEXTURE_ADDRESS_MODE(a as i32));
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(d.filter as i32),
+                    Filter: D3D12_FILTER(d.filter_for_host(aniso_point_mip_supported) as i32),
                     AddressU: u,
                     AddressV: v,
                     AddressW: w,
@@ -219,6 +247,7 @@ impl Host {
         }
     }
 
+    /// A compute pipeline; user data is root parameter 0.
     pub fn compute_pipeline(
         &self,
         cs: &HostShader,
@@ -246,6 +275,8 @@ impl Host {
         unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| self.explained(e))
     }
 
+    /// The error with the debug layer's messages since the last call, if
+    /// the layer is on (`OATHKEEP_D3D12_DEBUG`).
     fn explained(&self, e: windows::core::Error) -> String {
         let mut text = err(e);
         let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {
@@ -261,10 +292,7 @@ impl Host {
                 let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
                 if queue.GetMessage(i, Some(message), &mut len).is_ok() {
                     let m = &*message;
-                    let bytes = std::slice::from_raw_parts(
-                        m.pDescription,
-                        m.DescriptionByteLength.saturating_sub(1),
-                    );
+                    let bytes = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength.saturating_sub(1));
                     text.push_str(" | ");
                     text.push_str(&String::from_utf8_lossy(bytes));
                 }
@@ -274,6 +302,8 @@ impl Host {
         text
     }
 
+    /// A graphics pipeline from a vertex and a pixel shader, with float or
+    /// integer 32-bit targets as the pixel shader writes them.
     pub fn pipeline(
         &self,
         vs: &HostShader,
@@ -284,6 +314,8 @@ impl Host {
         Ok((root, pso))
     }
 
+    /// A graphics pipeline with the given root signature; vertex inputs
+    /// packed in register order.
     pub fn pipeline_with(
         &self,
         root: &ID3D12RootSignature,
@@ -293,6 +325,8 @@ impl Host {
         self.pipeline_with_gs(root, vs, None, ps)
     }
 
+    /// As [`Host::pipeline_with`], with a geometry shader between the two
+    /// (the rectangle stage, `rect_list_gs`).
     pub fn pipeline_with_gs(
         &self,
         root: &ID3D12RootSignature,
@@ -331,11 +365,9 @@ impl Host {
                 pShaderBytecode: ps.as_ptr().cast(),
                 BytecodeLength: ps.len(),
             },
-            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
-                D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: gs.as_ptr().cast(),
-                    BytecodeLength: gs.len(),
-                }
+            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: gs.as_ptr().cast(),
+                BytecodeLength: gs.len(),
             }),
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {
@@ -378,6 +410,8 @@ impl Host {
         pso.map_err(err)
     }
 
+    /// A mesh pipeline from a mesh and a pixel shader (user data of the mesh
+    /// stage is root parameter 0, the pixel stage's 1).
     pub fn mesh_pipeline(
         &self,
         ms: &HostShader,
@@ -391,12 +425,15 @@ impl Host {
         Ok((root, pso))
     }
 
+    /// A mesh pipeline with the given root signature: the pipeline-state
+    /// stream form, with the targets [`Host::pipeline_with`] would use.
     pub fn mesh_pipeline_with(
         &self,
         root: &ID3D12RootSignature,
         ms: &[u8],
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        /// A stream subobject: its type, then its description, pointer-aligned.
         #[repr(C, align(8))]
         struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
         #[repr(C)]
@@ -484,6 +521,7 @@ impl Host {
     }
 }
 
+/// A vertex shader that feeds `ps`'s inputs (zeros) and a position.
 pub fn stub_vs(ps: &HostShader) -> Result<HostShader, String> {
     let inputs = sig(&ps.dxil, FourCC::ISG1)?;
     let mut outputs: Vec<SigElement> = inputs
@@ -513,6 +551,7 @@ pub fn stub_vs(ps: &HostShader) -> Result<HostShader, String> {
     Ok(stub(false, outputs))
 }
 
+/// A pixel shader that reads nothing and writes target 0.
 pub fn stub_ps() -> HostShader {
     let target = SigElement {
         name: "SV_Target".into(),
@@ -576,26 +615,42 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
     }
 }
 
+/// A root argument for [`Host::draw`].
 #[cfg(test)]
 pub enum Root {
     Constants(Vec<u32>),
-    Table { sampler: bool, index: usize },
-    View { srv: bool, data: Vec<u32> },
+    /// A table starting at this heap index.
+    Table {
+        sampler: bool,
+        index: usize,
+    },
+    /// A root CBV (or with `srv`, a root SRV) over a buffer of these
+    /// dwords ([`Host::dispatch`] only).
+    View {
+        srv: bool,
+        data: Vec<u32>,
+    },
 }
 
+/// Bindings for [`Host::draw`]: root arguments and the heap contents.
 #[cfg(test)]
 pub struct Draw<'a> {
     pub roots: Vec<(u32, Root)>,
+    /// RGBA32F textures (width, height, texels) at view-heap indices 0..
     pub textures: &'a [(u32, u32, &'a [[f32; 4]])],
+    /// Samplers at sampler-heap indices 0..
     pub samplers: &'a [D3D12_SAMPLER_DESC],
+    /// Three vertices of stride bytes (none for position-free layouts).
     pub vertices: &'a [f32],
     pub stride: u32,
     pub size: (u32, u32),
+    /// Mesh thread groups to dispatch instead of drawing (0: draw).
     pub mesh_groups: u32,
 }
 
 #[cfg(test)]
 impl Host {
+    /// Draws one triangle into an RGBA32F target and returns its texels.
     pub fn draw(
         &self,
         root: &ID3D12RootSignature,
@@ -934,27 +989,48 @@ fn transition(
     }
 }
 
+/// A view in the heap for [`Host::dispatch`].
 #[cfg(test)]
 pub enum View<'a> {
+    /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
-    Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F cube SRV (face size, mip count, texels in D3D subresource order).
+    Cube(u32, u16, &'a [[f32; 4]]),
+    /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
+    /// An R32_UINT texture UAV (width, height), zeroed (atomics).
     UintTextureUav(u32, u32),
+    /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// A typed buffer UAV pre-filled with `data` (`format`, bytes per element).
+    TypedUav {
+        data: &'a [u32],
+        format: DXGI_FORMAT,
+        elem_bytes: u32,
+    },
+    /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
+    /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
 }
 
+/// How [`View::Buffer`] is viewed.
 #[cfg(test)]
 #[derive(Clone, Copy)]
 pub enum Stride {
     Raw,
+    /// RGBA32F elements.
     Typed,
+    /// Structured, elements of this many bytes.
     Structured(u32),
+    /// Typed, elements in this format of this many bytes.
     Format(DXGI_FORMAT, u32),
 }
 
+/// Bindings for [`Host::dispatch`]: root arguments, the view heap in order,
+/// the sampler heap, and the group counts.
 #[cfg(test)]
 pub struct Dispatch<'a> {
     pub roots: Vec<(u32, Root)>,
@@ -965,6 +1041,8 @@ pub struct Dispatch<'a> {
 
 #[cfg(test)]
 impl Host {
+    /// Runs a compute pipeline and returns each UAV's contents in heap
+    /// order (texels as float bits, row by row).
     pub fn dispatch(
         &self,
         root: &ID3D12RootSignature,
@@ -1030,6 +1108,7 @@ impl Host {
                 Flags: flags,
                 ..Default::default()
             };
+            // Texel words: 4 for RGBA32F, 1 for R32_UINT.
             let footprint_as =
                 |r: &ID3D12Resource, w: u32, h: u32, words: u32| D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(r),
@@ -1068,6 +1147,7 @@ impl Host {
                 })
                 .map_err(err)
             };
+            // An upload buffer holding `data` (sized for a constant buffer).
             let upload = |data: &[u32]| -> Result<ID3D12Resource, String> {
                 let size = (data.len() * 4).next_multiple_of(256);
                 let b = make(
@@ -1089,26 +1169,30 @@ impl Host {
             let sampler_size =
                 dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
             let mut keep = Vec::new();
+            // UAVs: (resource, dwords or texture size, readback buffer).
             let mut uavs = Vec::new();
             for (i, v) in d.views.iter().enumerate() {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
                     View::Texture(..) | View::Cube(..) => {
-                        let (w, h, texels, faces) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1),
-                            View::Cube(n, t) => (n, n, t, 6),
+                        let (w, h, mut texels, faces, mips) = match *v {
+                            View::Texture(w, h, t) => (w, h, t, 1, 1),
+                            View::Cube(n, mips, t) => (n, n, t, 6, mips),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
                         desc.DepthOrArraySize = faces as u16;
+                        desc.MipLevels = mips;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        let pitch = (w as usize * 16).next_multiple_of(256);
-                        for face in 0..faces as usize {
+                        for sub in 0..u32::from(mips) * faces {
+                            let mip = sub % u32::from(mips);
+                            let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
+                            let pitch = (w as usize * 16).next_multiple_of(256);
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
                                 &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
@@ -1116,9 +1200,10 @@ impl Host {
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            let texels = &texels[face * (w * h) as usize..];
+                            let (level, rest) = texels.split_at((w * h) as usize);
+                            texels = rest;
                             for y in 0..h as usize {
-                                let row = &texels[y * w as usize..(y + 1) * w as usize];
+                                let row = &level[y * w as usize..(y + 1) * w as usize];
                                 std::ptr::copy_nonoverlapping(
                                     row.as_ptr().cast::<u8>(),
                                     p.cast::<u8>().add(y * pitch),
@@ -1127,7 +1212,7 @@ impl Host {
                             }
                             upload.Unmap(0, None);
                             let mut at_face = subresource(&tex);
-                            at_face.Anonymous.SubresourceIndex = face as u32;
+                            at_face.Anonymous.SubresourceIndex = sub;
                             list.CopyTextureRegion(
                                 &at_face,
                                 0,
@@ -1149,7 +1234,7 @@ impl Host {
                             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                 TextureCube: D3D12_TEXCUBE_SRV {
-                                    MipLevels: 1,
+                                    MipLevels: u32::from(mips),
                                     ..Default::default()
                                 },
                             },
@@ -1162,6 +1247,7 @@ impl Host {
                         keep.push(tex);
                     }
                     View::RawUav(_) | View::HalfUav(_) => {
+                        // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
                                 2 * e,
@@ -1187,6 +1273,46 @@ impl Host {
                                 Buffer: D3D12_BUFFER_UAV {
                                     NumElements: elements,
                                     Flags: flags,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((b, None, n, rb));
+                    }
+                    View::TypedUav {
+                        data,
+                        format,
+                        elem_bytes,
+                    } => {
+                        let n = data.len() as u32;
+                        let bytes = u64::from(n) * 4;
+                        let elements = (bytes / u64::from(elem_bytes)) as u32;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let up = upload(data)?;
+                        list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
+                        keep.push(up);
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: elements,
+                                    Flags: D3D12_BUFFER_UAV_FLAG_NONE,
                                     ..Default::default()
                                 },
                             },
@@ -1331,6 +1457,7 @@ impl Host {
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);
             for (r, size, n, rb) in &uavs {
+                // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
                     r,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

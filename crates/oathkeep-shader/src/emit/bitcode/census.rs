@@ -1,6 +1,14 @@
+//! Counts of a module's instructions by kind (a diagnostic): what a
+//! translated program costs before the driver's compiler sees it.
+//!
+//! `OATHKEEP_SHADER_CENSUS` (any value) turns the counting on; the counts of
+//! the module a thread wrote last are read with [`take`]. The `translate`
+//! command writes them as a table (see `apps/victory/src/translate.rs`).
+
 use super::{Cast, Module, Op, Tag, Term, V};
 use std::cell::RefCell;
 
+/// The kinds, in the order of [`Census::counts`].
 pub const KINDS: [&str; 26] = [
     "total",
     "arith",
@@ -30,12 +38,16 @@ pub const KINDS: [&str; 26] = [
     "blocks",
 ];
 
+/// Instruction counts of one written module, by [`KINDS`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Census {
     pub counts: [u32; KINDS.len()],
 }
 
 thread_local! {
+    /// The modules this thread wrote since the last [`take`]: the length and
+    /// a hash of each one's bitcode, with its counts (a program may be
+    /// emitted in several forms before one is kept).
     static WRITTEN: RefCell<Vec<(usize, u64, Census)>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -45,11 +57,14 @@ fn fnv(bytes: &[u8]) -> u64 {
     })
 }
 
+/// Whether modules are counted (`OATHKEEP_SHADER_CENSUS` set).
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("OATHKEEP_SHADER_CENSUS").is_some())
 }
 
+/// The counts of the module whose bitcode the container `dxil` holds, if
+/// this thread wrote it since the last call (which forgets the others).
 pub fn take(dxil: &[u8]) -> Option<Census> {
     let written = WRITTEN.with(|l| std::mem::take(&mut *l.borrow_mut()));
     let at = dxil.windows(4).position(|w| w == b"BC\xC0\xDE")?;
@@ -60,6 +75,8 @@ pub fn take(dxil: &[u8]) -> Option<Census> {
         .map(|w| w.2)
 }
 
+/// Counts `m`, whose written form is `bitcode`, and keeps the result for
+/// [`take`].
 pub(crate) fn note(m: &Module, bitcode: &[u8]) {
     if !enabled() {
         return;
@@ -96,10 +113,12 @@ fn kind(name: &str) -> usize {
 }
 
 impl Module {
+    /// The instructions [`Module::write`] writes, by kind.
     pub(crate) fn census(&self) -> Census {
         let k = |s: &str| KINDS.iter().position(|k| *k == s).expect("kind");
         let call_kind: Vec<usize> = self.funcs.iter().map(|f| kind(&f.name)).collect();
         let live = self.live();
+        // The blocks `write` lays out: those reached from the entry.
         let mut seen = vec![false; self.blocks.len()];
         let mut stack = vec![0usize];
         if !self.blocks.is_empty() {

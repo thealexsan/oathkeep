@@ -1,3 +1,20 @@
+//! A console without a network cable: the title reaches loopback only.
+//!
+//! Every way out of Winsock and WinHTTP a title can import or look up by
+//! name is vetted here; the rest of both DLLs is the host's own.
+//!
+//! * Connects (also by name, by list, `ConnectEx` from `WSAIoctl`) and
+//!   datagram sends to anything but 127.0.0.0/8 and ::1 fail with
+//!   `WSAENETUNREACH`.
+//! * Forward lookups other than `localhost` and IP literals fail with
+//!   `WSAHOST_NOT_FOUND`; reverse lookups of other addresses come back
+//!   numeric, or fail if a name is required, as with no network.
+//! * `WinHttpConnect` to a host that is not loopback fails with
+//!   `ERROR_WINHTTP_CANNOT_CONNECT`, so no request (or WebSocket) handle can
+//!   exist for one. Proxies are off and proxy auto-detection (WPAD, PAC
+//!   downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
+//! * A bind to all interfaces is narrowed to loopback, so nothing on the
+//!   network can connect in.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
@@ -49,6 +66,7 @@ const WSAID_WSASENDMSG: Guid = Guid(
 type Socket = usize;
 type Handle = *mut c_void;
 
+/// Logs `what` for `destination` the first time (no payload, ever).
 fn once(what: &'static str, destination: String) {
     static SEEN: Mutex<Vec<(&str, String)>> = Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -79,6 +97,7 @@ fn wide(text: *const u16) -> Option<String> {
     })
 }
 
+/// An IPv4 or IPv6 `sockaddr` of `len` bytes.
 fn socket_addr(addr: *const u8, len: i32) -> Option<SocketAddr> {
     let len = usize::try_from(len).ok()?;
     if addr.is_null() || len < 4 {
@@ -94,6 +113,7 @@ fn socket_addr(addr: *const u8, len: i32) -> Option<SocketAddr> {
     }
 }
 
+/// A raw address of family `kind` (`gethostbyaddr` style).
 fn raw_ip(addr: *const c_char, len: i32, kind: i32) -> Option<IpAddr> {
     let len = usize::try_from(len).ok()?;
     if addr.is_null() {
@@ -112,6 +132,7 @@ fn loopback(ip: IpAddr) -> bool {
     ip.to_canonical().is_loopback()
 }
 
+/// `localhost` or a loopback literal (bracketed IPv6 too).
 fn loopback_name(name: &str) -> bool {
     let bare = name.trim_start_matches('[').trim_end_matches(']');
     bare.eq_ignore_ascii_case("localhost") || bare.parse().is_ok_and(loopback)
@@ -121,6 +142,8 @@ fn shown(addr: Option<impl ToString>) -> String {
     addr.map_or_else(|| "not an IP address".into(), |a| a.to_string())
 }
 
+/// True for a loopback `sockaddr`; otherwise logs it and sets
+/// `WSAENETUNREACH`. Other address families count as off the machine.
 fn reachable(what: &'static str, addr: *const u8, len: i32) -> bool {
     match socket_addr(addr, len) {
         Some(a) if loopback(a.ip()) => true,
@@ -132,6 +155,8 @@ fn reachable(what: &'static str, addr: *const u8, len: i32) -> bool {
     }
 }
 
+/// Connecting by name: only to loopback. A name would need a lookup
+/// (`WSAHOST_NOT_FOUND`), an address a route (`WSAENETUNREACH`).
 fn reachable_name(name: Option<String>) -> bool {
     match name {
         Some(name) if !loopback_name(&name) => {
@@ -144,10 +169,13 @@ fn reachable_name(name: Option<String>) -> bool {
             });
             false
         }
+        // No name: the host rejects the call itself.
         _ => true,
     }
 }
 
+/// Names answered without asking the network: none, `localhost`, IP
+/// literals (connecting to one is vetted separately).
 fn resolvable(name: Option<String>) -> bool {
     match name {
         Some(name)
@@ -163,6 +191,7 @@ fn resolvable(name: Option<String>) -> bool {
     }
 }
 
+/// Reverse lookups ask DNS unless the address is loopback.
 fn reverse_resolvable(ip: Option<IpAddr>) -> bool {
     match ip {
         Some(ip) if loopback(ip) => true,
@@ -173,6 +202,8 @@ fn reverse_resolvable(ip: Option<IpAddr>) -> bool {
     }
 }
 
+/// `getnameinfo` flags that keep a host name lookup on the machine: the
+/// numeric form, as without a network, or `None` if a name is required.
 fn name_info_flags(sa: *const u8, len: i32, host_wanted: bool, flags: i32) -> Option<i32> {
     if !host_wanted
         || flags & NI_NUMERICHOST != 0
@@ -186,6 +217,8 @@ fn name_info_flags(sa: *const u8, len: i32, host_wanted: bool, flags: i32) -> Op
         Some(flags | NI_NUMERICHOST)
     }
 }
+
+// Connects.
 
 pub extern "system" fn connect(s: Socket, name: *const u8, len: i32) -> i32 {
     if !reachable("network connect blocked", name, len) {
@@ -255,12 +288,15 @@ pub extern "system" fn WSAConnectByNameW(
     )
 }
 
+/// `SOCKET_ADDRESS`; a `SOCKET_ADDRESS_LIST` is an `i32` count, then these
+/// (pointer aligned).
 #[repr(C)]
 struct SocketAddress {
     addr: *const u8,
     len: i32,
 }
 
+/// Every candidate must be loopback.
 pub extern "system" fn WSAConnectByList(
     s: Socket,
     list: *const u8,
@@ -314,6 +350,7 @@ pub extern "system" fn WSAJoinLeaf(
     )
 }
 
+/// `ConnectEx` as `WSAIoctl` hands it out: vetted, then the socket's own.
 extern "system" fn connect_ex(
     s: Socket,
     name: *const u8,
@@ -361,6 +398,9 @@ extern "system" fn connect_ex(
     real(s, name, len, send, send_len, sent, overlapped)
 }
 
+/// The `ConnectEx` and `WSASendMsg` pointers it hands out are ours; the
+/// multi-pointer query (Registered I/O, whose `RIOSendEx` takes any
+/// address) is refused as by an old system. Other controls pass through.
 pub extern "system" fn WSAIoctl(
     s: Socket,
     code: u32,
@@ -393,6 +433,10 @@ pub extern "system" fn WSAIoctl(
     result
 }
 
+// Datagram sends.
+
+/// Without an address it sends to the connected peer, which `connect` vetted;
+/// so does a stream socket whatever `to` says (Winsock ignores it there).
 pub extern "system" fn sendto(
     s: Socket,
     buf: *const u8,
@@ -428,6 +472,7 @@ pub extern "system" fn WSASendTo(
     )
 }
 
+/// A connection-oriented socket, whose sends go to the peer `connect` vetted.
 fn stream(s: Socket) -> bool {
     const SOL_SOCKET: i32 = 0xffff;
     const SO_TYPE: i32 = 0x1008;
@@ -437,6 +482,7 @@ fn stream(s: Socket) -> bool {
     getsockopt(s, SOL_SOCKET, SO_TYPE, &mut kind, &mut len) == 0 && kind == SOCK_STREAM
 }
 
+/// The start of a `WSAMSG`: the destination.
 #[repr(C)]
 struct MessageName {
     name: *const u8,
@@ -463,6 +509,10 @@ pub extern "system" fn WSASendMsg(
     )
 }
 
+/// All interfaces become loopback, the only one an unplugged console has;
+/// any other address is not ours (`WSAEADDRNOTAVAIL`).
+// shortcut: `[::]` becomes `[::1]`, so a dual-stack listener no longer hears
+// 127.0.0.1; bind both families if a title relies on that.
 pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
     let host_bind = host!("ws2_32.dll", "bind": extern "system" fn(Socket, *const u8, i32) -> i32);
     match socket_addr(name, len) {
@@ -485,6 +535,16 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
     }
 }
 
+// Forward lookups.
+
+fn blocked_lookup(result: *mut *mut c_void) -> i32 {
+    if !result.is_null() {
+        // SAFETY: a non-null result points to the caller's output slot.
+        unsafe { result.write(std::ptr::null_mut()) };
+    }
+    WSAHOST_NOT_FOUND
+}
+
 pub extern "system" fn getaddrinfo(
     node: *const c_char,
     service: *const c_char,
@@ -492,7 +552,7 @@ pub extern "system" fn getaddrinfo(
     result: *mut *mut c_void,
 ) -> i32 {
     if !resolvable(narrow(node)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "getaddrinfo": extern "system" fn(*const c_char, *const c_char, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
@@ -506,7 +566,7 @@ pub extern "system" fn GetAddrInfoW(
     result: *mut *mut c_void,
 ) -> i32 {
     if !resolvable(wide(node)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoW": extern "system" fn(*const u16, *const u16, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
@@ -526,7 +586,7 @@ pub extern "system" fn GetAddrInfoExA(
     handle: *mut Handle,
 ) -> i32 {
     if !resolvable(narrow(name)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
@@ -546,7 +606,7 @@ pub extern "system" fn GetAddrInfoExW(
     handle: *mut Handle,
 ) -> i32 {
     if !resolvable(wide(name)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
@@ -575,6 +635,10 @@ pub extern "system" fn WSAAsyncGetHostByName(
     )
 }
 
+/// Name-space queries (DNS, also network lists and Bluetooth) are refused
+/// as a console without a network answers them.
+// shortcut: local name spaces are refused too; pass those through if a title
+// needs one.
 pub extern "system" fn WSALookupServiceBeginA(
     _restrictions: *const c_void,
     _flags: u32,
@@ -585,6 +649,7 @@ pub extern "system" fn WSALookupServiceBeginA(
     SOCKET_ERROR
 }
 
+/// See [`WSALookupServiceBeginA`].
 pub extern "system" fn WSALookupServiceBeginW(
     restrictions: *const c_void,
     flags: u32,
@@ -592,6 +657,8 @@ pub extern "system" fn WSALookupServiceBeginW(
 ) -> i32 {
     WSALookupServiceBeginA(restrictions, flags, lookup)
 }
+
+// Reverse lookups.
 
 pub extern "system" fn gethostbyaddr(addr: *const c_char, len: i32, kind: i32) -> *mut c_void {
     if !reverse_resolvable(raw_ip(addr, len, kind)) {
@@ -655,6 +722,10 @@ pub extern "system" fn GetNameInfoW(
     )
 }
 
+// WinHTTP.
+
+/// The one door to a server: requests, uploads and WebSockets all hang off
+/// the handle this returns.
 pub extern "system" fn WinHttpConnect(
     session: Handle,
     server: *const u16,
@@ -674,6 +745,8 @@ pub extern "system" fn WinHttpConnect(
     )
 }
 
+/// Sessions never use a proxy: only loopback is reachable, and a proxy
+/// (named, or found by auto-detection) would carry it off the machine.
 pub extern "system" fn WinHttpOpen(
     agent: *const u16,
     access: u32,
@@ -693,6 +766,7 @@ pub extern "system" fn WinHttpOpen(
     )
 }
 
+/// See [`WinHttpOpen`]: a proxy set later is accepted and not used.
 pub extern "system" fn WinHttpSetOption(
     handle: Handle,
     option: u32,
@@ -708,6 +782,7 @@ pub extern "system" fn WinHttpSetOption(
     )
 }
 
+/// Proxy auto-detection asks the network (DHCP, DNS, a PAC download).
 fn no_auto_proxy() -> u32 {
     once("HTTP proxy auto-detection blocked", "WPAD/PAC".into());
     ERROR_WINHTTP_AUTODETECTION_FAILED
@@ -759,6 +834,7 @@ pub extern "system" fn WinHttpGetProxySettingsEx(
     no_auto_proxy()
 }
 
+/// Winsock imports by ordinal; the Winsock 1.1 numbers are fixed.
 fn ordinal(name: &'static str, f: usize) -> HleExport {
     HleExport { name, address: f }
 }
@@ -823,11 +899,58 @@ mod tests {
         a
     }
 
+    // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
     const AWAY: [u8; 4] = [192, 0, 2, 1];
     const HOME: [u8; 4] = [127, 0, 0, 1];
 
     #[test]
+    fn blocked_name_lookups_clear_the_result() {
+        let ansi = c"blocked.invalid".as_ptr();
+        let wide: Vec<u16> = "blocked.invalid\0".encode_utf16().collect();
+        let wide = wide.as_ptr();
+        let null = std::ptr::null();
+        let null_mut = std::ptr::null_mut();
+        let check = |lookup: &dyn Fn(*mut *mut c_void) -> i32| {
+            let mut result = std::ptr::dangling_mut::<c_void>();
+            assert_eq!(lookup(&mut result), WSAHOST_NOT_FOUND);
+            assert!(result.is_null());
+            assert_eq!(lookup(std::ptr::null_mut()), WSAHOST_NOT_FOUND);
+        };
+        check(&|result| getaddrinfo(ansi, std::ptr::null(), null, result));
+        check(&|result| GetAddrInfoW(wide, std::ptr::null(), null, result));
+        check(&|result| {
+            GetAddrInfoExA(
+                ansi,
+                std::ptr::null(),
+                0,
+                null,
+                null,
+                result,
+                null,
+                null_mut,
+                null,
+                std::ptr::null_mut(),
+            )
+        });
+        check(&|result| {
+            GetAddrInfoExW(
+                wide,
+                std::ptr::null(),
+                0,
+                null,
+                null,
+                result,
+                null,
+                null_mut,
+                null,
+                std::ptr::null_mut(),
+            )
+        });
+    }
+
+    #[test]
     fn only_loopback_is_reachable() {
+        // Also starts Winsock for the raw calls below.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
@@ -835,6 +958,7 @@ mod tests {
         let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
         let null = std::ptr::null_mut::<c_void>();
 
+        // Connects.
         let s = socket(2, 1, 6);
         assert_ne!(s, INVALID_SOCKET);
         assert_eq!(connect(s, v4(AWAY, 80).as_ptr(), 16), SOCKET_ERROR);
@@ -857,9 +981,11 @@ mod tests {
         assert_eq!(last_error(), WSAHOST_NOT_FOUND);
         assert_eq!(connect(s, v4(HOME, port).as_ptr(), 16), 0);
         listener.accept().unwrap();
+        // A stream socket sends to its vetted peer whatever `to` says.
         assert_eq!(sendto(s, b"x".as_ptr(), 1, 0, v4(AWAY, 9).as_ptr(), 16), 1);
         close(s);
 
+        // `ConnectEx` from `WSAIoctl` is the vetted one.
         let s = socket(2, 1, 6);
         let mut f = 0usize;
         let mut size = 0u32;
@@ -883,6 +1009,7 @@ mod tests {
         assert_eq!(last_error(), WSAENETUNREACH);
         close(s);
 
+        // Datagram sends.
         let u = socket(2, 2, 17);
         assert_eq!(
             sendto(u, b"x".as_ptr(), 1, 0, v4(AWAY, 9).as_ptr(), 16),
@@ -895,6 +1022,7 @@ mod tests {
         );
         close(u);
 
+        // Forward and reverse lookups.
         let mut result = null;
         assert_eq!(
             getaddrinfo(
@@ -946,6 +1074,7 @@ mod tests {
         );
         assert!(gethostbyaddr(AWAY.as_ptr().cast(), 4, 2).is_null());
 
+        // WinHTTP.
         assert!(WinHttpConnect(null, name.as_ptr(), 443, 0).is_null());
         // SAFETY: no arguments.
         let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
@@ -955,6 +1084,7 @@ mod tests {
             ERROR_WINHTTP_AUTODETECTION_FAILED
         );
 
+        // The ordinals we override name the functions they stand for.
         let m = module();
         for e in m.exports.iter().filter(|e| e.name.starts_with('#')) {
             let named = m
@@ -971,6 +1101,10 @@ mod tests {
                 named.name
             );
         }
+        // Every override names a real export of its DLL. Some exports only
+        // exist on newer Windows (WinHttpGetProxySettingsEx is absent from
+        // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
+        // them only when the host really lacks them.
         const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if e.name.starts_with("WinHttp") {

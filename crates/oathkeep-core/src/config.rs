@@ -1,3 +1,9 @@
+//! Where the user's files live.
+//!
+//! Resolution order for each value: environment variable, then the config
+//! file (`OATHKEEP_CONFIG`, else `./oathkeep.toml`), then the default.
+//! See `oathkeep.example.toml` at the repository root.
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -7,10 +13,16 @@ use crate::policy::ensure_outside_repo;
 
 #[derive(Debug, Default, Clone)]
 pub struct Config {
+    /// The user's dump of the title.
     pub game_dir: Option<PathBuf>,
+    /// Root for all derived data. Always outside the repository.
     pub cache_dir: PathBuf,
+    /// What titles write and must keep (persistent local storage). Never
+    /// inside the cache, which may be deleted at any time.
     pub data_dir: PathBuf,
+    /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
+    /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
 
@@ -32,8 +44,9 @@ struct FilePaths {
 }
 
 impl Config {
+    /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
-        let explicit = std::env::var_os("OATHKEEP_CONFIG").map(PathBuf::from);
+        let explicit = explicit_config_path(|k| std::env::var_os(k));
         let path = explicit
             .clone()
             .unwrap_or_else(|| PathBuf::from("oathkeep.toml"));
@@ -87,6 +100,7 @@ impl Config {
         })
     }
 
+    /// The game directory, or a helpful error if it is not configured.
     pub fn require_game_dir(&self) -> Result<&Path> {
         self.game_dir.as_deref().context(
             "no game directory configured: set OATHKEEP_GAME_DIR or [paths].game_dir in \
@@ -94,13 +108,23 @@ impl Config {
         )
     }
 
+    /// Returns `<cache>/<sub>`, creating it, after checking the asset policy.
     pub fn cache_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.cache_dir, sub)
     }
 
+    /// Returns `<data>/<sub>`, creating it, after checking the asset policy.
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
     }
+}
+
+/// The config file explicitly named by the environment, if any. An empty
+/// `OATHKEEP_CONFIG` means unset, like the other path variables.
+fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    env("OATHKEEP_CONFIG")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -110,14 +134,13 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// `%LOCALAPPDATA%/oathkeep/<name>` (elsewhere the XDG or home cache).
 fn default_dir(name: &str) -> Result<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .context(
-            "cannot determine a user directory; set OATHKEEP_CACHE_DIR and OATHKEEP_DATA_DIR",
-        )?;
+        .context("cannot determine a user directory; set OATHKEEP_CACHE_DIR and OATHKEEP_DATA_DIR")?;
     Ok(base.join("oathkeep").join(name))
 }
 
@@ -170,6 +193,17 @@ mod tests {
         assert_eq!(
             cfg.test_titles,
             vec![PathBuf::from("first"), PathBuf::from("second")]
+        );
+    }
+
+    #[test]
+    fn empty_config_env_is_ignored() {
+        let empty = |k: &str| (k == "OATHKEEP_CONFIG").then(OsString::new);
+        assert_eq!(explicit_config_path(empty), None);
+        let set = |k: &str| (k == "OATHKEEP_CONFIG").then(|| OsString::from("custom.toml"));
+        assert_eq!(
+            explicit_config_path(set),
+            Some(PathBuf::from("custom.toml"))
         );
     }
 

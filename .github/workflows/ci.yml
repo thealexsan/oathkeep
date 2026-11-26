@@ -21,3 +21,5 @@ jobs:
       - uses: actions/checkout@v5
       - name: Asset & Clean-Room Policy
         run: cargo xtask policy
+      - name: Progress Graph & GitHub Page Up-to-Date
+        run: cargo xtask progress --check

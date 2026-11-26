@@ -1,3 +1,14 @@
+//! Translated shaders kept on disk (decision 0003): under the configured
+//! cache folder, keyed by the container's content and by the translator
+//! (the BLAKE3 of its sources) and its settings, so a changed translator
+//! never serves an old translation. Entries go through
+//! `oathkeep-pipeline`'s content-addressed cache, which writes them
+//! atomically; an entry that does not read back is translated again.
+//!
+//! The entry is our own encoding of [`HostShader`]: a field added to it
+//! must be added to `encode` and `decode` too (entries of older builds
+//! are ignored anyway).
+
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,6 +22,7 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
+/// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
     match Cache::open(dir) {
         Ok(cache) => {
@@ -20,55 +32,88 @@ pub fn use_shader_cache(dir: PathBuf) {
     }
 }
 
+/// Shaders found in the cache and translated since the start.
 pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+/// What identifies a translation beside its container: the translator
+/// (the BLAKE3 of its sources, `build.rs`), the settings it runs with, and
+/// what it was told of the host. Not our executable: a rebuild of anything
+/// else used to translate every shader again.
 fn build() -> [u8; 32] {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    let limit = oathkeep_shader::emit::loop_limit();
-    if limit != oathkeep_shader::emit::DEFAULT_LOOP_LIMIT {
-        WARNED.call_once(|| {
+    // The view heap's null slot differs by host GPU: a translation cached
+    // without the clamp must not be served (`host_settings` below).
+    crate::descriptor::host::probe_view_limit();
+    static FIXED: OnceLock<Vec<u8>> = OnceLock::new();
+    let fixed = FIXED.get_or_init(|| {
+        let limit = oathkeep_shader::emit::loop_limit();
+        if limit != oathkeep_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
                 limit,
                 "OATHKEEP_SHADER_LOOP_LIMIT: translated loops stop sooner"
-            )
-        });
-    }
-    static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
-    let exe = EXE.get_or_init(|| {
-        if std::env::var_os("OATHKEEP_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") {
-            match std::env::current_exe().and_then(std::fs::read) {
-                Ok(bytes) => Some(*blake3::hash(&bytes).as_bytes()),
-                Err(e) => {
-                    tracing::warn!(error = %e, "cannot read our executable; keying on the translator");
-                    None
-                }
-            }
-        } else {
-            None
+            );
         }
+        let mut bytes = env!("OATHKEEP_TRANSLATOR").as_bytes().to_vec();
+        bytes.extend_from_slice(&limit.to_le_bytes());
+        // Which group barriers wait is part of the translation too.
+        bytes.push(oathkeep_shader::emit::group_sync());
+        // So are the switches that pick the form of a wave64 program:
+        // without them here a run with `OATHKEEP_WAVE_WIDE=0` was
+        // served the translations an earlier run of the same
+        // executable had cached with the switch unset.
+        for name in [
+            "OATHKEEP_WAVE_WIDE",
+            "OATHKEEP_WAVE_DEEP_SKIPS",
+            "OATHKEEP_WAVE_OWN_BITS",
+            "OATHKEEP_WAVE_LOCAL",
+            "OATHKEEP_F16_NEAREST",
+            "OATHKEEP_HELPER_OWN",
+            "OATHKEEP_FIRSTLANE_OWN",
+            "OATHKEEP_FIRST_HALF",
+            "OATHKEEP_STRICT_JOINS",
+            "OATHKEEP_MESH_OUTPUT_STRICT",
+            "OATHKEEP_BVH_FENCES",
+            "OATHKEEP_BVH_BOUNDS",
+        ] {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(b'=');
+            if let Some(value) = std::env::var_os(name) {
+                bytes.extend_from_slice(value.as_encoded_bytes());
+            }
+            bytes.push(0);
+        }
+        // And which clean-up passes ran over the translated code.
+        bytes.extend_from_slice(&oathkeep_shader::emit::shader_opt().to_le_bytes());
+        bytes
     });
-    let mut h = blake3::Hasher::new();
-    h.update(b"oathkeep shader cache key 2\0");
-    if let Some(exe) = exe {
-        h.update(exe);
+    let mut hash = blake3::Hasher::new();
+    hash.update(fixed);
+    for value in oathkeep_shader::emit::host_settings() {
+        hash.update(&value.to_le_bytes());
     }
-    h.update(&oathkeep_shader::emit::translation_fingerprint());
-    h.update(include_bytes!("shader_cache.rs"));
-    *h.finalize().as_bytes()
+    *hash.finalize().as_bytes()
 }
 
-pub fn warm(container: &[u8]) -> Result<bool, String> {
-    let cache = CACHE.get().ok_or("no shader cache")?;
-    let ran = AtomicBool::new(false);
-    let translate = |c: &[u8]| {
-        ran.store(true, Ordering::Relaxed);
-        oathkeep_shader::emit::translate(c).map_err(|e| e.to_string())
-    };
-    cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
+/// What tells one set of translations from another ([`build`]).
+pub(crate) fn translation() -> [u8; 32] {
+    build()
 }
 
+/// Puts the translation of `container` into the cache before any title asks
+/// for it (`victory shaders`): whether it was there already, or why it does
+/// not translate. The host is opened first, as a run does: what the card
+/// can do decides the form of some programs.
+pub fn precompile(container: &[u8]) -> Result<bool, String> {
+    let _ = crate::host::host();
+    let misses = MISSES.load(Ordering::Relaxed);
+    host_shader(container)?;
+    // (Counts other threads' misses too: the caller only adds them up.)
+    Ok(MISSES.load(Ordering::Relaxed) == misses)
+}
+
+/// The translation of a console shader container, from the cache when
+/// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| oathkeep_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
@@ -77,6 +122,8 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     }
 }
 
+/// The cache entry's converter: the build and the container in, the
+/// encoded translation out. `ran` tells a miss from a hit.
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
@@ -87,6 +134,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         "shader.dxil"
     }
     fn version(&self) -> u32 {
+        // The build fingerprint in the input does the versioning.
         1
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -164,6 +212,7 @@ fn root_type(code: u32) -> RootType {
     }
 }
 
+/// Little-endian words and length-prefixed lists.
 fn encode(s: &HostShader) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -348,9 +397,11 @@ mod tests {
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
+        // Another build translates again.
         assert_eq!(cached(&cache, &[8; 32], container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
+        // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
@@ -359,6 +410,7 @@ mod tests {
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
+        // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
     }

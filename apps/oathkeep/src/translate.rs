@@ -1,3 +1,6 @@
+//! The offline batch: every shader found goes through the translator, and
+//! what it cannot handle yet is tallied (decision 0003).
+
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -24,6 +27,7 @@ struct Tally {
     structured: usize,
     vector: usize,
     guarded: usize,
+    /// Guards that read a mask the pass cannot see into.
     opaque: usize,
     lane_branches: usize,
     uniform_branches: usize,
@@ -31,30 +35,43 @@ struct Tally {
     loaded: usize,
     built: usize,
     constant: usize,
+    /// Descriptors and scalar accesses with a computed address term.
     dynamic: usize,
     scalar: usize,
     used: usize,
+    /// Used-resource entries whose root parameter no descriptor traces
+    /// to, by resource and root type.
     untraced_used: BTreeMap<String, usize>,
+    /// Root parameters descriptors trace to that no used entry names.
     unlisted: usize,
+    /// Vertex and pixel programs, and those whose I/O was raised.
     io_programs: usize,
     io_raised: usize,
     interpolated: usize,
     vertex_values: usize,
+    /// Exports by target kind.
     exports: BTreeMap<&'static str, usize>,
+    /// Exports still packed as f16 pairs after the export patch.
     compressed: usize,
+    /// Vertex and pixel programs every earlier stage handled, and how far
+    /// emission got with them.
     emit_programs: usize,
     emitted: usize,
     validated: usize,
     pipelines: usize,
+    /// The same for compute programs.
     cs_programs: usize,
     cs_emitted: usize,
     cs_validated: usize,
     cs_pipelines: usize,
+    /// The same for mesh programs.
     ms_programs: usize,
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
+    /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
 }
@@ -123,15 +140,24 @@ impl Tally {
     }
 }
 
+/// Emitted shaders by label, shared between threads.
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
+/// The optional checks after emission, one set per thread.
 struct Checks {
+    /// Shaders named in `OATHKEEP_PAIRS` (`vs+ps,...`, label substrings),
+    /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
 }
 
+/// `translate --warm <file>`: the containers whose hash the file names are
+/// translated into the run's shader cache, on `jobs` threads; nothing is
+/// made on the GPU. A run of the title then finds them there instead of
+/// translating each at its first use.
 pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()> {
+    // `--warm all`: every container found, whatever its hash.
     let all = file.as_os_str() == "all";
     let mut wanted: HashSet<String> = HashSet::new();
     if !all {
@@ -143,15 +169,11 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                 }
             }
         }
-        anyhow::ensure!(
-            !wanted.is_empty(),
-            "no 16-digit shader hash in {}",
-            file.display()
-        );
+        anyhow::ensure!(!wanted.is_empty(), "no 16-digit shader hash in {}", file.display());
     }
-    let limit = std::env::var("OATHKEEP_WARM_SECONDS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok());
+    // `OATHKEEP_WARM_SECONDS=<n>`: stop taking new shaders after n seconds
+    // (what is done stays in the cache; the next warm-up goes on from there).
+    let limit = std::env::var("OATHKEEP_WARM_SECONDS").ok().and_then(|v| v.trim().parse::<u64>().ok());
     let cfg = oathkeep_core::Config::load()?;
     oathkeep_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
@@ -160,10 +182,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
@@ -189,10 +208,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                             }
                             let n = counts[4].fetch_add(1, Ordering::Relaxed) + 1;
                             if n.is_multiple_of(1000) {
-                                println!(
-                                    "warm-up      {n} shaders so far, {:.0} s",
-                                    began.elapsed().as_secs_f64()
-                                );
+                                println!("warm-up      {n} shaders so far, {:.0} s", began.elapsed().as_secs_f64());
                             }
                             let which = match oathkeep_hle::modules::d3d12x::warm_shader(&bytes) {
                                 Ok(true) => 0,
@@ -207,16 +223,8 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
         }
     }
     let [translated, there, failed] = [0, 1, 2].map(|i| counts[i].load(Ordering::Relaxed));
-    let asked = if all {
-        "all".to_owned()
-    } else {
-        wanted.len().to_string()
-    };
-    let stopped = if counts[3].load(Ordering::Relaxed) > 0 {
-        " (stopped at the time limit)"
-    } else {
-        ""
-    };
+    let asked = if all { "all".to_owned() } else { wanted.len().to_string() };
+    let stopped = if counts[3].load(Ordering::Relaxed) > 0 { " (stopped at the time limit)" } else { "" };
     println!(
         "warm-up      {asked} hashes asked, {} found: {translated} translated now, {there} in the cache already, {failed} do not translate; {:.1} s on {threads} threads{stopped}",
         translated + there + failed,
@@ -232,13 +240,18 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
+    // Dumped shaders and validator reports are game-derived (rule #1).
+    if let Some(dir) = std::env::var_os("OATHKEEP_EMIT_DUMP") {
+        oathkeep_core::ensure_outside_repo(Path::new(&dir))?;
+    }
     let paths = crate::default_paths(paths)?;
-    if let Some(n) = std::env::var("OATHKEEP_HOST_MAX_WAVE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
+    // `OATHKEEP_HOST_MAX_WAVE=32`: translate as for a host whose waves have
+    // at most 32 lanes (as the runtime does on such a card).
+    if let Some(n) = std::env::var("OATHKEEP_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
         oathkeep_shader::emit::set_host_max_wave(n);
     }
+    // `OATHKEEP_HOST_RDNA=1`: as for an AMD RDNA card (`OATHKEEP_RDNA_FLOAT`).
+    oathkeep_shader::emit::set_host_rdna(std::env::var_os("OATHKEEP_HOST_RDNA").is_some_and(|v| v == "1"));
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -380,6 +393,67 @@ pub fn run(
     Ok(())
 }
 
+/// Every shader found into the cache runs translate from.
+pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
+    let cfg = oathkeep_core::Config::load()?;
+    oathkeep_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let paths = crate::default_paths(paths)?;
+    let threads =
+        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let started = std::time::Instant::now();
+    let seen = Mutex::new(HashSet::new());
+    let done = AtomicUsize::new(0);
+    let failed = Mutex::new(BTreeMap::<String, (usize, String)>::new());
+    for root in &paths {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let jobs = sources(&data);
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..threads.min(jobs.len()) {
+                    s.spawn(|| {
+                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let Some(bytes) = job.bytes() else { continue };
+                            let hash = blake3::hash(&bytes);
+                            if !lock(&seen).insert(hash) {
+                                continue;
+                            }
+                            match oathkeep_hle::modules::d3d12x::precompile(&bytes) {
+                                Ok(_) => {
+                                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if n.is_multiple_of(1000) {
+                                        println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
+                                    }
+                                }
+                                Err(why) => {
+                                    let mut failed = lock(&failed);
+                                    failed.entry(why).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    }
+    let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "{} shaders in the cache, {} do not translate, {:.0} s",
+        done.load(Ordering::Relaxed),
+        failed.values().map(|f| f.0).sum::<usize>(),
+        started.elapsed().as_secs_f64()
+    );
+    for (why, (n, hash)) in failed {
+        println!("  {n:>5}  {why}  (e.g. {hash})");
+    }
+    Ok(())
+}
+
 fn translate(
     source: &Source,
     path: &Path,
@@ -391,7 +465,11 @@ fn translate(
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
+    // The hash a run's log names the shader by (`hash=` in "first bind",
+    // "shader does not translate", "host pipeline refused").
     let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    // Diagnostics: `OATHKEEP_TRANSLATE_ONLY=<hash prefix>,...` translates
+    // those containers alone.
     static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let only = ONLY.get_or_init(|| {
         std::env::var("OATHKEEP_TRANSLATE_ONLY")
@@ -409,20 +487,21 @@ fn translate(
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
+    let Some(dxil) = container.part(FourCC::DXIL).or(container.part(FourCC::ACCC)).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
+    // `~`: the hash of the code alone; containers that differ only around
+    // it are translated once, the others listed as duplicates of it.
     let code = blake3::hash(dxil);
     let code8 = code.to_hex()[..8].to_owned();
     let example = || format!("{} ~{code8}", example());
+    // `OATHKEEP_DUMP_MATCH=<dir>;<text>|<text>...`: the containers whose
+    // line holds one of the texts (a name, `#hash`), as the title has them.
     if let Ok(spec) = std::env::var("OATHKEEP_DUMP_MATCH")
         && let Some((dir, texts)) = spec.split_once(';')
     {
         let line = example();
-        if texts
-            .split('|')
-            .any(|text| !text.is_empty() && line.contains(text))
-        {
+        if texts.split('|').any(|text| !text.is_empty() && line.contains(text)) {
             let name: String = source
                 .label()
                 .chars()
@@ -431,10 +510,7 @@ fn translate(
                 .take(70)
                 .collect();
             let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(
-                std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")),
-                &bytes[..],
-            );
+            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
         }
     }
     if !lock(seen).insert(code) {
@@ -448,43 +524,32 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // `OATHKEEP_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
+    // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("OATHKEEP_FAIL_DUMP");
-    let before: Option<BTreeMap<String, usize>> = dump
-        .as_ref()
-        .map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
     translate_programs(&container, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
             if *n > was && was < 3 {
-                let stem: String = reason
-                    .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                    .take(60)
-                    .collect();
+                let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
                 let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(
-                    std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")),
-                    &bytes[..],
-                );
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
             }
         }
     }
 }
 
-fn translate_programs(
-    container: &Container,
-    programs: Vec<NativeProgram>,
-    example: &dyn Fn() -> String,
-    t: &mut Tally,
-    checks: &mut Checks,
-) {
+fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
         match oathkeep_shader::spill::build(&p) {
             Ok(program) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
+                // Per-lane descriptors are traced on the per-lane form; its
+                // failure is listed after the resources' and I/O's.
                 let structured = structure::structure(&program);
                 let lanes = structured.as_ref().ok();
                 let res = match resource::track(&program, &p.layout, p.stage, lanes) {
@@ -565,17 +630,17 @@ fn translate_programs(
     }
 }
 
+/// `OATHKEEP_SHADER_CENSUS=<file>`: one line per emitted program, appended:
+/// its label, the console program's instructions by encoding class (a
+/// static count of the whole program, not of one thread's path), and the
+/// host module's instructions by kind (`emit::census::KINDS`).
 fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &emit::HostShader) {
-    use oathkeep_shader::gfx10::Fields;
     use std::io::Write;
+    use oathkeep_shader::gfx10::Fields;
     static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     let Some(out) = OUT.get_or_init(|| {
         let path = std::env::var_os("OATHKEEP_SHADER_CENSUS")?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
         Some(Mutex::new(file))
     }) else {
         return;
@@ -583,6 +648,7 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     let Some(census) = emit::census::take(&shader.dxil) else {
         return;
     };
+    // total, vector, scalar, descriptor loads, buffer and memory, image, LDS, control, other
     let mut console = [0u32; 9];
     for inst in p.blocks.iter().flat_map(|b| &b.insts) {
         console[0] += 1;
@@ -599,12 +665,7 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
         console[k] += 1;
     }
     let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
-    for (name, n) in [
-        "c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other",
-    ]
-    .iter()
-    .zip(console)
-    {
+    for (name, n) in ["c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other"].iter().zip(console) {
         line.push_str(&format!("\t{name}={n}"));
     }
     for (name, n) in emit::census::KINDS.iter().zip(census.counts) {
@@ -614,6 +675,7 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     let _ = lock(out).write_all(line.as_bytes());
 }
 
+/// Validates an emitted shader if asked to.
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
@@ -623,6 +685,13 @@ fn check(
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
     }
+    // With `--list`: a hash of the module and of what the host binds for it,
+    // to show which shaders a change to the translator touches.
+    if t.list {
+        let hash = blake3::hash(format!("{shader:?}").as_bytes()).to_hex();
+        t.lines.push(format!("{}  emitted {}", label(), &hash[..16]));
+    }
+    // `OATHKEEP_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
         && let Ok(dir) = std::env::var("OATHKEEP_EMIT_DUMP")
     {
@@ -653,6 +722,9 @@ fn check(
         }
     }
     let Some(v) = checks.validator.as_mut() else {
+        if t.list && checks.host.is_none() {
+            t.lines.push(format!("{}  emitted", label()));
+        }
         return;
     };
     match v.validate(&mut shader.dxil) {
@@ -691,6 +763,8 @@ fn check(
     }
 }
 
+/// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,
+/// 3 pipelines.
 fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
     let [a, b, c, d] = match stage {
         HwStage::Cs => [
@@ -768,6 +842,8 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 unreachable!("leaves are no phis, selects or per-lane choices")
             }
         };
+        // Heaps hold dynamic resources, which no used entry lists; code
+        // tables are no root parameter.
         if let Some(a) = a
             && a.param != resource::CODE
             && !matches!(
@@ -778,6 +854,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
             traced.insert(p.layout[a.param].user_data);
         }
     }
+    // Root constants are listed as a CBV, read straight from the SGPRs.
     traced.extend(
         r.params
             .iter()
@@ -787,6 +864,9 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
     );
     let listed: HashSet<u8> = p.used.iter().map(|u| u.user_data).collect();
     t.used += p.used.len();
+    // Immediate samplers are literals in the code: the distinct sampler
+    // values (decoded) are matched against the listed entries, which do not
+    // say which value is whose.
     let mut values: Vec<emit::StaticSampler> = Vec::new();
     for d in r
         .descriptors
@@ -804,6 +884,9 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
             }
         }
     }
+    // Engines often declare equal samplers at several registers, so equal
+    // values may stand for several entries, but never more values than
+    // entries.
     let immediate = p
         .used
         .iter()
@@ -856,4 +939,25 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Shader dumps are game-derived, so a dump directory in the repo is refused.
+    #[test]
+    fn emit_dump_inside_repo_is_refused() {
+        // SAFETY: no other test in this binary touches the environment.
+        unsafe { std::env::set_var("OATHKEEP_EMIT_DUMP", env!("CARGO_MANIFEST_DIR")) };
+        let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
+        let err = super::run(vec![missing], false, false, false, Some(1)).unwrap_err();
+        // SAFETY: as above; unset so a later test's `run` is not refused.
+        unsafe { std::env::remove_var("OATHKEEP_EMIT_DUMP") };
+        assert!(
+            matches!(
+                err.downcast_ref(),
+                Some(oathkeep_core::PolicyError::InsideRepo { .. })
+            ),
+            "{err}"
+        );
+    }
 }

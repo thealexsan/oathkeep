@@ -1,14 +1,43 @@
+//! Operand fields of GFX10 instructions, by encoding.
+//!
+//! Layouts follow AMD's RDNA ISA reference. Register ranges carry their size
+//! in dwords, which depends on the opcode (read from its name) and, for lane
+//! masks (VCC, EXEC, compare results), on the wave size.
+
 use super::{Encoding, Instruction};
 
+/// A source or destination of an instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operand {
-    Scalar { code: u8, dwords: u8 },
-    Vector { reg: u8, dwords: u8 },
+    /// Scalar registers by operand code: 0-105 `s0`-`s105`, 106/107
+    /// `vcc_lo`/`vcc_hi`, 108-123 `ttmp0`-`ttmp15`, 124 `m0`, 125 `null`,
+    /// 126/127 `exec_lo`/`exec_hi`. The decoder gives no code above 127; the
+    /// IR names scalars parked in VGPR lanes by the codes from 128 up
+    /// (`crate::ir::PARKED`).
+    Scalar {
+        code: u8,
+        dwords: u8,
+    },
+    Vector {
+        reg: u8,
+        dwords: u8,
+    },
+    /// Inline constant or read-only special source, by operand code
+    /// (128-192: 0-64, 193-208: -1 to -16, 240-248: floats, 251-254: vccz,
+    /// execz, scc, lds_direct).
     Const(u8),
+    /// The 32-bit literal that follows the instruction.
     Literal(u32),
-    Attr { index: u8, chan: u8, high: bool },
+    /// Interpolation attribute and channel (0-3 = x-w); `high` selects the
+    /// upper f16 half.
+    Attr {
+        index: u8,
+        chan: u8,
+        high: bool,
+    },
 }
 
+/// Operand code of `null` (no register; reads as 0).
 pub const NULL: u8 = 125;
 const VCC: u8 = 106;
 const EXEC: u8 = 126;
@@ -22,17 +51,20 @@ pub struct Cache {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fields {
+    /// SOP1, SOP2, SOPC, SOPK; `imm` is SOPK's 16-bit immediate.
     Sop {
         dst: Option<Operand>,
         src: Vec<Operand>,
         imm: Option<u16>,
     },
+    /// The 16-bit immediate: branch offset in dwords, wait counts, message...
     Sopp {
         imm: u16,
     },
     Smem {
         data: Option<Operand>,
         base: Operand,
+        /// Signed byte offset, added to `soffset`.
         offset: i32,
         soffset: Operand,
         cache: Cache,
@@ -40,6 +72,8 @@ pub enum Fields {
     Valu(Valu),
     Vintrp {
         dst: Operand,
+        /// The i/j VGPR, or for `v_interp_mov_f32` the parameter (0 `p10`,
+        /// 1 `p20`, 2 `p0`) as [`Operand::Const`].
         src: Operand,
         attr: Operand,
     },
@@ -51,7 +85,9 @@ pub enum Fields {
         offset1: u8,
         gds: bool,
     },
+    /// MUBUF, and MTBUF with `format` set.
     Buffer {
+        /// Loaded, stored, or the atomic operand (and result with `glc`).
         data: Option<Operand>,
         addr: Operand,
         rsrc: Operand,
@@ -66,6 +102,7 @@ pub enum Fields {
     },
     Image {
         data: Operand,
+        /// One range, or one VGPR per address with the NSA form.
         addr: Vec<Operand>,
         rsrc: Operand,
         sampler: Option<Operand>,
@@ -79,6 +116,7 @@ pub enum Fields {
         lwe: bool,
         cache: Cache,
     },
+    /// FLAT, GLOBAL and SCRATCH.
     Flat {
         dst: Option<Operand>,
         addr: Option<Operand>,
@@ -90,6 +128,7 @@ pub enum Fields {
     },
     Exp {
         target: u8,
+        /// Per channel; `None` when disabled.
         src: [Option<Operand>; 4],
         compr: bool,
         done: bool,
@@ -97,17 +136,26 @@ pub enum Fields {
     },
 }
 
+/// VOP1, VOP2, VOPC, VOP3 and VOP3P, with their SDWA and DPP forms.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Valu {
+    /// A VGPR range, an SGPR (`v_readlane_b32`...) or a lane mask (compares).
     pub dst: Option<Operand>,
+    /// Carry-out or the second result of VOP3B (`v_add_co_u32`, `v_div_scale_f32`...).
     pub carry: Option<Operand>,
+    /// In operand order, including the implicit VCC of VOP2 `v_cndmask_b32`
+    /// and carry-in, and the literal of `v_madmk`/`v_madak` forms.
     pub src: Vec<Operand>,
+    /// Bit i applies to `src[i]`. For VOP3P, `neg` is the low half's.
     pub neg: u8,
     pub abs: u8,
+    /// VOP3P: negate the high half (`v_fma_mix*`: absolute value).
     pub neg_hi: u8,
+    /// VOP3: bit 3 is the destination. VOP3P with `opsel_hi`: the halves used.
     pub opsel: u8,
     pub opsel_hi: u8,
     pub clamp: bool,
+    /// Output modifier: 1 ×2, 2 ×4, 3 ÷2.
     pub omod: u8,
     pub sdwa: Option<Sdwa>,
     pub dpp: Option<Dpp>,
@@ -115,14 +163,18 @@ pub struct Valu {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sdwa {
+    /// Selects: 0-3 byte, 4-5 word, 6 dword. Compares have no `dst_sel`.
     pub dst_sel: u8,
+    /// 0 pad with zeros, 1 sign-extend, 2 preserve.
     pub dst_unused: u8,
     pub src_sel: [u8; 2],
+    /// Bit i sign-extends `src[i]`.
     pub sext: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dpp {
+    /// DPP16: `ctrl` is the 9-bit permutation (quad_perm, row shifts...).
     Row {
         ctrl: u16,
         row_mask: u8,
@@ -130,13 +182,12 @@ pub enum Dpp {
         bound_ctrl: bool,
         fi: bool,
     },
-    Lanes {
-        sel: u32,
-        fi: bool,
-    },
+    /// DPP8: eight 3-bit lane selects.
+    Lanes { sel: u32, fi: bool },
 }
 
 impl Instruction {
+    /// Decodes the operand fields. `wave64` sizes lane masks.
     pub fn fields(&self, wave64: bool) -> Fields {
         let name = self.name().unwrap_or("");
         let w = |i: usize| self.words.get(i).copied().unwrap_or(0);
@@ -184,19 +235,32 @@ impl Instruction {
             }
             Encoding::Sopp => Fields::Sopp { imm: w0 as u16 },
             Encoding::Smem => {
-                let data = match name {
-                    "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => None,
-                    n if n.starts_with("s_dcache_discard") => None,
-                    "s_memtime" | "s_memrealtime" => Some(2),
-                    _ => Some(data_dwords(name)),
+                let sdata = (w0 >> 6 & 0x7F) as u8;
+                // s_atc_probe*: SDATA is a 7-bit immediate, not an SGPR. The
+                // buffer form's resource is 4 dwords. GLC and DLC are not operands.
+                let probe = matches!(name, "s_atc_probe" | "s_atc_probe_buffer");
+                let data = if probe {
+                    Some(Operand::Literal(u32::from(sdata)))
+                } else {
+                    match name {
+                        "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => None,
+                        n if n.starts_with("s_dcache_discard") => None,
+                        "s_memtime" | "s_memrealtime" => Some(scalar(sdata, 2)),
+                        _ => Some(scalar(sdata, data_dwords(name))),
+                    }
                 };
-                let base = 2 + 2 * u8::from(name.starts_with("s_buffer_"));
+                let base =
+                    2 + 2 * u8::from(name.starts_with("s_buffer_") || name == "s_atc_probe_buffer");
                 Fields::Smem {
-                    data: data.map(|d| scalar((w0 >> 6 & 0x7F) as u8, d)),
+                    data,
                     base: scalar(((w0 & 0x3F) << 1) as u8, base),
                     offset: (w1 << 11) as i32 >> 11,
                     soffset: scalar((w1 >> 25) as u8, 1),
-                    cache: cache(bit(w0, 16), false, bit(w0, 14)),
+                    cache: if probe {
+                        Cache::default()
+                    } else {
+                        cache(bit(w0, 16), false, bit(w0, 14))
+                    },
                 }
             }
             Encoding::Vop1 | Encoding::Vop2 | Encoding::Vopc | Encoding::Vop3 | Encoding::Vop3p => {
@@ -303,6 +367,8 @@ impl Instruction {
                 let addr = if w0 >> 1 & 3 == 0 {
                     vec![vector(w1 & 0xFF, count)]
                 } else {
+                    // NSA: one VGPR per address, the first in dword 1, the rest
+                    // in the extra dwords.
                     (0..usize::from(count))
                         .map(|i| match i {
                             0 => vector(w1 & 0xFF, 1),
@@ -337,6 +403,7 @@ impl Instruction {
                 let addr = match self.encoding {
                     Encoding::Flat => Some(vector(w1 & 0xFF, 2)),
                     Encoding::Global => Some(vector(w1 & 0xFF, 1 + u8::from(saddr == NULL))),
+                    // With an SGPR base, scratch takes no VGPR.
                     _ => (saddr == NULL).then(|| vector(w1 & 0xFF, 1)),
                 };
                 let ret = if atomic && name.contains("cmpswap") {
@@ -351,6 +418,8 @@ impl Instruction {
                     saddr: (self.encoding != Encoding::Flat)
                         .then(|| scalar(saddr, 1 + u8::from(self.encoding == Encoding::Global))),
                     offset: match self.encoding {
+                        // GFX10 FLAT offsets are 11-bit and unsigned: the
+                        // hardware ignores bit 11.
                         Encoding::Flat => (w0 & 0x7FF) as i16,
                         _ => ((w0 << 4) as i16) >> 4,
                     },
@@ -375,6 +444,7 @@ impl Instruction {
     }
 
     fn valu(&self, name: &str, lanes: u8) -> Valu {
+        // No operands; the console compiler stores a shader hash in their fields.
         if matches!(name, "v_nop" | "v_pipeflush" | "v_clrexcp") {
             return Valu::default();
         }
@@ -403,6 +473,7 @@ impl Instruction {
                             src_sel: [(ext >> 16 & 7) as u8, (ext >> 24 & 7) as u8],
                             sext: (ext >> 19 & 1 | ext >> 26 & 2) as u8,
                         };
+                        // The s0/s1 bits select an SGPR or constant instead of a VGPR.
                         src0 = (ext & 0xFF) | if ext >> 23 & 1 == 0 { 256 } else { 0 };
                         if ext >> 31 == 1 {
                             src1 = vsrc1 - 256;
@@ -545,6 +616,7 @@ impl Instruction {
     }
 }
 
+/// VOP3-only opcodes that take two sources (the rest take three).
 const VOP3_TWO_SOURCES: &[&str] = &[
     "v_add_f64",
     "v_mul_f64",
@@ -593,6 +665,7 @@ const VOP3_TWO_SOURCES: &[&str] = &[
     "v_add_nc_i32",
 ];
 
+/// VOP3 opcodes whose bits 14:8 hold a scalar destination instead of `abs`/`opsel`.
 const VOP3B: &[&str] = &[
     "v_add_co_u32",
     "v_sub_co_u32",
@@ -617,6 +690,7 @@ fn vector(reg: u32, dwords: u8) -> Operand {
     }
 }
 
+/// A 9-bit source field (8-bit scalar fields are the same codes below 256).
 fn source(code: u32, dwords: u8, literal: u32) -> Operand {
     match code {
         0..=127 => scalar(code as u8, dwords),
@@ -626,6 +700,7 @@ fn source(code: u32, dwords: u8, literal: u32) -> Operand {
     }
 }
 
+/// VALU destinations that are SGPRs.
 fn valu_dst(name: &str, field: u32, dwords: u8) -> Operand {
     match name {
         "v_readlane_b32" | "v_readfirstlane_b32" => scalar(field as u8, 1),
@@ -633,6 +708,7 @@ fn valu_dst(name: &str, field: u32, dwords: u8) -> Operand {
     }
 }
 
+/// LDS opcodes on two addresses (`ds_read2_b32`...), with `offset0`/`offset1`.
 pub(super) fn ds_pair(name: &str) -> bool {
     name.split('_').any(|t| {
         ["read2", "write2", "wrxchg2"]
@@ -641,6 +717,7 @@ pub(super) fn ds_pair(name: &str) -> bool {
     })
 }
 
+/// Dwords of a type suffix such as `b64` or `f32`.
 fn type_dwords(token: &str) -> u8 {
     match token {
         "b64" | "u64" | "i64" | "f64" => 2,
@@ -648,6 +725,7 @@ fn type_dwords(token: &str) -> u8 {
     }
 }
 
+/// (sdst, ssrc0, ssrc1) dwords of a scalar ALU opcode.
 fn salu_dwords(name: &str) -> (u8, u8, u8) {
     match name {
         "s_lshl_b64" | "s_lshr_b64" | "s_ashr_i64" | "s_bfe_u64" | "s_bfe_i64"
@@ -662,6 +740,7 @@ fn salu_dwords(name: &str) -> (u8, u8, u8) {
     }
 }
 
+/// (vdst, [src0, src1, src2]) dwords of a VALU opcode.
 fn valu_dwords(name: &str) -> (u8, [u8; 3]) {
     let parts: Vec<&str> = name.split('_').collect();
     match name {
@@ -683,6 +762,7 @@ fn valu_dwords(name: &str) -> (u8, [u8; 3]) {
     }
 }
 
+/// Dwords of loaded, stored or atomic data, from the opcode name.
 fn data_dwords(name: &str) -> u8 {
     let mut n: u8 = 1;
     for token in name.split('_') {
@@ -704,7 +784,11 @@ fn data_dwords(name: &str) -> u8 {
     n
 }
 
+/// Address dwords of an image opcode: offset, bias, compare, derivatives,
+/// coordinates, then LOD/clamp/mip, packed in pairs with `a16`.
 fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
+    // (coordinates, derivatives per direction) for 1D 2D 3D CUBE 1D_ARRAY
+    // 2D_ARRAY 2D_MSAA 2D_MSAA_ARRAY.
     const DIMS: [(u8, u8); 8] = [
         (1, 1),
         (2, 2),

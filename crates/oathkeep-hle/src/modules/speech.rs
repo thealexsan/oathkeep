@@ -1,3 +1,10 @@
+//! Accessibility: speech synthesis for the title's narration. No voice is
+//! installed here, and every stream is valid WAVE audio of no length, so
+//! narration is silent.
+// shortcut: silent speech. The host's engine (SAPI through COM, or WinRT
+// speech synthesis) needs COM bindings this crate has only in diagnostics
+// builds, plus voice enumeration and SSML the title sends (slot 0xa8); the
+// title then plays the empty stream and goes on.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
@@ -6,12 +13,14 @@ use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text,
 };
 
+/// Closed captions, high contrast, speech to text and synthesis.
 pub const PROVIDER: Guid = Guid::new(
     0x3e24_1977,
     0x6237,
     0x41e9,
     [0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1],
 );
+/// Unchanged since 2020.
 pub const IID: Guid = Guid::new(
     0xd722_b373,
     0x8c4d,
@@ -22,14 +31,20 @@ pub const IID: Guid = Guid::new(
 pub static OBJECT: Object = Object::new("accessibility", &VTABLE);
 pub const INTERFACES: &[Interface] = &[(PROVIDER, IID, &OBJECT)];
 
+/// A WAVE file of 16 kHz mono 16-bit PCM with no samples: RIFF size 36,
+/// a 16-byte format chunk (PCM, 1 channel, 16,000 Hz, 32,000 bytes/s,
+/// block 2, 16 bits), an empty data chunk.
 const SILENCE: [u8; 44] =
     *b"RIFF\x24\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x80\x3e\0\0\0\x7d\0\0\x02\0\x10\0data\0\0\0\0";
 
+/// Synthesizers and streams hold nothing, so their handles are fixed
+/// addresses and closing them is free.
 static SYNTHESIZER: u8 = 0;
 static STREAM: u8 = 0;
 
 type This = *const Object;
 
+/// No voice is installed, so the callback never runs.
 extern "system" fn enumerate_voices(
     _: This,
     _context: *mut c_void,
@@ -84,25 +99,25 @@ static VTABLE: Methods<22> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    missing::<3> as *const (),
-    missing::<4> as *const (),
-    missing::<5> as *const (),
-    missing::<6> as *const (),
-    missing::<7> as *const (),
-    enumerate_voices as *const (),
-    create as *const (),
-    close as *const (),
-    set_default_voice as *const (),
-    set_custom_voice as *const (),
-    create_stream as *const (),
-    close as *const (),
-    stream_size as *const (),
-    stream_data as *const (),
-    missing::<17> as *const (),
-    missing::<18> as *const (),
-    missing::<19> as *const (),
-    missing::<20> as *const (),
-    create_stream as *const (),
+    missing::<3> as *const (),      // 0x18 closed captions
+    missing::<4> as *const (),      // 0x20
+    missing::<5> as *const (),      // 0x28 high contrast
+    missing::<6> as *const (),      // 0x30 speech to text
+    missing::<7> as *const (),      // 0x38
+    enumerate_voices as *const (),  // 0x40
+    create as *const (),            // 0x48
+    close as *const (),             // 0x50
+    set_default_voice as *const (), // 0x58
+    set_custom_voice as *const (),  // 0x60
+    create_stream as *const (),     // 0x68 from text
+    close as *const (),             // 0x70 a stream
+    stream_size as *const (),       // 0x78
+    stream_data as *const (),       // 0x80
+    missing::<17> as *const (),     // 0x88 speech to text
+    missing::<18> as *const (),     // 0x90
+    missing::<19> as *const (),     // 0x98
+    missing::<20> as *const (),     // 0xa0
+    create_stream as *const (),     // 0xa8 from SSML
 ]);
 
 #[cfg(test)]

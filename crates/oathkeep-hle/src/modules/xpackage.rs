@@ -1,3 +1,6 @@
+//! XPackage: the title's own installation, complete and launchable, with
+//! every chunk ready; no other package (content, add-ons) is installed.
+//! The package is the folder of the title's executable (`G:` to the title).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
@@ -17,6 +20,9 @@ pub const PROVIDER: Guid = Guid::new(
     [0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e],
 );
 
+/// As the title (2026) asks for it. Its slots up to 0xd0 take the
+/// arguments the public API lists in the same order; 0x110 uninstalls a
+/// package, 0x128/0x130 mount one with UI, 0x138 enumerates packages.
 pub const IID_2026: Guid = Guid::new(
     0x0b9d_556e,
     0xab70,
@@ -27,8 +33,11 @@ pub const IID_2026: Guid = Guid::new(
 pub static OBJECT: Object = Object::new("package", &VTABLE);
 pub const INTERFACES: &[Interface] = &[(PROVIDER, IID_2026, &OBJECT)];
 
+/// The documented "could not resolve an identifier for the package".
 pub const NO_PACKAGE: HRESULT = 0x8924_5208_u32 as i32;
 
+/// Our installation's identifier: the title id in hex (titles keep it in 33
+/// bytes and hand it back to us).
 pub fn identifier() -> String {
     format!("{:08X}", runtime::title().id)
 }
@@ -37,6 +46,7 @@ fn is_ours(id: *const c_char) -> bool {
     text(id).is_some_and(|id| id == identifier())
 }
 
+/// Bytes in the package folder, counted once.
 fn package_bytes() -> u64 {
     fn size(dir: &Path) -> u64 {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -68,6 +78,8 @@ extern "system" fn is_packaged(_: This) -> bool {
     true
 }
 
+/// Installation monitors all watch the same finished installation, so the
+/// handle is a fixed address.
 static MONITOR: u8 = 0;
 fn monitor() -> *const c_void {
     (&raw const MONITOR).cast()
@@ -113,6 +125,7 @@ extern "system" fn progress(_: This, _: *const c_void, out: *mut Progress) {
     );
 }
 
+/// The installation is complete, so progress never changes.
 extern "system" fn register_progress(
     _: This,
     _monitor: *const c_void,
@@ -123,6 +136,21 @@ extern "system" fn register_progress(
     put(out, token())
 }
 
+/// The completed installation has no pending progress callbacks to wait for.
+extern "system" fn unregister_progress(
+    _: This,
+    _monitor: *const c_void,
+    _token: u64,
+    _wait: bool,
+) -> bool {
+    true
+}
+
+/// 0: ready.
+// shortcut: every selector counts as installed, including ones the
+// package's layout does not have (the console answers those with an
+// invalid-selector error); the title asks only about its own
+// chunks, which a full install has.
 extern "system" fn find_availability(
     _: This,
     id: *const c_char,
@@ -147,6 +175,7 @@ extern "system" fn change_order(
 
 static INSTALL: u8 = 0;
 
+/// Everything is installed: done at once, the result is a monitor.
 extern "system" fn install_chunks_async(
     _: This,
     id: *const c_char,
@@ -171,6 +200,7 @@ extern "system" fn install_chunks_result(
     xasync::result(block, (&raw const INSTALL).cast(), out)
 }
 
+/// Nothing to download.
 extern "system" fn estimate_download(
     _: This,
     id: *const c_char,
@@ -189,6 +219,9 @@ extern "system" fn estimate_download(
     put(bytes, 0)
 }
 
+// shortcut: accepted but nothing is removed (the package folder is the
+// user's), so the chunks stay ready; the title's one call site
+// (title+0x293b4b0, its chunk manager) would then see them still installed.
 extern "system" fn uninstall_chunks(
     _: This,
     id: *const c_char,
@@ -198,11 +231,14 @@ extern "system" fn uninstall_chunks(
     if is_ours(id) { S_OK } else { NO_PACKAGE }
 }
 
+/// Mount handles only come from mounting another package, and there is
+/// none.
 extern "system" fn mount_path(_: This, _: *const c_void, _: usize, _: *mut u8) -> HRESULT {
     xasync::E_INVALIDARG
 }
 extern "system" fn close_mount(_: This, _: *const c_void) {}
 
+/// Only other packages are uninstalled this way, and none is installed.
 extern "system" fn uninstall_package(_: This, id: *const c_char) -> bool {
     tracing::info!(
         id = text(id).unwrap_or_default(),
@@ -228,6 +264,9 @@ extern "system" fn mount_result(
     xasync::result(block, (&raw const MOUNT).cast(), out)
 }
 
+/// Titles enumerate content packages (kind 1); there are none.
+// shortcut: the game kind (0) also lists nothing, not this installation;
+// The title enumerates only content (kind 1, title+0x2937bf0).
 extern "system" fn enumerate(
     _: This,
     kind: u32,
@@ -243,49 +282,77 @@ static VTABLE: Methods<40> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    current_identifier as *const (),
-    is_packaged as *const (),
-    create_monitor as *const (),
-    close_monitor as *const (),
-    progress as *const (),
-    missing::<8> as *const (),
-    register_progress as *const (),
-    missing::<10> as *const (),
-    missing::<11> as *const (),
-    find_availability as *const (),
-    missing::<13> as *const (),
-    change_order as *const (),
-    missing::<15> as *const (),
-    install_chunks_async as *const (),
-    install_chunks_result as *const (),
-    estimate_download as *const (),
-    uninstall_chunks as *const (),
-    missing::<20> as *const (),
-    missing::<21> as *const (),
-    missing::<22> as *const (),
-    missing::<23> as *const (),
-    missing::<24> as *const (),
-    mount_path as *const (),
-    close_mount as *const (),
-    missing::<27> as *const (),
-    missing::<28> as *const (),
-    missing::<29> as *const (),
-    missing::<30> as *const (),
-    missing::<31> as *const (),
-    missing::<32> as *const (),
-    missing::<33> as *const (),
-    uninstall_package as *const (),
-    missing::<35> as *const (),
-    missing::<36> as *const (),
-    mount_async as *const (),
-    mount_result as *const (),
-    enumerate as *const (),
+    current_identifier as *const (),    // 0x18
+    is_packaged as *const (),           // 0x20
+    create_monitor as *const (),        // 0x28
+    close_monitor as *const (),         // 0x30
+    progress as *const (),              // 0x38
+    missing::<8> as *const (),          // 0x40 update a monitor
+    register_progress as *const (),     // 0x48
+    unregister_progress as *const (),   // 0x50
+    missing::<11> as *const (),         // 0x58 user locale
+    find_availability as *const (),     // 0x60
+    missing::<13> as *const (),         // 0x68 enumerate chunk availability
+    change_order as *const (),          // 0x70
+    missing::<15> as *const (),         // 0x78 install chunks
+    install_chunks_async as *const (),  // 0x80
+    install_chunks_result as *const (), // 0x88
+    estimate_download as *const (),     // 0x90
+    uninstall_chunks as *const (),      // 0x98
+    missing::<20> as *const (),         // 0xa0
+    missing::<21> as *const (),         // 0xa8
+    missing::<22> as *const (),         // 0xb0
+    missing::<23> as *const (),         // 0xb8 mount (deprecated)
+    missing::<24> as *const (),         // 0xc0 mount path size
+    mount_path as *const (),            // 0xc8
+    close_mount as *const (),           // 0xd0
+    missing::<27> as *const (),         // 0xd8
+    missing::<28> as *const (),         // 0xe0 enumerate packages (older)
+    missing::<29> as *const (),         // 0xe8
+    missing::<30> as *const (),         // 0xf0
+    missing::<31> as *const (),         // 0xf8
+    missing::<32> as *const (),         // 0x100
+    missing::<33> as *const (),         // 0x108
+    uninstall_package as *const (),     // 0x110
+    missing::<35> as *const (),         // 0x118
+    missing::<36> as *const (),         // 0x120
+    mount_async as *const (),           // 0x128
+    mount_result as *const (),          // 0x130
+    enumerate as *const (),             // 0x138
 ]);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn completed_installation_unregisters_progress_immediately() {
+        type Register =
+            extern "system" fn(This, *const c_void, *mut c_void, *const c_void, *mut u64) -> HRESULT;
+        type Unregister = extern "system" fn(This, *const c_void, u64, bool) -> bool;
+        extern "system" fn callback(_: *mut c_void, _: *const c_void) {}
+
+        let this: This = &OBJECT;
+        let register = method::<Register>(&OBJECT, 0x48);
+        assert_eq!(VTABLE.0[0x50 / 8], unregister_progress as *const ());
+        let unregister = method::<Unregister>(&OBJECT, 0x50);
+        for wait in [false, true] {
+            let mut token = 0;
+            assert_eq!(
+                register(
+                    this,
+                    monitor(),
+                    std::ptr::null_mut(),
+                    callback as *const c_void,
+                    &mut token
+                ),
+                S_OK
+            );
+            assert_ne!(token, 0);
+            assert!(unregister(this, monitor(), token, wait));
+        }
+    }
 
     #[test]
     fn the_installation_is_complete_and_alone() {
