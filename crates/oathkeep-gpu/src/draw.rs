@@ -214,8 +214,7 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     tables_gone: bool,
-    shadow_cache: Vec<(u64, u64, u8, std::sync::Arc<crate::shadow::Shadow>)>,
-    shadow_cache_gen: u64,
+    shadow_cache: Vec<(u64, u64, u8, u64, std::sync::Arc<crate::shadow::Shadow>)>,
     constants_pool: Vec<Vec<u32>>,
     scratch_fresh: Vec<u8>,
     scratch_made: Vec<(u8, u32)>,
@@ -707,29 +706,22 @@ const SHADOW_CACHE_CAP: usize = 16;
 
 impl State {
     #[inline]
-    fn sync_shadow_cache(&mut self) {
-        let g = crate::shadow::generation();
-        if self.shadow_cache_gen != g {
-            self.shadow_cache.clear();
-            self.shadow_cache_gen = g;
-        }
-    }
-
-    #[inline]
     fn cache_shadow(
         &mut self,
         address: u64,
         len: u64,
         kind: u8,
+        epoch: u64,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
     ) {
         let norm_len = len.max(1);
         if let Some(pos) = self
             .shadow_cache
             .iter()
-            .position(|(a, l, k, _)| *a == address && *l == norm_len && *k == kind)
+            .position(|(a, l, k, _, _)| *a == address && *l == norm_len && *k == kind)
         {
-            self.shadow_cache[pos].3 = shadow.clone();
+            self.shadow_cache[pos].3 = epoch;
+            self.shadow_cache[pos].4 = shadow.clone();
             if pos > 0 {
                 self.shadow_cache[..=pos].rotate_right(1);
             }
@@ -739,7 +731,7 @@ impl State {
             self.shadow_cache.pop();
         }
         self.shadow_cache
-            .insert(0, (address, norm_len, kind, shadow.clone()));
+            .insert(0, (address, norm_len, kind, epoch, shadow.clone()));
     }
 
     #[inline]
@@ -749,24 +741,29 @@ impl State {
         len: u64,
         kind: u8,
     ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-        self.sync_shadow_cache();
         let norm_len = len.max(1);
         let pos = self
             .shadow_cache
             .iter()
-            .position(|(a, l, k, _)| *a == address && *l == norm_len && *k == kind)?;
+            .position(|(a, l, k, _, _)| *a == address && *l == norm_len && *k == kind)?;
+        let (_, _, _, ep, ref s) = self.shadow_cache[pos];
+        if s.is_dead() || crate::shadow::epoch_for_range(address, norm_len) != ep {
+            self.shadow_cache.remove(pos);
+            return None;
+        }
         if pos > 0 {
             self.shadow_cache[..=pos].rotate_right(1);
         }
-        Some(self.shadow_cache[0].3.clone())
+        Some(self.shadow_cache[0].4.clone())
     }
 
     fn find_shadow(&mut self, address: u64, len: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
         if let Some(s) = self.lookup_shadow_cached(address, len, 0) {
             return Some(s);
         }
+        let ep = crate::shadow::epoch_for_range(address, len.max(1));
         let s = crate::shadow::find(address, len)?;
-        self.cache_shadow(address, len, 0, &s);
+        self.cache_shadow(address, len, 0, ep, &s);
         Some(s)
     }
 
@@ -778,8 +775,9 @@ impl State {
         if let Some(s) = self.lookup_shadow_cached(address, len, 1) {
             return Some(s);
         }
+        let ep = crate::shadow::epoch_for_range(address, len.max(1));
         let s = crate::shadow::find_any(address, len)?;
-        self.cache_shadow(address, len, 1, &s);
+        self.cache_shadow(address, len, 1, ep, &s);
         Some(s)
     }
 
@@ -791,8 +789,9 @@ impl State {
         if let Some(s) = self.lookup_shadow_cached(address, len, 2) {
             return Some(s);
         }
+        let ep = crate::shadow::epoch_for_range(address, len.max(1));
         let s = crate::shadow::find_existing(address, len)?;
-        self.cache_shadow(address, len, 2, &s);
+        self.cache_shadow(address, len, 2, ep, &s);
         Some(s)
     }
 
@@ -1195,14 +1194,17 @@ impl State {
                 _ => None,
             };
             let Some(address) = address else { return 0 };
-            let shadow = (self.shadow_cache_gen == crate::shadow::generation())
-                .then(|| {
-                    self.shadow_cache
-                        .iter()
-                        .find(|(a, l, k, _)| *a == address && *l == 1 && *k == 0)
-                        .map(|(_, _, _, s)| s.clone())
+            let shadow = self
+                .shadow_cache
+                .iter()
+                .find(|(a, l, k, ep, s)| {
+                    *a == address
+                        && *l == 1
+                        && *k == 0
+                        && !s.is_dead()
+                        && crate::shadow::epoch_for_range(address, 1) == *ep
                 })
-                .flatten()
+                .map(|(_, _, _, _, s)| s.clone())
                 .or_else(|| crate::shadow::find(address, 1));
             return shadow.map_or(0, |s| {
                 // SAFETY: a live buffer.

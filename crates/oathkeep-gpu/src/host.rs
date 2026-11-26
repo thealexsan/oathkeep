@@ -5993,17 +5993,17 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let (
             mut prep_ask_once,
+            mut prep_stale,
             mut prep_run_deferred,
             mut prep_prelude,
             mut prep_batch_flush,
             mut prep_snapshots,
             mut prep_card,
-        ) = (0u64, 0u64, 0u64, 0u64, 0u64, CardPrepUs::default());
+        ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, CardPrepUs::default());
         if crate::watch::once() {
             #[cfg(feature = "diagnostics")]
             let t = std::time::Instant::now();
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> =
-                std::collections::HashMap::new();
+            let mut spans: Vec<(usize, (usize, usize))> = Vec::new();
             for list in runs {
                 let deferred = list.deferred();
                 if !deferred.has_kernel_watch {
@@ -6014,24 +6014,29 @@ impl Host {
                         Step::Refresh(shadow, address, len)
                             if !shadow.unwatched() && !shadow.guarded() =>
                         {
-                            let span = spans
-                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                                .or_insert((*address, *address + *len));
-                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                            let key = std::sync::Arc::as_ptr(shadow) as usize;
+                            let end = *address + *len;
+                            if let Some((_, span)) = spans.iter_mut().find(|(k, _)| *k == key) {
+                                *span = (span.0.min(*address), span.1.max(end));
+                            } else {
+                                spans.push((key, (*address, end)));
+                            }
                         }
                         Step::Texture(staging) => {
                             if let Some((from, to)) = staging.watch_range() {
-                                let span = spans
-                                    .entry(std::sync::Arc::as_ptr(staging) as usize)
-                                    .or_insert((from, to));
-                                *span = (span.0.min(from), span.1.max(to));
+                                let key = std::sync::Arc::as_ptr(staging) as usize;
+                                if let Some((_, span)) = spans.iter_mut().find(|(k, _)| *k == key) {
+                                    *span = (span.0.min(from), span.1.max(to));
+                                } else {
+                                    spans.push((key, (from, to)));
+                                }
                             }
                         }
                         _ => {}
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let ranges: Vec<(usize, usize)> = spans.into_iter().map(|(_, r)| r).collect();
             if !ranges.is_empty() {
                 crate::watch::ask_once(&ranges);
             }
@@ -6039,7 +6044,19 @@ impl Host {
             {
                 prep_ask_once += t.elapsed().as_micros() as u64;
             }
-            if behind && stale_under_flights(runs) {
+            let is_stale = if behind {
+                #[cfg(feature = "diagnostics")]
+                let t_stale = std::time::Instant::now();
+                let res = stale_under_flights(runs);
+                #[cfg(feature = "diagnostics")]
+                {
+                    prep_stale += t_stale.elapsed().as_micros() as u64;
+                }
+                res
+            } else {
+                false
+            };
+            if is_stale {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
@@ -6053,10 +6070,19 @@ impl Host {
                     }
                 }
             }
-        } else if behind && stale_under_flights(runs) {
-            let settling = std::time::Instant::now();
-            self.settle(&mut submitted, WHY_STALE);
-            settled += settling.elapsed();
+        } else if behind {
+            #[cfg(feature = "diagnostics")]
+            let t_stale = std::time::Instant::now();
+            let res = stale_under_flights(runs);
+            #[cfg(feature = "diagnostics")]
+            {
+                prep_stale += t_stale.elapsed().as_micros() as u64;
+            }
+            if res {
+                let settling = std::time::Instant::now();
+                self.settle(&mut submitted, WHY_STALE);
+                settled += settling.elapsed();
+            }
         }
         let mut preludes: Vec<PooledPrelude> = Vec::new();
         for list in runs {
@@ -6121,6 +6147,7 @@ impl Host {
         {
             use crate::copystat::{C, add};
             let accounted = prep_ask_once
+                + prep_stale
                 + prep_run_deferred
                 + prep_prelude
                 + prep_batch_flush
@@ -6129,6 +6156,7 @@ impl Host {
                 + prep_card.fill_upload
                 + prep_card.record;
             add(C::PrepAskOnceUs, prep_ask_once);
+            add(C::PrepStaleUs, prep_stale);
             add(C::PrepRunDeferredUs, prep_run_deferred);
             add(C::PrepPreludeUs, prep_prelude);
             add(C::PrepBatchFlushUs, prep_batch_flush);
@@ -8039,23 +8067,29 @@ impl Batch {
         self.refresh_max = 0;
         self.pending_tex_min = 0;
         self.pending_tex_max = 0;
-        let mut ranges: Vec<(usize, usize)> = self
-            .refreshes
-            .iter()
-            .filter(|r| !r.0.unwatched() && !r.0.guarded())
-            .flat_map(|r| r.1.iter().copied())
-            .collect();
-        for (_, _, staging) in &self.pending_textures {
-            if let Some(range) = staging.watch_range() {
-                ranges.push(range);
+        let ahead = if crate::watch::is_journal_kept() {
+            false
+        } else {
+            let mut ranges: Vec<(usize, usize)> = self
+                .refreshes
+                .iter()
+                .filter(|r| !r.0.unwatched() && !r.0.guarded())
+                .flat_map(|r| r.1.iter().copied())
+                .collect();
+            for (_, _, staging) in &self.pending_textures {
+                if let Some(range) = staging.watch_range() {
+                    ranges.push(range);
+                }
             }
-        }
-        let ahead = ranges.len() > 1;
-        if ahead {
-            let started = std::time::Instant::now();
-            crate::watch::ask_ahead(&ranges);
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
+            if ranges.len() > 1 {
+                let started = std::time::Instant::now();
+                crate::watch::ask_ahead(&ranges);
+                PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        };
         if wide_refresh() && self.refreshes.len() >= 2 {
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);

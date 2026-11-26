@@ -21,6 +21,8 @@ pub(crate) struct Shadow {
     clean_guard_epochs: [AtomicU64; crate::watch::CLEAN_EPOCH_SHARDS],
     ever_written: AtomicBool,
     watched: AtomicU8,
+    dead: AtomicBool,
+    has_pending: AtomicBool,
     pending: Mutex<Vec<(usize, usize)>>,
     flights: Mutex<Flights>,
     before: Mutex<Option<Vec<u8>>>,
@@ -2848,9 +2850,15 @@ fn diff_runs_or_masked(
     max_runs: usize,
 ) -> MergeDiff {
     let n = title.len().min(held.len());
+    if title[..n] == held[..n] {
+        return MergeDiff::Empty;
+    }
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut i = 0usize;
     while i < n {
+        while i + 64 <= n && title[i..i + 64] == held[i..i + 64] {
+            i += 64;
+        }
         while i + 8 <= n && title[i..i + 8] == held[i..i + 8] {
             i += 8;
         }
@@ -2881,6 +2889,9 @@ fn diff_runs_or_masked(
         let mut changed_bytes = 0usize;
         let mut cur = first_diff;
         while cur <= last_diff {
+            while cur + 64 <= last_diff + 1 && title[cur..cur + 64] == held[cur..cur + 64] {
+                cur += 64;
+            }
             while cur + 8 <= last_diff + 1 && title[cur..cur + 8] == held[cur..cur + 8] {
                 cur += 8;
             }
@@ -2921,11 +2932,17 @@ fn diff_runs_or_masked(
     MergeDiff::Runs(runs)
 }
 
-fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+#[inline]
+fn for_each_changed_run(now: &[u8], was: &[u8], mut f: impl FnMut(usize, usize)) {
     let n = now.len().min(was.len());
-    let mut runs = Vec::new();
+    if now[..n] == was[..n] {
+        return;
+    }
     let mut i = 0;
     while i < n {
+        while i + 64 <= n && now[i..i + 64] == was[i..i + 64] {
+            i += 64;
+        }
         while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
             i += 8;
         }
@@ -2939,8 +2956,14 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
         while i < n && now[i] != was[i] {
             i += 1;
         }
-        runs.push((first, i - first));
+        f(first, i - first);
     }
+}
+
+#[cfg(test)]
+fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    for_each_changed_run(now, was, |r, m| runs.push((r, m)));
     runs
 }
 
@@ -3374,6 +3397,9 @@ fn let_go_idle_with(urgent: bool) {
         }
     };
     if !gone_loose.is_empty() || !gone_buffers.is_empty() {
+        for s in gone_loose.iter().chain(gone_buffers.iter()) {
+            s.mark_dead();
+        }
         SHADOW_GEN.fetch_add(1, Ordering::Release);
         let went = gone_loose.len() + gone_buffers.len();
         let bytes: u64 = gone_loose
@@ -3465,6 +3491,14 @@ impl Shadow {
         len > 0 && self.ever_written()
     }
 
+    pub(crate) fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_dead(&self) {
+        self.dead.store(true, Ordering::Release);
+    }
+
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
@@ -3544,6 +3578,8 @@ impl Shadow {
             clean_guard_epochs: [const { AtomicU64::new(0) }; crate::watch::CLEAN_EPOCH_SHARDS],
             ever_written: AtomicBool::new(false),
             watched: AtomicU8::new(0),
+            dead: AtomicBool::new(false),
+            has_pending: AtomicBool::new(false),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -3596,6 +3632,7 @@ impl Shadow {
         }
         if self.card.is_some() {
             pending.push(range);
+            self.has_pending.store(true, Ordering::Release);
             return;
         }
         let mut parts = vec![self.inside(address, len)];
@@ -3617,6 +3654,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.has_pending.store(true, Ordering::Release);
         let taken: usize = parts
             .iter()
             .map(|&(from, to)| to.saturating_sub(from))
@@ -3889,6 +3927,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        self.has_pending.store(!pending.is_empty(), Ordering::Release);
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -3932,12 +3971,9 @@ impl Shadow {
         }
     }
 
+    #[inline]
     pub(crate) fn writes_pending(&self) -> bool {
-        !self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
+        self.has_pending.load(Ordering::Acquire)
     }
 
     pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
@@ -4202,7 +4238,9 @@ impl Shadow {
                     // are in a declared range.
                     let held =
                         unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
+                    let mut runs_n = 0u64;
+                    let mut bytes_n = 0u64;
+                    for_each_changed_run(title, held, |r, m| {
                         // SAFETY: inside the copy's mapping. The card may be
                         // writing the copy beside these bytes; they are
                         // written here and nothing around them.
@@ -4213,9 +4251,13 @@ impl Shadow {
                                 m,
                             )
                         };
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        runs_n += 1;
+                        bytes_n += m as u64;
+                    });
+                    if runs_n > 0 {
+                        held.copy_from_slice(title);
+                        MERGED[1].fetch_add(runs_n, Ordering::Relaxed);
+                        MERGED[2].fetch_add(bytes_n, Ordering::Relaxed);
                     }
                 }
                 drop(before);
@@ -4368,16 +4410,22 @@ impl Shadow {
                     continue;
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
-                for (r, m) in changed_runs(t, held) {
+                let mut runs_n = 0u64;
+                let mut bytes_n = 0u64;
+                for_each_changed_run(t, held, |r, m| {
                     // SAFETY: inside the copy's mapping. The card may be writing
                     // the copy beside these bytes; they are written here and
                     // nothing around them.
                     unsafe {
                         std::ptr::copy_nonoverlapping(t.as_ptr().add(r), self.data.add(at + r), m)
                     };
-                    held[r..r + m].copy_from_slice(&t[r..r + m]);
-                    MERGED[1].fetch_add(1, Ordering::Relaxed);
-                    MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    runs_n += 1;
+                    bytes_n += m as u64;
+                });
+                if runs_n > 0 {
+                    held.copy_from_slice(t);
+                    MERGED[1].fetch_add(runs_n, Ordering::Relaxed);
+                    MERGED[2].fetch_add(bytes_n, Ordering::Relaxed);
                 }
             }
         }
@@ -6731,6 +6779,64 @@ fn buffers_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize)
     BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
+pub(crate) const SHADOW_EPOCH_BUCKETS: usize = 64;
+static SHADOW_EPOCHS: [AtomicU64; SHADOW_EPOCH_BUCKETS] =
+    [const { AtomicU64::new(1) }; SHADOW_EPOCH_BUCKETS];
+
+#[inline]
+fn bump_shadow_epochs(start: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let b0 = (start >> 20) as usize;
+    let b1 = (start.saturating_add(len - 1) >> 20) as usize;
+    let count = (b1 - b0 + 1).min(SHADOW_EPOCH_BUCKETS);
+    for i in 0..count {
+        SHADOW_EPOCHS[(b0 + i) & (SHADOW_EPOCH_BUCKETS - 1)].fetch_add(1, Ordering::Release);
+    }
+}
+
+#[inline]
+pub(crate) fn snapshot_epochs() -> [u64; SHADOW_EPOCH_BUCKETS] {
+    std::array::from_fn(|b| SHADOW_EPOCHS[b].load(Ordering::Acquire))
+}
+
+#[inline]
+pub(crate) fn epoch_for_range_from(
+    snap: &[u64; SHADOW_EPOCH_BUCKETS],
+    start: u64,
+    len: u64,
+) -> u64 {
+    let b0 = (start >> 20) as usize;
+    let b1 = (start.saturating_add(len.max(1) - 1) >> 20) as usize;
+    if b0 == b1 {
+        return snap[b0 & (SHADOW_EPOCH_BUCKETS - 1)];
+    }
+    let count = (b1 - b0 + 1).min(SHADOW_EPOCH_BUCKETS);
+    let mut sum = 0u64;
+    for i in 0..count {
+        sum = sum.wrapping_add(snap[(b0 + i) & (SHADOW_EPOCH_BUCKETS - 1)]);
+    }
+    sum
+}
+
+#[inline]
+pub(crate) fn epoch_for_range(start: u64, len: u64) -> u64 {
+    let b0 = (start >> 20) as usize;
+    let b1 = (start.saturating_add(len.max(1) - 1) >> 20) as usize;
+    if b0 == b1 {
+        return SHADOW_EPOCHS[b0 & (SHADOW_EPOCH_BUCKETS - 1)].load(Ordering::Acquire);
+    }
+    let count = (b1 - b0 + 1).min(SHADOW_EPOCH_BUCKETS);
+    let mut sum = 0u64;
+    for i in 0..count {
+        sum = sum.wrapping_add(
+            SHADOW_EPOCHS[(b0 + i) & (SHADOW_EPOCH_BUCKETS - 1)].load(Ordering::Acquire),
+        );
+    }
+    sum
+}
+
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     buffers_write().insert(
         (start, resource),
@@ -6739,17 +6845,23 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    bump_shadow_epochs(start, len);
     SHADOW_GEN.fetch_add(1, Ordering::Release);
 }
 
 static SHADOW_GEN: AtomicU64 = AtomicU64::new(1);
 
+#[allow(dead_code)]
 pub(crate) fn generation() -> u64 {
     SHADOW_GEN.load(Ordering::Acquire)
 }
 
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers_write().remove(&(start, resource)).is_some() {
+    if let Some(entry) = buffers_write().remove(&(start, resource)) {
+        if let Some(s) = &entry.shadow {
+            s.mark_dead();
+        }
+        bump_shadow_epochs(start, entry.end.saturating_sub(start));
         SHADOW_GEN.fetch_add(1, Ordering::Release);
     }
 }
@@ -6793,6 +6905,10 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     }
     let n = gone.len() as u64;
     if !gone.is_empty() {
+        for shadow in &gone {
+            shadow.mark_dead();
+        }
+        bump_shadow_epochs(at, len);
         SHADOW_GEN.fetch_add(1, Ordering::Release);
         let mut evicted = INPLACE_EVICTED.lock().unwrap_or_else(|e| e.into_inner());
         for shadow in &gone {

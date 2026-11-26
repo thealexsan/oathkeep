@@ -350,6 +350,28 @@ struct StageEntry {
     action: StageAction,
 }
 
+impl StageEntry {
+    #[inline]
+    fn is_valid(&self) -> bool {
+        if self.is_buffer {
+            if let StageAction::Buffer {
+                shadow,
+                address,
+                len,
+            } = &self.action
+            {
+                !shadow.is_dead() && crate::shadow::epoch_for_range(*address, *len) == self.epoch
+            } else {
+                false
+            }
+        } else {
+            STAGE_TEX_EPOCHS[self.tex_bucket as usize]
+                .load(std::sync::atomic::Ordering::Acquire)
+                == self.epoch
+        }
+    }
+}
+
 struct StageStripe {
     map: std::collections::HashMap<u64, usize>,
     entries: Vec<Option<StageEntry>>,
@@ -2412,15 +2434,7 @@ impl HostHeap {
             .unwrap_or_else(|e| e.into_inner());
         let &local = guard.map.get(&key)?;
         let entry = guard.entries[local].as_ref()?;
-        if entry.key != key {
-            return None;
-        }
-        let cur_epoch = if entry.is_buffer {
-            crate::shadow::generation()
-        } else {
-            STAGE_TEX_EPOCHS[entry.tex_bucket as usize].load(std::sync::atomic::Ordering::Acquire)
-        };
-        if entry.epoch != cur_epoch {
+        if entry.key != key || !entry.is_valid() {
             return None;
         }
         #[cfg(feature = "diagnostics")]
@@ -2507,6 +2521,8 @@ impl HostHeap {
         let key = (u64::from(words[1]) << 32) | u64::from(words[2]);
         let stripe_idx = ((key ^ (key >> 17) ^ (key >> 33)) as usize) & (STAGE_STRIPES - 1);
         let dst = self.cpu(index);
+        #[cfg(feature = "diagnostics")]
+        let mut miss_kind: u8 = 0; // 0 = new, 1 = buf_epoch, 2 = tex_epoch
         {
             let guard = stage.stripes[stripe_idx]
                 .read()
@@ -2515,13 +2531,7 @@ impl HostHeap {
                 && let Some(entry) = guard.entries[local].as_ref()
                 && entry.key == key
             {
-                let cur_epoch = if entry.is_buffer {
-                    crate::shadow::generation()
-                } else {
-                    STAGE_TEX_EPOCHS[entry.tex_bucket as usize]
-                        .load(std::sync::atomic::Ordering::Acquire)
-                };
-                if entry.epoch == cur_epoch {
+                if entry.is_valid() {
                     // SAFETY: dst is our dynamic shader-visible slot; src is a live CPU staging
                     // slot protected from concurrent overwrite by the stripe read lock.
                     unsafe {
@@ -2547,53 +2557,59 @@ impl HostHeap {
                         is_texture: entry.is_texture,
                     };
                 }
+                #[cfg(feature = "diagnostics")]
+                {
+                    miss_kind = if entry.is_buffer { 1 } else { 2 };
+                }
             }
         }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::StageCacheMisses, 1);
+        {
+            crate::copystat::add(crate::copystat::C::StageCacheMisses, 1);
+            crate::copystat::add(
+                match miss_kind {
+                    1 => crate::copystat::C::StageCacheMissBufEpoch,
+                    2 => crate::copystat::C::StageCacheMissTexEpoch,
+                    _ => crate::copystat::C::StageCacheMissNew,
+                },
+                1,
+            );
+        }
         let Some(view) = crate::descriptor::view_from_words(words) else {
             self.make_null_dynamic(index);
             return DynamicMade::missing();
         };
         let is_texture = is_texture_view(&view);
         let view_kind = stage_view_kind(&view);
-        let buf_epoch = crate::shadow::generation();
         let mut guard = stage.stripes[stripe_idx]
             .write()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(&local) = guard.map.get(&key)
             && let Some(entry) = guard.entries[local].as_ref()
             && entry.key == key
+            && entry.is_valid()
         {
-            let cur_epoch = if entry.is_buffer {
-                crate::shadow::generation()
-            } else {
-                STAGE_TEX_EPOCHS[entry.tex_bucket as usize]
-                    .load(std::sync::atomic::Ordering::Acquire)
-            };
-            if entry.epoch == cur_epoch {
-                // SAFETY: dst is our dynamic slot; src is guarded by stripe write lock.
-                unsafe {
-                    host.device.CopyDescriptorsSimple(
-                        1,
-                        dst,
-                        stage.cpu(entry.slot),
-                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    );
-                }
-                let kept = if entry.kept_raw != 0 && !already_kept(entry.kept_raw) {
-                    entry.kept.clone()
-                } else {
-                    None
-                };
-                return DynamicMade {
-                    found: true,
-                    kept,
-                    action: entry.action.clone(),
-                    view_kind: entry.view_kind,
-                    is_texture: entry.is_texture,
-                };
+            // SAFETY: dst is our dynamic slot; src is guarded by stripe write lock.
+            unsafe {
+                host.device.CopyDescriptorsSimple(
+                    1,
+                    dst,
+                    stage.cpu(entry.slot),
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
             }
+            let kept = if entry.kept_raw != 0 && !already_kept(entry.kept_raw) {
+                entry.kept.clone()
+            } else {
+                None
+            };
+            return DynamicMade {
+                found: true,
+                kept,
+                action: entry.action.clone(),
+                view_kind: entry.view_kind,
+                is_texture: entry.is_texture,
+            };
         }
         let local = if let Some(&existing) = guard.map.get(&key) {
             existing
@@ -2603,6 +2619,7 @@ impl HostHeap {
             at
         };
         let slot = (stripe_idx * SLOTS_PER_STRIPE + local) as u32;
+        let pre_shadow_epochs = crate::shadow::snapshot_epochs();
         let pre_tex_epochs: [u64; STAGE_TEX_BUCKETS] = std::array::from_fn(|b| {
             STAGE_TEX_EPOCHS[b].load(std::sync::atomic::Ordering::Acquire)
         });
@@ -2631,6 +2648,7 @@ impl HostHeap {
         let (action, is_buffer, tex_bucket, epoch) = if let Some((shadow, address, len)) =
             buffer_copy_with_hint(resolved, made_shadow)
         {
+            let ep = crate::shadow::epoch_for_range_from(&pre_shadow_epochs, address, len);
             (
                 StageAction::Buffer {
                     shadow,
@@ -2639,7 +2657,7 @@ impl HostHeap {
                 },
                 true,
                 0u8,
-                buf_epoch,
+                ep,
             )
         } else if let View::Shader(resource, _) | View::Unordered(resource, _, _) = resolved {
             let addr = crate::resource::texture_memory(*resource as crate::object::This)
