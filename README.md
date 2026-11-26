@@ -11,18 +11,18 @@ It runs unmodified x86-64 console executables directly on a Windows host by prov
 <!-- oathkeep:progress:start -->
 ## Compatibility & Code Coverage Progress
 
-Live dashboard: [thealexsan.github.io/oathkeep](https://thealexsan.github.io/oathkeep/) · Libraries: **52.4%** (`688/1314`) · RDNA2 decoded: **100.0%** (`1233/1233`) · RDNA2 → DXIL lowered: **52.1%** (`642/1233`) · Latest world: **5.4 fps (184.0 ms/f)**.
+Live dashboard: [thealexsan.github.io/oathkeep](https://thealexsan.github.io/oathkeep/) · Libraries: **52.4%** (`688/1314`) · RDNA2 decoded: **100.0%** (`1233/1233`) · RDNA2 → DXIL lowered: **52.1%** (`642/1233`) · Latest world: **5.4 fps (185.5 ms/f)**.
 
 ![Oathkeep Codebase Coverage Dashboard](docs/progress.svg)
 
 | Run | Commit | Peak FPS | Frame | Summary |
 | --- | --- | ---: | ---: | --- |
+| diag-fps-swarm3b | `09a807e` | 5.4 | 185.5 ms | PR #3 Round 3 FPS swarm + CopyMemoryToMemoryX Step::Copy + 16 GB RAM commit caps verified clean! Reached frame-1782 (+124 frames further in… |
 | diag-fps-swarm2b | `3a0890d` | 5.4 | 184.0 ms | Post-revert Round 2 baseline verified clean! Peak 5.4 fps (184.0 ms/f) in-world, 0/11,093 refused dynamic tables, 0 exploding triangles, in… |
 | diag-fps-swarm2 | `289d0ea` | 3.1 | 320.1 ms | Round 2 capture verified Wave64 LDS fixes (5dc3b25986622949 & 6f225b641c5b0708 compiled/bound cleanly), async sweep (41-54->0.1 ms), and ra… |
 | diag-fps-swarm1 | `d1e5000` | 3.9 | 256.1 ms | Round 1 4-worker FPS swarm verified clean (95ccbe8..d1e5000): peak 3.9 fps (256.1 ms/f), steady 2.9-3.9 fps, preparing -37%, copy-back -39%… |
 | diag-visual-holereuse | `487d82a` | 2.9 | 347.8 ms | Zero-VRAM-growth hole reuse (pool::NO_GROW + tiles no_grow + 5/6-block staging cap + reuse-only admission) admitted 24,000+ textures into e… |
 | diag-visual-vramfix2 | `301d66f` | 3.4 | 295.1 ms | VRAM overshoot & Wave64 shader 02384a60fda6f2d0 verified fixed! Peak DXGI VRAM 6,874/7,164 MB (down from 7,602 MB crash), pool::TEXTURES 4,… |
-| diag-visual-merged | `b6b9b0e` | 3.0 | 335.3 ms | 4-worker visual swarm verified in-world (frame-2100..2148): crisp foreground character/hair/eyes/DOF/outdoor vehicles, 0 depth-plane misses… |
 <!-- oathkeep:progress:end -->
 
 ## Requirements

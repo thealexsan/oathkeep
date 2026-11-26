@@ -4,7 +4,7 @@
   </defs>
   <rect width="1120" height="1015" fill="#0d0f12"/>
   <text x="16" y="26" fill="#f0f3f6" font-size="15.5" font-weight="600">System &amp; Console Libraries*: 52.36% (688/1314)</text>
-  <text x="1104" y="26" text-anchor="end" fill="#8b949e" font-size="11" class="mono">World: 5.4 fps (184.0 ms/f) · 2026-11-26</text>
+  <text x="1104" y="26" text-anchor="end" fill="#8b949e" font-size="11" class="mono">World: 5.4 fps (185.5 ms/f) · 2026-11-27</text>
   <text x="16" y="50" fill="#f0f3f6" font-size="13.5" font-weight="600">Large libraries: 48.61% (403/829)</text>
   <text x="568" y="50" fill="#f0f3f6" font-size="13.5" font-weight="600">Medium libraries: 51.52% (203/394)</text>
   <g>

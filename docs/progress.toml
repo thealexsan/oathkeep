@@ -1,14 +1,14 @@
 [meta]
-updated = "2026-11-26"
-commit = "main"
+updated = "2026-11-27"
+commit = "01b0f10"
 branch = "main"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "5.4 fps peak in-world (184.0 ms/f; 1.5-5.4 fps across diag-fps-swarm2b, 145.7s TIMEOUT_CLEAN; 0 refused dynamic tables, 0 exploding tris, intact ceiling/interiors)"
-current_frame_ms = "184.0-655.0 ms in diag-fps-swarm2b (planning 1.1-5.5 ms, waiting for flights 0.1-0.2 ms, sweep 0.1-0.6 ms, lists' steps 122-137 ms)"
-current_gpu_ms = "0.0-33.8 ms (145.7s TIMEOUT_CLEAN; 0 crashes/TDRs/OOMs, 0 failed Wave64 shaders, 0 refused PSOs)"
-current_preparing_ms = "116.9-239.4 ms in diag-fps-swarm2b (refreshes 62-80 ms, heap views 67-98 ms slots + 68-86 ms textures)"
+current_fps = "5.4 fps peak in-world (185.5 ms/f; reached frame-1782 in 145s, +124 frames further than swarm2b; 0 crashes/TDRs/refusals, 1:1 console visuals)"
+current_frame_ms = "185.5 ms/f unswapped in diag-fps-swarm3b (slots 30.6 ms -56%, textures pass 15.6-21.8 ms -58-70%, moves 48.4 ms -60%, snapshots 15 MB -85%)"
+current_gpu_ms = "0.0-43.9 ms (145s clean; 0 crashes/TDRs/OOMs, 0 failed Wave64 shaders, 0 refused dynamic tables)"
+current_preparing_ms = "110.9 ms unswapped in diag-fps-swarm3b (copies 38.7 ms, textures 5.4 ms; late 16 GB pagefile spikes from 6.26 GB in 1,341 host command lists)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~20-30 min (merged clean Round 2 + shader-warming launcher to main; next: main-based PRs for Round 3 FPS targeting refreshes/heap views/card steps)"
+eta = "PR #3 merged (Round 3 FPS + 16 GB RAM commit caps); next: monolith decomposition refactor & host command-list commit reduction (6.26 GB)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -424,3 +424,12 @@ frame_ms = 184.0
 gpu_ms = "0.0-33.8 ms (145.7s TIMEOUT_CLEAN; 0 crashes/TDRs/OOMs, 0 failed Wave64 shaders, 0 refused dynamic tables)"
 preparing_ms = "116.9-239.4 ms (planning 1.1-5.5 ms, flights 0.1-0.2 ms, sweep 0.1-0.6 ms, refreshes 62-80 ms, heap views 67-98 ms slots + 68-86 ms textures)"
 status = "Post-revert Round 2 baseline verified clean! Peak 5.4 fps (184.0 ms/f) in-world, 0/11,093 refused dynamic tables, 0 exploding triangles, intact ceiling/lighting/interiors on frame-1602/1618/1634/1658, and both Wave64 LDS compute shaders bound cleanly; merging perf/commit-reduction into main before Round 3 FPS PRs"
+
+[[runs]]
+label = "diag-fps-swarm3b"
+commit = "09a807e"
+fps = 5.4
+frame_ms = 185.5
+gpu_ms = "0.0-43.9 ms (145s clean; 0 crashes/TDRs/OOMs, 0 failed Wave64 shaders, 0/10,367 refused dynamic tables)"
+preparing_ms = "110.9 ms unswapped (copies 38.7 ms, slots 30.6 ms -56%, textures pass 15.6-21.8 ms -58-70%, moves 48.4 ms -60%, snapshots 15 MB -85%)"
+status = "PR #3 Round 3 FPS swarm + CopyMemoryToMemoryX Step::Copy + 16 GB RAM commit caps verified clean! Reached frame-1782 (+124 frames further in 145s) with crisp 1:1 visuals (frame-1704/1758/1782), host copies down 2.0 GB at equivalent scene (4,687->2,672 MB); exposed 6.26 GB private commit in 1,341 host command lists causing late 16 GB swap spikes"

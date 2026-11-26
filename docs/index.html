@@ -119,7 +119,7 @@
       <div class="mono muted">
         <a href="https://github.com/thealexsan/oathkeep">GitHub</a> ·
         <a href="https://discord.gg/PM6pr4Azzk">Discord</a> ·
-        main · 2026-11-26
+        main · 2026-11-27
       </div>
     </header>
 
@@ -142,7 +142,7 @@
       <div class="card">
         <div class="k">Latest In-World FPS</div>
         <div class="v mono">5.4 fps</div>
-        <div class="s mono">184.0 ms/f · target 30 fps</div>
+        <div class="s mono">185.5 ms/f · target 30 fps</div>
       </div>
     </section>
 
@@ -167,7 +167,8 @@
     <div class="card" style="padding: 4px 12px; overflow-x: auto;">
       <table>
         <thead><tr><th>Run</th><th>Commit</th><th class="num">Peak FPS</th><th class="num">Frame</th><th>Summary</th></tr></thead>
-        <tbody><tr><td class="mono">diag-fps-swarm2b</td><td class="mono">3a0890d</td><td class="mono num">5.4</td><td class="mono num">184.0 ms</td><td class="muted">Post-revert Round 2 baseline verified clean! Peak 5.4 fps (184.0 ms/f) in-world, 0/11,093 refused dynamic tables, 0 exploding triangles, intact ceiling/lighting/interiors on frame-1602/1618/1634/1658, and both Wave64 LDS compute shaders bound cleanly; merging perf/commit-reduction into main before Round 3 FPS PRs</td></tr>
+        <tbody><tr><td class="mono">diag-fps-swarm3b</td><td class="mono">09a807e</td><td class="mono num">5.4</td><td class="mono num">185.5 ms</td><td class="muted">PR #3 Round 3 FPS swarm + CopyMemoryToMemoryX Step::Copy + 16 GB RAM commit caps verified clean! Reached frame-1782 (+124 frames further in 145s) with crisp 1:1 visuals (frame-1704/1758/1782), host copies down 2.0 GB at equivalent scene (4,687-&gt;2,672 MB); exposed 6.26 GB private commit in 1,341 host command lists causing late 16 GB swap spikes</td></tr>
+<tr><td class="mono">diag-fps-swarm2b</td><td class="mono">3a0890d</td><td class="mono num">5.4</td><td class="mono num">184.0 ms</td><td class="muted">Post-revert Round 2 baseline verified clean! Peak 5.4 fps (184.0 ms/f) in-world, 0/11,093 refused dynamic tables, 0 exploding triangles, intact ceiling/lighting/interiors on frame-1602/1618/1634/1658, and both Wave64 LDS compute shaders bound cleanly; merging perf/commit-reduction into main before Round 3 FPS PRs</td></tr>
 <tr><td class="mono">diag-fps-swarm2</td><td class="mono">289d0ea</td><td class="mono num">3.1</td><td class="mono num">320.1 ms</td><td class="muted">Round 2 capture verified Wave64 LDS fixes (5dc3b25986622949 &amp; 6f225b641c5b0708 compiled/bound cleanly), async sweep (41-54-&gt;0.1 ms), and race-free watch.rs (guards 91-&gt;16-43 ms), with 1:1 late frames (frame-1661..1677); caught &amp; immediately reverted 5d52155 card-plan/thin regression and CAPPED_DYNAMIC=131072 table exhaustion (290 refused -&gt; early-frame stretched tris), and shipped oathkeep launch + scripts/launch.ps1 shader-warming preloader</td></tr>
 <tr><td class="mono">diag-fps-swarm1</td><td class="mono">d1e5000</td><td class="mono num">3.9</td><td class="mono num">256.1 ms</td><td class="muted">Round 1 4-worker FPS swarm verified clean (95ccbe8..d1e5000): peak 3.9 fps (256.1 ms/f), steady 2.9-3.9 fps, preparing -37%, copy-back -39%, land::rest -96% (25.6-&gt;0.92 ms via bury recycler), snapshots -45%, DXGI VRAM -310 MB (6,838/7,161 MB), windows commit -586 MB (no-length -1,124 MB, 0 slot mismatches), crisp 1:1 in-world visuals (frame-1915..1939); exposed Round 2 blockers: 91.1 ms GUARDS lock wait from batched yields, 52.6 ms BEHIND_PLACED stall, ~200 ms CPU recording/thin-list gap, and 512 KiB window-count growth (3,810 windows)</td></tr>
 <tr><td class="mono">diag-visual-holereuse</td><td class="mono">487d82a</td><td class="mono num">2.9</td><td class="mono num">347.8 ms</td><td class="muted">Zero-VRAM-growth hole reuse (pool::NO_GROW + tiles no_grow + 5/6-block staging cap + reuse-only admission) admitted 24,000+ textures into existing pool holes with 0 extra VRAM heaps and 0 staging spikes; secondary NPC faces, background patrons, and interior walls/posters textured and lit (frame-1928..1998).</td></tr>
@@ -178,7 +179,6 @@
 <tr><td class="mono">diag-run106</td><td class="mono">77f2abc</td><td class="mono num">15.7</td><td class="mono num">63.7 ms</td><td class="muted">Fix AH1+AH2+AH3a verified clean! Heavy 4010-draw scene +61% (7.7-&gt;12.4 fps, 130.2-&gt;80.6 ms/f), moves -32% (36.5-&gt;24.7 / 17.9-&gt;12.8 ms), guards -29%, rec -10%; pinned down visual root causes: refused mesh PSO R8_UINT RTV (format=62) + R32G32B32_FLOAT (element=12) null SRV</td></tr>
 <tr><td class="mono">diag-run105</td><td class="mono">61ccefc</td><td class="mono num">16.6</td><td class="mono num">60.3 ms</td><td class="muted">100% CLEAN 130.2s baseline! Fixed relay hot-hash race (f73fd1a) + VEH guard-page TOCTOU in watch.rs::handle_write_fault (61ccefc). Zero CPU exceptions, zero GPU hangs, zero refusals, 7.7-16.6 fps steady 3D (12.8 median / 16.6 peak)</td></tr>
 <tr><td class="mono">diag-run98</td><td class="mono">c059f27</td><td class="mono num">17.5</td><td class="mono num">57.2 ms</td><td class="muted">Fix AF1-AF2 peak 17.5 fps (57.2 ms/f), but late crash at ~125s traced to AF1/AF2/AG2 races (subsequently reverted &amp; fixed in f73fd1a + 61ccefc)</td></tr>
-<tr><td class="mono">diag-run94</td><td class="mono">a24cbeb</td><td class="mono num">16.8</td><td class="mono num">59.4 ms</td><td class="muted">Fix AC1-AC4 verified clean: pre_prep sweep -85% (0.08-0.60 ms), guards -55% (4.6-15.3 ms), alias_apply -65% (1.19-5.21 ms), watches -50% (6.72-17.84 ms), make_at miss -50% (3.16-11.17 ms), true indirect 4.56-11.39 ms, NEW ALL-TIME LOW 27.5 ms preparing &amp; 79.1 ms rec (11.7-16.8 fps steady); exposed next 3 blockers: 13.2-18.1 ms card copy-back (20.8 MB), 14.5-24.8 ms batch_flush, and 10.8-13.7 ms post-present gap -&gt; next: Fix AD</td></tr>
 </tbody>
       </table>
     </div>

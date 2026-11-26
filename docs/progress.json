@@ -1,7 +1,7 @@
 {
-  "updated": "2026-11-26",
+  "updated": "2026-11-27",
   "branch": "main",
-  "commit": "main",
+  "commit": "01b0f10",
   "pages_url": "https://thealexsan.github.io/oathkeep/",
   "libraries": {
     "implemented": 688,
@@ -26,11 +26,11 @@
   },
   "unsupported_sites": 230,
   "performance": {
-    "latest_run": "diag-fps-swarm2b",
-    "commit": "3a0890d",
+    "latest_run": "diag-fps-swarm3b",
+    "commit": "09a807e",
     "fps": 5.4,
     "target_fps": 30.0,
     "playable_pct": 18.0,
-    "frame_ms": 184.0
+    "frame_ms": 185.5
   }
 }
