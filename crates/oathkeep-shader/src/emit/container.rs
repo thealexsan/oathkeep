@@ -467,9 +467,9 @@ mod tests {
             wave_size: None,
         });
         recovered[1].interp = 2;
-        super::super::vertex_output_interpolation(&psv, &mut recovered).unwrap();
+        super::super::signature::vertex_output_interpolation(&psv, &mut recovered).unwrap();
         assert_eq!(recovered.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1, 2]);
-        assert!(super::super::vertex_output_interpolation(&psv[..psv.len() - 1], &mut recovered)
+        assert!(super::super::signature::vertex_output_interpolation(&psv[..psv.len() - 1], &mut recovered)
             .is_err());
     }
 
