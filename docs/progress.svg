@@ -672,19 +672,19 @@
     <rect x="1089.0" y="662.2" width="14.0" height="4.8" fill="#2fa343"/>
     <rect x="1089.0" y="662.2" width="14.0" height="4.8" fill="none" stroke="#0d0f12" stroke-width="1"/>
   </g>
-  <text x="16" y="694" fill="#f0f3f6" font-size="13.5" font-weight="600">Unsupported / stub sites by area (230)</text>
+  <text x="16" y="694" fill="#f0f3f6" font-size="13.5" font-weight="600">Unsupported / stub sites by area (221)</text>
   <text x="16" y="719.0" fill="#c8ced6" font-size="11.5">HLE / Runtime Stubs</text>
   <rect x="182.0" y="708.0" width="316.0" height="13" fill="#4a5058"/>
   <rect x="182.0" y="708.0" width="316.0" height="13" fill="#c98f24"/>
   <text x="552.0" y="719.0" text-anchor="end" fill="#f0f3f6" font-size="11.5" class="mono">161</text>
-  <text x="16" y="741.0" fill="#c8ced6" font-size="11.5">Shader / Resource &amp; IR</text>
+  <text x="16" y="741.0" fill="#c8ced6" font-size="11.5">Shader / Emit &amp; Lower</text>
   <rect x="182.0" y="730.0" width="316.0" height="13" fill="#4a5058"/>
-  <rect x="182.0" y="730.0" width="56.9" height="13" fill="#c98f24"/>
-  <text x="552.0" y="741.0" text-anchor="end" fill="#f0f3f6" font-size="11.5" class="mono">29</text>
-  <text x="16" y="763.0" fill="#c8ced6" font-size="11.5">Shader / Emit &amp; Lower</text>
+  <rect x="182.0" y="730.0" width="45.1" height="13" fill="#c98f24"/>
+  <text x="552.0" y="741.0" text-anchor="end" fill="#f0f3f6" font-size="11.5" class="mono">23</text>
+  <text x="16" y="763.0" fill="#c8ced6" font-size="11.5">Shader / Resource &amp; IR</text>
   <rect x="182.0" y="752.0" width="316.0" height="13" fill="#4a5058"/>
-  <rect x="182.0" y="752.0" width="45.1" height="13" fill="#c98f24"/>
-  <text x="552.0" y="763.0" text-anchor="end" fill="#f0f3f6" font-size="11.5" class="mono">23</text>
+  <rect x="182.0" y="752.0" width="39.3" height="13" fill="#c98f24"/>
+  <text x="552.0" y="763.0" text-anchor="end" fill="#f0f3f6" font-size="11.5" class="mono">20</text>
   <text x="16" y="785.0" fill="#c8ced6" font-size="11.5">GPU / D3D12.x Host</text>
   <rect x="182.0" y="774.0" width="316.0" height="13" fill="#4a5058"/>
   <rect x="182.0" y="774.0" width="29.4" height="13" fill="#c98f24"/>

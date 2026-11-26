@@ -118,14 +118,97 @@ pub fn scan_codebase(root: &Path) -> Result<CodeMetrics> {
     })
 }
 
-/// Strip `#[cfg(test)] mod tests { ... }` tail from a Rust source file so tests never skew static counts.
+/// Strip inline `#[cfg(test)] mod tests { ... }` tail from a Rust source file so tests never skew static counts.
 pub(crate) fn strip_tests(src: &str) -> &str {
-    for marker in ["#[cfg(test)]\nmod tests", "#[cfg(test)]\r\nmod tests"] {
+    for marker in [
+        "#[cfg(test)]\nmod tests {",
+        "#[cfg(test)]\r\nmod tests {",
+        "#[cfg(test)]\nmod tests{",
+        "#[cfg(test)]\r\nmod tests{",
+    ] {
         if let Some(pos) = src.find(marker) {
             return &src[..pos];
         }
     }
     src
+}
+
+fn is_test_source(path: &Path) -> bool {
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if fname == "tests.rs" || fname.ends_with("_tests.rs") {
+        return true;
+    }
+    path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        == Some("tests")
+}
+
+/// Collect all non-test `.rs` files belonging to a Rust module at `base`
+/// (accepts `path/to/foo.rs`, `path/to/foo`, or a directory `path/to/dir`).
+/// Orders `<foo>.rs` and `<foo>/mod.rs` first, followed by submodules sorted by path.
+fn collect_module_files(base: &Path) -> Vec<std::path::PathBuf> {
+    let stem_path = if base.extension().and_then(|s| s.to_str()) == Some("rs") {
+        base.with_extension("")
+    } else {
+        base.to_path_buf()
+    };
+    let file_path = stem_path.with_extension("rs");
+    let mut head = Vec::new();
+    let mut rest = Vec::new();
+
+    if file_path.is_file() && !is_test_source(&file_path) {
+        head.push(file_path);
+    }
+    if stem_path.is_dir() {
+        let mod_rs = stem_path.join("mod.rs");
+        for entry in WalkDir::new(&stem_path).into_iter().filter_map(Result::ok) {
+            let p = entry.path();
+            if !p.is_file()
+                || p.extension().and_then(|s| s.to_str()) != Some("rs")
+                || is_test_source(p)
+            {
+                continue;
+            }
+            if p == mod_rs {
+                head.push(p.to_path_buf());
+            } else {
+                rest.push(p.to_path_buf());
+            }
+        }
+    }
+    rest.sort();
+    head.extend(rest);
+    head.dedup();
+    head
+}
+
+/// Read and concatenate all non-test `.rs` sources belonging to a module (single file or directory).
+fn read_module_sources(base: &Path) -> Result<String> {
+    read_module_sources_inner(base, true)
+}
+
+fn read_module_sources_raw(base: &Path) -> Result<String> {
+    read_module_sources_inner(base, false)
+}
+
+fn read_module_sources_inner(base: &Path, strip_inline_tests: bool) -> Result<String> {
+    let files = collect_module_files(base);
+    if files.is_empty() {
+        anyhow::bail!("no Rust sources found for module {}", base.display());
+    }
+    let mut out = String::new();
+    for path in files {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        out.push_str(if strip_inline_tests {
+            strip_tests(&raw)
+        } else {
+            &raw
+        });
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 fn strip_line_comment(line: &str) -> &str {
@@ -269,24 +352,28 @@ fn hle_display_name(stem: &str) -> String {
 fn scan_hle_libraries(root: &Path) -> Result<Vec<LibraryEntry>> {
     let dir = root.join("crates/oathkeep-hle/src/modules");
     let mut entries = Vec::new();
-    let mut files: Vec<_> = fs::read_dir(&dir)
+    let mut stems = BTreeSet::new();
+    for entry in fs::read_dir(&dir)
         .with_context(|| format!("reading {}", dir.display()))?
         .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("rs"))
-        .collect();
-    files.sort();
-
-    for path in files {
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if stem == "mod" {
-            continue;
+    {
+        let p = entry.path();
+        if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("rs") {
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+                && stem != "mod"
+            {
+                stems.insert(stem.to_owned());
+            }
+        } else if p.is_dir() && p.join("mod.rs").is_file() {
+            if let Some(stem) = p.file_name().and_then(|s| s.to_str()) {
+                stems.insert(stem.to_owned());
+            }
         }
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let src = strip_tests(&raw);
+    }
+
+    for stem in stems {
+        let raw = read_module_sources(&dir.join(&stem))?;
+        let src = raw.as_str();
         let mut cells = Vec::new();
 
         // 1. Parse `static ...: Methods<N> = Methods([ ... ]);`, `Table<N> = Table([ ... ]);`, `Vtable([ ... ]);`
@@ -373,7 +460,7 @@ fn scan_hle_libraries(root: &Path) -> Result<Vec<LibraryEntry>> {
 
         if !cells.is_empty() {
             entries.push(LibraryEntry {
-                name: hle_display_name(stem),
+                name: hle_display_name(&stem),
                 cells,
             });
         }
@@ -430,16 +517,13 @@ fn scan_gpu_com_interfaces(root: &Path) -> Result<Vec<LibraryEntry>> {
     let mut entries = Vec::new();
 
     for &(file, label, anchor) in specs {
-        let raw = if let Some(cached) = file_cache.get(file) {
+        let src = if let Some(cached) = file_cache.get(file) {
             cached.as_str()
         } else {
-            let p = gpu_dir.join(file);
-            let text = fs::read_to_string(&p)
-                .with_context(|| format!("reading {}", p.display()))?;
+            let text = read_module_sources(&gpu_dir.join(file))?;
             file_cache.insert(file, text);
             file_cache.get(file).expect("just inserted").as_str()
         };
-        let src = strip_tests(raw);
         let Some(pos) = src.find(anchor) else {
             continue;
         };
@@ -520,22 +604,20 @@ fn parse_missing_table_len(body: &str) -> Option<usize> {
 }
 
 fn scan_rdna2_isa(root: &Path) -> Result<Vec<IsaFamily>> {
-    let opcodes_path = root.join("crates/oathkeep-shader/src/gfx10/opcodes.rs");
-    let opcodes_src = fs::read_to_string(&opcodes_path)
-        .with_context(|| format!("reading {}", opcodes_path.display()))?;
-    let gfx10_mod = fs::read_to_string(root.join("crates/oathkeep-shader/src/gfx10/mod.rs"))
-        .context("reading gfx10/mod.rs")?;
-    let ir_raw = fs::read_to_string(root.join("crates/oathkeep-shader/src/ir.rs"))
-        .context("reading ir.rs")?;
-    let lower_raw = fs::read_to_string(root.join("crates/oathkeep-shader/src/emit/lower.rs"))
-        .context("reading emit/lower.rs")?;
-    let intersect_raw =
-        fs::read_to_string(root.join("crates/oathkeep-shader/src/emit/intersect.rs"))
-            .context("reading emit/intersect.rs")?;
+    let shader_src = root.join("crates/oathkeep-shader/src");
+    let opcodes_src = read_module_sources(&shader_src.join("gfx10/opcodes"))?;
+    let gfx10_mod = read_module_sources(&shader_src.join("gfx10/mod.rs"))?;
+    let ir_raw = read_module_sources(&shader_src.join("ir"))?;
+    let lower_raw = read_module_sources(&shader_src.join("emit/lower"))?;
+    let intersect_raw = if collect_module_files(&shader_src.join("emit/intersect")).is_empty() {
+        String::new()
+    } else {
+        read_module_sources(&shader_src.join("emit/intersect"))?
+    };
 
-    let ir_src = strip_tests(&ir_raw);
-    let lower_src = strip_tests(&lower_raw);
-    let intersect_src = strip_tests(&intersect_raw);
+    let ir_src = ir_raw.as_str();
+    let lower_src = lower_raw.as_str();
+    let intersect_src = intersect_raw.as_str();
 
     // 1. Parse all 19 opcode tables from `gfx10/opcodes.rs`
     let mut raw_families: Vec<(String, Vec<String>)> = Vec::new();
@@ -940,21 +1022,11 @@ fn scan_unsupported_sites(root: &Path) -> Result<Vec<AreaCount>> {
     let mut out = Vec::new();
     for &(area, paths) in buckets {
         let mut count = 0usize;
+        let mut seen = BTreeSet::new();
         for rel in paths {
-            let full = root.join(rel);
-            if full.is_file() {
-                count += count_unsupported_in_file(&full)?;
-            } else if full.is_dir() {
-                for entry in WalkDir::new(&full).into_iter().filter_map(Result::ok) {
-                    let p = entry.path();
-                    if p.extension().and_then(|s| s.to_str()) != Some("rs") {
-                        continue;
-                    }
-                    let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                    if fname.ends_with("_tests.rs") || fname == "tests.rs" {
-                        continue;
-                    }
-                    count += count_unsupported_in_file(p)?;
+            for p in collect_module_files(&root.join(rel)) {
+                if seen.insert(p.clone()) {
+                    count += count_unsupported_in_file(&p)?;
                 }
             }
         }
@@ -1006,15 +1078,12 @@ fn scan_dxgi_formats(root: &Path) -> Result<Vec<FormatBar>> {
     // Full DXGI console format catalog: standard 1..=115 (115) + console extensions 116..=120 (5) + 189..=191 (3) = 123.
     const TOTAL_DXGI: usize = 123;
 
-    let res_raw = fs::read_to_string(root.join("crates/oathkeep-gpu/src/resource.rs"))
-        .context("reading resource.rs")?;
-    let tex_raw = fs::read_to_string(root.join("crates/oathkeep-formats/src/texture.rs"))
-        .context("reading texture.rs")?;
-    let host_raw = fs::read_to_string(root.join("crates/oathkeep-gpu/src/host.rs"))
-        .context("reading host.rs")?;
+    let res_raw = read_module_sources(&root.join("crates/oathkeep-gpu/src/resource"))?;
+    let tex_raw = read_module_sources(&root.join("crates/oathkeep-formats/src/texture"))?;
+    let host_raw = read_module_sources_raw(&root.join("crates/oathkeep-gpu/src/host"))?;
 
-    let (elem_all, elem_uncompressed) = parse_resource_element_formats(strip_tests(&res_raw));
-    let tex_tiling = parse_match_u32_set(strip_tests(&tex_raw), "pub fn format(dxgi: u32)");
+    let (elem_all, elem_uncompressed) = parse_resource_element_formats(&res_raw);
+    let tex_tiling = parse_match_u32_set(&tex_raw, "pub fn format(dxgi: u32)");
     let swap_fmts = parse_match_u32_set(&host_raw, "fn swap_format(");
 
     // Typed buffer views in `descriptor/host.rs` accept non-block-compressed non-typeless formats from `resource::element`.
