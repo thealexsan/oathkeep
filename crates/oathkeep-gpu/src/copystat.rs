@@ -87,6 +87,10 @@ pub(crate) enum C {
     PrepCardRecordUs,
     PrepStaleUs,
     PrepOtherUs,
+    PrepLockContendUs,
+    PrepLateBlockedUs,
+    PrepSweepUs,
+    PrepMakeWaitingUs,
     GuardReadFastN,
     GuardReadFastUs,
     GuardPreAliasUs,
@@ -117,6 +121,10 @@ pub(crate) enum C {
     RecEarlyTexUs,
     RecTablesUs,
     RecTablesMakeAtUs,
+    RecTablesMakeBatchUs,
+    RecTablesMakeCbvUs,
+    RecTablesMakeMissUs,
+    RecTablesMakePostUs,
     RecMemoryReadyUs,
     RecIndirectUs,
     TablesFreshOver,
@@ -142,8 +150,9 @@ pub(crate) enum C {
     StageCacheMissNew,
     StageCacheMissBufEpoch,
     StageCacheMissTexEpoch,
+    StageCacheBypass,
 }
-const COUNTERS: usize = 156;
+const COUNTERS: usize = 160;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1174,7 +1183,8 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "preparing breakdown per frame: ask_once {:.1} ms, stale {:.1} ms, run_deferred {:.1} ms, prelude {:.1} ms, \
          batch_flush {:.1} ms, snapshots {:.1} ms, card_prepare_write {:.1} ms, \
-         card_fill_upload {:.1} ms, card_record {:.1} ms, other {:.1} ms",
+         card_fill_upload {:.1} ms, card_record {:.1} ms, other {:.1} ms | \
+         pre_prep: lock_wait {:.2} ms, late_blk {:.2} ms, sweep {:.2} ms, mk_wait {:.2} ms",
         ms(c[C::PrepAskOnceUs as usize]),
         ms(c[C::PrepStaleUs as usize]),
         ms(c[C::PrepRunDeferredUs as usize]),
@@ -1185,6 +1195,10 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::PrepCardFillUploadUs as usize]),
         ms(c[C::PrepCardRecordUs as usize]),
         ms(c[C::PrepOtherUs as usize]),
+        ms(c[C::PrepLockContendUs as usize]),
+        ms(c[C::PrepLateBlockedUs as usize]),
+        ms(c[C::PrepSweepUs as usize]),
+        ms(c[C::PrepMakeWaitingUs as usize]),
     );
     tracing::info!(
         "micro-diag guards/frame: read_fast {:.0}x {:.2} ms, pre_alias {:.2} ms, write_wait {:.2} ms, \
@@ -1225,15 +1239,20 @@ pub(crate) fn log(frames: f64) {
         c[C::IndUavEmitted as usize],
     );
     tracing::info!(
-        "micro-diag rec/tables/frame: bind {:.2} ms (early_tex {:.2} ms, tables {:.2} ms, make_at {:.2} ms, \
-         mem_ready {:.2} ms), indirect {:.2} ms; fresh_tables: over {:.0} (<868k {:.0}, 868k..1M {:.0}, >=1M {:.0}), \
+        "micro-diag rec/tables/frame: bind {:.2} ms (early_tex {:.2} ms, tables {:.2} ms, make_at {:.2} ms \
+         [batch {:.2}, cbv {:.2}, miss {:.2}, post {:.2}], mem_ready {:.2} ms), indirect {:.2} ms; \
+         fresh_tables: over {:.0} (<868k {:.0}, 868k..1M {:.0}, >=1M {:.0}), \
          cbv_fail {:.0} (unalign {:.0}, short {:.0}, no_shadow {:.0}), hit {:.0}, uncacheable {:.0}, \
-         span_sum {:.0}, used_sum {:.0}; stage_cache: hit {:.0}, miss {:.0} (new {:.0}, buf_ep {:.0}, tex_ep {:.0}); cbv_scratch: hit {:.0}, miss {:.0} (hoist {:.0}, in_wr {:.0}, in_bl {:.0}); \
+         span_sum {:.0}, used_sum {:.0}; stage_cache: hit {:.0}, miss {:.0} (new {:.0}, bypass {:.0}, buf_ep {:.0}, tex_ep {:.0}); cbv_scratch: hit {:.0}, miss {:.0} (hoist {:.0}, in_wr {:.0}, in_bl {:.0}); \
          bindless_wr {:.0}",
         ms(c[C::RecBindUs as usize]),
         ms(c[C::RecEarlyTexUs as usize]),
         ms(c[C::RecTablesUs as usize]),
         ms(c[C::RecTablesMakeAtUs as usize]),
+        ms(c[C::RecTablesMakeBatchUs as usize]),
+        ms(c[C::RecTablesMakeCbvUs as usize]),
+        ms(c[C::RecTablesMakeMissUs as usize]),
+        ms(c[C::RecTablesMakePostUs as usize]),
         ms(c[C::RecMemoryReadyUs as usize]),
         ms(c[C::RecIndirectUs as usize]),
         c[C::TablesFreshOver as usize],
@@ -1251,6 +1270,7 @@ pub(crate) fn log(frames: f64) {
         c[C::StageCacheHits as usize],
         c[C::StageCacheMisses as usize],
         c[C::StageCacheMissNew as usize],
+        c[C::StageCacheBypass as usize],
         c[C::StageCacheMissBufEpoch as usize],
         c[C::StageCacheMissTexEpoch as usize],
         c[C::CbvScratchHits as usize],

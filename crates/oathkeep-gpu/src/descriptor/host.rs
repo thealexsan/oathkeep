@@ -334,8 +334,16 @@ impl DynamicMade {
     }
 }
 
+pub(crate) enum BatchSlot {
+    Unprobed,
+    Hit(DynamicMade),
+    MissNew,
+    MissEpoch(u8),
+}
+
 const STAGE_STRIPES: usize = 256;
 const SLOTS_PER_STRIPE: usize = 1024;
+const RECENT_MISS_SLOTS: usize = 32;
 
 struct StageEntry {
     key: u64,
@@ -420,6 +428,7 @@ struct StageHeap {
     cpu: usize,
     step: u32,
     stripes: Box<[std::sync::RwLock<StageStripe>; STAGE_STRIPES]>,
+    recent_miss: Box<[[std::sync::atomic::AtomicU64; RECENT_MISS_SLOTS]; STAGE_STRIPES]>,
 }
 
 // SAFETY: CPU-only descriptor heap; per-stripe RwLock guards concurrent read/write
@@ -472,11 +481,17 @@ fn cpu_stage_heap() -> Option<&'static StageHeap> {
                 .map(|_| std::sync::RwLock::new(StageStripe::new()))
                 .collect();
             let stripes = stripes.into_boxed_slice().try_into().ok()?;
+            let recent_miss: Vec<[std::sync::atomic::AtomicU64; RECENT_MISS_SLOTS]> =
+                (0..STAGE_STRIPES)
+                    .map(|_| std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)))
+                    .collect();
+            let recent_miss = recent_miss.into_boxed_slice().try_into().ok()?;
             Some(StageHeap {
                 _heap: heap,
                 cpu,
                 step,
                 stripes,
+                recent_miss,
             })
         })
         .as_ref()
@@ -2492,11 +2507,11 @@ impl HostHeap {
         trim: u32,
         used_k: &[u32],
         words_list: &[[u32; 3]],
-        out: &mut Vec<Option<DynamicMade>>,
+        out: &mut Vec<BatchSlot>,
         mut already_kept: impl FnMut(usize) -> bool,
     ) {
         out.clear();
-        out.resize_with(used_k.len(), || None);
+        out.resize_with(used_k.len(), || BatchSlot::Unprobed);
         if self.sampler || used_k.len() < 2 {
             return;
         }
@@ -2556,23 +2571,28 @@ impl HostHeap {
                     if let Some(&local) = guard.map.get(&key)
                         && let Some(entry) = guard.entries[local].as_ref()
                         && entry.key == key
-                        && entry.is_valid()
                     {
-                        dsts[n_copy] = self.cpu(dst_idx);
-                        srcs[n_copy] = stage.cpu(entry.slot);
-                        n_copy += 1;
-                        let kept = if entry.kept_raw != 0 && !already_kept(entry.kept_raw) {
-                            entry.kept.clone()
+                        if entry.is_valid() {
+                            dsts[n_copy] = self.cpu(dst_idx);
+                            srcs[n_copy] = stage.cpu(entry.slot);
+                            n_copy += 1;
+                            let kept = if entry.kept_raw != 0 && !already_kept(entry.kept_raw) {
+                                entry.kept.clone()
+                            } else {
+                                None
+                            };
+                            out[out_i] = BatchSlot::Hit(DynamicMade {
+                                found: true,
+                                kept,
+                                action: entry.action.clone(),
+                                view_kind: entry.view_kind,
+                                is_texture: entry.is_texture,
+                            });
                         } else {
-                            None
-                        };
-                        out[out_i] = Some(DynamicMade {
-                            found: true,
-                            kept,
-                            action: entry.action.clone(),
-                            view_kind: entry.view_kind,
-                            is_texture: entry.is_texture,
-                        });
+                            out[out_i] = BatchSlot::MissEpoch(if entry.is_buffer { 1 } else { 2 });
+                        }
+                    } else {
+                        out[out_i] = BatchSlot::MissNew;
                     }
                 }
                 if n_copy > 0 {
@@ -2609,12 +2629,16 @@ impl HostHeap {
     }
 
     /// Copies a cached CPU staging descriptor into dynamic slot `index` via
-    /// `CopyDescriptorsSimple`, bypassing `descriptor::view()` RwLocks, `GetDesc()`,
-    /// `shadow::find()`, and `CreateShaderResourceView` on cache hits (~99.9% steady state).
-    pub(crate) fn copy_or_make_dynamic(
+    /// `CopyDescriptorsSimple`, optionally skipping the initial stripe read-lock probe
+    /// when `copy_dynamic_batch` already established `miss_kind` (`0` = new, `1` = buf_epoch,
+    /// `2` = tex_epoch). Brand-new misses pass through a lock-free 2-hit admission filter
+    /// (`StageHeap::recent_miss`) so one-shot transient views render directly into `dst`
+    /// without acquiring the stripe write lock or polluting the staging cache.
+    pub(crate) fn copy_or_make_dynamic_probed(
         &self,
         index: u32,
         words: [u32; 3],
+        probed_miss: Option<u8>,
         already_kept: impl FnOnce(usize) -> bool,
     ) -> DynamicMade {
         if self.sampler || words[0] != VIEW_TAG {
@@ -2687,9 +2711,8 @@ impl HostHeap {
         let key = (u64::from(words[1]) << 32) | u64::from(words[2]);
         let stripe_idx = ((key ^ (key >> 17) ^ (key >> 33)) as usize) & (STAGE_STRIPES - 1);
         let dst = self.cpu(index);
-        #[cfg(feature = "diagnostics")]
-        let mut miss_kind: u8 = 0; // 0 = new, 1 = buf_epoch, 2 = tex_epoch
-        {
+        let mut miss_kind: u8 = probed_miss.unwrap_or(0); // 0 = new, 1 = buf_epoch, 2 = tex_epoch
+        if probed_miss.is_none() {
             let guard = stage.stripes[stripe_idx]
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
@@ -2723,10 +2746,7 @@ impl HostHeap {
                         is_texture: entry.is_texture,
                     };
                 }
-                #[cfg(feature = "diagnostics")]
-                {
-                    miss_kind = if entry.is_buffer { 1 } else { 2 };
-                }
+                miss_kind = if entry.is_buffer { 1 } else { 2 };
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -2747,6 +2767,58 @@ impl HostHeap {
         };
         let is_texture = is_texture_view(&view);
         let view_kind = stage_view_kind(&view);
+        if miss_kind == 0 {
+            let recent_slot = (key.wrapping_mul(0xbf58_476d_1ce4_e5b9) >> 59) as usize;
+            let prev = stage.recent_miss[stripe_idx][recent_slot]
+                .swap(key, std::sync::atomic::Ordering::Relaxed);
+            if prev != key {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::StageCacheBypass, 1);
+                let (kept, made_shadow, made_placed) = make_detailed(&view, dst);
+                let Some(kept_res) = kept else {
+                    null_for(&view, dst);
+                    return DynamicMade {
+                        found: true,
+                        kept: None,
+                        action: StageAction::None,
+                        view_kind,
+                        is_texture,
+                    };
+                };
+                let resolved = made_placed.as_ref().unwrap_or(&view);
+                let action = if let Some((shadow, address, len)) =
+                    buffer_copy_with_hint(resolved, made_shadow)
+                {
+                    StageAction::Buffer {
+                        shadow,
+                        address,
+                        len,
+                    }
+                } else if let View::Shader(resource, _) | View::Unordered(resource, _, _) = resolved
+                {
+                    StageAction::Texture {
+                        resource: *resource,
+                    }
+                } else {
+                    StageAction::None
+                };
+                let kept_raw = kept_res
+                    .as_ref()
+                    .map_or(0, |r| windows::core::Interface::as_raw(r) as usize);
+                let ret_kept = if kept_raw != 0 && !already_kept(kept_raw) {
+                    kept_res
+                } else {
+                    None
+                };
+                return DynamicMade {
+                    found: true,
+                    kept: ret_kept,
+                    action,
+                    view_kind,
+                    is_texture,
+                };
+            }
+        }
         enum PreStageEpoch {
             Buf(u64),
             Tex(u8, u64),

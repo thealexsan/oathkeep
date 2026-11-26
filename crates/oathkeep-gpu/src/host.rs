@@ -2646,19 +2646,31 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 fn stale_under_flights(runs: &[&HostList]) -> bool {
     use std::sync::Arc;
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+    let mut by_shadow: FastHashMap<usize, usize> = FastHashMap::default();
+    let mut last_ptr = 0usize;
+    let mut last_idx = 0usize;
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
             {
                 let range = (*address, *address + *len);
-                if let Some((_, list_ranges)) =
-                    spans.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow))
-                {
-                    list_ranges.push(range);
+                let ptr = Arc::as_ptr(shadow) as usize;
+                let idx = if ptr == last_ptr {
+                    last_idx
+                } else if let Some(&existing) = by_shadow.get(&ptr) {
+                    last_ptr = ptr;
+                    last_idx = existing;
+                    existing
                 } else {
-                    spans.push((shadow.clone(), vec![range]));
-                }
+                    let idx = spans.len();
+                    spans.push((shadow.clone(), Vec::with_capacity(8)));
+                    by_shadow.insert(ptr, idx);
+                    last_ptr = ptr;
+                    last_idx = idx;
+                    idx
+                };
+                spans[idx].1.push(range);
             }
         }
     }
@@ -2671,10 +2683,31 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         *ranges = merged;
     }
     if late_exact() {
-        if spans.len() >= 2 && wide_refresh() {
+        let allow_wide = wide_refresh();
+        let mut large: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        let mut small: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        for (shadow, ranges) in spans {
+            if allow_wide && shadow.byte_len() >= (8 << 20) {
+                large.push((shadow, ranges));
+            } else {
+                small.push((shadow, ranges));
+            }
+        }
+        let mut runs_left = 256;
+        for (shadow, ranges) in &large {
+            for &(from, to) in ranges {
+                if shadow.merge_under_writes_wide(from, to - from, &mut runs_left, true) {
+                    return true;
+                }
+            }
+        }
+        if small.is_empty() {
+            return false;
+        }
+        if small.len() >= 2 && allow_wide {
             let any_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let per_budget = (256 / spans.len()).max(16);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = spans
+            let per_budget = (runs_left / small.len()).max(16);
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = small
                 .into_iter()
                 .map(|(shadow, ranges)| {
                     let any_stale = any_stale.clone();
@@ -2695,14 +2728,10 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
             crate::shadow::wide_stale_run(jobs);
             return any_stale.load(Ordering::Relaxed);
         }
-        let mut runs_left = 256;
-        let allow_wide = wide_refresh();
-        return spans.iter().any(|(shadow, ranges)| {
-            ranges
-                .iter()
-                .any(|&(from, to)| {
-                    shadow.merge_under_writes_wide(from, to - from, &mut runs_left, allow_wide)
-                })
+        return small.iter().any(|(shadow, ranges)| {
+            ranges.iter().any(|&(from, to)| {
+                shadow.merge_under_writes_wide(from, to - from, &mut runs_left, allow_wide)
+            })
         });
     }
     spans.iter().any(|(shadow, ranges)| {
@@ -6109,6 +6138,8 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        let t_after_lock = std::time::Instant::now();
         let was_working = working(true);
         submitting(1, runs.len());
         if !late {
@@ -6120,6 +6151,8 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let t_after_late = std::time::Instant::now();
         let behind = late && flying();
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if !behind {
@@ -6142,6 +6175,8 @@ impl Host {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let t_after_sweep = std::time::Instant::now();
         let behind = late && flying();
         crate::descriptor::make_waiting();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
@@ -6149,6 +6184,25 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(
+                crate::copystat::C::PrepLockContendUs,
+                (t_after_lock - called).as_micros() as u64,
+            );
+            crate::copystat::add(
+                crate::copystat::C::PrepLateBlockedUs,
+                (t_after_late - t_after_lock).as_micros() as u64,
+            );
+            crate::copystat::add(
+                crate::copystat::C::PrepSweepUs,
+                (t_after_sweep - t_after_late).as_micros() as u64,
+            );
+            crate::copystat::add(
+                crate::copystat::C::PrepMakeWaitingUs,
+                (started - t_after_sweep).as_micros() as u64,
+            );
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());

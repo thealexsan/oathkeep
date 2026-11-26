@@ -2463,7 +2463,7 @@ fn heap_workers() -> &'static Workers {
         let count = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(4)
-            .clamp(2, 4);
+            .clamp(2, 8);
         for i in 0..count {
             let _ = std::thread::Builder::new()
                 .name(format!("oathkeep-heap-{i}"))
@@ -2493,6 +2493,16 @@ pub(crate) fn wide_heap_run(jobs: Vec<Job>) {
     wide_leaf_on(heap_workers(), jobs);
 }
 
+fn stale_worker_count() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .clamp(2, 8)
+    })
+}
+
 fn stale_workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -2501,10 +2511,7 @@ fn stale_workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let count = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(4)
-            .clamp(2, 4);
+        let count = stale_worker_count();
         for i in 0..count {
             let _ = std::thread::Builder::new()
                 .name(format!("oathkeep-stale-{i}"))
@@ -4123,6 +4130,10 @@ impl Shadow {
         self.has_pending.load(Ordering::Acquire)
     }
 
+    pub(crate) fn byte_len(&self) -> u64 {
+        self.len
+    }
+
     pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
@@ -4344,7 +4355,7 @@ impl Shadow {
                 if allow_wide && stale.len() >= 4 {
                     let snap_ptr = snapshot.as_mut_ptr() as usize;
                     let data_ptr = self.data as usize;
-                    let chunk_n = stale.len().div_ceil(4).max(2);
+                    let chunk_n = stale.len().div_ceil(stale_worker_count()).max(2);
                     let pages_out =
                         std::sync::Arc::new(Mutex::new(Vec::<usize>::with_capacity(stale.len())));
                     let jobs: Vec<Job> = stale
@@ -4509,57 +4520,183 @@ impl Shadow {
             {
                 let _before = self.before.lock().unwrap_or_else(|e| e.into_inner());
                 let mut old = card.old.lock().unwrap_or_else(|e| e.into_inner());
-                for page in stale {
-                    let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
-                    if lo >= hi {
-                        continue;
+                if allow_wide && stale.len() >= 4 {
+                    let mut work: Vec<(usize, usize, usize, usize, usize, usize)> =
+                        Vec::with_capacity(stale.len());
+                    for page in stale {
+                        let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                        if lo >= hi {
+                            continue;
+                        }
+                        let n = hi - lo;
+                        let at = lo - start;
+                        let p = self.pieces(at, at + n).start;
+                        let (p_lo, _) = self.piece(p);
+                        let Some(piece_buf) = old.get_mut(&p) else {
+                            #[cfg(feature = "diagnostics")]
+                            Self::log_why_stale("no_card_old", self, p, lo, hi);
+                            return true;
+                        };
+                        let off = at - p_lo;
+                        let held_ptr = piece_buf[off..off + n].as_mut_ptr() as usize;
+                        work.push((page, lo, hi, at, held_ptr, n));
                     }
-                    let n = hi - lo;
-                    let title = &mut title[..n];
-                    if !crate::host::read_into(lo as *const u8, title) {
-                        continue;
+                    if !work.is_empty() {
+                        #[derive(Default)]
+                        struct CardMergeChunk {
+                            pages: u64,
+                            runs: u64,
+                            bytes: u64,
+                            runs_spent: usize,
+                            clear_spans: Vec<(usize, usize)>,
+                            dirty_spans: Vec<(usize, usize)>,
+                            masked_pushes: Vec<(usize, Vec<u8>, Vec<u8>)>,
+                            mark_pages: Vec<usize>,
+                        }
+                        let card_size = card.size as usize;
+                        let chunk_n = work.len().div_ceil(stale_worker_count()).max(2);
+                        let n_chunks = work.len().div_ceil(chunk_n);
+                        let per_chunk_runs = (*runs_left).div_ceil(n_chunks);
+                        let mut results: Vec<CardMergeChunk> =
+                            (0..n_chunks).map(|_| CardMergeChunk::default()).collect();
+                        let results_base = results.as_mut_ptr() as usize;
+                        let jobs: Vec<Job> = work
+                            .chunks(chunk_n)
+                            .enumerate()
+                            .map(|(ci, chunk)| {
+                                let items = chunk.to_vec();
+                                Box::new(move || {
+                                    let mut local_title = vec![0u8; PAGE];
+                                    let mut out = CardMergeChunk {
+                                        mark_pages: Vec::with_capacity(items.len()),
+                                        ..CardMergeChunk::default()
+                                    };
+                                    let mut local_runs_left = per_chunk_runs;
+                                    for (page, lo, _hi, at, held_ptr, n) in items {
+                                        let t = &mut local_title[..n];
+                                        if !crate::host::read_into(lo as *const u8, t) {
+                                            continue;
+                                        }
+                                        out.pages += 1;
+                                        let max_runs = local_runs_left.min(16);
+                                        // SAFETY: `stale` pages are strictly unique, so every
+                                        // `(held_ptr, n)` slice refers to a disjoint byte range
+                                        // inside `card.old` while `self.before` and `card.old`
+                                        // remain locked on the calling thread until `wide_stale_run`
+                                        // joins all workers.
+                                        let held = unsafe {
+                                            std::slice::from_raw_parts_mut(held_ptr as *mut u8, n)
+                                        };
+                                        match diff_runs_or_masked(at, card_size, t, held, max_runs)
+                                        {
+                                            MergeDiff::Empty => {}
+                                            MergeDiff::Runs(runs) => {
+                                                let spent = runs.len();
+                                                local_runs_left =
+                                                    local_runs_left.saturating_sub(spent);
+                                                out.runs_spent += spent;
+                                                for (r, m) in runs {
+                                                    out.runs += 1;
+                                                    out.bytes += m as u64;
+                                                    let (c_from, c_to) = (at + r, at + r + m);
+                                                    out.clear_spans.push((c_from, c_to));
+                                                    out.dirty_spans.push((c_from, c_to));
+                                                }
+                                            }
+                                            MergeDiff::Masked {
+                                                offset,
+                                                data,
+                                                mask,
+                                                changed_runs,
+                                                changed_bytes,
+                                                first_off,
+                                                last_end,
+                                            } => {
+                                                out.runs += changed_runs as u64;
+                                                out.bytes += changed_bytes as u64;
+                                                out.clear_spans.push((first_off, last_end));
+                                                out.masked_pushes.push((offset, data, mask));
+                                            }
+                                        }
+                                        if (page * PAGE).max(start) >= a
+                                            && ((page + 1) * PAGE).min(end) <= e
+                                        {
+                                            out.mark_pages.push(page);
+                                        }
+                                    }
+                                    // SAFETY: `ci` is unique in `0..n_chunks` and `results`
+                                    // outlives `wide_stale_run`.
+                                    unsafe {
+                                        *(results_base as *mut CardMergeChunk).add(ci) = out;
+                                    }
+                                }) as Job
+                            })
+                            .collect();
+                        wide_stale_run(jobs);
+                        for chunk_out in results {
+                            total_pages += chunk_out.pages;
+                            total_runs += chunk_out.runs;
+                            total_bytes += chunk_out.bytes;
+                            *runs_left = runs_left.saturating_sub(chunk_out.runs_spent);
+                            clear_spans.extend(chunk_out.clear_spans);
+                            dirty_spans.extend(chunk_out.dirty_spans);
+                            masked_pushes.extend(chunk_out.masked_pushes);
+                            mark_pages.extend(chunk_out.mark_pages);
+                        }
                     }
-                    total_pages += 1;
-                    let at = lo - start;
-                    let p = self.pieces(at, at + n).start;
-                    let (p_lo, _) = self.piece(p);
-                    let max_runs = (*runs_left).min(16);
-                    let Some(piece_buf) = old.get_mut(&p) else {
-                        #[cfg(feature = "diagnostics")]
-                        Self::log_why_stale("no_card_old", self, p, lo, hi);
-                        return true;
-                    };
-                    let held = &mut piece_buf[at - p_lo..at - p_lo + n];
-                    let diff = diff_runs_or_masked(at, card.size as usize, title, held, max_runs);
-                    match diff {
-                        MergeDiff::Empty => {}
-                        MergeDiff::Runs(runs) => {
-                            *runs_left = runs_left.saturating_sub(runs.len());
-                            for (r, m) in runs {
-                                total_runs += 1;
-                                total_bytes += m as u64;
-                                let (c_from, c_to) = (at + r, at + r + m);
-                                clear_spans.push((c_from, c_to));
-                                dirty_spans.push((c_from, c_to));
+                } else {
+                    for page in stale {
+                        let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                        if lo >= hi {
+                            continue;
+                        }
+                        let n = hi - lo;
+                        let title = &mut title[..n];
+                        if !crate::host::read_into(lo as *const u8, title) {
+                            continue;
+                        }
+                        total_pages += 1;
+                        let at = lo - start;
+                        let p = self.pieces(at, at + n).start;
+                        let (p_lo, _) = self.piece(p);
+                        let max_runs = (*runs_left).min(16);
+                        let Some(piece_buf) = old.get_mut(&p) else {
+                            #[cfg(feature = "diagnostics")]
+                            Self::log_why_stale("no_card_old", self, p, lo, hi);
+                            return true;
+                        };
+                        let held = &mut piece_buf[at - p_lo..at - p_lo + n];
+                        let diff = diff_runs_or_masked(at, card.size as usize, title, held, max_runs);
+                        match diff {
+                            MergeDiff::Empty => {}
+                            MergeDiff::Runs(runs) => {
+                                *runs_left = runs_left.saturating_sub(runs.len());
+                                for (r, m) in runs {
+                                    total_runs += 1;
+                                    total_bytes += m as u64;
+                                    let (c_from, c_to) = (at + r, at + r + m);
+                                    clear_spans.push((c_from, c_to));
+                                    dirty_spans.push((c_from, c_to));
+                                }
+                            }
+                            MergeDiff::Masked {
+                                offset,
+                                data,
+                                mask,
+                                changed_runs,
+                                changed_bytes,
+                                first_off,
+                                last_end,
+                            } => {
+                                total_runs += changed_runs as u64;
+                                total_bytes += changed_bytes as u64;
+                                clear_spans.push((first_off, last_end));
+                                masked_pushes.push((offset, data, mask));
                             }
                         }
-                        MergeDiff::Masked {
-                            offset,
-                            data,
-                            mask,
-                            changed_runs,
-                            changed_bytes,
-                            first_off,
-                            last_end,
-                        } => {
-                            total_runs += changed_runs as u64;
-                            total_bytes += changed_bytes as u64;
-                            clear_spans.push((first_off, last_end));
-                            masked_pushes.push((offset, data, mask));
+                        if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                            mark_pages.push(page);
                         }
-                    }
-                    if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
-                        mark_pages.push(page);
                     }
                 }
             }

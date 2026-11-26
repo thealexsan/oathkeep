@@ -282,7 +282,7 @@ pub(crate) struct State {
     scratch_selected: Vec<u32>,
     scratch_used_k: Vec<u32>,
     scratch_words: Vec<[u32; 3]>,
-    scratch_dyn_made: Vec<Option<crate::descriptor::host::DynamicMade>>,
+    scratch_dyn_made: Vec<crate::descriptor::host::BatchSlot>,
     scratch_addresses: Vec<u64>,
     scratch_constants: Vec<u32>,
 }
@@ -2032,7 +2032,7 @@ impl State {
             todo.dedup();
         }
         if todo.len() >= 64 {
-            let worker_count = (todo.len() / 32).clamp(2, 4);
+            let worker_count = (todo.len() / 32).clamp(2, 8);
             let chunk_size = todo.len().div_ceil(worker_count);
             let heap_ptr = std::ptr::from_ref(heap) as usize;
             let host_ptr = std::ptr::from_ref(host) as usize;
@@ -4009,6 +4009,8 @@ impl State {
             self.sync_list_gen(list.reset_gen());
             let mut premade = std::mem::take(&mut self.scratch_dyn_made);
             let kept_ptrs = &self.kept_ptrs;
+            #[cfg(feature = "diagnostics")]
+            let t_batch = std::time::Instant::now();
             host.copy_dynamic_batch(
                 first,
                 trim,
@@ -4017,6 +4019,10 @@ impl State {
                 &mut premade,
                 |raw| kept_ptrs.contains(&raw),
             );
+            #[cfg(feature = "diagnostics")]
+            let batch_ns = t_batch.elapsed().as_nanos() as u64;
+            #[cfg(feature = "diagnostics")]
+            let (mut cbv_ns, mut miss_ns, mut post_ns) = (0u64, 0u64, 0u64);
             for used_i in 0..self.scratch_used_k.len() {
                 let k = self.scratch_used_k[used_i];
                 let words = self.scratch_words[used_i];
@@ -4032,6 +4038,8 @@ impl State {
                     .map(|&idx| &used[idx])
                     .filter(|u| u.table_offset_dwords / 8 == k);
                 if let Some((address, size)) = crate::descriptor::constant_from_words(words) {
+                    #[cfg(feature = "diagnostics")]
+                    let t_cbv = std::time::Instant::now();
                     let size_u64 = u64::from(size);
                     let existing = self.find_shadow_existing(address, size_u64);
                     let gpu_active = existing
@@ -4051,6 +4059,10 @@ impl State {
                             }
                             self.keep_dynamic(list, &shadow.buffer);
                             host.constant_at_dynamic(index, gpu, size);
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                cbv_ns += t_cbv.elapsed().as_nanos() as u64;
+                            }
                             continue;
                         }
                         if gpu_active
@@ -4064,26 +4076,60 @@ impl State {
                             }
                             self.keep_dynamic(list, &scratch);
                             host.constant_at_dynamic(index, scratch_gpu, size);
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                cbv_ns += t_cbv.elapsed().as_nanos() as u64;
+                            }
                             continue;
                         }
                     }
                     let Some((gpu, to)) = list.scratch(size_u64) else {
                         host.make_null_dynamic(index);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            cbv_ns += t_cbv.elapsed().as_nanos() as u64;
+                        }
                         continue;
                     };
                     list.defer_fill(to, address as *const u8, size as usize);
                     host.constant_at_dynamic(index, gpu, size);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        cbv_ns += t_cbv.elapsed().as_nanos() as u64;
+                    }
                     continue;
                 }
-                let made = premade[used_i].take().unwrap_or_else(|| {
-                    host.copy_or_make_dynamic(index, words, |raw| self.is_kept_dynamic(list, raw))
-                });
+                let made = match std::mem::replace(
+                    &mut premade[used_i],
+                    crate::descriptor::host::BatchSlot::Unprobed,
+                ) {
+                    crate::descriptor::host::BatchSlot::Hit(m) => m,
+                    slot => {
+                        #[cfg(feature = "diagnostics")]
+                        let t_miss = std::time::Instant::now();
+                        let probed = match slot {
+                            crate::descriptor::host::BatchSlot::MissNew => Some(0),
+                            crate::descriptor::host::BatchSlot::MissEpoch(mk) => Some(mk),
+                            _ => None,
+                        };
+                        let m = host.copy_or_make_dynamic_probed(index, words, probed, |raw| {
+                            self.is_kept_dynamic(list, raw)
+                        });
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            miss_ns += t_miss.elapsed().as_nanos() as u64;
+                        }
+                        m
+                    }
+                };
                 if !made.found {
                     if used_entry.is_some() {
                         once!(slot, "a table entry without a view");
                     }
                     continue;
                 }
+                #[cfg(feature = "diagnostics")]
+                let t_post = std::time::Instant::now();
                 if let Some(res) = made.kept {
                     self.keep_dynamic(list, &res);
                 }
@@ -4141,14 +4187,24 @@ impl State {
                         host.mirror(title + k, table + u64::from(k) * 32, true);
                     }
                 }
+                #[cfg(feature = "diagnostics")]
+                {
+                    post_ns += t_post.elapsed().as_nanos() as u64;
+                }
             }
             premade.clear();
             self.scratch_dyn_made = premade;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(
-                crate::copystat::C::RecTablesMakeAtUs,
-                t_make.elapsed().as_micros() as u64,
-            );
+            {
+                crate::copystat::add(
+                    crate::copystat::C::RecTablesMakeAtUs,
+                    t_make.elapsed().as_micros() as u64,
+                );
+                crate::copystat::add(crate::copystat::C::RecTablesMakeBatchUs, batch_ns / 1000);
+                crate::copystat::add(crate::copystat::C::RecTablesMakeCbvUs, cbv_ns / 1000);
+                crate::copystat::add(crate::copystat::C::RecTablesMakeMissUs, miss_ns / 1000);
+                crate::copystat::add(crate::copystat::C::RecTablesMakePostUs, post_ns / 1000);
+            }
             let offset = (first - trim) * 32;
             let uav_done_seq = if uav_buffers.is_empty() || record_uav_writes {
                 list.gpu_write_seq()
