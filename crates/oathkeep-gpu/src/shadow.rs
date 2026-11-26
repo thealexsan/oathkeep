@@ -3598,27 +3598,70 @@ fn let_go_idle_with(urgent: bool) {
             Vec::new()
         }
     };
-    if !gone_loose.is_empty() || !gone_buffers.is_empty() {
-        for s in gone_loose.iter().chain(gone_buffers.iter()) {
+    let gone_aligned: Vec<Arc<Shadow>> = {
+        let map = if urgent {
+            ALIGNED.try_write().ok()
+        } else {
+            Some(ALIGNED.write().unwrap_or_else(|e| e.into_inner()))
+        };
+        if let Some(mut map) = map
+            && !map.is_empty()
+        {
+            let idle: Vec<(u64, u64)> = map
+                .iter()
+                .filter(|(_, s)| {
+                    Arc::strong_count(s) == 1
+                        && !s.writes_pending()
+                        && crate::host::long_ago(
+                            s.used.load(Ordering::Relaxed),
+                            idle_ms,
+                            idle_frames,
+                        )
+                        && crate::host::references(&s.buffer) == 1
+                })
+                .map(|(key, _)| *key)
+                .collect();
+            let gone: Vec<Arc<Shadow>> = idle
+                .into_iter()
+                .filter_map(|key| map.remove(&key))
+                .collect();
+            ALIGNED_LEN.store(map.len(), Ordering::Release);
+            gone
+        } else {
+            Vec::new()
+        }
+    };
+    if !gone_loose.is_empty() || !gone_buffers.is_empty() || !gone_aligned.is_empty() {
+        for s in gone_loose
+            .iter()
+            .chain(gone_buffers.iter())
+            .chain(gone_aligned.iter())
+        {
             s.mark_dead();
         }
         SHADOW_GEN.fetch_add(1, Ordering::Release);
-        let went = gone_loose.len() + gone_buffers.len();
+        let went = gone_loose.len() + gone_buffers.len() + gone_aligned.len();
         let bytes: u64 = gone_loose
             .iter()
             .chain(gone_buffers.iter())
+            .chain(gone_aligned.iter())
             .map(|s| s.len)
             .sum();
         crate::host::trail(|| {
             format!(
-                "sweep: {went} host copies of title memory let go ({} KiB; {} windows, {} buffers), held by no list and no slot",
+                "sweep: {went} host copies of title memory let go ({} KiB; {} windows, {} buffers, {} aligned), held by no list and no slot",
                 bytes >> 10,
                 gone_loose.len(),
-                gone_buffers.len()
+                gone_buffers.len(),
+                gone_aligned.len()
             )
         });
     }
-    for shadow in gone_loose.into_iter().chain(gone_buffers) {
+    for shadow in gone_loose
+        .into_iter()
+        .chain(gone_buffers)
+        .chain(gone_aligned)
+    {
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         crate::host::retire(shadow);
@@ -8180,6 +8223,64 @@ fn longest_tail(
 }
 
 static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
+static ALIGNED: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
+static ALIGNED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+pub(crate) fn has_aligned() -> bool {
+    ALIGNED_LEN.load(Ordering::Relaxed) != 0
+}
+
+pub(crate) fn find_aligned_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if !has_aligned() {
+        return None;
+    }
+    let need = len.max(1);
+    let map = ALIGNED.read().unwrap_or_else(|e| e.into_inner());
+    map.range((address, need)..=(address, u64::MAX))
+        .next()
+        .map(|(_, s)| {
+            s.used.store(crate::host::moment(), Ordering::Relaxed);
+            s.clone()
+        })
+}
+
+/// Returns or creates a small dedicated host shadow whose start equals `address`,
+/// giving `offset(address) == 0` (divisible by any typed buffer element stride,
+/// e.g. `12` for `DXGI_FORMAT_R32G32B32_FLOAT`) and a 64 KiB-aligned host GPU VA
+/// (256-byte aligned for CBVs).
+pub(crate) fn find_aligned(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let need = len.max(1);
+    if let Some(s) = find_aligned_existing(address, need) {
+        return Some(s);
+    }
+    let mut map = ALIGNED.write().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = map.range((address, need)..=(address, u64::MAX)).next() {
+        s.used.store(crate::host::moment(), Ordering::Relaxed);
+        return Some(s.clone());
+    }
+    let size = need.checked_next_multiple_of(256)?;
+    let (buffer, data) = host()?.shared_buffer(size)?;
+    crate::host::name(&buffer, || {
+        format!("aligned title view {address:#x}+{need:#x}")
+    });
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, need));
+    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    map.insert((address, need), shadow.clone());
+    let total = map.len();
+    ALIGNED_LEN.store(total, Ordering::Release);
+    if total <= 16 || total.is_power_of_two() {
+        tracing::info!(
+            start = format_args!("{address:#x}"),
+            len = need,
+            aligned_shadows = total,
+            "aligned sub-shadow created for unaligned view"
+        );
+    }
+    Some(shadow)
+}
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let unsized_grid = window().max(TAIL_STEP);

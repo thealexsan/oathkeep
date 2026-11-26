@@ -611,7 +611,11 @@ impl HostPipeline {
         } else {
             false
         };
-        let state = g.describe();
+        let (blend, blend_sanitized) = sanitize_blend_for_targets(g.blend, &g.targets);
+        let mut state = g.describe();
+        if blend_sanitized {
+            state.push_str(" blend-sanitized");
+        }
         if mesh.is_some() {
             let name = super::library::name(
                 "mesh triangles",
@@ -625,6 +629,7 @@ impl HostPipeline {
                 code(0),
                 code(1),
                 g,
+                blend,
                 depth_bounds,
                 &name,
             ) {
@@ -644,6 +649,10 @@ impl HostPipeline {
                         samples = g.samples.Count,
                         quality = g.samples.Quality,
                         depth_bounds,
+                        blend_sanitized,
+                        ?blend,
+                        raster = ?g.rasterizer,
+                        depth = ?g.depth,
                         ms_bytes = code(0).BytecodeLength,
                         ps_bytes = code(1).BytecodeLength,
                         "host mesh pipeline refused"
@@ -652,7 +661,7 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host mesh pipeline");
+            tracing::info!(?shaders, blend_sanitized, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             let any_stores = bound.iter().any(|s| s.translated().stores);
             return Some(HostPipeline {
@@ -692,7 +701,7 @@ impl HostPipeline {
                         BytecodeLength: gs.len(),
                     }
                 }),
-            BlendState: g.blend,
+            BlendState: blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -925,12 +934,94 @@ fn graphics_depth_bounds_pipeline(
     }
 }
 
+fn is_integer_format(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
+/// D3D12 rejects `CreatePipelineState` (`E_INVALIDARG`) if `BlendEnable` applies to any
+/// integer RTV format (`*_UINT` / `*_SINT`), including when `IndependentBlendEnable == FALSE`
+/// and `RenderTarget[0].BlendEnable == TRUE` with a mixed float/UNORM + integer MRT set.
+/// Sanitize only when an integer RTV would actually be rejected so existing cached PSOs
+/// keep identical cache keys.
+fn sanitize_blend_for_targets(
+    mut blend: D3D12_BLEND_DESC,
+    targets: &D3D12_RT_FORMAT_ARRAY,
+) -> (D3D12_BLEND_DESC, bool) {
+    let count = (targets.NumRenderTargets as usize).min(8);
+    if count == 0 || !targets.RTFormats[..count].iter().copied().any(is_integer_format) {
+        return (blend, false);
+    }
+    if !blend.IndependentBlendEnable.as_bool() {
+        let rt0 = blend.RenderTarget[0];
+        if !rt0.BlendEnable.as_bool() {
+            return (blend, false);
+        }
+        let all_int = targets.RTFormats[..count]
+            .iter()
+            .copied()
+            .all(is_integer_format);
+        if all_int {
+            blend.RenderTarget[0].BlendEnable = false.into();
+            return (blend, true);
+        }
+        blend.IndependentBlendEnable = true.into();
+        for rt in &mut blend.RenderTarget {
+            *rt = rt0;
+            rt.LogicOpEnable = false.into();
+        }
+        for i in 0..count {
+            if is_integer_format(targets.RTFormats[i]) {
+                blend.RenderTarget[i].BlendEnable = false.into();
+            }
+        }
+        return (blend, true);
+    }
+    let mut changed = false;
+    for i in 0..count {
+        if is_integer_format(targets.RTFormats[i]) {
+            if blend.RenderTarget[i].BlendEnable.as_bool() {
+                blend.RenderTarget[i].BlendEnable = false.into();
+                changed = true;
+            }
+            if blend.RenderTarget[i].LogicOpEnable.as_bool() {
+                blend.RenderTarget[i].LogicOpEnable = false.into();
+                changed = true;
+            }
+        }
+    }
+    (blend, changed)
+}
+
 fn mesh_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
     ms: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
+    blend: D3D12_BLEND_DESC,
     depth_bounds: bool,
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
@@ -957,7 +1048,7 @@ fn mesh_pipeline(
             ),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(
                 D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
                 g.sample_mask,
@@ -988,7 +1079,7 @@ fn mesh_pipeline(
             ),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(
                 D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
                 g.sample_mask,
@@ -1149,14 +1240,60 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name).expect("made");
+        mesh_pipeline(
+            &host.device,
+            &root,
+            code(&ms),
+            code(&ps),
+            &g,
+            g.blend,
+            false,
+            &name,
+        )
+        .expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name)
-            .expect("made again");
+        mesh_pipeline(
+            &host.device,
+            &root,
+            code(&ms),
+            code(&ps),
+            &g,
+            g.blend,
+            false,
+            &name,
+        )
+        .expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
+    }
+
+    #[test]
+    fn sanitize_blend_disables_blend_on_integer_rtvs() {
+        let mut targets = D3D12_RT_FORMAT_ARRAY {
+            NumRenderTargets: 3,
+            ..Default::default()
+        };
+        targets.RTFormats[0] = DXGI_FORMAT_R32_FLOAT;
+        targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+
+        let mut g = GraphicsState::default();
+        g.blend.IndependentBlendEnable = false.into();
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+
+        let (sanitized, changed) = sanitize_blend_for_targets(g.blend, &targets);
+        assert!(changed);
+        assert!(sanitized.IndependentBlendEnable.as_bool());
+        assert!(sanitized.RenderTarget[0].BlendEnable.as_bool());
+        assert!(sanitized.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!sanitized.RenderTarget[2].BlendEnable.as_bool());
+
+        // Non-integer targets stay untouched so cached PSO keys remain identical.
+        targets.RTFormats[2] = DXGI_FORMAT_R8_UNORM;
+        let (_, changed_float) = sanitize_blend_for_targets(g.blend, &targets);
+        assert!(!changed_float);
     }
 
     const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {

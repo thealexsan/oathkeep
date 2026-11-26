@@ -3588,6 +3588,68 @@ fn view_extent() -> bool {
     *ON.get_or_init(|| std::env::var_os("OATHKEEP_VIEW_EXTENT").is_none_or(|v| v != "0"))
 }
 
+fn view_needs_aligned_shadow(view: &View, shadow: &crate::shadow::Shadow) -> bool {
+    let (base, words, unordered): (u64, &[u32; 10], bool) = match view {
+        View::Shader(r, Some(desc)) => {
+            let Some((data, _)) = crate::resource::buffer_bytes(*r as crate::object::This) else {
+                return false;
+            };
+            (data as u64, desc, false)
+        }
+        View::Placed(false, resource, desc) if resource[0] == 1 => {
+            let Ok(words) = desc[..10].try_into() else {
+                return false;
+            };
+            (u64::from(desc[10]) | u64::from(desc[11]) << 32, words, false)
+        }
+        View::Unordered(r, _, Some(desc)) => {
+            let Some((data, _)) = crate::resource::buffer_bytes(*r as crate::object::This) else {
+                return false;
+            };
+            (data as u64, desc, true)
+        }
+        View::Placed(true, resource, desc) if resource[0] == 1 => {
+            let Ok(words) = desc[..10].try_into() else {
+                return false;
+            };
+            (u64::from(desc[10]) | u64::from(desc[11]) << 32, words, true)
+        }
+        _ => return false,
+    };
+    let offset = shadow.offset(base);
+    if unordered {
+        let desc = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        let buf = unsafe { desc.Anonymous.Buffer };
+        if desc.Format == DXGI_FORMAT_UNKNOWN
+            && raw_window(offset, buf.FirstElement, buf.NumElements, buf.StructureByteStride)
+                .is_some()
+        {
+            return false;
+        }
+        let element = if buf.StructureByteStride > 0 {
+            u64::from(buf.StructureByteStride)
+        } else if buf.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            4
+        } else {
+            crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+        };
+        element > 0 && offset % element != 0
+    } else {
+        let desc = srv_desc(words);
+        // SAFETY: a buffer view's union member.
+        let buf = unsafe { desc.Anonymous.Buffer };
+        if desc.Format == DXGI_FORMAT_UNKNOWN
+            && raw_window(offset, buf.FirstElement, buf.NumElements, buf.StructureByteStride)
+                .is_some()
+        {
+            return false;
+        }
+        let element = element_size(&desc);
+        element > 0 && offset % element != 0
+    }
+}
+
 pub(crate) fn buffer_copy_with_hint(
     view: &View,
     hint: Option<std::sync::Arc<crate::shadow::Shadow>>,
@@ -3599,16 +3661,30 @@ pub(crate) fn buffer_copy_with_hint(
     if let Some(shadow) = hint {
         return Some((shadow, address, len));
     }
-    if view_extent()
+    let shadow = if view_extent()
         && let Some((base, width)) = buffer_extent(view)
         && address >= base
         && address - base < width.max(1)
     {
-        if let Some(shadow) = crate::shadow::find(base, width) {
-            return Some((shadow, address, len));
+        crate::shadow::find(base, width).or_else(|| crate::shadow::find(address, len))
+    } else {
+        crate::shadow::find(address, len)
+    };
+    if let Some(shadow) = shadow {
+        if crate::shadow::has_aligned()
+            && view_needs_aligned_shadow(view, &shadow)
+            && let Some(aligned) = crate::shadow::find_aligned_existing(address, len)
+        {
+            return Some((aligned, address, len));
         }
+        return Some((shadow, address, len));
     }
-    crate::shadow::find(address, len).map(|shadow| (shadow, address, len))
+    if crate::shadow::has_aligned()
+        && let Some(aligned) = crate::shadow::find_aligned_existing(address, len)
+    {
+        return Some((aligned, address, len));
+    }
+    None
 }
 
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
@@ -3686,7 +3762,7 @@ fn buffer_srv_with_shadow(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     find_shadow: &mut dyn FnMut(u64, u64) -> Option<std::sync::Arc<crate::shadow::Shadow>>,
 ) -> Option<(Kept, std::sync::Arc<crate::shadow::Shadow>)> {
-    let shadow = find_shadow(address, len)?;
+    let mut shadow = find_shadow(address, len)?;
     let offset = shadow.offset(address);
     // SAFETY: a buffer view's union member.
     let structured = unsafe { desc.Anonymous.Buffer };
@@ -3713,7 +3789,7 @@ fn buffer_srv_with_shadow(
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     if window.is_none() {
-        if element == 0 || offset % element != 0 {
+        if element == 0 {
             once!(
                 offset,
                 element,
@@ -3726,7 +3802,36 @@ fn buffer_srv_with_shadow(
             );
             return None;
         }
-        buffer.FirstElement += offset / element;
+        if offset % element != 0 {
+            let aligned = buffer
+                .FirstElement
+                .checked_mul(element)
+                .and_then(|skip| address.checked_add(skip))
+                .and_then(|view_start| {
+                    let view_len = u64::from(buffer.NumElements).checked_mul(element)?;
+                    (view_len > 0)
+                        .then(|| crate::shadow::find_aligned(view_start, view_len))
+                        .flatten()
+                });
+            if let Some(aligned_shadow) = aligned {
+                shadow = aligned_shadow;
+                buffer.FirstElement = 0;
+            } else {
+                once!(
+                    offset,
+                    element,
+                    format = desc.Format.0,
+                    stride = structured.StructureByteStride,
+                    first = structured.FirstElement,
+                    count = structured.NumElements,
+                    address = format_args!("{address:#x}"),
+                    "buffer view not on an element of its host copy"
+                );
+                return None;
+            }
+        } else {
+            buffer.FirstElement += offset / element;
+        }
     }
     let (first, count, stride) = (
         buffer.FirstElement,
@@ -3768,11 +3873,7 @@ fn buffer_uav_with_shadow(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     find_shadow: &mut dyn FnMut(u64, u64) -> Option<std::sync::Arc<crate::shadow::Shadow>>,
 ) -> Option<(Kept, std::sync::Arc<crate::shadow::Shadow>)> {
-    let shadow = find_shadow(address, len)?;
-    if !shadow.allow_uav() {
-        once!("unordered access to a buffer whose host copy shaders cannot write");
-        return None;
-    }
+    let mut shadow = find_shadow(address, len)?;
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -3798,8 +3899,28 @@ fn buffer_uav_with_shadow(
         buffer.NumElements = count;
         buffer.StructureByteStride = 0;
         buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-    } else {
-        if element == 0 || offset % element != 0 {
+    } else if element == 0 {
+        once!(
+            offset,
+            element,
+            "unordered buffer view not on an element of its host copy"
+        );
+        return None;
+    } else if offset % element != 0 {
+        let aligned = buffer
+            .FirstElement
+            .checked_mul(element)
+            .and_then(|skip| address.checked_add(skip))
+            .and_then(|view_start| {
+                let view_len = u64::from(buffer.NumElements).checked_mul(element)?;
+                (view_len > 0)
+                    .then(|| crate::shadow::find_aligned(view_start, view_len))
+                    .flatten()
+            });
+        if let Some(aligned_shadow) = aligned {
+            shadow = aligned_shadow;
+            buffer.FirstElement = 0;
+        } else {
             once!(
                 offset,
                 element,
@@ -3807,7 +3928,12 @@ fn buffer_uav_with_shadow(
             );
             return None;
         }
+    } else {
         buffer.FirstElement += offset / element;
+    }
+    if !shadow.allow_uav() {
+        once!("unordered access to a buffer whose host copy shaders cannot write");
+        return None;
     }
     buffer.CounterOffsetInBytes = 0;
     let (first, count, stride) = (
@@ -3983,17 +4109,25 @@ fn make_detailed_with_shadow(
     match view {
         &View::Constant(address, size) => {
             let aligned = size.next_multiple_of(256);
-            let Some(shadow) = find_shadow(address, u64::from(size)) else {
+            let Some(mut shadow) = find_shadow(address, u64::from(size)) else {
                 return (None, None, None);
             };
-            let gpu = shadow.gpu(address);
             if !shadow.can_bind_cbv(address, size) {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
-                return (None, None, None);
+                if size > 0
+                    && let Some(aligned_shadow) =
+                        crate::shadow::find_aligned(address, u64::from(size))
+                    && aligned_shadow.can_bind_cbv(address, size)
+                {
+                    shadow = aligned_shadow;
+                } else {
+                    once!(
+                        address = format_args!("{address:#x}"),
+                        "constant buffer not 256-byte aligned on the host"
+                    );
+                    return (None, None, None);
+                }
             }
+            let gpu = shadow.gpu(address);
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
                 SizeInBytes: aligned,
