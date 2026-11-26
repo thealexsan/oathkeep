@@ -64,7 +64,21 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    const GIB: u64 = 1 << 30;
     match memory {
+        // On 4–10 GiB GPUs, avoid hoarding up to 768 MiB–4 GiB of empty 64 MiB
+        // blocks in VRAM; return emptied blocks immediately once usage >= 85%.
+        Some([budget, used, ..]) if budget >= GIB && budget < 11 * GIB => {
+            let pct = u128::from(used) * 100;
+            let b = u128::from(budget);
+            if pct >= b * 85 {
+                0
+            } else if keep && pct < b * 78 {
+                4
+            } else {
+                1
+            }
+        }
         Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
         _ => SPARE,
     }
@@ -599,10 +613,20 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
         assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+        // 8 GiB GPU (~7,161 MiB budget) stays compact and releases all empty blocks at >= 85%.
+        let b8 = 7161 * MIB;
+        assert_eq!(spares(Some([b8, 4000 * MIB, 0, 0]), true), 4);
+        assert_eq!(spares(Some([b8, 5800 * MIB, 0, 0]), true), 1);
+        assert_eq!(spares(Some([b8, 6100 * MIB, 0, 0]), true), 0);
+        assert_eq!(spares(Some([b8, 4000 * MIB, 0, 0]), false), 1);
+        // 16 GiB GPU retains SPARE_KEPT below 85%.
+        assert_eq!(spares(Some([16 * GIB, 10 * GIB, 0, 0]), true), SPARE_KEPT);
     }
 
     #[test]

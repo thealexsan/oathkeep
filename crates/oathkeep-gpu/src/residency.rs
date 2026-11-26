@@ -197,13 +197,26 @@ pub(crate) fn vram_plan(
     }
 }
 
+/// Credits reusable pool headroom against DXGI local VRAM usage only while raw
+/// VRAM usage stays safely below the adapter's pressure zone (< 85%). Once raw
+/// DXGI usage reaches 85%, fragmented holes inside existing texture blocks
+/// cannot satisfy committed textures, render targets, tiled heaps, or shadow
+/// buffers and must not mask true VRAM pressure or oversubscription.
+pub(crate) fn pool_free_credit(budget: u64, raw_used: u64, raw_pool_free: u64) -> u64 {
+    if budget == 0 || raw_used >= budget / 100 * 85 {
+        return 0;
+    }
+    raw_pool_free.min(budget / 16)
+}
+
 /// Samples current DXGI local VRAM usage and updates the cached VRAM pressure
 /// tier and eviction target.
 pub(crate) fn sample_vram() -> VramPlan {
     let video = crate::host::host().and_then(|h| h.video_memory());
     let plan = match video {
         Some([budget, used, ..]) => {
-            let pool_free = crate::pool::texture_room().saturating_add(crate::tiles::free_room());
+            let raw_pool_free = crate::pool::texture_room().saturating_add(crate::tiles::free_room());
+            let pool_free = pool_free_credit(budget, used, raw_pool_free);
             let reserved_extra = crate::shadow::card_room_kept()
                 .saturating_add(crate::resource::targets_room_kept(Some(budget)));
             let filled_textures =
@@ -416,6 +429,18 @@ mod tests {
         let unknown = vram_plan(0, 4000 * MIB, 0, 0, 2000 * MIB);
         assert_eq!(unknown.level, VramLevel::Normal);
         assert_eq!(unknown.reclaim_bytes, 0);
+    }
+
+    #[test]
+    fn pool_free_credit_caps_fragmented_holes_and_zeros_at_85_percent() {
+        let budget = 7161 * MIB;
+        // Below 85% raw usage: capped to budget / 16 (~447 MiB), never 1.5 GiB.
+        assert_eq!(pool_free_credit(budget, 5000 * MIB, 1563 * MIB), budget / 16);
+        assert_eq!(pool_free_credit(budget, 5000 * MIB, 128 * MIB), 128 * MIB);
+        // At or above 85% raw usage: zero credit so real VRAM pressure triggers eviction.
+        assert_eq!(pool_free_credit(budget, 6100 * MIB, 1563 * MIB), 0);
+        assert_eq!(pool_free_credit(budget, 7602 * MIB, 1563 * MIB), 0);
+        assert_eq!(pool_free_credit(0, 5000 * MIB, 500 * MIB), 0);
     }
 
     #[test]

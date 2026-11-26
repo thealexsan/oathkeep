@@ -175,16 +175,22 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
                     ..Default::default()
                 },
                 Alignment: 0,
-                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
             };
             let mut made: Option<ID3D12Heap> = None;
             // SAFETY: plain creation; the out pointer is ours.
             if let Err(e) = unsafe { device.CreateHeap::<ID3D12Heap>(&raw const desc, &raw mut made) } {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, "no heap for texture levels given on demand: those levels stay empty");
                 return None;
             }
+            let heap = made?;
+            if let Err(e) = crate::host::resident(device, &heap).and_then(|()| crate::host::mapped(device)) {
+                tracing::warn!(error = %e, "a heap for texture levels given on demand is not resident");
+                return None;
+            }
             let fresh = Heap {
-                heap: made?,
+                heap,
                 free: vec![(0, HEAP_TILES)],
             };
             STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);

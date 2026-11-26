@@ -1695,11 +1695,20 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
+        // used. Never admit new allocations once raw DXGI local VRAM hits the
+        // budget ceiling, even if fragmented pool holes exist.
         Some([budget, used, ..]) => {
-            let pool_free = crate::pool::texture_room().saturating_add(crate::tiles::free_room());
+            let limit = budget / 100 * room_percent();
+            if used >= limit {
+                return false;
+            }
+            let pool_free = crate::residency::pool_free_credit(
+                budget,
+                used,
+                crate::pool::texture_room().saturating_add(crate::tiles::free_room()),
+            );
             used.saturating_sub(pool_free) + crate::shadow::card_room_kept() + targets_room_kept(Some(budget))
-                < budget / 100 * room_percent()
+                < limit
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -2056,7 +2065,11 @@ pub(crate) fn let_go_idle() {
         .get_or_init(|| !matches!(std::env::var("OATHKEEP_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
-            let pool_free = crate::pool::texture_room().saturating_add(crate::tiles::free_room());
+            let pool_free = crate::residency::pool_free_credit(
+                budget,
+                used,
+                crate::pool::texture_room().saturating_add(crate::tiles::free_room()),
+            );
             let used = used.saturating_sub(pool_free)
                 + crate::shadow::card_room_kept()
                 + targets_room_kept(Some(budget));
