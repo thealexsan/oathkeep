@@ -350,7 +350,7 @@ fn hle_display_name(stem: &str) -> String {
 }
 
 fn scan_hle_libraries(root: &Path) -> Result<Vec<LibraryEntry>> {
-    let dir = root.join("crates/oathkeep-hle/src/modules");
+    let dir = root.join("engine/hle/src/modules");
     let mut entries = Vec::new();
     let mut stems = BTreeSet::new();
     for entry in fs::read_dir(&dir)
@@ -493,7 +493,7 @@ fn is_function_notimpl_stub(src: &str, fn_name: &str) -> bool {
 }
 
 fn scan_gpu_com_interfaces(root: &Path) -> Result<Vec<LibraryEntry>> {
-    let gpu_dir = root.join("crates/oathkeep-gpu/src");
+    let gpu_dir = root.join("engine/gpu/src");
     let specs: &[(&str, &str, &str)] = &[
         ("device.rs", "ID3D12Device", "static FUNCTIONS: Table<"),
         ("list.rs", "ID3D12CommandList", "const fn list_table("),
@@ -604,7 +604,7 @@ fn parse_missing_table_len(body: &str) -> Option<usize> {
 }
 
 fn scan_rdna2_isa(root: &Path) -> Result<Vec<IsaFamily>> {
-    let shader_src = root.join("crates/oathkeep-shader/src");
+    let shader_src = root.join("engine/shader/src");
     let opcodes_src = read_module_sources(&shader_src.join("gfx10/opcodes"))?;
     let gfx10_mod = read_module_sources(&shader_src.join("gfx10/mod.rs"))?;
     let ir_raw = read_module_sources(&shader_src.join("ir"))?;
@@ -1007,16 +1007,16 @@ fn is_opcode_lowered(
 
 fn scan_unsupported_sites(root: &Path) -> Result<Vec<AreaCount>> {
     let buckets: &[(&str, &[&str])] = &[
-        ("Shader / Emit & Lower", &["crates/oathkeep-shader/src/emit"]),
+        ("Shader / Emit & Lower", &["engine/shader/src/emit"]),
         ("Shader / Resource & IR", &[
-            "crates/oathkeep-shader/src/resource.rs",
-            "crates/oathkeep-shader/src/ir.rs",
-            "crates/oathkeep-shader/src/io.rs",
-            "crates/oathkeep-shader/src/structure.rs",
+            "engine/shader/src/resource",
+            "engine/shader/src/ir",
+            "engine/shader/src/io",
+            "engine/shader/src/structure",
         ]),
-        ("HLE / Runtime Stubs", &["crates/oathkeep-hle/src"]),
-        ("GPU / D3D12.x Host", &["crates/oathkeep-gpu/src"]),
-        ("Formats / Tiling & Audio", &["crates/oathkeep-formats/src"]),
+        ("HLE / Runtime Stubs", &["engine/hle/src"]),
+        ("GPU / D3D12.x Host", &["engine/gpu/src"]),
+        ("Formats / Tiling & Audio", &["engine/formats/src"]),
     ];
 
     let mut out = Vec::new();
@@ -1078,9 +1078,9 @@ fn scan_dxgi_formats(root: &Path) -> Result<Vec<FormatBar>> {
     // Full DXGI console format catalog: standard 1..=115 (115) + console extensions 116..=120 (5) + 189..=191 (3) = 123.
     const TOTAL_DXGI: usize = 123;
 
-    let res_raw = read_module_sources(&root.join("crates/oathkeep-gpu/src/resource"))?;
-    let tex_raw = read_module_sources(&root.join("crates/oathkeep-formats/src/texture"))?;
-    let host_raw = read_module_sources_raw(&root.join("crates/oathkeep-gpu/src/host"))?;
+    let res_raw = read_module_sources(&root.join("engine/gpu/src/resource"))?;
+    let tex_raw = read_module_sources(&root.join("engine/formats/src/texture"))?;
+    let host_raw = read_module_sources_raw(&root.join("engine/gpu/src/host"))?;
 
     let (elem_all, elem_uncompressed) = parse_resource_element_formats(&res_raw);
     let tex_tiling = parse_match_u32_set(&tex_raw, "pub fn format(dxgi: u32)");

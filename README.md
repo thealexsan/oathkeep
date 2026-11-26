@@ -92,15 +92,15 @@ XInput controllers work natively. Without a controller connected, the keyboard a
 See [docs/architecture.md](docs/architecture.md) for subsystem details:
 
 - `apps/oathkeep` — `oathkeep` CLI (`run`, `inspect`, `census`, `translate`, `shader-info`, `lib-exports`, `config`)
-- `crates/oathkeep-core` — configuration, logging, repo-boundary enforcement (`ensure_outside_repo`)
-- `crates/oathkeep-pe` — read-only PE32+ and import-library parser
-- `crates/oathkeep-loader` — PE32+ image preparation, TLS redirection, console CPU instruction emulation
-- `crates/oathkeep-hle` — console OS, filesystem, DirectStorage, input, audio (XMA/Opus), and runtime HLE
-- `crates/oathkeep-gpu` — Direct3D 12.x device, command lists, bindless heaps, texture/memory sync, host D3D12 backend
-- `crates/oathkeep-shader` — RDNA 2 decoder, IR, optimization passes, and DXIL emitter
-- `crates/oathkeep-formats` — texture layouts, BCPack, and audio codecs
-- `crates/oathkeep-pipeline` — converter trait and content-addressed cache
-- `crates/oathkeep-game` — build identification and format helpers
+- `engine/core` — configuration, logging, repo-boundary enforcement (`ensure_outside_repo`)
+- `engine/pe` — read-only PE32+ and import-library parser
+- `engine/loader` — PE32+ image preparation, TLS redirection, console CPU instruction emulation
+- `engine/hle` — console OS, filesystem, DirectStorage, input, audio (XMA/Opus), and runtime HLE
+- `engine/gpu` — Direct3D 12.x device, command lists, bindless heaps, texture/memory sync, host D3D12 backend
+- `engine/shader` — RDNA 2 decoder, IR, optimization passes, and DXIL emitter
+- `engine/formats` — texture layouts, BCPack, and audio codecs
+- `engine/pipeline` — converter trait and content-addressed cache
+- `engine/game` — build identification and format helpers
 - `scripts/` — launcher (`play.ps1`) and Windows 10 Agility SDK setup (`setup-agility-sdk.ps1`)
 - `xtask` — repository asset-policy enforcement (`cargo xtask policy`) and hook installer
 

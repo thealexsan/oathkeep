@@ -22,7 +22,7 @@ const ALLOWED_NAMES: &[&str] = &[
 ];
 
 const EXCEPTIONS: &[(&str, &str)] = &[(
-    "crates/oathkeep-formats/src/bcpack-tables.bin",
+    "engine/formats/src/bcpack-tables.bin",
     "BCPack constant tables required for decoding (docs/asset-policy.md)",
 )];
 
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn accepts_source() {
-        assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
+        assert!(check("engine/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
     }

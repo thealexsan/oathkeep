@@ -22,7 +22,7 @@ In any form (files, commits, issues, pull requests, string literals, tests, fixt
 
 ## Binary Exception
 
-`crates/oathkeep-formats/src/bcpack-tables.bin` (~78 KiB) is the single documented exception in `xtask/src/policy.rs`: static entropy/dictionary tables required to decode the BCPack compression format. No further binary exceptions will be accepted.
+`engine/formats/src/bcpack-tables.bin` (~78 KiB) is the single documented exception in `xtask/src/policy.rs`: static entropy/dictionary tables required to decode the BCPack compression format. No further binary exceptions will be accepted.
 
 ## Where User Data Lives
 

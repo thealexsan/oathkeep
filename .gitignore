@@ -57,7 +57,7 @@ D3D12/
 # Typical game data (non-exhaustive on purpose; the policy check is an allowlist)
 *.bin
 # The one exception (docs/asset-policy.md): the BCPack format's constant tables.
-!/crates/oathkeep-formats/src/bcpack-tables.bin
+!/engine/formats/src/bcpack-tables.bin
 *.dat
 *.pak
 *.rpf
