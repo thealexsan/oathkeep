@@ -1498,8 +1498,8 @@ pub(super) fn multi_wave_wide_safe(
 
 /// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
 /// some lanes run (`all` is [`all_lane_blocks`]): per IR block, whether the host waves meet (a
-/// group barrier) at its start and before its exit. `None` if barriers cannot keep the
-/// console's order.
+/// group barrier) at its start and before its exit, or `Err(blocks)` naming the LDS-touching
+/// blocks in regions whose accesses barriers alone cannot order.
 ///
 /// The console runs the wave's lanes in step, so an LDS write is seen by every later read. Two
 /// host waves keep that order if they meet between any two accesses of which one writes. A
@@ -1521,7 +1521,7 @@ fn lds_meetings(
     io: &Io,
     threads: [u32; 3],
     all: &[bool],
-) -> Option<Vec<(bool, bool)>> {
+) -> Result<Vec<(bool, bool)>, Vec<usize>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
         match st.exits[b] {
@@ -1724,6 +1724,7 @@ fn lds_meetings(
         }
     }
     let model = ThreadModel::new(p, io, threads);
+    let mut bad: Vec<usize> = Vec::new();
     for r in 0..n {
         if reads[r].is_empty() || writes[r].is_empty() {
             continue;
@@ -1751,8 +1752,12 @@ fn lds_meetings(
                 .all(|&wr| reads[r].iter().all(|&rr| wr.disjoint(rr)))
         });
         if !atomic_safe {
-            return None;
+            bad.extend_from_slice(&blocks_in[r]);
+            continue;
         }
+    }
+    if !bad.is_empty() {
+        return Err(bad);
     }
     let mut meet = vec![(false, false); n];
     for b in 0..n {
@@ -1766,7 +1771,7 @@ fn lds_meetings(
             }
         }
     }
-    Some(meet)
+    Ok(meet)
 }
 
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
@@ -2239,16 +2244,19 @@ impl<'a> Lower<'a> {
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, x.io, cs.threads, &all) {
-                            lds_meet = Some((all.clone(), meet));
-                            lds_ok = true;
-                        }
                         if !lds_ok {
-                            // (the blocks whose LDS accesses not every lane runs: with the
-                            // branches around them taken wave-wide they get their barriers)
-                            for (b, blk) in p.blocks.iter().enumerate() {
-                                if !all.get(b).copied().unwrap_or(false) && blk.insts.iter().any(lds) {
-                                    need(b);
+                            match lds_meetings(p, x.st, x.io, cs.threads, &all) {
+                                Ok(meet) => {
+                                    lds_meet = Some((all.clone(), meet));
+                                    lds_ok = true;
+                                }
+                                Err(bad) => {
+                                    // Only widen branches enclosing regions whose LDS accesses
+                                    // actually failed ordering — leave already-safe regions
+                                    // (e.g. lock-free CAS / disjoint-atomic regions) untouched.
+                                    for b in bad {
+                                        need(b);
+                                    }
                                 }
                             }
                         }
@@ -2297,7 +2305,7 @@ impl<'a> Lower<'a> {
                         why.push("LDS in a group over 32");
                         match all_lane_blocks(x.st) {
                             None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, x.io, cs.threads, &all).is_none() => {
+                            Some(all) if lds_meetings(p, x.st, x.io, cs.threads, &all).is_err() => {
                                 why.push("an LDS read and write in one lane-branch region")
                             }
                             Some(_) => {}
