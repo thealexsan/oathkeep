@@ -182,13 +182,13 @@
   <rect x="474" y="296" width="382" height="62" rx="6" fill="#161b22" stroke="#30363d"/>
   <text x="486" y="314" fill="#8b949e" font-size="10.5" font-weight="600">LATEST WORLD TELEMETRY (RTX 3070 8 GB, 1080P)</text>
   <text x="486" y="330" fill="#8b949e" font-size="10" class="mono">FPS</text>
-  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">11.9-17.3 fps steady (diag-run81 peak 17.3 fps / 57.7 ms, +10% over run79; heavy scenes +16-43% in run82)</text>
+  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">11.8-18.3 fps steady (diag-run89b NEW PEAK 18.3 fps / 54.5 ms; heavy scenes +17-38% over run88)</text>
   <text x="575" y="330" fill="#8b949e" font-size="10" class="mono">FRAME</text>
-  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">57.7-84.2 ms (0 refused dynamic slots, 0 crashes/TDRs, 0.0 ms GPU wait)</text>
+  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">54.5-85.0 ms (0 refused dynamic slots, 0 crashes/TDRs, 0.0 ms GPU wait)</text>
   <text x="664" y="330" fill="#8b949e" font-size="10" class="mono">GPU</text>
-  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">0.0 ms wait (GPU busy 71-98% at ~95 W; 100% CPU-bound on recording + submit thread)</text>
+  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">0.0 ms wait (GPU busy 67-84%; CPU-bound on recording make_at + submit preparing)</text>
   <text x="753" y="330" fill="#8b949e" font-size="10" class="mono">PREP</text>
-  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">36.2-53.1 ms (batch_flush 15.3-20.3 ms, moves shadow 11.3-17.5 ms, rec 121.6-134.9 ms, make_at 32.5-37.5 ms)</text>
+  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">33.0-45.9 ms (batch_flush 12.4-22.5 ms, stale 4.6 ms, run_deferred 4.4 ms, snapshots 2.8 ms)</text>
   <line x1="24" y1="374" x2="856" y2="374" stroke="#21262d"/>
   <text x="24" y="390" fill="#8b949e" font-size="11">Target: 20-30+ FPS (1:1 visuals) • Clean-room Xbox Series X|S (GDK) layer</text>
   <text x="704" y="390" text-anchor="end" fill="#8b949e" font-size="11">Less</text>

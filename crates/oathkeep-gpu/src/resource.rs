@@ -954,6 +954,7 @@ pub(crate) struct HostTexture {
     pub(crate) state: std::sync::atomic::AtomicU32,
     bytes: u64,
     filled: bool,
+    allow_uav: bool,
     pub(crate) tiled: Option<crate::tiles::Tiled>,
 }
 
@@ -1150,7 +1151,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     made.clone()
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn host_made<'a>(
     this: This,
 ) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
@@ -1160,6 +1161,35 @@ pub(crate) fn host_made<'a>(
     let (host, _) = hosted(this, false)?;
     // SAFETY: as in `host_resource`.
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
+}
+
+/// Returns the host D3D12 resource(s) eligible for a targeted
+/// `D3D12_RESOURCE_BARRIER_TYPE_UAV` barrier on `this`.
+///
+/// Never triggers lazy host creation and never returns a resource created
+/// without `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS` (e.g. a depth texture
+/// whose UAV writes target its colour/plane `Twin` instead).
+#[cfg(windows)]
+pub(crate) fn uav_barrier_targets(
+    this: This,
+) -> Option<[Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>; 2]> {
+    if this.is_null() {
+        return None;
+    }
+    let (host, twin) = hosted(this, false)?;
+    if let Some(twin) = twin {
+        let colour = twin.colour.allow_uav.then(|| twin.colour.texture.clone());
+        let plane = twin
+            .plane
+            .as_ref()
+            .filter(|p| p.allow_uav)
+            .map(|p| p.texture.clone());
+        if colour.is_some() || plane.is_some() {
+            return Some([colour, plane]);
+        }
+        return None;
+    }
+    host.allow_uav.then(|| [Some(host.texture.clone()), None])
 }
 
 #[cfg(windows)]
@@ -1679,7 +1709,12 @@ impl HostTexture {
         state: u32,
     ) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let bytes = host_bytes(&texture);
+        // SAFETY: `texture` is a live host D3D12 resource.
+        let allow_uav = unsafe { texture.GetDesc() }
+            .Flags
+            .contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
@@ -1687,6 +1722,7 @@ impl HostTexture {
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
+            allow_uav,
             tiled: None,
         }
     }
@@ -1696,12 +1732,18 @@ impl HostTexture {
         state: u32,
         tiled: crate::tiles::Tiled,
     ) -> HostTexture {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        // SAFETY: `texture` is a live host D3D12 resource.
+        let allow_uav = unsafe { texture.GetDesc() }
+            .Flags
+            .contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes: 0,
             filled: false,
+            allow_uav,
             tiled: Some(tiled),
         }
     }

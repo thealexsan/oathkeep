@@ -2705,45 +2705,35 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
             let mut all_resolved = true;
             for &raw_res in &plan.tex_targets[..plan.tex_target_len] {
                 let title_res = raw_res as This;
-                let mut added = false;
-                if let Some(twin) = crate::resource::twin_resource(title_res) {
-                    list.keep(twin);
-                    targeted.push(Barrier {
-                        kind: 2,
-                        flags: 0,
-                        first: twin.as_raw().cast_const().cast(),
-                        second: 0,
-                        last: 0,
-                    });
-                    added = true;
-                }
-                if let Some(host_tex) = crate::resource::host_made(title_res) {
-                    list.keep(host_tex);
-                    targeted.push(Barrier {
-                        kind: 2,
-                        flags: 0,
-                        first: host_tex.as_raw().cast_const().cast(),
-                        second: 0,
-                        last: 0,
-                    });
-                    added = true;
-                }
-                if !added {
+                if let Some(targets) = crate::resource::uav_barrier_targets(title_res) {
+                    for res in targets.into_iter().flatten() {
+                        let raw = res.as_raw().cast_const().cast();
+                        list.keep(&res);
+                        targeted.push(Barrier {
+                            kind: 2,
+                            flags: 0,
+                            first: raw,
+                            second: 0,
+                            last: 0,
+                        });
+                    }
+                } else {
                     all_resolved = false;
                     break;
                 }
             }
-            if all_resolved {
+            if all_resolved && !targeted.as_slice().is_empty() {
                 let slice = targeted.as_slice();
-                // SAFETY: identical layout; borrowed resource pointers, never
-                // released through this slice.
+                // SAFETY: identical layout; borrowed resource pointers kept alive
+                // on `list` for the duration of recording.
                 let host_barriers = unsafe {
                     std::slice::from_raw_parts(
                         slice.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
                         slice.len(),
                     )
                 };
-                // SAFETY: an open list and live host texture resources.
+                // SAFETY: an open list and live host texture resources created with
+                // `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`.
                 unsafe { list.list.ResourceBarrier(host_barriers) };
                 return;
             }
