@@ -1235,3 +1235,82 @@ fn multi_wave_widening_keeps_safe_atomic_lds_region_unwidened() {
         assert_eq!(result[0][2], 5, "disjoint LDS read for count={count}");
     }
 }
+
+/// Single-console-wave (`8x8x1 = 64` threads) compute program with LDS whose
+/// lane-divergent branch performs both an LDS write and an LDS read plus a
+/// cross-half wave reduction (`WAVE_OR_V7_TO_S7`). Initial lowering returns
+/// `Ok((_, Some(64)))` because `lds_meetings` rejects the divergent read+write
+/// region; `emit::emit` must automatically widen the branch (`single_wave_lds`)
+/// without requiring a hardcoded container digest, pass `dxil.dll` validation,
+/// and produce exact results across both 32-lane host waves.
+#[test]
+fn single_wave_lds_branch_lowers_through_emit() {
+    let mut body = vec![
+        // Flatten 2D `[8, 8, 1]` thread ID (`v0 = x`, `v1 = y`) into `v0 = y * 8 + x` (`0..63`).
+        0x3402_0283, // v_lshlrev_b32 v1, 3, v1
+        0x4A00_0101, // v_add_nc_u32 v0, v1, v0
+        // Inside `if (v0 < s0)`: write `(v0 + 10)` to `lds[v0 * 4]`, read `lds[0]`,
+        // compute wave-wide OR of `1 << (v0 >> 1)`, and store `(wave_or + lds[0])`.
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0021, // s_cbranch_execz +33 (to restore of exec)
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x4A04_008A, // v_add_nc_u32 v2, 10, v0
+        0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2 offset:0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xD8D8_0000, 0x0400_0003, // ds_read_b32 v4, v3 offset:0
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+    ];
+    body.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    body.extend_from_slice(&[
+        0x4A00_0807, // v_add_nc_u32 v0, s7, v4
+        0xE070_1000, 0x8002_0003, // buffer_store_dword v0, v3, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+    let mut native = native_with_lds(&body, 64, 1);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.threads = [8, 8, 1];
+        cs.rsrc2 |= 1 << 11; // TIDIG_COMP_CNT = 1 (v0 = x, v1 = y)
+    }
+    let container = crate::dxbc::Container {
+        digest: [0xaa; 16],
+        version: (1, 0),
+        parts: Vec::new(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+    let io = io::raise(&p, &native).expect("io");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let emitted = super::emit(&container, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = emitted.expect("single-wave LDS branch must lower to wave32 via emit()");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false).or_else(|_| Host::new(true)) else { return };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else { return };
+    for count in [1u32, 19, 32, 33, 50, 64] {
+        let mut constants = vec![0u32; shader.user_data_dwords() as usize];
+        constants[0] = count;
+        let result = host
+            .dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(constants))],
+                views: &[View::RawUav(4)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            })
+            .expect("dispatch");
+        let expected_or = (0..count).fold(0u32, |acc, t| acc | (1u32 << (t >> 1)));
+        assert_eq!(
+            result[0][0],
+            expected_or.wrapping_add(10),
+            "widened 8x8x1 LDS + wave OR mismatch for count={count}"
+        );
+    }
+}
+

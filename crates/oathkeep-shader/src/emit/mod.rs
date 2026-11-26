@@ -548,6 +548,16 @@ pub fn emit(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
+        // Single-console-wave (64-thread) compute kernels that allocate LDS and
+        // stayed at Wave64 in `original` only because `lds_meetings` flagged an
+        // LDS read+write inside a lane-divergent branch (`Ok((_, Some(64)))`)
+        // safely lower via `widen()` without affecting particle kernels (`lds == 0`)
+        // that failed `original` on wave intrinsics inside loops.
+        let single_wave_lds = matches!(
+            native.io,
+            crate::native::StageIo::Cs(cs)
+                if cs.threads.iter().product::<u32>() == 64 && ((cs.rsrc2 >> 15) & 0x1ff) > 0
+        ) && matches!(&original, Ok((_, Some(64))));
         let multi_wave_group = matches!(
             native.io,
             crate::native::StageIo::Cs(cs)
@@ -556,7 +566,7 @@ pub fn emit(
         );
         let wide_on = wide_option
             .as_ref()
-            .map_or(scene_kernel || multi_wave_group, |v| v == "1");
+            .map_or(scene_kernel || single_wave_lds || multi_wave_group, |v| v == "1");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().

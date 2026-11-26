@@ -49,6 +49,7 @@ impl TablePlan {
             .iter()
             .filter(|u| u.root == RootType::Table)
             .map(|u| u.slot)
+            .chain(indexed.iter().map(|v| v.table_slot))
             .collect();
         slots.sort_unstable();
         slots.dedup();
@@ -96,18 +97,55 @@ impl TableGroup {
         Some(&self.entries[self.by_descriptor[i].1])
     }
 
-    fn needs_snapshot(&self, heap: &crate::descriptor::Heap, host_count: u32, table: u64) -> bool {
-        let index_at = |dword: u32| {
-            table
-                .checked_add(u64::from(dword) * 4)
-                .and_then(|end| heap.index(end))
-        };
-        match index_at(self.max_dword) {
+    fn selected_descriptors(&self, mut read_constant: impl FnMut(u8, u32) -> u32) -> Vec<u32> {
+        if self.indexed.is_empty() {
+            return Vec::new();
+        }
+        let mut selected: Vec<u32> = self
+            .indexed
+            .iter()
+            .map(|index| {
+                let constant = read_constant(index.constant_slot, index.constant_dword);
+                // The shader adds i32 byte offsets and shifts by 5.
+                index.byte_offset.wrapping_add(constant << index.shift) / 32
+            })
+            .collect();
+        selected.sort_unstable();
+        selected.dedup();
+        selected
+    }
+
+    fn needs_snapshot(
+        &self,
+        heap: &crate::descriptor::Heap,
+        host_count: u32,
+        table: u64,
+        selected: &[u32],
+    ) -> bool {
+        self.needs_snapshot_by(host_count, table, selected, |end| heap.index(end))
+    }
+
+    fn needs_snapshot_by(
+        &self,
+        host_count: u32,
+        table: u64,
+        selected: &[u32],
+        index_of: impl Fn(u64) -> Option<u32>,
+    ) -> bool {
+        let index_at = |dword: u32| table.checked_add(u64::from(dword) * 4).and_then(&index_of);
+        let max_dword = self
+            .max_dword
+            .max(selected.last().copied().unwrap_or(0).saturating_mul(8));
+        match index_at(max_dword) {
             Some(i) => i >= host_count,
-            None => self
-                .entries
-                .iter()
-                .any(|u| index_at(u.table_offset_dwords).is_some_and(|i| i >= host_count)),
+            None => {
+                self.entries
+                    .iter()
+                    .any(|u| index_at(u.table_offset_dwords).is_some_and(|i| i >= host_count))
+                    || selected
+                        .iter()
+                        .any(|&k| index_at(k.saturating_mul(8)).is_some_and(|i| i >= host_count))
+            }
         }
     }
 }
@@ -2042,7 +2080,16 @@ impl State {
                 if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                     crate::picked::runs_in(list);
                 }
+                // `depth_pyramid_cpu_occlusion` (`42683eebec081520`) samples the
+                // CPU software-rasterized 128x72 R32_FLOAT occlusion pyramid to
+                // seed GPU Hi-Z culling (`meshlet_args` / mesh draws). Force
+                // same-frame CopyTextureRegion recording so camera cuts never
+                // cull interior walls or ceilings against a 1-frame-stale CPU
+                // occlusion pyramid.
+                let _cpu_occ_guard =
+                    (compute && stage.shader.hash == "42683eebec081520").then(BakingGuard::enter);
                 let made = self.tables(list, &t.tables, compute);
+                drop(_cpu_occ_guard);
                 STORES.set(true);
                 if made.iter().any(|m| m.1 == u32::MAX) {
                     once!("a draw whose descriptor table found no free slots is dropped");
@@ -2980,10 +3027,11 @@ impl State {
         // has run are made from that.
         host.texture_views_remade();
         host.texture_slots_flip();
-        // And with room (or enough free tiles already committed in tiles::POOL),
-        // the textures whose upload left a held level without the card's memory
-        // are uploaded again.
-        if room || crate::tiles::free_room() >= (16 << 20) {
+        // And with room (or at least 1 MiB = 16 free 64 KiB tiles committed in
+        // `tiles::POOL`), placed textures whose upload left a held level without
+        // tiles (`OATHKEEP_LEVELS_ON_DEMAND=1`) are retried instead of stranding
+        // 14-15 MiB of free tiles behind a 16 MiB gate.
+        if room || crate::tiles::free_room() >= TILE_REUSE_FLOOR {
             host.texture_slots_waiting(frame);
         }
         let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
@@ -3039,18 +3087,24 @@ impl State {
         // drains; `OATHKEEP_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("OATHKEEP_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && on_time >= 1024 && room && !crate::residency::limited_host_ram() {
-            (per_frame * 3, span * 3)
-        } else {
-            (per_frame, span)
-        };
-        let per_frame = if !room && !required && !baking { per_frame.min(48 << 20) } else { per_frame };
+        let pool_room = crate::pool::texture_room();
+        let (per_frame, span) = heap_texture_pass_budget(
+            per_frame,
+            span,
+            on_time,
+            catchup,
+            room,
+            crate::residency::limited_host_ram(),
+            required,
+            baking,
+            pool_room,
+        );
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
             Some((ms, bytes, _)) => {
-                let bytes = if !room && !required && !baking { bytes.min(48 << 20) } else { bytes };
+                let bytes = clamp_pass_bytes_when_full(bytes, room, required, baking, pool_room);
                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
             }
             None => (span, per_frame),
@@ -3198,7 +3252,7 @@ impl State {
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
                     let can_reuse = crate::pool::texture_room() >= (32 << 20)
-                        || crate::tiles::free_room() >= (16 << 20);
+                        || crate::tiles::free_room() >= TILE_REUSE_FLOOR;
                     if !can_reuse {
                         refused += 1;
                         if full_card_pass() {
@@ -4049,11 +4103,13 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
-        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+    fn table_descriptor(&self, list: &HostList, slot: u8, descriptor: u32, kind: Option<ResourceType>, compute: bool) {
+        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
             return;
         };
-        let handle = table + u64::from(u.table_offset_dwords) * 4;
+        let Some(handle) = table.checked_add(u64::from(descriptor) * 32) else {
+            return;
+        };
         let Some(heap) = self.heap_of(handle) else {
             return;
         };
@@ -4061,7 +4117,9 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            if let Some(kind) = kind.or_else(|| view_kind(&view)) {
+                readable(list, kind, &view);
+            }
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -4069,6 +4127,10 @@ impl State {
                 host.slot_tabled(index);
             }
         }
+    }
+
+    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+        self.table_descriptor(list, u.slot, u.table_offset_dwords / 8, Some(u.kind), compute);
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
@@ -4090,13 +4152,23 @@ impl State {
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
-        for group in &plan.groups {
+        let selected_by_group: Vec<Vec<u32>> = plan
+            .groups
+            .iter()
+            .map(|group| {
+                group.selected_descriptors(|cslot, cdword| {
+                    self.user_value(compute, cslot, RootType::Constants, cdword)
+                })
+            })
+            .collect();
+        for (group, selected) in plan.groups.iter().zip(&selected_by_group) {
             let slot = group.slot;
             let needs_snapshot = group.has_cbv
                 || match self.roots_ref(compute).get(usize::from(slot)) {
                     Some(&Root::Table(table)) => self.heap_of(table).is_some_and(|heap| {
-                        heap.host()
-                            .is_some_and(|host| group.needs_snapshot(heap, host.count(), table))
+                        heap.host().is_some_and(|host| {
+                            group.needs_snapshot(heap, host.count(), table, selected)
+                        })
                     }),
                     _ => false,
                 };
@@ -4110,8 +4182,17 @@ impl State {
                 self.table_entry(list, &group.entries[e], compute);
             }
         }
+        for (group, selected) in plan.groups.iter().zip(&selected_by_group) {
+            if !selected.is_empty() && !selected_slot(&fresh, group.slot) {
+                for &k in selected {
+                    if group.entry(k).is_none() {
+                        self.table_descriptor(list, group.slot, k, None, compute);
+                    }
+                }
+            }
+        }
         let mut made = Few::default();
-        for group in &plan.groups {
+        for (group, selected) in plan.groups.iter().zip(selected_by_group) {
             let slot = group.slot;
             if !selected_slot(&fresh, slot) {
                 continue;
@@ -4129,25 +4210,9 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = group
-                .indexed
-                .iter()
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
-            selected.sort_unstable();
-            selected.dedup();
             let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
-            if n > crate::descriptor::host::DYNAMIC
+            if n > host.dynamic_count()
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
@@ -4169,7 +4234,10 @@ impl State {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
-                let once = ready_once() && selected.is_empty() && !group.has_uav;
+                let once = ready_once()
+                    && !crate::texture::BAKING.get()
+                    && selected.is_empty()
+                    && !group.has_uav;
                 if once
                     && known.epoch == list.epoch()
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
@@ -4262,7 +4330,11 @@ impl State {
                     let was = (listed.ready, listed.tabled);
                     if let Some(kind) = kind {
                         let tested = TESTED_DEPTH.get();
-                        if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
+                        if !crate::texture::BAKING.get()
+                            && kind == ResourceType::Srv
+                            && listed.ready.0 == list.epoch()
+                            && listed.ready.1 == tested.0
+                        {
                             if listed.ready.2 {
                                 TESTED_DEPTH.set((tested.0, true));
                             }
@@ -5041,6 +5113,71 @@ impl RecordHash {
     }
 }
 
+/// Minimum free bytes in `tiles::POOL` (`1 MiB` = 16 tiles) to retry waiting
+/// `OATHKEEP_LEVELS_ON_DEMAND=1` textures and admit tiled mip tails when `!room`.
+const TILE_REUSE_FLOOR: u64 = 1 << 20;
+
+/// Minimum already-committed free holes in `pool::texture_room()` (`64 MiB`)
+/// needed to keep the full per-frame reuse staging budget when `!room` (filling
+/// existing pool holes via `with_no_grow` allocates zero additional VRAM).
+const POOL_REUSE_HEADROOM: u64 = 64 << 20;
+
+fn clamp_pass_bytes_when_full(
+    bytes: u64,
+    room: bool,
+    required: bool,
+    baking: bool,
+    pool_room: u64,
+) -> u64 {
+    if !room && !required && !baking && pool_room < POOL_REUSE_HEADROOM {
+        bytes.min(48 << 20)
+    } else {
+        bytes
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn heap_texture_pass_budget(
+    per_frame: u64,
+    span: std::time::Duration,
+    on_time: usize,
+    catchup: bool,
+    room: bool,
+    limited_ram: bool,
+    required: bool,
+    baking: bool,
+    pool_room: u64,
+) -> (u64, std::time::Duration) {
+    let (per_frame, span) = if catchup && on_time >= 1024 && room && !limited_ram {
+        (per_frame * 3, span * 3)
+    } else {
+        (per_frame, span)
+    };
+    (
+        clamp_pass_bytes_when_full(per_frame, room, required, baking, pool_room),
+        span,
+    )
+}
+
+/// Temporarily enables `crate::texture::BAKING` (`true`) for the current scope
+/// so CPU-written occlusion textures record `CopyTextureRegion` in the same
+/// frame instead of waiting until the following frame after submission detiling.
+struct BakingGuard(bool);
+
+impl BakingGuard {
+    fn enter() -> Self {
+        let prev = crate::texture::BAKING.get();
+        crate::texture::BAKING.set(true);
+        Self(prev)
+    }
+}
+
+impl Drop for BakingGuard {
+    fn drop(&mut self) {
+        crate::texture::BAKING.set(self.0);
+    }
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -5083,6 +5220,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                     (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
                     _ => 0,
                 };
+                // Small CPU-written R32_FLOAT (`DXGI_FORMAT_R32_FLOAT == 41`,
+                // `<= 256x256`) depth pyramids feed same-frame GPU Hi-Z culling
+                // and must land in VRAM before the dispatch in `list` runs.
+                let sync_cpu_occlusion = crate::texture::PICKING.get().is_none()
+                    && crate::resource::texture_kind(*resource as This)
+                        .is_some_and(|(w, h, fmt)| fmt == 41 && w <= 256 && h <= 256);
+                let _guard = sync_cpu_occlusion.then(BakingGuard::enter);
                 crate::texture::upload_from(list, *resource as This, first);
             }
             // A depth texture shaders also write: what they wrote, first.
@@ -5389,5 +5533,125 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+#[cfg(test)]
+mod table_plan_and_reuse_tests {
+    use std::time::Duration;
+
+    use oathkeep_shader::native::{ResourceType, RootType, UsedResource};
+    use oathkeep_shader::resource::RootIndexedView;
+
+    use super::{
+        BakingGuard, POOL_REUSE_HEADROOM, TILE_REUSE_FLOOR, TablePlan, clamp_pass_bytes_when_full,
+        heap_texture_pass_budget,
+    };
+
+    #[test]
+    fn table_plan_tracks_indexed_only_tables_and_high_slot_snapshots() {
+        let indexed = [RootIndexedView {
+            table_slot: 3,
+            constant_slot: 0,
+            constant_dword: 2,
+            shift: 5,
+            byte_offset: 64,
+        }];
+        let plan = TablePlan::new(&[], &indexed);
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].slot, 3);
+        assert_eq!(plan.groups[0].indexed.len(), 1);
+
+        let selected = plan.groups[0].selected_descriptors(|slot, dword| {
+            assert_eq!((slot, dword), (0, 2));
+            10 // (64 + (10 << 5)) / 32 == 12
+        });
+        assert_eq!(selected, vec![12]);
+
+        let start = 0x1000_0000u64;
+        let count = 1_245_184u32;
+        let index_of = |handle: u64| {
+            let off = handle.checked_sub(start)?;
+            (off % 32 == 0)
+                .then(|| u32::try_from(off / 32).ok())
+                .flatten()
+                .filter(|&i| i < count)
+        };
+        let host_count = 868_927u32;
+        // High transient table past `host_count` (e.g. slot 900,000) must snapshot
+        // even when `entries` is empty and only `RootIndexedView` accesses it.
+        let high_table = start + 900_000u64 * 32;
+        assert!(plan.groups[0].needs_snapshot_by(host_count, high_table, &selected, index_of));
+
+        // Table starting 4 slots below `host_count` whose `RootIndexedView` reaches
+        // `host_count - 4 + 12 >= host_count` must also snapshot.
+        let straddling_table = start + u64::from(host_count - 4) * 32;
+        assert!(plan.groups[0].needs_snapshot_by(host_count, straddling_table, &selected, index_of));
+
+        // Table well inside `[0..host_count)` without CBVs stays direct.
+        let low_table = start + 1000 * 32;
+        assert!(!plan.groups[0].needs_snapshot_by(host_count, low_table, &selected, index_of));
+
+        // Mixed static + indexed declarations merge cleanly into one group.
+        let used = [UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 3,
+        }];
+        let merged = TablePlan::new(&used, &indexed);
+        assert_eq!(merged.groups.len(), 1);
+        assert_eq!(merged.direct.len(), 1);
+        assert_eq!(merged.groups[0].max_dword, 8);
+    }
+
+    #[test]
+    fn tile_floor_and_pool_hole_budgets_do_not_starve_zero_vram_reuse() {
+        // 14 MiB of free 64 KiB tiles (224 tiles) must pass the reuse floor.
+        assert!((14u64 << 20) >= TILE_REUSE_FLOOR);
+        assert_eq!(TILE_REUSE_FLOOR, 1 << 20);
+
+        // When VRAM is at its ceiling (`!room`) but `pool::texture_room()` has
+        // >= 64 MiB of committed holes (e.g. 1,111 MiB), zero-VRAM-growth reuse
+        // keeps its full 192 MiB per-frame staging budget instead of dropping to 48 MiB.
+        let base = 192u64 << 20;
+        let span = Duration::from_millis(250);
+        let (budget_with_holes, out_span) =
+            heap_texture_pass_budget(base, span, 2048, true, false, true, false, false, 1111 << 20);
+        assert_eq!(budget_with_holes, base);
+        assert_eq!(out_span, span);
+        assert_eq!(
+            clamp_pass_bytes_when_full(128 << 20, false, false, false, POOL_REUSE_HEADROOM),
+            128 << 20
+        );
+
+        // When committed pool holes are nearly exhausted (< 64 MiB), `!room`
+        // still clamps non-bake passes to 48 MiB.
+        let (budget_scarce, _) =
+            heap_texture_pass_budget(base, span, 2048, true, false, true, false, false, 16 << 20);
+        assert_eq!(budget_scarce, 48 << 20);
+        assert_eq!(
+            clamp_pass_bytes_when_full(128 << 20, false, false, false, 16 << 20),
+            48 << 20
+        );
+    }
+
+    #[test]
+    fn baking_guard_restores_previous_thread_local_state() {
+        crate::texture::BAKING.set(false);
+        {
+            let _outer = BakingGuard::enter();
+            assert!(crate::texture::BAKING.get());
+            {
+                let _inner = BakingGuard::enter();
+                assert!(crate::texture::BAKING.get());
+            }
+            assert!(crate::texture::BAKING.get());
+        }
+        assert!(!crate::texture::BAKING.get());
     }
 }

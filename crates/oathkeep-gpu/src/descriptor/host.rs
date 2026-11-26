@@ -1517,6 +1517,14 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// Dynamic-slot budget on a [`PORTABLE_VIEWS`] (1,000,000) capped heap when the
+/// title's heap exceeds `null - DYNAMIC`: `State::tables_done` reclaims dynamic
+/// slots at every submission fence and `State::fresh_tables` deduplicates tables
+/// within each list, so `2^17` (131,072) dynamic slots leaves `868,927` direct
+/// 1:1 bindless slots (`~148,000` slots of headroom above the `~721,000` peak
+/// bindless index instead of `16,931`).
+pub(crate) const CAPPED_DYNAMIC: u32 = 1 << 17;
+
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `OATHKEEP_DYNAMIC_SLOTS`
@@ -1549,7 +1557,12 @@ fn dynamic_slots_for(count: u32, null: u32, env_override: Option<u32>) -> u32 {
     if null < PORTABLE_VIEWS {
         let max_dyn = (null / 2).max(1);
         let min_dyn = MIN_DYNAMIC.min(max_dyn);
-        return env_override.unwrap_or(DYNAMIC).clamp(min_dyn, max_dyn);
+        let default = if count.saturating_add(DYNAMIC) > null {
+            CAPPED_DYNAMIC
+        } else {
+            DYNAMIC
+        };
+        return env_override.unwrap_or(default).clamp(min_dyn, max_dyn);
     }
     let most = env_override.unwrap_or(DYNAMIC << 2);
     null.saturating_sub(count)
@@ -1862,7 +1875,7 @@ impl HostHeap {
         }
         let counts = [0, 1, 2].map(|i| self.capped_mirror[i].swap(0, Relaxed));
         let raw_pages = self.capped_raw_pages.swap(0, Relaxed);
-        if counts == [0, 0, 0] {
+        if counts == [0, 0, 0] && raw_pages == 0 {
             return None;
         }
         Some((
@@ -1881,6 +1894,11 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// Number of dynamic descriptor slots reserved past [`HostHeap::count`].
+    pub(crate) fn dynamic_count(&self) -> u32 {
+        self.dynamic
     }
 
     /// The GPU address of the table of element strides by title slot (view
@@ -5536,11 +5554,14 @@ mod tests {
 
     #[test]
     fn capped_view_heap_dynamic_budget_and_telemetry() {
-        // NVIDIA 1,000,000 cap (null = 999,999) with 1,245,184 title slots.
-        assert_eq!(dynamic_slots_for(1_245_184, 999_999, None), DYNAMIC);
-        assert_eq!(999_999u32.saturating_sub(DYNAMIC), 737_855);
+        // NVIDIA 1,000,000 cap (null = 999,999) with 1,245,184 title slots:
+        // uses CAPPED_DYNAMIC (131,072) so direct_slots widens to 868,927.
+        assert_eq!(dynamic_slots_for(1_245_184, 999_999, None), CAPPED_DYNAMIC);
+        assert_eq!(999_999u32.saturating_sub(CAPPED_DYNAMIC), 868_927);
+        // A title heap that fits alongside DYNAMIC on a 1,000,000 cap keeps DYNAMIC.
+        assert_eq!(dynamic_slots_for(500_000, 999_999, None), DYNAMIC);
         // Explicit OATHKEEP_DYNAMIC_SLOTS override works on capped heaps and clamps safely.
-        assert_eq!(dynamic_slots_for(1_245_184, 999_999, Some(1 << 17)), 1 << 17);
+        assert_eq!(dynamic_slots_for(1_245_184, 999_999, Some(1 << 18)), 1 << 18);
         assert_eq!(dynamic_slots_for(1_245_184, 999_999, Some(1024)), 1 << 16);
         assert_eq!(dynamic_slots_for(1_245_184, 999_999, Some(900_000)), 999_999 / 2);
         // AMD uncapped (null = 2^21 - 1) leaves room for up to 4x DYNAMIC.
@@ -5552,8 +5573,9 @@ mod tests {
         assert_eq!(dynamic_slots_for(1024, 0, None), DYNAMIC);
         assert_eq!(dynamic_slots_for(1024, 0, Some(1 << 19)), 1 << 19);
 
-        // Verify past-cap mirror telemetry records below-null vs past-null drops safely.
-        let Some(heap) = HostHeap::new(false, 4) else {
+        // Verify past-cap mirror telemetry records below-null vs past-null drops safely,
+        // and `capped_raw_pages` alone surfaces `capped_telemetry` when `title_count > count`.
+        let Some(mut heap) = HostHeap::new(false, 4) else {
             return;
         };
         let mut fake = [0u32; 8];
@@ -5565,6 +5587,14 @@ mod tests {
         assert_eq!(heap.capped_mirror[1].load(Relaxed), 1);
         assert_eq!(heap.capped_mirror[2].load(Relaxed), 1);
         assert_eq!(heap.highest_capped.load(Relaxed), heap.count + heap.dynamic + 5);
+        heap.title_count = heap.count + 16;
+        let first_snap = heap.capped_telemetry().expect("mirror counts trigger telemetry");
+        assert_eq!(first_snap.6, [1, 1, 1]);
+        assert!(heap.capped_telemetry().is_none(), "empty telemetry suppressed");
+        heap.note_capped_raw_page();
+        let page_snap = heap.capped_telemetry().expect("raw page past cap triggers telemetry");
+        assert_eq!(page_snap.6, [0, 0, 0]);
+        assert_eq!(page_snap.7, 1);
     }
 
     /// Such a view is made on a copy of its own bytes, and that copy is the one
