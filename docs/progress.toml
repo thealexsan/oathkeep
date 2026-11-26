@@ -3,12 +3,12 @@ updated = "2026-11-26"
 commit = "perf/commit-reduction"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "2.9-3.4 fps with 1:1 verified visuals in diag-visual-holereuse (150.8s TIMEOUT_CLEAN; peak VRAM 7,148/7,161 MB, 24,000+ hole-reused textures, 0 crashes/TDRs/OOMs)"
-current_frame_ms = "347.8 ms in diag-visual-holereuse (157.4 ms preparing, 100.1 ms GPU, 57.4 ms copy-back; 1:1 console visuals verified — all NPC faces & interior walls textured and lit)"
-current_gpu_ms = "17.7-100.1 ms (150.8s TIMEOUT_CLEAN; peak VRAM 7,148/7,161 MB, staging 57-112 MB, tiles 305/320 MB reused, 0 depth-plane misses)"
-current_preparing_ms = "157.4 ms in diag-visual-holereuse (2324-3044 draws/f, 0 non-RT dropped shaders, 0 capped-view-heap hits)"
+current_fps = "2.9-3.9 fps peak (256.1-339.4 ms/f) in diag-fps-swarm1 (145.3s TIMEOUT_CLEAN; peak VRAM 6,838/7,161 MB, 0 crashes/TDRs/OOMs)"
+current_frame_ms = "256.1-339.4 ms in diag-fps-swarm1 (preparing 157.4->99.2 ms, GPU 100.1->43.1 ms, copy-back 57.4->35.0 ms, land::rest 25.6->0.92 ms)"
+current_gpu_ms = "17.2-43.1 ms (145.3s TIMEOUT_CLEAN; peak VRAM 6,838/7,161 MB, -310 MB headroom, 0 depth-plane misses)"
+current_preparing_ms = "99.2 ms in diag-fps-swarm1 (-37% vs 157.4 ms; snapshots 24.7->13.6 ms, heap spans 3.9->0.5 ms, 0 refused buffer views)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~20-30 min (1:1 visuals verified; launching 20-30+ FPS optimization swarm next)"
+eta = "~20-35 min (Round 1 FPS swarm cut preparing -37%, copy-back -39%, VRAM -310 MB; Round 2 targets 91 ms GUARDS lock, 52 ms BEHIND_PLACED, and recording gap)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -391,9 +391,18 @@ status = "VRAM overshoot & Wave64 shader 02384a60fda6f2d0 verified fixed! Peak D
 
 [[runs]]
 label = "diag-visual-holereuse"
-commit = "perf/commit-reduction"
+commit = "487d82a"
 fps = 2.9
 frame_ms = 347.8
 gpu_ms = "17.7-100.1 ms (150.8s TIMEOUT_CLEAN, peak VRAM 7,148/7,161 MB, 0 crashes/TDRs/OOMs)"
 preparing_ms = "157.4 ms (2324-3044 draws/f, staging 57-112 MB, tiles 305/320 MB reused)"
-status = "1:1 CONSOLE VISUALS VERIFIED! Zero-VRAM-growth hole reuse (pool::NO_GROW + tiles no_grow + 5/6-block staging cap + reuse-only admission) admitted 24,000+ textures into existing pool holes with 0 extra VRAM heaps and 0 staging spikes; secondary NPC faces, background patrons, and interior walls/posters are now 100% textured and naturally lit (frame-1928..1990). Ready for 20-30+ FPS optimization swarm!"
+status = "Zero-VRAM-growth hole reuse (pool::NO_GROW + tiles no_grow + 5/6-block staging cap + reuse-only admission) admitted 24,000+ textures into existing pool holes with 0 extra VRAM heaps and 0 staging spikes; secondary NPC faces, background patrons, and interior walls/posters textured and lit (frame-1928..1998)."
+
+[[runs]]
+label = "diag-fps-swarm1"
+commit = "d1e5000"
+fps = 3.9
+frame_ms = 256.1
+gpu_ms = "17.2-43.1 ms (145.3s TIMEOUT_CLEAN, peak VRAM 6,838/7,161 MB, 0 crashes/TDRs/OOMs)"
+preparing_ms = "99.2 ms (-37% vs 157.4 ms; snapshots 13.6 ms, copy-back 35.0 ms, land::rest 0.92 ms, heap buffers 2.0-16.2 ms)"
+status = "Round 1 4-worker FPS swarm verified clean (95ccbe8..d1e5000): peak 3.9 fps (256.1 ms/f), steady 2.9-3.9 fps, preparing -37%, copy-back -39%, land::rest -96% (25.6->0.92 ms via bury recycler), snapshots -45%, DXGI VRAM -310 MB (6,838/7,161 MB), windows commit -586 MB (no-length -1,124 MB, 0 slot mismatches), crisp 1:1 in-world visuals (frame-1915..1939); exposed Round 2 blockers: 91.1 ms GUARDS lock wait from batched yields, 52.6 ms BEHIND_PLACED stall, ~200 ms CPU recording/thin-list gap, and 512 KiB window-count growth (3,810 windows)"
