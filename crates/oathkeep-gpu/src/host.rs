@@ -8015,15 +8015,9 @@ impl HostList {
                     if let Some(t) = copy_run_start.take() {
                         copy_us += t.elapsed().as_micros() as u64;
                     }
-                    batch.flush_one_range(shadow, *address, address.saturating_add(*len));
+                    batch.defer_gpu_write(shadow, *address, *len);
                     #[cfg(feature = "diagnostics")]
-                    let snapshot = std::time::Instant::now();
-                    shadow.writing(*address, *len);
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::GpuWrites, 1);
-                        add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
-                    }
+                    add(C::GpuWrites, 1);
                 }
                 Step::Texture(staging) => {
                     if let Some(t) = copy_run_start.take() {
@@ -8087,6 +8081,9 @@ struct Batch {
     pending_textures: Vec<(usize, usize, std::sync::Arc<crate::texture::Staging>)>,
     pending_tex_min: usize,
     pending_tex_max: usize,
+    pending_gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    pending_gpu_min: usize,
+    pending_gpu_max: usize,
     after_textures: Vec<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -8150,6 +8147,23 @@ impl Batch {
                 self.last_refresh_at = at;
             }
         }
+    }
+
+    fn defer_gpu_write(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        let end = address.saturating_add(len);
+        if self.pending_gpu_writes.is_empty() {
+            self.pending_gpu_min = address;
+            self.pending_gpu_max = end;
+        } else {
+            self.pending_gpu_min = self.pending_gpu_min.min(address);
+            self.pending_gpu_max = self.pending_gpu_max.max(end);
+        }
+        self.pending_gpu_writes.push((shadow.clone(), address, len));
     }
 
     fn flush_one_range(
@@ -8289,6 +8303,37 @@ impl Batch {
                 for (from, to) in spans {
                     Self::update(&shadow, from, to);
                 }
+            }
+        }
+        if !self.pending_gpu_writes.is_empty()
+            && dst < self.pending_gpu_max
+            && end > self.pending_gpu_min
+        {
+            let mut overlapping_gpu = Vec::new();
+            let mut i = 0;
+            while i < self.pending_gpu_writes.len() {
+                let (_, addr, glen) = self.pending_gpu_writes[i];
+                let gend = addr.saturating_add(glen);
+                if addr < end && gend > dst {
+                    overlapping_gpu.push(self.pending_gpu_writes.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            if self.pending_gpu_writes.is_empty() {
+                self.pending_gpu_min = 0;
+                self.pending_gpu_max = 0;
+            }
+            for (shadow, addr, glen) in overlapping_gpu {
+                self.flush_one_range(&shadow, addr, addr.saturating_add(glen));
+                #[cfg(feature = "diagnostics")]
+                let snapshot = std::time::Instant::now();
+                shadow.writing(addr, glen);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(
+                    crate::copystat::C::SnapshotUs,
+                    snapshot.elapsed().as_micros() as u64,
+                );
             }
         }
         if !self.pending_textures.is_empty()
@@ -8444,6 +8489,20 @@ impl Batch {
             for (_, _, staging) in self.pending_textures.drain(..) {
                 staging.refresh();
             }
+        }
+        if !self.pending_gpu_writes.is_empty() {
+            self.pending_gpu_min = 0;
+            self.pending_gpu_max = 0;
+            #[cfg(feature = "diagnostics")]
+            let snapshot = std::time::Instant::now();
+            for (shadow, addr, glen) in self.pending_gpu_writes.drain(..) {
+                shadow.writing(addr, glen);
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::SnapshotUs,
+                snapshot.elapsed().as_micros() as u64,
+            );
         }
         for work in self.after_textures.drain(..) {
             work();

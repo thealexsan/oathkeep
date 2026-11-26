@@ -3,12 +3,12 @@ updated = "2026-11-26"
 commit = "perf/commit-reduction"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "11.8-18.3 fps steady (diag-run89b NEW PEAK 18.3 fps / 54.5 ms; heavy scenes +17-38% over run88)"
-current_frame_ms = "54.5-85.0 ms (0 refused dynamic slots, 0 crashes/TDRs, 0.0 ms GPU wait)"
-current_gpu_ms = "0.0 ms wait (GPU busy 67-84%; CPU-bound on recording make_at + submit preparing)"
-current_preparing_ms = "33.0-45.9 ms (batch_flush 12.4-22.5 ms, stale 4.6 ms, run_deferred 4.4 ms, snapshots 2.8 ms)"
+current_fps = "11.6-16.6 fps heavy 3D steady / 18.3 fps peak (diag-run90: heavy 3D scenes +18-32%, drw=3958 9.8->11.6 fps, drw=3449 11.7->13.8 fps, drw=2473 10.4->13.7 fps)"
+current_frame_ms = "60.4-86.0 ms heavy 3D (54.5 ms peak, 0 refused dynamic slots, 0 crashes/TDRs, 0.0 ms GPU wait)"
+current_gpu_ms = "0.0 ms wait (GPU busy 67-86%; 100% CPU-bound across 5 recording threads + submit preparing)"
+current_preparing_ms = "34.8-46.6 ms (run_deferred 1.5-1.9 ms [-68%], snapshots 1.3-1.6 ms [-53%], copy-back 13.6-18.4 ms [-30%])"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~15-20 min (Fix Z: batch CopyDescriptors in make_at + defer run_deferred GpuWrite flushes + CARD_BUFFERS_MIN_KB=512 + alias_apply hot-skip -> 20-30+ FPS)"
+eta = "~15-20 min (Fix AA: 2-hit stage-cache admission filter + parallel card stale_under_flights + 128 KB card-buffer threshold + 8-worker heap_buffers -> 20-30+ FPS)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -283,9 +283,18 @@ status = "Fix X1-X3 verified: new peak 17.4 fps (57.3 ms/f), heavy-scene prep -2
 
 [[runs]]
 label = "diag-run89b"
-commit = "perf/commit-reduction"
+commit = "cafadfe"
 fps = 18.3
 frame_ms = 54.5
 gpu_ms = "0.0 ms wait (67-84% busy)"
 preparing_ms = "33.0-45.9 ms (batch_flush 12.4-22.5 ms, moves 12.8-34.8 ms)"
 status = "Fix Y1-Y4 verified: NEW PEAK 18.3 fps (54.5 ms/f), heavy scenes +17-38% (10.0->13.8, 9.3->11.9, 8.4->9.8 fps), 0 crashes/TDRs/refusals; next: Fix Z (batched CopyDescriptors, parallel GpuWrite flush, CARD_BUFFERS_MIN_KB=512, alias_apply hot-skip)"
+
+[[runs]]
+label = "diag-run90"
+commit = "perf/commit-reduction"
+fps = 16.6
+frame_ms = 60.4
+gpu_ms = "0.0 ms wait (67-86% busy)"
+preparing_ms = "34.8-46.6 ms (run_deferred 1.5-1.9 ms, snapshots 1.3-1.6 ms, back 13.6-18.4 ms)"
+status = "Fix Z1-Z4 verified: run_deferred -68% (5.0->1.6 ms), snapshots -53% (3.0->1.4 ms), copy-back -30% (24->16 ms), compared MB -56% (33->14.4 MB), heavy 3D scenes +18-32% (drw=3958 9.8->11.6, drw=3449 11.7->13.8, drw=2473 10.4->13.7 fps); next: Fix AA (2-hit stage-cache admission filter + parallel card stale_under_flights + 128 KB card threshold)"

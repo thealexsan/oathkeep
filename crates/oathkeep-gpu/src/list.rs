@@ -2735,6 +2735,8 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
                 // SAFETY: an open list and live host texture resources created with
                 // `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`.
                 unsafe { list.list.ResourceBarrier(host_barriers) };
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::WaitsForGroupsTargeted, 1);
                 return;
             }
         }
@@ -2744,8 +2746,12 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         if plan.affects_indirect {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::WaitsForGroupsIndirect, 1);
             list.mark_uav_clean();
         } else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::WaitsForGroupsKeepIndirect, 1);
             list.mark_uav_clean_keep_indirect();
         }
         list_obj.uav_barrier_needed = false;

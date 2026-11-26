@@ -2480,6 +2480,134 @@ impl HostHeap {
         self.lookup_mirrored_stage_words(index, words)
     }
 
+    /// Batched fast path for `fresh_tables`: looks up all `VIEW_TAG` entries in `used_k`/`words_list`,
+    /// acquires unique stage-cache stripe read locks in strictly ascending stripe order
+    /// (SRWLock-safe, deadlock-free, and eviction-safe), copies all valid hits in a single
+    /// `ID3D12Device::CopyDescriptors` COM call per chunk (up to 32 entries), and writes
+    /// `Some(DynamicMade)` into the matching `out[i]` slot. Non-`VIEW_TAG` or cache-miss
+    /// entries remain `None` for the caller to handle via `copy_or_make_dynamic`.
+    pub(crate) fn copy_dynamic_batch(
+        &self,
+        first: u32,
+        trim: u32,
+        used_k: &[u32],
+        words_list: &[[u32; 3]],
+        out: &mut Vec<Option<DynamicMade>>,
+        mut already_kept: impl FnMut(usize) -> bool,
+    ) {
+        out.clear();
+        out.resize_with(used_k.len(), || None);
+        if self.sampler || used_k.len() < 2 {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(stage) = cpu_stage_heap() else {
+            return;
+        };
+        const CHUNK: usize = 32;
+        let mut base = 0usize;
+        while base < used_k.len() {
+            let end = (base + CHUNK).min(used_k.len());
+            let mut candidates = [(0usize, 0u32, 0u64, 0usize); CHUNK];
+            let mut n_cand = 0usize;
+            let mut stripes = [0usize; CHUNK];
+            let mut n_stripes = 0usize;
+            for i in base..end {
+                let words = words_list[i];
+                if words[0] != VIEW_TAG || crate::descriptor::constant_from_words(words).is_some() {
+                    continue;
+                }
+                let key = (u64::from(words[1]) << 32) | u64::from(words[2]);
+                let stripe_idx =
+                    ((key ^ (key >> 17) ^ (key >> 33)) as usize) & (STAGE_STRIPES - 1);
+                candidates[n_cand] = (i, first + (used_k[i] - trim), key, stripe_idx);
+                stripes[n_stripes] = stripe_idx;
+                n_cand += 1;
+                n_stripes += 1;
+            }
+            if n_cand >= 2 {
+                stripes[..n_stripes].sort_unstable();
+                let mut uniq = 0usize;
+                for j in 0..n_stripes {
+                    if uniq == 0 || stripes[j] != stripes[uniq - 1] {
+                        stripes[uniq] = stripes[j];
+                        uniq += 1;
+                    }
+                }
+                // Acquire stripe read locks in strictly ascending stripe index order:
+                // no duplicate stripe locks (SRWLock-safe) and total lock order (deadlock-free).
+                let mut guards: [Option<std::sync::RwLockReadGuard<'_, StageStripe>>; CHUNK] =
+                    [const { None }; CHUNK];
+                for s in 0..uniq {
+                    guards[s] = Some(
+                        stage.stripes[stripes[s]]
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner()),
+                    );
+                }
+                let mut dsts = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); CHUNK];
+                let mut srcs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); CHUNK];
+                let mut n_copy = 0usize;
+                for &(out_i, dst_idx, key, stripe_idx) in &candidates[..n_cand] {
+                    let pos = stripes[..uniq].binary_search(&stripe_idx).unwrap();
+                    let guard = guards[pos].as_ref().unwrap();
+                    if let Some(&local) = guard.map.get(&key)
+                        && let Some(entry) = guard.entries[local].as_ref()
+                        && entry.key == key
+                        && entry.is_valid()
+                    {
+                        dsts[n_copy] = self.cpu(dst_idx);
+                        srcs[n_copy] = stage.cpu(entry.slot);
+                        n_copy += 1;
+                        let kept = if entry.kept_raw != 0 && !already_kept(entry.kept_raw) {
+                            entry.kept.clone()
+                        } else {
+                            None
+                        };
+                        out[out_i] = Some(DynamicMade {
+                            found: true,
+                            kept,
+                            action: entry.action.clone(),
+                            view_kind: entry.view_kind,
+                            is_texture: entry.is_texture,
+                        });
+                    }
+                }
+                if n_copy > 0 {
+                    // SAFETY: all `dsts` are freshly allocated dynamic shader-visible slots owned
+                    // exclusively by this recording thread; all `srcs` are live CPU staging slots
+                    // protected from concurrent eviction by the held stripe read guards.
+                    unsafe {
+                        if n_copy == 1 {
+                            host.device.CopyDescriptorsSimple(
+                                1,
+                                dsts[0],
+                                srcs[0],
+                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            );
+                        } else {
+                            host.device.CopyDescriptors(
+                                n_copy as u32,
+                                dsts.as_ptr(),
+                                None,
+                                n_copy as u32,
+                                srcs.as_ptr(),
+                                None,
+                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            );
+                        }
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::StageCacheHits, n_copy as u64);
+                }
+                drop(guards);
+            }
+            base = end;
+        }
+    }
+
     /// Copies a cached CPU staging descriptor into dynamic slot `index` via
     /// `CopyDescriptorsSimple`, bypassing `descriptor::view()` RwLocks, `GetDesc()`,
     /// `shadow::find()`, and `CreateShaderResourceView` on cache hits (~99.9% steady state).

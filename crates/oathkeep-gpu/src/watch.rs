@@ -1735,18 +1735,33 @@ fn apply_alias_protection_sharded(
         }
         all_other_runs = merged;
     }
+    let frame = crate::frame::current();
     let skip_absent = COMMIT_TITLE_MEMORY.get().is_some();
     for (a, b) in all_other_runs {
         for_each_shard_span(a, b, |shard, sa, sb| {
             let already_protected = {
                 let g = guards_read_shard(shard);
-                g.protected.contains_range(sa, sb)
-                    || (skip_absent
-                        && g.absent.overlaps(sa, sb)
-                        && g.protected
-                            .gaps_in(sa, sb)
-                            .into_iter()
-                            .all(|(ga, gb)| g.absent.contains_range(ga, gb)))
+                if g.protected.contains_range(sa, sb) {
+                    true
+                } else {
+                    let check_absent = skip_absent && g.absent.overlaps(sa, sb);
+                    let has_hot = !g.hot.is_empty();
+                    (check_absent || has_hot)
+                        && g.protected.gaps_in(sa, sb).into_iter().all(|(ga, gb)| {
+                            if check_absent && g.absent.contains_range(ga, gb) {
+                                true
+                            } else if !has_hot {
+                                false
+                            } else if check_absent && g.absent.overlaps(ga, gb) {
+                                g.absent
+                                    .gaps_in(ga, gb)
+                                    .into_iter()
+                                    .all(|(ha, hb)| all_hot(&g.hot, ha, hb, frame))
+                            } else {
+                                all_hot(&g.hot, ga, gb, frame)
+                            }
+                        })
+                }
             };
             if !already_protected {
                 let mut g = guards_write_shard(shard);
@@ -1754,6 +1769,21 @@ fn apply_alias_protection_sharded(
             }
         });
     }
+}
+
+#[inline]
+fn all_hot(hot: &BTreeMap<usize, u64>, a: usize, b: usize, frame: u64) -> bool {
+    if a >= b || hot.len() < b - a {
+        return false;
+    }
+    let mut expect = a;
+    for (&block, &until) in hot.range(a..b) {
+        if block != expect || until <= frame {
+            return false;
+        }
+        expect += 1;
+    }
+    expect == b
 }
 
 pub(crate) const MANY_VIEWS: usize = 64;

@@ -1471,7 +1471,13 @@ fn card_limits() -> (u64, u64) {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(|kb| (kb << 10).max(64 << 10))
-            .unwrap_or_else(|| mb("OATHKEEP_CARD_BUFFERS_MIN_MB", 1).max(1 << 20));
+            .or_else(|| {
+                std::env::var("OATHKEEP_CARD_BUFFERS_MIN_MB")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map(|m| (m << 20).max(64 << 10))
+            })
+            .unwrap_or(512 << 10);
         (min_bytes, mb("OATHKEEP_CARD_BUFFERS_MB", 1024))
     })
 }

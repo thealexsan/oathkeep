@@ -282,6 +282,7 @@ pub(crate) struct State {
     scratch_selected: Vec<u32>,
     scratch_used_k: Vec<u32>,
     scratch_words: Vec<[u32; 3]>,
+    scratch_dyn_made: Vec<Option<crate::descriptor::host::DynamicMade>>,
     scratch_addresses: Vec<u64>,
     scratch_constants: Vec<u32>,
 }
@@ -4005,6 +4006,17 @@ impl State {
             let mut entry_cursor = 0usize;
             #[cfg(feature = "diagnostics")]
             let t_make = std::time::Instant::now();
+            self.sync_list_gen(list.reset_gen());
+            let mut premade = std::mem::take(&mut self.scratch_dyn_made);
+            let kept_ptrs = &self.kept_ptrs;
+            host.copy_dynamic_batch(
+                first,
+                trim,
+                &self.scratch_used_k,
+                &self.scratch_words,
+                &mut premade,
+                |raw| kept_ptrs.contains(&raw),
+            );
             for used_i in 0..self.scratch_used_k.len() {
                 let k = self.scratch_used_k[used_i];
                 let words = self.scratch_words[used_i];
@@ -4063,8 +4075,8 @@ impl State {
                     host.constant_at_dynamic(index, gpu, size);
                     continue;
                 }
-                let made = host.copy_or_make_dynamic(index, words, |raw| {
-                    self.is_kept_dynamic(list, raw)
+                let made = premade[used_i].take().unwrap_or_else(|| {
+                    host.copy_or_make_dynamic(index, words, |raw| self.is_kept_dynamic(list, raw))
                 });
                 if !made.found {
                     if used_entry.is_some() {
@@ -4130,6 +4142,8 @@ impl State {
                     }
                 }
             }
+            premade.clear();
+            self.scratch_dyn_made = premade;
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(
                 crate::copystat::C::RecTablesMakeAtUs,
