@@ -115,12 +115,43 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container_len: usize,
     container: Mutex<ContainerStore>,
+    pub(crate) left_out: Option<&'static str>,
     #[cfg(windows)]
     is_spilled: bool,
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+}
+
+fn shader_left_out(stage: &'static str, bytes: &[u8]) -> Option<&'static str> {
+    if stage != "compute" {
+        return None;
+    }
+    let contains = |name: &[u8]| bytes.windows(name.len()).any(|w| w == name);
+    static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
+    let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
+        let builder = std::env::var_os("OATHKEEP_BVH_BUILDER").is_some_and(|v| v == "1");
+        if builder {
+            return false;
+        }
+        std::env::var_os("OATHKEEP_RT_RESOLVE").is_none_or(|v| v == "0")
+    });
+    if skip_rt && contains(b"CS_RaytracingResolve") {
+        return Some("shades ray-tracing hits without BVH, left out");
+    }
+    static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
+    let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
+        let builder = std::env::var_os("OATHKEEP_BVH_BUILDER").is_some_and(|v| v == "1");
+        if builder {
+            return std::env::var_os("OATHKEEP_ACTIVATE_RAYS").is_some_and(|v| v == "0");
+        }
+        std::env::var_os("OATHKEEP_ACTIVATE_RAYS").is_none_or(|v| v == "0")
+    });
+    if skip_activate && contains(b"CS_ScreenProbes_ActivateRays") {
+        return Some("ray activation shader without BVH, left out");
+    }
+    None
 }
 
 impl std::fmt::Debug for Shader {
@@ -202,6 +233,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container_len: bytes.len(),
                 container: Mutex::new(store),
+                left_out: shader_left_out(stage, bytes),
                 #[cfg(windows)]
                 is_spilled,
                 #[cfg(windows)]

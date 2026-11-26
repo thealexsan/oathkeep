@@ -9,12 +9,28 @@ use super::host::{GraphicsState, HostPipeline};
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Mutex<Option<Box<GraphicsState>>>,
-    is_compute: bool,
     queue_state: AtomicU8,
-    last_frame: AtomicU64,
+    was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     key: String,
     used: AtomicBool,
+    screen: bool,
+    scene_input: bool,
+    left_out: Option<&'static str>,
+}
+
+fn scene_input(shaders: &[Arc<Shader>]) -> bool {
+    shaders.iter().any(|s| {
+        matches!(
+            s.hash.as_str(),
+            "970c4fbb3b017c0e"
+                | "068c90badc86f1fd"
+                | "e4a7e088c7780ce8"
+                | "ebe4e53f031f5249"
+                | "2cc4c197ee29e291"
+                | "369cbe906ea72764"
+        ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
+    })
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -37,27 +53,36 @@ impl Pending {
                 .unwrap_or_default()
                 .as_bytes(),
         );
-        let is_compute = matches!(shaders.as_slice(), [s] if s.stage == "compute");
+        let scene_input = scene_input(&shaders);
+        let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
+            && shaders.iter().all(|s| s.stage != "mesh"))
+            || scene_input;
+        let left_out = shaders.iter().find_map(|s| s.left_out);
         Pending {
             shaders,
             graphics: Mutex::new(graphics),
-            is_compute,
             queue_state: AtomicU8::new(NOT_QUEUED),
-            last_frame: AtomicU64::new(0),
+            was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            screen,
+            scene_input,
+            left_out,
         }
     }
 
     fn make(&self) {
         self.made.get_or_init(|| {
+            let began = Instant::now();
             let graphics = self
                 .graphics
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
-            HostPipeline::new(&self.shaders, graphics.as_deref())
+            let made = HostPipeline::new(&self.shaders, graphics.as_deref());
+            super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            made
         });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -67,6 +92,9 @@ impl Pending {
 
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(why) = p.left_out {
+        return Some(why.into());
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
@@ -94,10 +122,25 @@ fn wait_budget() -> Duration {
         let millis = std::env::var("OATHKEEP_PIPELINE_WAIT_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(16);
+            .unwrap_or(500);
         tracing::info!(millis, "host pipeline wait budget per frame");
         Duration::from_millis(millis)
     })
+}
+
+fn screen_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let millis = std::env::var("OATHKEEP_SCREEN_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(10_000);
+        Duration::from_millis(millis)
+    })
+}
+
+fn screens_first() -> bool {
+    !screen_budget().is_zero()
 }
 
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -107,27 +150,34 @@ pub(crate) fn waiting() -> u64 {
 }
 
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        return None;
+    }
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        let frame = crate::frame::current();
-        p.last_frame.fetch_max(frame, Ordering::Relaxed);
         start(p, REQUESTED);
-        wait(p, frame);
+        wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
 }
 
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
 
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.left_out.is_some() {
+        return;
+    }
+    if !p.shaders.is_empty() && (p.scene_input || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+        start(p, if p.scene_input { REQUESTED } else { EARLY });
     }
 }
 
@@ -137,14 +187,21 @@ fn shared_budget() -> bool {
 }
 
 fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
+    let screen = p.screen && screens_first();
+    let budget = if screen {
+        screen_budget()
+    } else {
+        wait_budget()
+    };
     if budget.is_zero() {
         return;
     }
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    static SPENT: [Mutex<(u64, Duration)>; 2] =
+        [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    let spent_of = &SPENT[usize::from(screen)];
     let shared = shared_budget();
     let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -172,8 +229,16 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if screen && waited > Duration::from_millis(500) {
+        tracing::info!(
+            ms = waited.as_millis() as u64,
+            made = p.made.get().is_some(),
+            shaders = ?p.shaders,
+            "a pass over the screen was waited for"
+        );
+    }
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 == frame {
             if shared {
                 spent.1 = spent.1.saturating_sub(left - waited);
@@ -194,61 +259,94 @@ const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
 const MAKING: u8 = 3;
 
+fn slow_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        if std::env::var_os("OATHKEEP_PIPELINE_SLOW").is_some_and(|v| v == "0") {
+            usize::MAX
+        } else {
+            (worker_count() / 4).max(1)
+        }
+    })
+}
+
 struct Queue {
+    screen: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
+    slow: VecDeque<Arc<Pending>>,
+    slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
     const fn new() -> Self {
         Self {
+            screen: VecDeque::new(),
             early: VecDeque::new(),
+            slow: VecDeque::new(),
+            slow_now: 0,
             requested: VecDeque::new(),
         }
     }
 
     fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
+        self.push_as(
+            p,
+            priority,
+            slow_limit() != usize::MAX && super::library::slow(&p.key),
+        )
+    }
+
+    fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
         let prev = p.queue_state.load(Ordering::Relaxed);
         if prev >= priority {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
+        if priority == REQUESTED && p.screen && screens_first() {
+            self.screen.push_back(p.clone());
+        } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
+        } else if slow {
+            self.slow.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
         }
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self, allow_early: bool) -> Option<(Arc<Pending>, bool)> {
-        if !self.requested.is_empty() {
-            let mut best_idx = self.requested.len() - 1;
-            let mut best_key = (
-                self.requested[best_idx].last_frame.load(Ordering::Relaxed),
-                self.requested[best_idx].is_compute,
-            );
-            for i in (0..best_idx).rev() {
-                let key = (
-                    self.requested[i].last_frame.load(Ordering::Relaxed),
-                    self.requested[i].is_compute,
-                );
-                if key > best_key {
-                    best_key = key;
-                    best_idx = i;
-                }
-            }
-            let p = self.requested.remove(best_idx)?;
+    fn pop(&mut self, screens_only: bool, allow_early: bool, slow_limit: usize) -> Option<(Arc<Pending>, bool)> {
+        let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
+            std::iter::from_fn(|| list.pop_front())
+                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+        };
+        if let Some(p) = self.screen.pop_front() {
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            return Some((p, false));
+        }
+        if screens_only {
+            return None;
+        }
+        if let Some(p) = self.requested.pop_front() {
             p.queue_state.store(MAKING, Ordering::Relaxed);
             return Some((p, false));
         }
         if !allow_early {
             return None;
         }
-        let p = std::iter::from_fn(|| self.early.pop_front())
-            .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)?;
-        p.queue_state.store(MAKING, Ordering::Relaxed);
-        Some((p, true))
+        if let Some(p) = unclaimed(&mut self.early) {
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            return Some((p, true));
+        }
+        if self.slow_now < slow_limit
+            && let Some(p) = unclaimed(&mut self.slow)
+        {
+            p.was_slow.store(true, Ordering::Relaxed);
+            self.slow_now += 1;
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            return Some((p, true));
+        }
+        None
     }
 }
 
@@ -273,7 +371,7 @@ fn start(p: &Arc<Pending>, priority: u8) {
                 Ordering::Relaxed,
             );
         }
-        AVAILABLE.notify_one();
+        AVAILABLE.notify_all();
     }
 }
 
@@ -283,7 +381,7 @@ fn early_commit_floor() -> u64 {
         std::env::var("OATHKEEP_EARLY_PIPELINE_COMMIT_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(3072)
+            .unwrap_or(2048)
             << 20
     })
 }
@@ -296,28 +394,16 @@ fn early_allowed() -> bool {
     crate::host::available_commit().is_none_or(|avail| avail >= floor)
 }
 
-fn early_limit() -> usize {
-    let max = worker_count().min(4);
-    let Some(avail) = crate::host::available_commit() else {
-        return max;
-    };
-    if avail < (3072u64 << 20) {
-        1
-    } else if avail < (4096u64 << 20) {
-        max.min(2)
-    } else {
-        max
-    }
-}
+const SCREEN_WORKERS: usize = 2;
 
-fn next() -> (Arc<Pending>, bool) {
+fn next(screens_only: bool) -> (Arc<Pending>, bool) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        let allow_early = early_allowed();
-        if let Some(item) = queue.pop(allow_early) {
+        let allow_early = !screens_only && early_allowed();
+        if let Some(item) = queue.pop(screens_only, allow_early, slow_limit()) {
             return item;
         }
-        if !allow_early && !queue.early.is_empty() {
+        if !screens_only && !allow_early && (!queue.early.is_empty() || !queue.slow.is_empty()) {
             let (guard, _) = AVAILABLE
                 .wait_timeout(queue, Duration::from_millis(250))
                 .unwrap_or_else(|e| e.into_inner());
@@ -334,78 +420,11 @@ fn worker_count() -> usize {
         std::env::var("OATHKEEP_PIPELINE_WORKERS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .map(|n| n.clamp(1, 8))
+            .map(|n| n.clamp(1, 32))
             .unwrap_or_else(|| {
-                std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+                std::thread::available_parallelism().map_or(2, |n| (n.get() * 2 / 3).clamp(2, 8))
             })
     })
-}
-
-fn compile_limit() -> usize {
-    let max = worker_count();
-    let Some(avail) = crate::host::available_commit() else {
-        return max;
-    };
-    if avail < (2560u64 << 20) {
-        1
-    } else if avail < (4096u64 << 20) {
-        max.min(2)
-    } else {
-        max
-    }
-}
-
-static COMPILE_GATE: (Mutex<(usize, usize)>, Condvar) = (Mutex::new((0, 0)), Condvar::new());
-
-struct ActiveCompile {
-    early: bool,
-}
-
-impl ActiveCompile {
-    fn enter(early: bool) -> Self {
-        let (lock, cv) = &COMPILE_GATE;
-        let mut active = lock.lock().unwrap_or_else(|e| e.into_inner());
-        while active.0 >= compile_limit() || (early && active.1 >= early_limit()) {
-            let (guard, _) = cv
-                .wait_timeout(active, Duration::from_millis(50))
-                .unwrap_or_else(|e| e.into_inner());
-            active = guard;
-        }
-        active.0 += 1;
-        if early {
-            active.1 += 1;
-        }
-        drop(active);
-        if crate::host::available_commit().is_some_and(|c| c < (1536u64 << 20)) {
-            static LAST_RECLAIM: Mutex<Option<Instant>> = Mutex::new(None);
-            let should = {
-                let mut last = LAST_RECLAIM.lock().unwrap_or_else(|e| e.into_inner());
-                let now = Instant::now();
-                if last.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(5)) {
-                    *last = Some(now);
-                    true
-                } else {
-                    false
-                }
-            };
-            if should {
-                crate::host::reclaim_for_oom();
-            }
-        }
-        ActiveCompile { early }
-    }
-}
-
-impl Drop for ActiveCompile {
-    fn drop(&mut self) {
-        let (lock, cv) = &COMPILE_GATE;
-        let mut active = lock.lock().unwrap_or_else(|e| e.into_inner());
-        active.0 = active.0.saturating_sub(1);
-        if self.early {
-            active.1 = active.1.saturating_sub(1);
-        }
-        cv.notify_all();
-    }
 }
 
 fn workers() -> bool {
@@ -413,20 +432,32 @@ fn workers() -> bool {
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let workers = worker_count();
-        for i in 0..workers {
+        tracing::info!(workers, "pipeline workers");
+        let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
+        for i in 0..workers + screens {
+            let screens_only = i >= workers;
             let spawned = std::thread::Builder::new()
                 .name(format!("oathkeep-pipelines-{i}"))
-                .spawn(|| {
+                .spawn(move || {
+                    let lowest = !screens_only
+                        && std::env::var_os("OATHKEEP_PIPELINE_LOWEST").is_none_or(|v| v != "0");
                     // SAFETY: a plain call on our own thread.
                     unsafe {
                         use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        let priority = if lowest {
+                            THREAD_PRIORITY_LOWEST
+                        } else {
+                            THREAD_PRIORITY_BELOW_NORMAL
+                        };
+                        let _ = SetThreadPriority(GetCurrentThread(), priority);
                     }
                     loop {
-                        let (pending, is_early) = next();
-                        {
-                            let _permit = ActiveCompile::enter(is_early);
-                            pending.make();
+                        let (pending, _is_early) = next(screens_only);
+                        pending.make();
+                        if pending.was_slow.load(Ordering::Relaxed) {
+                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                            queue.slow_now = queue.slow_now.saturating_sub(1);
+                            AVAILABLE.notify_all();
                         }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
@@ -502,40 +533,57 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &promoted));
-        assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &requested));
+        assert!(Arc::ptr_eq(&queue.pop(false, true, 1).unwrap().0, &requested));
+        assert!(Arc::ptr_eq(&queue.pop(false, true, 1).unwrap().0, &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(queue.pop(false).is_none());
-        assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &earlier));
-        assert!(queue.pop(true).is_none());
+        assert!(queue.pop(false, false, 1).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false, true, 1).unwrap().0, &earlier));
+        assert!(queue.pop(false, true, 1).is_none());
     }
 
     #[test]
-    fn active_frame_and_compute_pipelines_beat_stale_graphics() {
-        let stale_gfx = Arc::new(Pending::new(Vec::new(), None));
-        stale_gfx.last_frame.store(10, Ordering::Relaxed);
-        let active_gfx = Arc::new(Pending::new(Vec::new(), None));
-        active_gfx.last_frame.store(20, Ordering::Relaxed);
-        let mut active_cs = Pending::new(Vec::new(), None);
-        active_cs.is_compute = true;
-        active_cs.last_frame.store(20, Ordering::Relaxed);
-        let active_cs = Arc::new(active_cs);
-
+    fn pipelines_known_to_take_long_leave_workers_for_the_others() {
+        let new = || Arc::new(Pending::new(Vec::new(), None));
+        let (long, longer, asked, quick) = (new(), new(), new(), new());
         let mut queue = Queue::new();
-        assert_eq!(queue.push(&active_cs, REQUESTED), Some(true));
-        assert_eq!(queue.push(&stale_gfx, REQUESTED), Some(true));
-        assert_eq!(queue.push(&active_gfx, REQUESTED), Some(true));
-
-        assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &active_cs));
-        assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &active_gfx));
-        assert!(Arc::ptr_eq(&queue.pop(true).unwrap().0, &stale_gfx));
-        assert!(queue.pop(true).is_none());
+        for p in [&long, &longer, &asked] {
+            assert_eq!(queue.push_as(p, EARLY, true), Some(true));
+        }
+        assert_eq!(queue.push_as(&quick, EARLY, false), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop(false, true, 1).unwrap().0, &quick));
+        assert!(Arc::ptr_eq(&queue.pop(false, true, 1).unwrap().0, &long));
+        assert!(queue.pop(false, true, 1).is_none());
+        assert_eq!(queue.push_as(&asked, REQUESTED, true), Some(false));
+        assert!(Arc::ptr_eq(&queue.pop(false, true, 1).unwrap().0, &asked));
+        assert!(!asked.was_slow.load(Ordering::Relaxed));
+        assert!(queue.pop(false, true, 1).is_none());
+        queue.slow_now -= 1;
+        assert!(Arc::ptr_eq(&queue.pop(false, true, 1).unwrap().0, &longer));
+        assert!(queue.pop(false, true, 1).is_none());
     }
 
     #[test]
-    fn stream_compute_pipeline_counts_as_compute() {
-        let cs = crate::pipeline::shader("compute", &[1, 2, 3, 4]);
-        let p = Pending::new(vec![cs], Some(Box::new(GraphicsState::default())));
-        assert!(p.is_compute);
+    fn passes_over_the_screen_go_first() {
+        let of = |screen| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.screen = screen;
+            Arc::new(p)
+        };
+        let (world, screen) = (of(false), of(true));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&world, REQUESTED), Some(true));
+        assert_eq!(queue.push(&screen, REQUESTED), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop(true, true, 1).unwrap().0, &screen));
+        assert!(queue.pop(true, true, 1).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false, true, 1).unwrap().0, &world));
+    }
+
+    #[test]
+    fn raytracing_resolve_compute_is_left_out_without_bvh() {
+        let cs = crate::pipeline::shader("compute", b"dummy CS_RaytracingResolve payload");
+        let p = Arc::new(Pending::new(vec![cs], None));
+        assert!(p.left_out.is_some());
+        assert!(ready(&p).is_none());
+        assert!(!now(&p));
     }
 }

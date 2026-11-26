@@ -83,6 +83,14 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+            && self.targets.NumRenderTargets > 0
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+    }
+
     pub(crate) unsafe fn read(&mut self, kind: u32, at: *const u8) {
         // SAFETY: the caller passes a whole subobject.
         unsafe {

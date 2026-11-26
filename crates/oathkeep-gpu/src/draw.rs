@@ -149,7 +149,7 @@ struct BakeSync {
     publish: Vec<(u32, u64, u64)>,
 }
 
-const BAKE_PIXEL_SHADERS: [&str; 7] = [
+pub(crate) const BAKE_PIXEL_SHADERS: [&str; 7] = [
     "c0a7fe77b1862e10",
     "0d1575a396dfe513",
     "b7cfd8dda91ebb6b",
