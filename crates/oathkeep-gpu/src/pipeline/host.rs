@@ -2,6 +2,7 @@ use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
 use oathkeep_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use oathkeep_shader::{ResourceType, RootType};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -256,12 +257,29 @@ pub(crate) fn bounded_root_srvs() -> bool {
     *ON.get_or_init(|| std::env::var_os("OATHKEEP_ROOT_SRV_DIRECT").is_none())
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct TableSlotPlan {
+    pub(crate) slot: u8,
+    pub(crate) min_k: u32,
+    pub(crate) max_k: u32,
+    pub(crate) max_offset_dwords: u32,
+    /// Pre-sorted by `k` (`table_offset_dwords / 8`): `(k, kind, table_offset_dwords)`.
+    pub(crate) entries: Vec<(u32, ResourceType, u32)>,
+    /// Pre-sorted and deduplicated `k` values (`table_offset_dwords / 8`).
+    pub(crate) unique_k: Vec<u32>,
+    /// `table_offset_dwords` for entries with `kind == ResourceType::Cbv`.
+    pub(crate) cbv_offsets: Vec<u32>,
+}
+
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
     pub(crate) user_data: Option<(u32, u32)>,
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
     pub(crate) root_uavs: Vec<(u8, u32)>,
+    pub(crate) table_plans: Vec<TableSlotPlan>,
+    pub(crate) has_memory_srv: bool,
+    pub(crate) biased_root_srvs: u64,
 }
 
 impl Stage {
@@ -275,6 +293,7 @@ impl Stage {
 pub(crate) struct HostPipeline {
     pub(crate) compute: bool,
     pub(crate) mesh: bool,
+    pub(crate) any_stores: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
     pub(crate) stages: Vec<Stage>,
@@ -343,13 +362,58 @@ impl HostPipeline {
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+            let translated = shader.translated()?;
+            let t = &translated.host;
+            let mut table_plans: Vec<TableSlotPlan> = Vec::new();
+            for u in &translated.used {
+                if u.root != RootType::Table {
+                    continue;
+                }
+                let k = u.table_offset_dwords / 8;
+                let plan = if let Some(p) = table_plans.iter_mut().find(|p| p.slot == u.slot) {
+                    p
+                } else {
+                    table_plans.push(TableSlotPlan {
+                        slot: u.slot,
+                        min_k: k,
+                        max_k: k,
+                        max_offset_dwords: u.table_offset_dwords,
+                        entries: Vec::new(),
+                        unique_k: Vec::new(),
+                        cbv_offsets: Vec::new(),
+                    });
+                    table_plans.last_mut().expect("just pushed")
+                };
+                plan.min_k = plan.min_k.min(k);
+                plan.max_k = plan.max_k.max(k);
+                plan.max_offset_dwords = plan.max_offset_dwords.max(u.table_offset_dwords);
+                plan.entries.push((k, u.kind, u.table_offset_dwords));
+                plan.unique_k.push(k);
+                if u.kind == ResourceType::Cbv {
+                    plan.cbv_offsets.push(u.table_offset_dwords);
+                }
+            }
+            for plan in &mut table_plans {
+                plan.entries.sort_by_key(|e| e.0);
+                plan.unique_k.sort_unstable();
+                plan.unique_k.dedup();
+            }
+            let has_memory_srv = t.root_srvs.contains(&oathkeep_shader::emit::SLOT_MEMORY);
+            let mut biased_root_srvs = 0u64;
+            for u in &t.user_data {
+                if u.root == RootType::Other(oathkeep_shader::emit::USER_VIEW_BIAS) && u.slot < 64 {
+                    biased_root_srvs |= 1u64 << u.slot;
+                }
+            }
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                table_plans,
+                has_memory_srv,
+                biased_root_srvs,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -514,9 +578,11 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
+            let any_stores = bound.iter().any(|s| s.translated().stores);
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                any_stores,
                 pso,
                 root,
                 stages: bound,
@@ -571,9 +637,11 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
+            let any_stores = bound.iter().any(|s| s.translated().stores);
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                any_stores,
                 pso,
                 root,
                 stages: bound,
@@ -683,9 +751,11 @@ impl HostPipeline {
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
+        let any_stores = bound.iter().any(|s| s.translated().stores);
         Some(HostPipeline {
             compute: false,
             mesh: false,
+            any_stores,
             pso,
             root,
             stages: bound,

@@ -6162,14 +6162,12 @@ impl Host {
             let now = now_ms();
             let last_swept = SWEPT.load(Ordering::Relaxed);
             if now > last_swept + 500 {
-                let behind_sweep_ms =
-                    if available_commit().is_some_and(|c| c < (2560u64 << 20)) {
-                        500
-                    } else {
-                        1500
-                    };
+                let tight = available_commit().is_some_and(|c| c < (2560u64 << 20));
+                let behind_sweep_ms = if tight { 500 } else { 4000 };
                 if now > last_swept + behind_sweep_ms {
-                    self.settle(&mut submitted, WHY_SYNC);
+                    if tight {
+                        self.settle(&mut submitted, WHY_SYNC);
+                    }
                     sweep();
                     SWEPT.store(now_ms(), Ordering::Relaxed);
                 }

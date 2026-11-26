@@ -274,11 +274,12 @@ pub(crate) struct State {
     root_srv_slots: DrawFastMap<(usize, u64), RootSlot>,
     root_uav_slots: DrawFastMap<(usize, u64), RootSlot>,
     tables_gone: bool,
-    shadow_cache: Vec<(u64, u64, u8, u64, std::sync::Arc<crate::shadow::Shadow>)>,
+    /// `(valid_start, valid_end, shadow_gen, range_epoch, shadow)` range-containment LRU cache
+    /// shared across `find_shadow`, `find_shadow_any`, and `find_shadow_existing`.
+    shadow_cache: Vec<(u64, u64, u64, u64, std::sync::Arc<crate::shadow::Shadow>)>,
     constants_pool: Vec<Vec<u32>>,
     scratch_fresh: Vec<u8>,
     scratch_made: Vec<(u8, u32)>,
-    scratch_entries: Vec<usize>,
     scratch_selected: Vec<u32>,
     scratch_used_k: Vec<u32>,
     scratch_words: Vec<[u32; 3]>,
@@ -811,24 +812,23 @@ fn direct_cbv() -> bool {
     *ON.get_or_init(|| std::env::var_os("OATHKEEP_DIRECT_CBV").is_none_or(|v| v != "0"))
 }
 
-const SHADOW_CACHE_CAP: usize = 16;
+const SHADOW_CACHE_CAP: usize = 24;
 
 impl State {
     #[inline]
     fn cache_shadow(
         &mut self,
-        address: u64,
-        len: u64,
-        kind: u8,
+        valid_start: u64,
+        valid_end: u64,
+        shadow_gen: u64,
         epoch: u64,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
     ) {
-        let norm_len = len.max(1);
-        if let Some(pos) = self
-            .shadow_cache
-            .iter()
-            .position(|(a, l, k, _, _)| *a == address && *l == norm_len && *k == kind)
-        {
+        let sid = shadow.id();
+        if let Some(pos) = self.shadow_cache.iter().position(|(vs, ve, _, _, s)| {
+            s.id() == sid && *vs == valid_start && *ve == valid_end
+        }) {
+            self.shadow_cache[pos].2 = shadow_gen;
             self.shadow_cache[pos].3 = epoch;
             self.shadow_cache[pos].4 = shadow.clone();
             if pos > 0 {
@@ -839,8 +839,10 @@ impl State {
         if self.shadow_cache.len() >= SHADOW_CACHE_CAP {
             self.shadow_cache.pop();
         }
-        self.shadow_cache
-            .insert(0, (address, norm_len, kind, epoch, shadow.clone()));
+        self.shadow_cache.insert(
+            0,
+            (valid_start, valid_end, shadow_gen, epoch, shadow.clone()),
+        );
     }
 
     #[inline]
@@ -848,31 +850,51 @@ impl State {
         &mut self,
         address: u64,
         len: u64,
-        kind: u8,
     ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
         let norm_len = len.max(1);
-        let pos = self
-            .shadow_cache
-            .iter()
-            .position(|(a, l, k, _, _)| *a == address && *l == norm_len && *k == kind)?;
-        let (_, _, _, ep, ref s) = self.shadow_cache[pos];
-        if s.is_dead() || crate::shadow::epoch_for_range(address, norm_len) != ep {
-            self.shadow_cache.remove(pos);
-            return None;
+        let end = address.checked_add(norm_len)?;
+        let unsized_ask = len <= 1;
+        let cur_gen = crate::shadow::generation();
+        let mut i = 0;
+        while i < self.shadow_cache.len() {
+            let (vs, ve, cached_gen, ep, ref s) = self.shadow_cache[i];
+            if address < vs || end > ve {
+                i += 1;
+                continue;
+            }
+            if unsized_ask && s.is_window() && ve.saturating_sub(address) < (256 << 10) {
+                i += 1;
+                continue;
+            }
+            if s.is_dead() {
+                self.shadow_cache.remove(i);
+                continue;
+            }
+            if cached_gen != cur_gen {
+                if crate::shadow::epoch_for_range(vs, ve.saturating_sub(vs).max(1)) != ep {
+                    self.shadow_cache.remove(i);
+                    continue;
+                }
+                self.shadow_cache[i].2 = cur_gen;
+            }
+            let shadow = self.shadow_cache[i].4.clone();
+            shadow.touch_used(crate::host::moment());
+            if i > 0 {
+                self.shadow_cache[..=i].rotate_right(1);
+            }
+            return Some(shadow);
         }
-        if pos > 0 {
-            self.shadow_cache[..=pos].rotate_right(1);
-        }
-        Some(self.shadow_cache[0].4.clone())
+        None
     }
 
     fn find_shadow(&mut self, address: u64, len: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-        if let Some(s) = self.lookup_shadow_cached(address, len, 0) {
+        if let Some(s) = self.lookup_shadow_cached(address, len) {
             return Some(s);
         }
-        let ep = crate::shadow::epoch_for_range(address, len.max(1));
-        let s = crate::shadow::find(address, len)?;
-        self.cache_shadow(address, len, 0, ep, &s);
+        let cur_gen = crate::shadow::generation();
+        let (s, vs, ve) = crate::shadow::find_with_range(address, len)?;
+        let ep = crate::shadow::epoch_for_range(vs, ve.saturating_sub(vs).max(1));
+        self.cache_shadow(vs, ve, cur_gen, ep, &s);
         Some(s)
     }
 
@@ -881,12 +903,13 @@ impl State {
         address: u64,
         len: u64,
     ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-        if let Some(s) = self.lookup_shadow_cached(address, len, 1) {
+        if let Some(s) = self.lookup_shadow_cached(address, len) {
             return Some(s);
         }
-        let ep = crate::shadow::epoch_for_range(address, len.max(1));
-        let s = crate::shadow::find_any(address, len)?;
-        self.cache_shadow(address, len, 1, ep, &s);
+        let cur_gen = crate::shadow::generation();
+        let (s, vs, ve) = crate::shadow::find_any_with_range(address, len)?;
+        let ep = crate::shadow::epoch_for_range(vs, ve.saturating_sub(vs).max(1));
+        self.cache_shadow(vs, ve, cur_gen, ep, &s);
         Some(s)
     }
 
@@ -895,12 +918,13 @@ impl State {
         address: u64,
         len: u64,
     ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-        if let Some(s) = self.lookup_shadow_cached(address, len, 2) {
+        if let Some(s) = self.lookup_shadow_cached(address, len) {
             return Some(s);
         }
-        let ep = crate::shadow::epoch_for_range(address, len.max(1));
-        let s = crate::shadow::find_existing(address, len)?;
-        self.cache_shadow(address, len, 2, ep, &s);
+        let cur_gen = crate::shadow::generation();
+        let (s, vs, ve) = crate::shadow::find_existing_with_range(address, len)?;
+        let ep = crate::shadow::epoch_for_range(vs, ve.saturating_sub(vs).max(1));
+        self.cache_shadow(vs, ve, cur_gen, ep, &s);
         Some(s)
     }
 
@@ -1303,17 +1327,23 @@ impl State {
                 _ => None,
             };
             let Some(address) = address else { return 0 };
+            let cur_gen = crate::shadow::generation();
             let shadow = self
                 .shadow_cache
                 .iter()
-                .find(|(a, l, k, ep, s)| {
-                    *a == address
-                        && *l == 1
-                        && *k == 0
+                .find(|(vs, ve, cached_gen, ep, s)| {
+                    address >= *vs
+                        && address.saturating_add(1) <= *ve
+                        && (!s.is_window() || ve.saturating_sub(address) >= (256 << 10))
                         && !s.is_dead()
-                        && crate::shadow::epoch_for_range(address, 1) == *ep
+                        && (*cached_gen == cur_gen
+                            || crate::shadow::epoch_for_range(*vs, ve.saturating_sub(*vs).max(1))
+                                == *ep)
                 })
-                .map(|(_, _, _, _, s)| s.clone())
+                .map(|(_, _, _, _, s)| {
+                    s.touch_used(crate::host::moment());
+                    s.clone()
+                })
                 .or_else(|| crate::shadow::find(address, 1));
             return shadow.map_or(0, |s| {
                 // SAFETY: a live buffer.
@@ -1587,7 +1617,7 @@ impl State {
             {
                 #[cfg(feature = "diagnostics")]
                 let _tables_scope = ScopeUs::start(crate::copystat::C::RecTablesUs);
-                self.tables_into(list, &t.used, &t.host.root_indexed_views, compute);
+                self.tables_into(list, &stage.table_plans, &t.host.root_indexed_views, compute);
             }
             STORES.set(true);
             if self.scratch_made.iter().any(|m| m.1 == u32::MAX) {
@@ -1599,11 +1629,7 @@ impl State {
             if writes && t.bindless_stores {
                 bindless_writes = true;
             }
-            let memory = if t
-                .host
-                .root_srvs
-                .contains(&oathkeep_shader::emit::SLOT_MEMORY)
-            {
+            let memory = if stage.has_memory_srv {
                 #[cfg(feature = "diagnostics")]
                 let _mem_scope = ScopeUs::start(crate::copystat::C::RecMemoryReadyUs);
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
@@ -1693,10 +1719,15 @@ impl State {
                         continue;
                     };
                     let biased = srv
-                        && t.host.user_data.iter().any(|u| {
-                            u.slot == slot
-                                && u.root == RootType::Other(oathkeep_shader::emit::USER_VIEW_BIAS)
-                        });
+                        && if slot < 64 {
+                            (stage.biased_root_srvs & (1u64 << slot)) != 0
+                        } else {
+                            t.host.user_data.iter().any(|u| {
+                                u.slot == slot
+                                    && u.root
+                                        == RootType::Other(oathkeep_shader::emit::USER_VIEW_BIAS)
+                            })
+                        };
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
                             return false;
@@ -1763,7 +1794,7 @@ impl State {
             crate::copystat::add(crate::copystat::C::BindlessWrites, 1);
             list.note_bindless_gpu_write();
         }
-        if compute || p.stages.iter().any(|s| s.translated().stores) {
+        if compute || p.any_stores {
             list.mark_uav_dirty();
         }
         true
@@ -3342,11 +3373,12 @@ impl State {
     fn table_entry_with_heap(
         &mut self,
         list: &HostList,
-        u: &UsedResource,
+        kind: ResourceType,
+        table_offset_dwords: u32,
         table: u64,
         heap: &'static crate::descriptor::Heap,
     ) {
-        let handle = table + u64::from(u.table_offset_dwords) * 4;
+        let handle = table + u64::from(table_offset_dwords) * 4;
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
@@ -3358,7 +3390,7 @@ impl State {
         } else {
             0
         };
-        if self.mirrored_done_hit(list, heap_id, host, index, made_key, Some(u.kind)) {
+        if self.mirrored_done_hit(list, heap_id, host, index, made_key, Some(kind)) {
             return;
         }
         if let Some((action, _, is_texture)) = host.lookup_mirrored_stage_words(index, words) {
@@ -3370,7 +3402,7 @@ impl State {
                     len,
                 } => {
                     self.refresh_shadow(list, &shadow, address, len);
-                    if u.kind == ResourceType::Uav {
+                    if kind == ResourceType::Uav {
                         if STORES.get() || !write_skip() {
                             shadow.gpu_writes(list, address, len);
                             cache_entry = Some(MirroredDone {
@@ -3396,10 +3428,10 @@ impl State {
                     }
                 }
                 crate::descriptor::host::StageAction::Texture { resource } => {
-                    let was_twin = readable_texture(list, resource, u.kind);
-                    if !was_twin && matches!(u.kind, ResourceType::Srv | ResourceType::Uav) {
+                    let was_twin = readable_texture(list, resource, kind);
+                    if !was_twin && matches!(kind, ResourceType::Srv | ResourceType::Uav) {
                         let flags = MIRRORED_FLAG_TEX
-                            | if u.kind == ResourceType::Uav {
+                            | if kind == ResourceType::Uav {
                                 MIRRORED_FLAG_UAV_TEX
                             } else {
                                 0
@@ -3413,7 +3445,7 @@ impl State {
                     }
                 }
                 crate::descriptor::host::StageAction::None => {
-                    if u.kind != ResourceType::Uav {
+                    if kind != ResourceType::Uav {
                         cache_entry = Some(MirroredDone {
                             made_key,
                             seq: list.copy_seq(),
@@ -3460,7 +3492,7 @@ impl State {
                 }
                 return;
             }
-            let done_info = readable_cached(list, u.kind, &view);
+            let done_info = readable_cached(list, kind, &view);
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
             }
@@ -3539,12 +3571,15 @@ impl State {
     fn tables_into(
         &mut self,
         list: &HostList,
-        used: &[UsedResource],
+        plans: &[crate::pipeline::host::TableSlotPlan],
         indexed: &[RootIndexedView],
         compute: bool,
     ) {
         self.scratch_fresh.clear();
         self.scratch_made.clear();
+        if plans.is_empty() && indexed.is_empty() {
+            return;
+        }
         let mut slot_heaps: [Option<(u64, Option<&'static crate::descriptor::Heap>)>; 32] =
             [None; 32];
         let resolve_slot = |state: &State,
@@ -3588,21 +3623,26 @@ impl State {
                 fresh.contains(&slot)
             }
         };
-        for u in used {
-            if u.root != RootType::Table {
-                continue;
-            }
-            if is_fresh(u.slot, fresh_mask, &self.scratch_fresh) {
-                continue;
-            }
-            let Some((table, heap)) = resolve_slot(self, &mut slot_heaps, u.slot) else {
+        for plan in plans {
+            let Some((table, heap)) = resolve_slot(self, &mut slot_heaps, plan.slot) else {
                 continue;
             };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
+            let Some(host) = heap.host() else {
                 continue;
             };
-            if index >= host.count() {
+            let over = if let Some(index) =
+                heap.index(table + u64::from(plan.max_offset_dwords) * 4)
+            {
+                (index >= host.count()).then_some(index)
+            } else {
+                plan.entries.iter().find_map(|&(_, _, off)| {
+                    let idx = heap.index(table + u64::from(off) * 4)?;
+                    (idx >= host.count()).then_some(idx)
+                })
+            };
+            if let Some(index) = over {
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = index;
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::TablesFreshOver, 1);
@@ -3614,13 +3654,19 @@ impl State {
                         crate::copystat::add(crate::copystat::C::TablesOverGe1M, 1);
                     }
                 }
-                mark_fresh(u.slot, &mut fresh_mask, &mut self.scratch_fresh);
+                mark_fresh(plan.slot, &mut fresh_mask, &mut self.scratch_fresh);
                 continue;
             }
-            if u.kind == ResourceType::Cbv && !self.can_direct_cbv(end) {
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TablesFreshCbv, 1);
-                mark_fresh(u.slot, &mut fresh_mask, &mut self.scratch_fresh);
+            if !plan.cbv_offsets.is_empty() {
+                for &off in &plan.cbv_offsets {
+                    let end = table + u64::from(off) * 4;
+                    if heap.index(end).is_some() && !self.can_direct_cbv(end) {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::TablesFreshCbv, 1);
+                        mark_fresh(plan.slot, &mut fresh_mask, &mut self.scratch_fresh);
+                        break;
+                    }
+                }
             }
         }
         for ix in indexed {
@@ -3666,12 +3712,13 @@ impl State {
                 mark_fresh(ix.table_slot, &mut fresh_mask, &mut self.scratch_fresh);
             }
         }
-        for u in used {
-            if u.root == RootType::Table
-                && !is_fresh(u.slot, fresh_mask, &self.scratch_fresh)
-                && let Some((table, heap)) = resolve_slot(self, &mut slot_heaps, u.slot)
+        for plan in plans {
+            if !is_fresh(plan.slot, fresh_mask, &self.scratch_fresh)
+                && let Some((table, heap)) = resolve_slot(self, &mut slot_heaps, plan.slot)
             {
-                self.table_entry_with_heap(list, u, table, heap);
+                for &(_, kind, off) in &plan.entries {
+                    self.table_entry_with_heap(list, kind, off, table, heap);
+                }
             }
         }
         for ix in indexed {
@@ -3838,45 +3885,54 @@ impl State {
             let Some((table, heap)) = resolve_slot(self, &mut slot_heaps, slot) else {
                 continue;
             };
-            self.scratch_entries.clear();
-            for (idx, u) in used.iter().enumerate() {
-                if u.root == RootType::Table && u.slot == slot {
-                    self.scratch_entries.push(idx);
-                }
-            }
             if heap.samplers() || (table - heap.start) % 32 != 0 {
                 continue;
             }
             let Some(host) = heap.host() else {
                 continue;
             };
+            let plan = plans.iter().find(|p| p.slot == slot);
             self.scratch_selected.clear();
-            for index in indexed {
-                if index.table_slot != slot {
-                    continue;
+            if !indexed.is_empty() {
+                for index in indexed {
+                    if index.table_slot != slot {
+                        continue;
+                    }
+                    let constant = self.user_value(
+                        compute,
+                        index.constant_slot,
+                        RootType::Constants,
+                        index.constant_dword,
+                    );
+                    self.scratch_selected
+                        .push(index.byte_offset.wrapping_add(constant << index.shift) / 32);
                 }
-                let constant = self.user_value(
-                    compute,
-                    index.constant_slot,
-                    RootType::Constants,
-                    index.constant_dword,
-                );
-                self.scratch_selected
-                    .push(index.byte_offset.wrapping_add(constant << index.shift) / 32);
+                if self.scratch_selected.len() > 1 {
+                    self.scratch_selected.sort_unstable();
+                    self.scratch_selected.dedup();
+                }
             }
-            self.scratch_selected.sort_unstable();
-            self.scratch_selected.dedup();
-            self.scratch_used_k.clear();
-            for &idx in &self.scratch_entries {
-                self.scratch_used_k.push(used[idx].table_offset_dwords / 8);
-            }
-            self.scratch_used_k.extend_from_slice(&self.scratch_selected);
-            self.scratch_used_k.sort_unstable();
-            self.scratch_used_k.dedup();
-            let (Some(&min_k), Some(&max_k)) =
-                (self.scratch_used_k.first(), self.scratch_used_k.last())
-            else {
-                continue;
+            let mut owned_used_k: Option<Vec<u32>> = None;
+            let (used_k, min_k, max_k): (&[u32], u32, u32) = if self.scratch_selected.is_empty() {
+                let Some(p) = plan else {
+                    continue;
+                };
+                (&p.unique_k, p.min_k, p.max_k)
+            } else {
+                let mut v = std::mem::take(&mut self.scratch_used_k);
+                v.clear();
+                if let Some(p) = plan {
+                    v.extend_from_slice(&p.unique_k);
+                }
+                v.extend_from_slice(&self.scratch_selected);
+                v.sort_unstable();
+                v.dedup();
+                let (Some(&min_k), Some(&max_k)) = (v.first(), v.last()) else {
+                    self.scratch_used_k = v;
+                    continue;
+                };
+                let slot_ref = owned_used_k.insert(v);
+                (slot_ref.as_slice(), min_k, max_k)
             };
             let trim = if host.count() >= min_k { min_k } else { 0 };
             let span = max_k - trim + 1;
@@ -3884,6 +3940,9 @@ impl State {
             if span > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
+                if let Some(v) = owned_used_k.take() {
+                    self.scratch_used_k = v;
+                }
                 once!(slot, span, "fresh descriptor table exceeds the available span");
                 continue;
             }
@@ -3893,7 +3952,7 @@ impl State {
                 let mut h1 =
                     0xcbf2_9ce4_8422_2325_u64 ^ (u64::from(span) | (u64::from(trim) << 32));
                 let mut h2 = 0x517c_c1b7_2722_0a95_u64 ^ (heap_id as u64);
-                for &k in &self.scratch_used_k {
+                for &k in used_k {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     let words = unsafe { (at as *const [u32; 3]).read_unaligned() };
@@ -3975,10 +4034,16 @@ impl State {
                         }
                     }
                 }
+                if let Some(v) = owned_used_k.take() {
+                    self.scratch_used_k = v;
+                }
                 self.scratch_made.push((slot, offset));
                 continue;
             }
             let Some(first) = host.dynamic(span) else {
+                if let Some(v) = owned_used_k.take() {
+                    self.scratch_used_k = v;
+                }
                 self.scratch_made.push((slot, u32::MAX));
                 continue;
             };
@@ -3987,7 +4052,7 @@ impl State {
                 crate::copystat::add(crate::copystat::C::TablesFreshSpanSum, u64::from(span));
                 crate::copystat::add(
                     crate::copystat::C::TablesFreshUsedSum,
-                    self.scratch_used_k.len() as u64,
+                    used_k.len() as u64,
                 );
             }
             let mut deps: Vec<(u64, u64)> = Vec::new();
@@ -4001,8 +4066,7 @@ impl State {
             let record_uav_writes = STORES.get() || !write_skip();
             self.dynamic.push((heap_id, first, span));
             let title_first = heap.index(table);
-            self.scratch_entries
-                .sort_unstable_by_key(|&idx| used[idx].table_offset_dwords / 8);
+            let plan_entries = plan.map_or(&[][..], |p| p.entries.as_slice());
             let mut entry_cursor = 0usize;
             #[cfg(feature = "diagnostics")]
             let t_make = std::time::Instant::now();
@@ -4014,7 +4078,7 @@ impl State {
             host.copy_dynamic_batch(
                 first,
                 trim,
-                &self.scratch_used_k,
+                used_k,
                 &self.scratch_words,
                 &mut premade,
                 |raw| kept_ptrs.contains(&raw),
@@ -4023,20 +4087,16 @@ impl State {
             let batch_ns = t_batch.elapsed().as_nanos() as u64;
             #[cfg(feature = "diagnostics")]
             let (mut cbv_ns, mut miss_ns, mut post_ns) = (0u64, 0u64, 0u64);
-            for used_i in 0..self.scratch_used_k.len() {
-                let k = self.scratch_used_k[used_i];
+            for (used_i, &k) in used_k.iter().enumerate() {
                 let words = self.scratch_words[used_i];
                 let index = first + (k - trim);
-                while entry_cursor < self.scratch_entries.len()
-                    && used[self.scratch_entries[entry_cursor]].table_offset_dwords / 8 < k
-                {
+                while entry_cursor < plan_entries.len() && plan_entries[entry_cursor].0 < k {
                     entry_cursor += 1;
                 }
-                let used_entry = self
-                    .scratch_entries
+                let used_kind = plan_entries
                     .get(entry_cursor)
-                    .map(|&idx| &used[idx])
-                    .filter(|u| u.table_offset_dwords / 8 == k);
+                    .filter(|e| e.0 == k)
+                    .map(|e| e.1);
                 if let Some((address, size)) = crate::descriptor::constant_from_words(words) {
                     #[cfg(feature = "diagnostics")]
                     let t_cbv = std::time::Instant::now();
@@ -4123,7 +4183,7 @@ impl State {
                     }
                 };
                 if !made.found {
-                    if used_entry.is_some() {
+                    if used_kind.is_some() {
                         once!(slot, "a table entry without a view");
                     }
                     continue;
@@ -4133,7 +4193,7 @@ impl State {
                 if let Some(res) = made.kept {
                     self.keep_dynamic(list, &res);
                 }
-                let kind = used_entry.map(|u| u.kind).or_else(|| {
+                let kind = used_kind.or_else(|| {
                     self.scratch_selected
                         .binary_search(&k)
                         .ok()
@@ -4194,6 +4254,9 @@ impl State {
             }
             premade.clear();
             self.scratch_dyn_made = premade;
+            if let Some(v) = owned_used_k.take() {
+                self.scratch_used_k = v;
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::add(

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 pub(crate) const PAGE: usize = 64 << 10;
@@ -8,7 +8,7 @@ const DEFAULT_HOT_FRAMES: u64 = 6;
 const DEFAULT_HOT_FAULTS: u16 = 4;
 const HOT_STREAK_GAP: u64 = 2;
 const MAX_COOL_BACKOFF: u8 = 1;
-pub(crate) const CLEAN_EPOCH_SHARDS: usize = 8;
+pub(crate) const CLEAN_EPOCH_SHARDS: usize = 16;
 
 static GLOBAL_WRITE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RANGED_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -163,6 +163,10 @@ struct IntervalSet(BTreeMap<usize, usize>);
 impl IntervalSet {
     const fn new() -> Self {
         Self(BTreeMap::new())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     fn contains(&self, block: usize) -> bool {
@@ -522,6 +526,7 @@ fn wrote_journal_only(at: usize, len: usize) {
     j.guarded_asked = now;
     j.ahead_asked = now;
     let mut prev_shard = usize::MAX;
+    let mut prev_mid = usize::MAX;
     let mut prev_sub = usize::MAX;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
@@ -529,6 +534,11 @@ fn wrote_journal_only(at: usize, len: usize) {
         if sub != prev_sub {
             SUB_GUARDED_ASKED[sub].fetch_max(now, std::sync::atomic::Ordering::Release);
             prev_sub = sub;
+        }
+        let mid = mid_of(page);
+        if mid != prev_mid {
+            MID_GUARDED_ASKED[mid].fetch_max(now, std::sync::atomic::Ordering::Release);
+            prev_mid = mid;
         }
         let s = shard_of(page);
         if s != prev_shard {
@@ -805,6 +815,7 @@ pub(crate) fn writes_guarded_since_with_clean(
     let now = bump_journal_asked(&mut j, 1);
     j.guarded_asked = now;
     let mut prev_shard = usize::MAX;
+    let mut prev_mid = usize::MAX;
     let mut prev_sub = usize::MAX;
     for &page in &guarded {
         j.written.insert(page, now);
@@ -812,6 +823,11 @@ pub(crate) fn writes_guarded_since_with_clean(
         if sub != prev_sub {
             SUB_GUARDED_ASKED[sub].fetch_max(now, std::sync::atomic::Ordering::Release);
             prev_sub = sub;
+        }
+        let mid = mid_of(page);
+        if mid != prev_mid {
+            MID_GUARDED_ASKED[mid].fetch_max(now, std::sync::atomic::Ordering::Release);
+            prev_mid = mid;
         }
         let s = shard_of(page);
         if s != prev_shard {
@@ -846,7 +862,7 @@ struct Guards {
     partly: IntervalSet,
     /// Exact union `clean ∪ hot ∪ absent ∪ partly` (pairwise disjoint) for O(log n) fast-path checks.
     accounted: IntervalSet,
-    aliased: BTreeSet<usize>,
+    aliased: IntervalSet,
     /// Protected alias blocks whose sibling view was unlocked (`dirty_alias_block_spans`)
     /// and therefore need alias re-arming before returning to `clean`/`accounted`.
     alias_dirty: IntervalSet,
@@ -870,7 +886,7 @@ impl Guards {
             absent: IntervalSet::new(),
             partly: IntervalSet::new(),
             accounted: IntervalSet::new(),
-            aliased: BTreeSet::new(),
+            aliased: IntervalSet::new(),
             alias_dirty: IntervalSet::new(),
             recent_fault: BTreeMap::new(),
             hot: BTreeMap::new(),
@@ -894,11 +910,14 @@ impl Guards {
 }
 
 const GUARD_SHARDS: usize = 64;
-/// 1024 blocks (64 MiB) per contiguous address stripe.
+/// 1024 blocks (64 MiB) per contiguous address stripe (Tier 2).
 const SHARD_SHIFT: usize = 10;
-const SUB_BUCKETS: usize = 4096;
-/// 16 blocks (1 MiB) per sub-epoch bucket (4 GiB direct-mapped).
-const SUB_SHIFT: usize = 4;
+const MID_BUCKETS: usize = 4096;
+/// 64 blocks (4 MiB) per mid-epoch bucket (Tier 1, 16 GiB direct-mapped).
+const MID_SHIFT: usize = 6;
+const SUB_BUCKETS: usize = 16384;
+/// 4 blocks (256 KiB) per sub-epoch bucket (Tier 0, 4 GiB direct-mapped).
+const SUB_SHIFT: usize = 2;
 
 static GUARDS: [RwLock<Guards>; GUARD_SHARDS] =
     [const { RwLock::new(Guards::new()) }; GUARD_SHARDS];
@@ -906,6 +925,10 @@ static SHARD_GUARDED_ASKED: [std::sync::atomic::AtomicU64; GUARD_SHARDS] =
     [const { std::sync::atomic::AtomicU64::new(1) }; GUARD_SHARDS];
 static SHARD_CLEAN_EPOCH: [std::sync::atomic::AtomicU64; GUARD_SHARDS] =
     [const { std::sync::atomic::AtomicU64::new(1) }; GUARD_SHARDS];
+static MID_GUARDED_ASKED: [std::sync::atomic::AtomicU64; MID_BUCKETS] =
+    [const { std::sync::atomic::AtomicU64::new(1) }; MID_BUCKETS];
+static MID_CLEAN_EPOCH: [std::sync::atomic::AtomicU64; MID_BUCKETS] =
+    [const { std::sync::atomic::AtomicU64::new(1) }; MID_BUCKETS];
 static SUB_GUARDED_ASKED: [std::sync::atomic::AtomicU64; SUB_BUCKETS] =
     [const { std::sync::atomic::AtomicU64::new(1) }; SUB_BUCKETS];
 static SUB_CLEAN_EPOCH: [std::sync::atomic::AtomicU64; SUB_BUCKETS] =
@@ -917,8 +940,14 @@ fn sub_of(block: usize) -> usize {
 }
 
 #[inline]
+fn mid_of(block: usize) -> usize {
+    (block >> MID_SHIFT) & (MID_BUCKETS - 1)
+}
+
+#[inline]
 fn bump_sub_clean_block(block: usize) {
     SUB_CLEAN_EPOCH[sub_of(block)].fetch_add(1, std::sync::atomic::Ordering::Release);
+    MID_CLEAN_EPOCH[mid_of(block)].fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 #[inline]
@@ -931,6 +960,13 @@ fn bump_sub_clean_range(a: usize, b: usize) {
     let count = (s1 - s0 + 1).min(SUB_BUCKETS);
     for i in 0..count {
         SUB_CLEAN_EPOCH[(s0 + i) & (SUB_BUCKETS - 1)]
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+    let m0 = a >> MID_SHIFT;
+    let m1 = (b - 1) >> MID_SHIFT;
+    let mcount = (m1 - m0 + 1).min(MID_BUCKETS);
+    for i in 0..mcount {
+        MID_CLEAN_EPOCH[(m0 + i) & (MID_BUCKETS - 1)]
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
@@ -955,6 +991,18 @@ fn all_shards_guarded_asked_le(first: usize, last: usize, since: u64) -> bool {
     if sub_last - sub_first < 64 {
         for s in sub_first..=sub_last {
             if SUB_GUARDED_ASKED[s & (SUB_BUCKETS - 1)].load(std::sync::atomic::Ordering::Acquire)
+                > since
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    let mid_first = first >> MID_SHIFT;
+    let mid_last = (last - 1) >> MID_SHIFT;
+    if mid_last - mid_first < 64 {
+        for m in mid_first..=mid_last {
+            if MID_GUARDED_ASKED[m & (MID_BUCKETS - 1)].load(std::sync::atomic::Ordering::Acquire)
                 > since
             {
                 return false;
@@ -995,6 +1043,16 @@ pub(crate) fn shards_for_range(start: usize, end: usize) -> Option<([usize; CLEA
         }
         return Some((buckets, sub_count));
     }
+    let mid_first = first >> MID_SHIFT;
+    let mid_last = (last - 1) >> MID_SHIFT;
+    let mid_count = (mid_last - mid_first) + 1;
+    if mid_count <= CLEAN_EPOCH_SHARDS {
+        let mut buckets = [0usize; CLEAN_EPOCH_SHARDS];
+        for (slot, b) in buckets.iter_mut().take(mid_count).enumerate() {
+            *b = SUB_BUCKETS + ((mid_first + slot) & (MID_BUCKETS - 1));
+        }
+        return Some((buckets, mid_count));
+    }
     let s_first = first >> SHARD_SHIFT;
     let s_last = (last - 1) >> SHARD_SHIFT;
     let count = (s_last - s_first) + 1;
@@ -1003,7 +1061,7 @@ pub(crate) fn shards_for_range(start: usize, end: usize) -> Option<([usize; CLEA
     }
     let mut shards = [0usize; CLEAN_EPOCH_SHARDS];
     for (slot, s) in shards.iter_mut().take(count).enumerate() {
-        *s = SUB_BUCKETS + ((s_first + slot) & (GUARD_SHARDS - 1));
+        *s = SUB_BUCKETS + MID_BUCKETS + ((s_first + slot) & (GUARD_SHARDS - 1));
     }
     Some((shards, count))
 }
@@ -1027,8 +1085,14 @@ pub(crate) fn guarded_shards_epochs_match(
             {
                 return false;
             }
+        } else if id < SUB_BUCKETS + MID_BUCKETS {
+            let m = id - SUB_BUCKETS;
+            if MID_CLEAN_EPOCH[m].load(Acquire) != ep || MID_GUARDED_ASKED[m].load(Acquire) > since
+            {
+                return false;
+            }
         } else {
-            let s = id - SUB_BUCKETS;
+            let s = id - SUB_BUCKETS - MID_BUCKETS;
             if SHARD_CLEAN_EPOCH[s].load(Acquire) != ep
                 || SHARD_GUARDED_ASKED[s].load(Acquire) > since
             {
@@ -1055,29 +1119,51 @@ pub(crate) fn guarded_clean_epochs_match(
     guarded_shards_epochs_match(&shards[..count], &epochs[..count], since)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EpochTier {
+    Sub(usize),
+    Mid(usize),
+    Shard,
+}
+
 #[inline]
 fn record_clean_epoch_span(
     clean_epochs: &mut [u64; CLEAN_EPOCH_SHARDS],
-    use_sub: bool,
-    sub_first: usize,
+    tier: EpochTier,
     slot: usize,
     shard: usize,
     a: usize,
     b: usize,
 ) {
-    if use_sub {
-        let sa = a >> SUB_SHIFT;
-        let sb = (b - 1) >> SUB_SHIFT;
-        for s in sa..=sb {
-            let idx = s - sub_first;
-            if idx < CLEAN_EPOCH_SHARDS {
-                clean_epochs[idx] = SUB_CLEAN_EPOCH[s & (SUB_BUCKETS - 1)]
-                    .load(std::sync::atomic::Ordering::Acquire);
+    match tier {
+        EpochTier::Sub(sub_first) => {
+            let sa = a >> SUB_SHIFT;
+            let sb = (b - 1) >> SUB_SHIFT;
+            for s in sa..=sb {
+                let idx = s - sub_first;
+                if idx < CLEAN_EPOCH_SHARDS {
+                    clean_epochs[idx] = SUB_CLEAN_EPOCH[s & (SUB_BUCKETS - 1)]
+                        .load(std::sync::atomic::Ordering::Acquire);
+                }
             }
         }
-    } else if slot < CLEAN_EPOCH_SHARDS {
-        clean_epochs[slot] =
-            SHARD_CLEAN_EPOCH[shard].load(std::sync::atomic::Ordering::Acquire);
+        EpochTier::Mid(mid_first) => {
+            let ma = a >> MID_SHIFT;
+            let mb = (b - 1) >> MID_SHIFT;
+            for m in ma..=mb {
+                let idx = m - mid_first;
+                if idx < CLEAN_EPOCH_SHARDS {
+                    clean_epochs[idx] = MID_CLEAN_EPOCH[m & (MID_BUCKETS - 1)]
+                        .load(std::sync::atomic::Ordering::Acquire);
+                }
+            }
+        }
+        EpochTier::Shard => {
+            if slot < CLEAN_EPOCH_SHARDS {
+                clean_epochs[slot] =
+                    SHARD_CLEAN_EPOCH[shard].load(std::sync::atomic::Ordering::Acquire);
+            }
+        }
     }
 }
 
@@ -1205,7 +1291,15 @@ fn guard_with_hot_fast(
     let mut span_count = 0usize;
     let sub_first = first >> SUB_SHIFT;
     let sub_last = (last - 1) >> SUB_SHIFT;
-    let use_sub = (sub_last - sub_first) + 1 <= CLEAN_EPOCH_SHARDS;
+    let mid_first = first >> MID_SHIFT;
+    let mid_last = (last - 1) >> MID_SHIFT;
+    let tier = if (sub_last - sub_first) + 1 <= CLEAN_EPOCH_SHARDS {
+        EpochTier::Sub(sub_first)
+    } else if (mid_last - mid_first) + 1 <= CLEAN_EPOCH_SHARDS {
+        EpochTier::Mid(mid_first)
+    } else {
+        EpochTier::Shard
+    };
     let mut clean_ok = !ask;
     let mut clean_epochs = [0u64; CLEAN_EPOCH_SHARDS];
     if !ask {
@@ -1217,22 +1311,14 @@ fn guard_with_hot_fast(
         for_each_shard_span(first, last, |shard, a, b| {
             let slot = span_count;
             span_count += 1;
-            if !use_sub && slot >= CLEAN_EPOCH_SHARDS {
+            if tier == EpochTier::Shard && slot >= CLEAN_EPOCH_SHARDS {
                 clean_ok = false;
             }
             let g = guards_read_shard(shard);
             if g.clean.contains_range(a, b) {
                 known = true;
                 if clean_ok {
-                    record_clean_epoch_span(
-                        &mut clean_epochs,
-                        use_sub,
-                        sub_first,
-                        slot,
-                        shard,
-                        a,
-                        b,
-                    );
+                    record_clean_epoch_span(&mut clean_epochs, tier, slot, shard, a, b);
                 }
                 return;
             }
@@ -1243,17 +1329,9 @@ fn guard_with_hot_fast(
                 if !has_hot && !has_partly {
                     if !probe_absent && clean_ok {
                         // When HLE demand-commit hooks are installed, every commit to an
-                        // `absent` block bumps its sub/shard clean epoch, so a span that is
+                        // `absent` block bumps its sub/mid/shard clean epoch, so a span that is
                         // purely `clean ∪ absent` is valid for lock-free clean-epoch caching.
-                        record_clean_epoch_span(
-                            &mut clean_epochs,
-                            use_sub,
-                            sub_first,
-                            slot,
-                            shard,
-                            a,
-                            b,
-                        );
+                        record_clean_epoch_span(&mut clean_epochs, tier, slot, shard, a, b);
                     } else {
                         clean_ok = false;
                     }
@@ -1334,8 +1412,8 @@ fn guard_with_hot_fast(
                     );
                 }
             }
-            let epochs =
-                (clean_ok && (use_sub || span_count <= CLEAN_EPOCH_SHARDS)).then_some(clean_epochs);
+            let epochs = (clean_ok && (tier != EpochTier::Shard || span_count <= CLEAN_EPOCH_SHARDS))
+                .then_some(clean_epochs);
             return Some((GuardHot::HotOnly(fast_hot_pairs), epochs));
         }
         if !known && !is_view(start, end) {
@@ -1410,16 +1488,8 @@ fn guard_with_hot_fast(
             t_wlock.elapsed().as_micros() as u64,
         );
         if g.clean.contains_range(a, b) {
-            if clean_ok && (use_sub || slot < CLEAN_EPOCH_SHARDS) {
-                record_clean_epoch_span(
-                    &mut clean_epochs,
-                    use_sub,
-                    sub_first,
-                    slot,
-                    shard,
-                    a,
-                    b,
-                );
+            if clean_ok && (tier != EpochTier::Shard || slot < CLEAN_EPOCH_SHARDS) {
+                record_clean_epoch_span(&mut clean_epochs, tier, slot, shard, a, b);
             }
             continue;
         }
@@ -1489,16 +1559,11 @@ fn guard_with_hot_fast(
             }
         }
         if g.accounted.contains_range(a, b) {
-            if clean_ok && (use_sub || slot < CLEAN_EPOCH_SHARDS) && g.clean.contains_range(a, b) {
-                record_clean_epoch_span(
-                    &mut clean_epochs,
-                    use_sub,
-                    sub_first,
-                    slot,
-                    shard,
-                    a,
-                    b,
-                );
+            if clean_ok
+                && (tier != EpochTier::Shard || slot < CLEAN_EPOCH_SHARDS)
+                && g.clean.contains_range(a, b)
+            {
+                record_clean_epoch_span(&mut clean_epochs, tier, slot, shard, a, b);
             } else {
                 clean_ok = false;
             }
@@ -1531,16 +1596,11 @@ fn guard_with_hot_fast(
                 }
             }
         }
-        if clean_ok && (use_sub || slot < CLEAN_EPOCH_SHARDS) && g.clean.contains_range(a, b) {
-            record_clean_epoch_span(
-                &mut clean_epochs,
-                use_sub,
-                sub_first,
-                slot,
-                shard,
-                a,
-                b,
-            );
+        if clean_ok
+            && (tier != EpochTier::Shard || slot < CLEAN_EPOCH_SHARDS)
+            && g.clean.contains_range(a, b)
+        {
+            record_clean_epoch_span(&mut clean_epochs, tier, slot, shard, a, b);
         } else {
             clean_ok = false;
         }
@@ -1617,8 +1677,8 @@ fn guard_with_hot_fast(
             });
         }
     }
-    let epochs =
-        (clean_ok && (use_sub || span_count <= CLEAN_EPOCH_SHARDS)).then_some(clean_epochs);
+    let epochs = (clean_ok && (tier != EpochTier::Shard || span_count <= CLEAN_EPOCH_SHARDS))
+        .then_some(clean_epochs);
     if written.is_empty() {
         Some((
             GuardHot::HotOnly(hot_pages.into_iter().map(|p| (p, HOT_WRITE)).collect()),
@@ -1709,14 +1769,21 @@ fn apply_alias_protection_sharded(
                 k += 1;
             }
             let slice = &all_blocks[i..k];
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            for &block in slice {
+                match runs.last_mut() {
+                    Some(last) if last.1 == block => last.1 = block + 1,
+                    _ => runs.push((block, block + 1)),
+                }
+            }
             let needs_insert = {
                 let g = guards_read_shard(shard);
-                slice.iter().any(|alias| !g.aliased.contains(alias))
+                runs.iter().any(|&(ra, rb)| !g.aliased.contains_range(ra, rb))
             };
             if needs_insert {
                 let mut g = guards_write_shard(shard);
-                for &alias in slice {
-                    g.aliased.insert(alias);
+                for (ra, rb) in runs {
+                    g.aliased.insert_range(ra, rb);
                 }
             }
             i = k;
@@ -1745,21 +1812,19 @@ fn apply_alias_protection_sharded(
                     true
                 } else {
                     let check_absent = skip_absent && g.absent.overlaps(sa, sb);
+                    let check_partly = g.partly.overlaps(sa, sb);
                     let has_hot = !g.hot.is_empty();
-                    (check_absent || has_hot)
+                    (check_absent || check_partly || has_hot)
                         && g.protected.gaps_in(sa, sb).into_iter().all(|(ga, gb)| {
-                            if check_absent && g.absent.contains_range(ga, gb) {
-                                true
-                            } else if !has_hot {
-                                false
-                            } else if check_absent && g.absent.overlaps(ga, gb) {
-                                g.absent
-                                    .gaps_in(ga, gb)
-                                    .into_iter()
-                                    .all(|(ha, hb)| all_hot(&g.hot, ha, hb, frame))
-                            } else {
-                                all_hot(&g.hot, ga, gb, frame)
-                            }
+                            alias_gap_skipped(
+                                &g,
+                                ga,
+                                gb,
+                                check_absent,
+                                check_partly,
+                                has_hot,
+                                frame,
+                            )
                         })
                 }
             };
@@ -1769,6 +1834,38 @@ fn apply_alias_protection_sharded(
             }
         });
     }
+}
+
+fn alias_gap_skipped(
+    g: &Guards,
+    ga: usize,
+    gb: usize,
+    check_absent: bool,
+    check_partly: bool,
+    has_hot: bool,
+    frame: u64,
+) -> bool {
+    if check_absent && g.absent.contains_range(ga, gb) {
+        return true;
+    }
+    if check_partly && g.partly.contains_range(ga, gb) {
+        return true;
+    }
+    if check_absent && g.absent.overlaps(ga, gb) {
+        return g
+            .absent
+            .gaps_in(ga, gb)
+            .into_iter()
+            .all(|(pa, pb)| alias_gap_skipped(g, pa, pb, false, check_partly, has_hot, frame));
+    }
+    if check_partly && g.partly.overlaps(ga, gb) {
+        return has_hot
+            && g.partly
+                .gaps_in(ga, gb)
+                .into_iter()
+                .all(|(ha, hb)| all_hot(&g.hot, ha, hb, frame));
+    }
+    has_hot && all_hot(&g.hot, ga, gb, frame)
 }
 
 #[inline]
@@ -1801,32 +1898,39 @@ fn protect_alias_range(g: &mut Guards, from: usize, to: usize) {
     let frame = crate::frame::current();
     let skip_absent = COMMIT_TITLE_MEMORY.get().is_some();
     for (a, b) in g.protected.gaps_in(from, to) {
-        let sub_ranges = if skip_absent && g.absent.overlaps(a, b) {
+        let sub_absent = if skip_absent && g.absent.overlaps(a, b) {
             g.absent.gaps_in(a, b)
         } else {
             vec![(a, b)]
         };
-        for (sa, sb) in sub_ranges {
-            let has_hot = g
-                .hot
-                .range(sa..sb)
-                .any(|(_, &until)| until > frame);
-            if has_hot {
-                let mut run_start = sa;
-                for block in sa..sb {
-                    if g.hot.get(&block).is_some_and(|&until| until > frame) {
-                        if run_start < block {
-                            protect_alias_span(g, run_start, block);
+        for (aa, ab) in sub_absent {
+            let sub_ranges = if g.partly.overlaps(aa, ab) {
+                g.partly.gaps_in(aa, ab)
+            } else {
+                vec![(aa, ab)]
+            };
+            for (sa, sb) in sub_ranges {
+                let has_hot = g
+                    .hot
+                    .range(sa..sb)
+                    .any(|(_, &until)| until > frame);
+                if has_hot {
+                    let mut run_start = sa;
+                    for block in sa..sb {
+                        if g.hot.get(&block).is_some_and(|&until| until > frame) {
+                            if run_start < block {
+                                protect_alias_span(g, run_start, block);
+                            }
+                            run_start = block + 1;
                         }
-                        run_start = block + 1;
                     }
+                    if run_start < sb {
+                        protect_alias_span(g, run_start, sb);
+                    }
+                    continue;
                 }
-                if run_start < sb {
-                    protect_alias_span(g, run_start, sb);
-                }
-                continue;
+                protect_alias_span(g, sa, sb);
             }
-            protect_alias_span(g, sa, sb);
         }
     }
 }
@@ -1870,6 +1974,8 @@ fn protect_alias_span(g: &mut Guards, a: usize, b: usize) {
         if matches!(info.State, MEM_RESERVE | MEM_FREE) {
             if raw_end > block {
                 g.absent.insert_range(block, raw_end);
+            } else if !g.hot.contains_key(&block) {
+                g.partly.insert(block);
             }
             block = next;
             continue;
@@ -1892,6 +1998,10 @@ fn protect_alias_span(g: &mut Guards, a: usize, b: usize) {
                             != 0
                     } {
                         g.protected.insert(single);
+                    } else if single < uncommitted_end(single) {
+                        g.absent.insert(single);
+                    } else if !g.hot.contains_key(&single) {
+                        g.partly.insert(single);
                     }
                 }
             }
@@ -2083,7 +2193,9 @@ fn open_and_aliases_block_spans_sharded(
         let opened_here = open_here_block_spans(shard, &mut g, a, b);
         if !opened_here.is_empty() && !g.aliased.is_empty() {
             for &(oa, ob) in &opened_here {
-                aliased.extend(g.aliased.range(oa..ob).copied());
+                g.aliased.for_each_overlap(oa, ob, |la, lb| {
+                    aliased.extend(la..lb);
+                });
             }
         }
         opened.extend(opened_here);
@@ -2460,7 +2572,9 @@ fn dirty_clean_aliases_for_range_sharded(first: usize, last: usize) {
     for_each_shard_span(first, last, |shard, a, b| {
         let g = guards_read_shard(shard);
         if !g.aliased.is_empty() {
-            aliased.extend(g.aliased.range(a..b).copied());
+            g.aliased.for_each_overlap(a, b, |la, lb| {
+                aliased.extend(la..lb);
+            });
         }
     });
     if aliased.is_empty() {
@@ -2659,7 +2773,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             g.accounted.overlaps(a, b)
                 || g.protected.overlaps(a, b)
                 || g.alias_dirty.overlaps(a, b)
-                || g.aliased.range(a..b).next().is_some()
+                || g.aliased.overlaps(a, b)
                 || g.recent_fault.range(a..b).next().is_some()
                 || g.cool_count.range(a..b).next().is_some()
         };
@@ -2675,10 +2789,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.clean.remove_range(a, b);
         g.accounted.remove_range(a, b);
         g.alias_dirty.remove_range(a, b);
-        let aliased: Vec<usize> = g.aliased.range(a..b).copied().collect();
-        for block in aliased {
-            g.aliased.remove(&block);
-        }
+        g.aliased.remove_range(a, b);
         let hot_keys: Vec<usize> = g.hot.range(a..b).map(|(&k, _)| k).collect();
         for block in hot_keys {
             g.hot.remove(&block);
@@ -2714,7 +2825,7 @@ fn install() {
         let block = at / BLOCK;
         let tracked = {
             let g = guards_read_shard(shard_of(block));
-            g.protected.contains(block) || g.aliased.contains(&block)
+            g.protected.contains(block) || g.aliased.contains(block)
         };
         if tracked && open_fault_sharded(at) {
             #[cfg(feature = "diagnostics")]
@@ -2738,7 +2849,7 @@ pub fn try_open_write(at: usize) -> bool {
     let block = at / BLOCK;
     let tracked = {
         let g = guards_read_shard(shard_of(block));
-        g.protected.contains(block) || g.aliased.contains(&block)
+        g.protected.contains(block) || g.aliased.contains(block)
     };
     if tracked && open_fault_sharded(at) {
         #[cfg(feature = "diagnostics")]

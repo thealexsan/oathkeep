@@ -176,7 +176,7 @@ struct CleanSubEntry {
     spans: Vec<(usize, usize)>,
 }
 
-const MAX_CLEAN_SUB_ENTRIES: usize = 16;
+const MAX_CLEAN_SUB_ENTRIES: usize = 64;
 
 struct CopiedState {
     pages: Vec<u64>,
@@ -3696,6 +3696,11 @@ impl Shadow {
     #[inline]
     pub(crate) fn touch_used(&self, now: u64) {
         self.used.store(now, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
     }
 
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -7362,76 +7367,160 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 }
 
 pub(crate) fn find_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_existing_with_range(address, len).map(|(s, _, _)| s)
+}
+
+pub(crate) fn find_existing_with_range(address: u64, len: u64) -> Option<(Arc<Shadow>, u64, u64)> {
     let end = address.checked_add(len.max(1))?;
-    {
+    let (buf_lo, buf_hi) = {
         let map = buffers_read();
-        if let Some((_, entry)) = map
-            .range(..=(address, usize::MAX))
-            .rev()
-            .take(64)
-            .find(|(_, e)| e.end >= end)
+        let mut max_skipped_end = 0u64;
+        let mut matched: Option<((u64, usize), &Entry)> = None;
+        for (&k, e) in map.range(..=(address, usize::MAX)).rev().take(64) {
+            if e.end >= end {
+                matched = Some((k, e));
+                break;
+            }
+            max_skipped_end = max_skipped_end.max(e.end);
+        }
+        let next_start = map
+            .range((address.saturating_add(1), 0)..)
+            .next()
+            .map_or(u64::MAX, |(k, _)| k.0);
+        if let Some((k, entry)) = matched
             && let Some(shadow) = &entry.shadow
         {
             shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-            return Some(shadow.clone());
+            let (vs, ve) = if max_skipped_end <= address {
+                (k.0.max(max_skipped_end), entry.end.min(next_start))
+            } else {
+                (address, end)
+            };
+            return Some((shadow.clone(), vs, ve));
         }
-    }
+        let (lo, hi) = if matched.is_some() {
+            (address, end)
+        } else if max_skipped_end <= address {
+            (max_skipped_end, next_start)
+        } else {
+            (address, next_start)
+        };
+        (lo, hi)
+    };
     let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     let from = address.saturating_sub(WINDOW);
     map.range((from, 0)..=(address, u64::MAX))
         .find(|((start, bytes), _)| *start <= address && *start + *bytes >= end)
         .map(|(_, s)| {
             s.used.store(crate::host::moment(), Ordering::Relaxed);
-            s.clone()
+            let vs = s.start.max(buf_lo).min(address);
+            let ve = s.start.saturating_add(s.len).min(buf_hi).max(end);
+            (s.clone(), vs, ve)
         })
 }
 
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    lookup(address, len, false)
+    lookup_with_range(address, len, false).map(|(s, _, _)| s)
 }
 
+pub(crate) fn find_with_range(address: u64, len: u64) -> Option<(Arc<Shadow>, u64, u64)> {
+    lookup_with_range(address, len, false)
+}
+
+#[allow(dead_code)]
 pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if !fine() {
         return find(address, len);
     }
-    lookup(address, len, true)
+    lookup_with_range(address, len, true).map(|(s, _, _)| s)
 }
 
-fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+pub(crate) fn find_any_with_range(address: u64, len: u64) -> Option<(Arc<Shadow>, u64, u64)> {
+    if !fine() {
+        return find_with_range(address, len);
+    }
+    lookup_with_range(address, len, true)
+}
+
+fn lookup_with_range(address: u64, len: u64, any: bool) -> Option<(Arc<Shadow>, u64, u64)> {
     let end = address.checked_add(len.max(1))?;
     {
         let map = buffers_read();
-        let found = map
-            .range(..=(address, usize::MAX))
-            .rev()
-            .take(64)
-            .find(|(_, e)| e.end >= end);
+        let mut max_skipped_end = 0u64;
+        let mut found: Option<((u64, usize), &Entry)> = None;
+        for (&k, e) in map.range(..=(address, usize::MAX)).rev().take(64) {
+            if e.end >= end {
+                found = Some((k, e));
+                break;
+            }
+            max_skipped_end = max_skipped_end.max(e.end);
+        }
+        let next_start = map
+            .range((address.saturating_add(1), 0)..)
+            .next()
+            .map_or(u64::MAX, |(k, _)| k.0);
         match found {
-            Some((_, entry)) if entry.shadow.is_some() => {
+            Some((k, entry)) if entry.shadow.is_some() => {
                 if let Some(s) = &entry.shadow {
                     s.used.store(crate::host::moment(), Ordering::Relaxed);
+                    let (vs, ve) = if max_skipped_end <= address {
+                        (k.0.max(max_skipped_end), entry.end.min(next_start))
+                    } else {
+                        (address, end)
+                    };
+                    return Some((s.clone(), vs, ve));
                 }
-                return entry.shadow.clone();
             }
             None => {
+                let buf_lo = if max_skipped_end <= address {
+                    max_skipped_end
+                } else {
+                    address
+                };
                 drop(map);
-                return loose(address, end, len <= 1, any);
+                let s = loose(address, end, len <= 1, any)?;
+                let vs = s.start.max(buf_lo).min(address);
+                let ve = s.start.saturating_add(s.len).min(next_start).max(end);
+                return Some((s, vs, ve));
             }
             Some(_) => {}
         }
     }
     let mut map = buffers_write();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
+    let mut max_skipped_end = 0u64;
+    let mut key: Option<(u64, usize)> = None;
+    for (&k, e) in map.range(..=(address, usize::MAX)).rev().take(64) {
+        if e.end >= end {
+            key = Some(k);
+            break;
+        }
+        max_skipped_end = max_skipped_end.max(e.end);
+    }
+    let next_start = map
+        .range((address.saturating_add(1), 0)..)
+        .next()
+        .map_or(u64::MAX, |(k, _)| k.0);
     let Some(key) = key else {
+        let buf_lo = if max_skipped_end <= address {
+            max_skipped_end
+        } else {
+            address
+        };
         drop(map);
-        return loose(address, end, len <= 1, any);
+        let s = loose(address, end, len <= 1, any)?;
+        let vs = s.start.max(buf_lo).min(address);
+        let ve = s.start.saturating_add(s.len).min(next_start).max(end);
+        return Some((s, vs, ve));
     };
     let entry = map.get_mut(&key)?;
+    let entry_end = entry.end;
+    let valid_bounds = |k0: u64| {
+        if max_skipped_end <= address {
+            (k0.max(max_skipped_end), entry_end.min(next_start))
+        } else {
+            (address, end)
+        }
+    };
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         let size = len.next_multiple_of(1 << 16);
@@ -7440,8 +7529,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             .get_or_init(|| std::env::var_os("OATHKEEP_INPLACE_BIG").is_some_and(|v| v == "1"));
         let prefer_card = !inplace_big && cards() && size >= card_limits().0;
         if !prefer_card && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
+            let shadow = Arc::new(Shadow::placed(placed, key.0, len, false));
+            entry.shadow = Some(shadow.clone());
+            let (vs, ve) = valid_bounds(key.0);
+            return Some((shadow, vs, ve));
         }
         let (buffer, data, card) = match card_for(size) {
             Some(on_card) => {
@@ -7469,8 +7560,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             }
             None => {
                 if prefer_card && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-                    entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-                    return entry.shadow.clone();
+                    let shadow = Arc::new(Shadow::placed(placed, key.0, len, false));
+                    entry.shadow = Some(shadow.clone());
+                    let (vs, ve) = valid_bounds(key.0);
+                    return Some((shadow, vs, ve));
                 }
                 let (buffer, data) = host()?.shared_buffer(size)?;
                 crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
@@ -7505,7 +7598,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     } else if let Some(s) = &entry.shadow {
         s.used.store(crate::host::moment(), Ordering::Relaxed);
     }
-    entry.shadow.clone()
+    let (vs, ve) = valid_bounds(key.0);
+    entry.shadow.clone().map(|s| (s, vs, ve))
 }
 
 const WINDOW: u64 = 4 << 20;
