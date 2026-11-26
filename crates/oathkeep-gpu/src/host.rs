@@ -2385,7 +2385,7 @@ unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &crate::shadow::Card
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OATHKEEP_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("OATHKEEP_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -2438,6 +2438,9 @@ impl CardPlan {
 /// What a submission does for copies in the card's memory.
 struct CardPlan {
     ranges: Vec<CardRange>,
+    /// Deduplicated per-buffer joined piece runs to hash/compare on the GPU:
+    /// `(shadow, before_gpu, hash_size, run_span, out_at, mode)`.
+    check_runs: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u32, crate::shadow::CardSpan, u32, u32)>,
     /// The compare, run after the submission's lists.
     check: Option<ID3D12CommandList>,
     /// The copies whose card side was brought up to date, alive until the
@@ -2787,6 +2790,7 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// 64 KiB piece; the compare hashes the whole piece for each and stores
 /// the hash, so the second of them may find it stored already and not
 /// flag it.
+#[cfg_attr(not(test), allow(dead_code))]
 fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
     let mut pieces: Vec<(usize, u32)> = flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect();
     pieces.sort_unstable();
@@ -4493,7 +4497,7 @@ impl Host {
         }
         // The ranges this submission's shaders may write, per copy.
         let declared: Vec<Declared> = declared.iter().filter(|(shadow, _)| shadow.carded()).cloned().collect();
-        let declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
+        let mut declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
         // (Of a copy with a declared range here, that says it.)
         let looked: Vec<&crate::picked::Range> =
             picked.looked.iter().filter(|l| !declared.iter().any(|(s, _)| Arc::ptr_eq(s, &l.0))).collect();
@@ -4561,9 +4565,10 @@ impl Host {
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)));
                     }
                     for (shadow, ranges) in &dirty {
-                        let Some((staging, before, _)) = shadow.card_sides() else {
+                        let Some(staging) = shadow.card_staging() else {
                             continue;
                         };
+                        let has_before = shadow.card_before_gpu().is_some();
                         if own.is_none() {
                             for &(a, b) in ranges {
                                 list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
@@ -4574,7 +4579,7 @@ impl Host {
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         #[cfg(feature = "diagnostics")]
                         traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
-                        if own.is_none() && before.is_some() && !ranges.is_empty() {
+                        if own.is_none() && has_before && !ranges.is_empty() {
                             let raw = shadow.buffer.as_raw();
                             if !transitioned.contains(&raw) {
                                 transitioned.push(raw);
@@ -4593,9 +4598,10 @@ impl Host {
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                     for (shadow, ranges) in &dirty {
-                        let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
+                        let Some(before_gpu) = shadow.card_before_gpu() else {
                             continue;
                         };
+                        let size = shadow.card_hash_size();
                         // No twin (it cost the card the copy's size again,
                         // 399 MB in run 75): `before` holds a 128-bit hash
                         // of each 64 KiB piece. The pieces just sent up are
@@ -4603,7 +4609,7 @@ impl Host {
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(2, before_gpu);
                         let joins = rehash_runs() || own.is_some();
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
@@ -4640,6 +4646,7 @@ impl Host {
         drop(order);
         let mut plan = CardPlan {
             ranges: Vec::new(),
+            check_runs: Vec::new(),
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
@@ -4647,44 +4654,71 @@ impl Host {
             looks,
             sends: own.map(send::Own::memory),
         };
-        // Each byte once, as the copy-back joins the declared ranges. The
-        // results go behind those of plans still in the air.
+        // Each byte once, as the copy-back joins the declared ranges, and each
+        // 64 KiB piece hashed once on the GPU across sub-ranges of the same
+        // buffer (`joined_piece_runs`).
         let mut at = work.taken;
-        for (shadow, ranges) in &declared {
-            let mut sorted = ranges.clone();
-            sorted.sort_unstable();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for (from, to) in sorted {
-                match spans.last_mut() {
-                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                    _ => spans.push((from, to)),
+        let declared_mode = if flown { 2 } else { 1 };
+        for (shadow, ranges) in &mut declared {
+            ranges.sort_unstable();
+            let mut resolved: Vec<(usize, usize, crate::shadow::CardSpan)> = Vec::with_capacity(ranges.len());
+            let mut w = 0usize;
+            for i in 0..ranges.len() {
+                let (from, to) = ranges[i];
+                if w > 0 && from <= ranges[w - 1].1 {
+                    ranges[w - 1].1 = ranges[w - 1].1.max(to);
+                } else {
+                    ranges[w] = (from, to);
+                    w += 1;
                 }
             }
-            let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
-            for (from, to) in spans {
-                let Some(span) = shadow.card_span(from, to) else {
-                    continue;
-                };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+            ranges.truncate(w);
+            for &(from, to) in ranges.iter() {
+                if let Some(span) = shadow.card_span(from, to) {
+                    resolved.push((from, to, span));
+                }
+            }
+            if resolved.is_empty() {
+                continue;
+            }
+            let before_gpu = shadow.card_before_gpu();
+            let size = shadow.card_hash_size() as u32;
+            let joined = crate::shadow::joined_piece_runs(resolved.iter().map(|r| r.2).collect());
+            let mut joined_meta: Vec<(crate::shadow::CardSpan, u32, bool)> = Vec::with_capacity(joined.len());
+            for run in joined {
+                let compared = before_gpu.is_some() && u64::from(at + run.pieces) * 4 <= work.differs.2;
+                let run_at = at;
+                if compared {
+                    at += run.pieces;
+                    if let Some(bgpu) = before_gpu {
+                        plan.check_runs.push((shadow.clone(), bgpu, size, run, run_at, declared_mode));
+                    }
+                }
+                joined_meta.push((run, run_at, compared));
+            }
+            let mut j = 0usize;
+            for (from, to, span) in resolved {
+                while j + 1 < joined_meta.len() && joined_meta[j].0.first + joined_meta[j].0.pieces <= span.first {
+                    j += 1;
+                }
+                let (run, run_at, compared) = joined_meta[j];
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
                     span,
-                    at,
+                    at: if compared { run_at + (span.first - run.first) } else { run_at },
                     compared,
                     picked: false,
                 });
-                if compared {
-                    at += span.pieces;
-                }
             }
         }
         for (shadow, from, len) in looked {
-            let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
-            if let Some(span) = shadow.card_span(*from, from + len)
-                && twin
+            let before_gpu = shadow.card_before_gpu();
+            if let (Some(bgpu), Some(span)) = (before_gpu, shadow.card_span(*from, from + len))
                 && u64::from(at + span.pieces) * 4 <= work.differs.2
             {
+                let size = shadow.card_hash_size() as u32;
+                plan.check_runs.push((shadow.clone(), bgpu, size, span, at, 1));
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (*from, from + len),
@@ -4697,7 +4731,7 @@ impl Host {
             }
         }
         work.taken = at;
-        if plan.ranges.iter().any(|r| r.compared) {
+        if !plan.check_runs.is_empty() {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
@@ -4722,15 +4756,15 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
-                            continue;
-                        };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        // (What is only looked at keeps its hashes: what
-                        // changed there is the next declared range's to land.)
-                        card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
+                    let mut last_shadow = 0usize;
+                    for (shadow, before_gpu, size, span, run_at, mode) in &plan.check_runs {
+                        let ptr = Arc::as_ptr(shadow) as usize;
+                        if ptr != last_shadow {
+                            last_shadow = ptr;
+                            list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(2, *before_gpu);
+                        }
+                        card_pass(list, span, *size, *run_at, *mode);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
@@ -4857,34 +4891,28 @@ impl Host {
         if let Some(differs) = differs {
             // Pieces caught while a later flight was at them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = std::collections::HashSet::<
+                (usize, usize, usize),
+                std::hash::BuildHasherDefault<AddressHash>,
+            >::default();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
-                let flags: Vec<(usize, u32, bool)> = plan
-                    .ranges
-                    .iter()
-                    .filter(|r| !r.picked)
-                    .flat_map(|r| {
-                        (0..r.span.pieces).map(move |p| {
-                            let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| torn::flagged(d));
-                            let wanted = suspects.map_or(flagged, |s| s.wanted((r.shadow.id(), r.span.first + p), flagged));
-                            (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, wanted)
-                        })
-                    })
-                    .collect();
-                let fetched = flagged_pieces(&flags);
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                    let shadow_id = r.shadow.id();
+                    let shadow_base = r.shadow.span().0 as usize;
                     if upcheck::on() {
-                        upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
+                        upcheck::declared(shadow_id, r.span.from as usize, r.span.to as usize);
                     }
                     for p in 0..r.span.pieces {
-                        if fetched.binary_search(&(copy, r.span.first + p)).is_err() {
+                        let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| torn::flagged(d));
+                        let wanted = suspects.map_or(flagged, |s| s.wanted((shadow_id, r.span.first + p), flagged));
+                        if !wanted {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && !seen.contains(&(copy, lo, hi)) {
-                            let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
+                        if lo < hi && seen.insert((copy, lo, hi)) {
+                            let key = (shadow_id, shadow_base + lo, hi - lo);
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
                                 land::count(land::stat::HAD, 1);
                                 land::count(land::stat::HAD_BYTES, (hi - lo) as u64);
@@ -4893,9 +4921,8 @@ impl Host {
                                 }
                             }
                             if upcheck::on() {
-                                upcheck::fetched(r.shadow.id(), lo);
+                                upcheck::fetched(shadow_id, lo);
                             }
-                            seen.insert((copy, lo, hi));
                             pieces.push((r.shadow.clone(), lo, hi, total));
                             total += (hi - lo) as u64;
                         }
@@ -5037,9 +5064,10 @@ impl Host {
                     }
                 }
                 let mut notes = land::Notes::default();
+                let mut addressed: Vec<(usize, usize, usize)> = Vec::new();
                 for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
-                    let addressed: Vec<(usize, usize, usize)> =
-                        run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
+                    addressed.clear();
+                    addressed.extend(run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)));
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run, and the next waits
                     // for this call.
@@ -5114,11 +5142,16 @@ impl Host {
                 let plans: Vec<(&CardPlan, u64)> = flights.iter().filter_map(|f| Some((f.card.as_ref()?, f.fence))).collect();
                 // (Each byte once: the ranges are joined.)
                 let mut back: Vec<Declared> = Vec::new();
+                let mut back_idx: ByCopy<usize> = ByCopy::default();
                 for flight in &flights {
                     for (shadow, ranges) in flight.back.iter().filter(|(shadow, _)| !shadow.carded()) {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => all.extend_from_slice(ranges),
-                            None => back.push((shadow.clone(), ranges.clone())),
+                        let key = std::sync::Arc::as_ptr(shadow) as usize;
+                        match back_idx.get(&key) {
+                            Some(&idx) => back[idx].1.extend_from_slice(ranges),
+                            None => {
+                                back_idx.insert(key, back.len());
+                                back.push((shadow.clone(), ranges.clone()));
+                            }
                         }
                     }
                 }

@@ -141,6 +141,28 @@ fn only_what_a_fetch_behind_the_flight_brought_is_left_out() {
     assert!(had.holds(7, (1, BLOCK, BLOCK)));
     had.landing(8);
     assert!(had.0.is_empty());
+
+    // Disjoint sub-ranges in the same 64 KiB block are all retained and coalesced when bridged.
+    had.fetched(10, [(4, 0x100, 0x200), (4, 0x800, 0x400), (4, 0x2000, 0x100)].into_iter());
+    assert!(had.holds(10, (4, 0x100, 0x200)));
+    assert!(had.holds(10, (4, 0x800, 0x400)));
+    assert!(had.holds(10, (4, 0x2000, 0x100)));
+    assert!(!had.holds(10, (4, 0x300, 0x500)));
+    had.fetched(10, [(4, 0x300, 0x500)].into_iter());
+    assert!(had.holds(10, (4, 0x100, 0xb00)));
+}
+
+#[test]
+fn nested_pool_calls_execute_inline_without_deadlock() {
+    let pool = Pool::new("victory-land", 4);
+    let sum = AtomicUsize::new(0);
+    pool.each(12, &|i| {
+        pool.each(5, &|j| {
+            sum.fetch_add(i * 10 + j, Ordering::Relaxed);
+        });
+    });
+    let expected: usize = (0..12).flat_map(|i| (0..5).map(move |j| i * 10 + j)).sum();
+    assert_eq!(sum.into_inner(), expected);
 }
 
 #[test]
