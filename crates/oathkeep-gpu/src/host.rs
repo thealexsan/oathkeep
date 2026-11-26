@@ -523,6 +523,23 @@ fn bury_lag() -> u64 {
     })
 }
 
+/// Background recycler thread for retired D3D12 resources so WDDM `Release()`
+/// calls do not stall the relay landing thread (~25 ms/frame in `stat::REST`).
+/// Bounded capacity ensures backpressure drops inline if the recycler ever
+/// falls behind.
+fn bury_recycler() -> &'static std::sync::mpsc::SyncSender<Vec<(u64, Retired)>> {
+    static TX: OnceLock<std::sync::mpsc::SyncSender<Vec<(u64, Retired)>>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<(u64, Retired)>>(64);
+        let _ = std::thread::Builder::new().name("oathkeep-bury".into()).spawn(move || {
+            for batch in rx {
+                drop(batch);
+            }
+        });
+        tx
+    })
+}
+
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
 /// numbers come in order, but for threads that overtake each other: one of
 /// those is dropped a little later than it could be.
@@ -536,7 +553,7 @@ fn bury(finished: u64) {
         }
         retired.drain(..n).collect()
     };
-    drop(done);
+    let _ = bury_recycler().try_send(done);
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -5737,10 +5754,11 @@ impl Host {
                 now_ms().saturating_sub(SWEPT.load(Ordering::Relaxed)),
             )
         {
-            // With the present sent ahead nothing else brings a moment
-            // with nothing in the air: one is made for the sweep.
-            self.settle(&mut submitted, WHY_SYNC);
+            // `sweep()` only frees objects that are unreferenced (`Arc::strong_count == 1`,
+            // `references == 1`, `long_ago(..., IDLE_FRAMES=4)`) or defers via `retire()`,
+            // so it does not need a full GPU drain unless `upcheck` is active.
             if upcheck::on() {
+                self.settle(&mut submitted, WHY_SYNC);
                 upcheck::at_rest(self);
             }
             sweep();
@@ -8927,7 +8945,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -8935,7 +8953,6 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
