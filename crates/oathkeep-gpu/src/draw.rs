@@ -200,13 +200,14 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     tables_gone: bool,
-    shadow_cache: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    shadow_cache: Vec<(u64, u64, u8, std::sync::Arc<crate::shadow::Shadow>)>,
     shadow_cache_gen: u64,
     constants_pool: Vec<Vec<u32>>,
     scratch_fresh: Vec<u8>,
     scratch_made: Vec<(u8, u32)>,
     scratch_entries: Vec<usize>,
     scratch_selected: Vec<u32>,
+    scratch_used_k: Vec<u32>,
     scratch_addresses: Vec<u64>,
     scratch_constants: Vec<u32>,
 }
@@ -674,12 +675,20 @@ impl State {
     }
 
     #[inline]
-    fn cache_shadow(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+    fn cache_shadow(
+        &mut self,
+        address: u64,
+        len: u64,
+        kind: u8,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+    ) {
+        let norm_len = len.max(1);
         if let Some(pos) = self
             .shadow_cache
             .iter()
-            .position(|s| std::sync::Arc::ptr_eq(s, shadow))
+            .position(|(a, l, k, _)| *a == address && *l == norm_len && *k == kind)
         {
+            self.shadow_cache[pos].3 = shadow.clone();
             if pos > 0 {
                 self.shadow_cache[..=pos].rotate_right(1);
             }
@@ -688,7 +697,8 @@ impl State {
         if self.shadow_cache.len() >= SHADOW_CACHE_CAP {
             self.shadow_cache.pop();
         }
-        self.shadow_cache.insert(0, shadow.clone());
+        self.shadow_cache
+            .insert(0, (address, norm_len, kind, shadow.clone()));
     }
 
     #[inline]
@@ -696,28 +706,26 @@ impl State {
         &mut self,
         address: u64,
         len: u64,
+        kind: u8,
     ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
         self.sync_shadow_cache();
-        let end = address.checked_add(len.max(1))?;
-        let unsized_ask = len <= 1;
-        let pos = self.shadow_cache.iter().position(|s| {
-            let (start, slen) = s.span();
-            start <= address
-                && end <= start.saturating_add(slen)
-                && (!unsized_ask || !s.is_window() || s.left(address) >= (256 << 10))
-        })?;
+        let norm_len = len.max(1);
+        let pos = self
+            .shadow_cache
+            .iter()
+            .position(|(a, l, k, _)| *a == address && *l == norm_len && *k == kind)?;
         if pos > 0 {
             self.shadow_cache[..=pos].rotate_right(1);
         }
-        Some(self.shadow_cache[0].clone())
+        Some(self.shadow_cache[0].3.clone())
     }
 
     fn find_shadow(&mut self, address: u64, len: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-        if let Some(s) = self.lookup_shadow_cached(address, len) {
+        if let Some(s) = self.lookup_shadow_cached(address, len, 0) {
             return Some(s);
         }
         let s = crate::shadow::find(address, len)?;
-        self.cache_shadow(&s);
+        self.cache_shadow(address, len, 0, &s);
         Some(s)
     }
 
@@ -726,11 +734,11 @@ impl State {
         address: u64,
         len: u64,
     ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-        if let Some(s) = self.lookup_shadow_cached(address, len) {
+        if let Some(s) = self.lookup_shadow_cached(address, len, 1) {
             return Some(s);
         }
         let s = crate::shadow::find_any(address, len)?;
-        self.cache_shadow(&s);
+        self.cache_shadow(address, len, 1, &s);
         Some(s)
     }
 
@@ -739,11 +747,11 @@ impl State {
         address: u64,
         len: u64,
     ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-        if let Some(s) = self.lookup_shadow_cached(address, len) {
+        if let Some(s) = self.lookup_shadow_cached(address, len, 2) {
             return Some(s);
         }
         let s = crate::shadow::find_existing(address, len)?;
-        self.cache_shadow(&s);
+        self.cache_shadow(address, len, 2, &s);
         Some(s)
     }
 
@@ -1112,13 +1120,8 @@ impl State {
                 .then(|| {
                     self.shadow_cache
                         .iter()
-                        .find(|s| {
-                            let (start, slen) = s.span();
-                            start <= address
-                                && address < start.saturating_add(slen)
-                                && (!s.is_window() || s.left(address) >= (256 << 10))
-                        })
-                        .cloned()
+                        .find(|(a, l, k, _)| *a == address && *l == 1 && *k == 0)
+                        .map(|(_, _, _, s)| s.clone())
                 })
                 .flatten()
                 .or_else(|| crate::shadow::find(address, 1));
@@ -3044,12 +3047,16 @@ impl State {
         if !direct_cbv() {
             return false;
         }
-        let Some(View::Constant(address, size)) = crate::descriptor::view(handle) else {
-            return false;
-        };
-        let aligned = u64::from(size.next_multiple_of(256));
-        self.find_shadow(address, aligned)
-            .is_some_and(|shadow| shadow.gpu(address) % 256 == 0 && shadow.left(address) >= aligned)
+        match crate::descriptor::view(handle) {
+            Some(View::Constant(address, size)) => {
+                let aligned = u64::from(size.next_multiple_of(256));
+                self.find_shadow(address, aligned)
+                    .is_some_and(|shadow| {
+                        shadow.gpu(address) % 256 == 0 && shadow.left(address) >= aligned
+                    })
+            }
+            _ => true,
+        }
     }
 
     fn tables_into(
@@ -3205,34 +3212,42 @@ impl State {
             }
             self.scratch_selected.sort_unstable();
             self.scratch_selected.dedup();
-            let n = self
-                .scratch_entries
-                .iter()
-                .map(|&idx| used[idx].table_offset_dwords / 8)
-                .chain(self.scratch_selected.last().copied())
-                .max()
-                .unwrap_or(0)
-                + 1;
-            let last = table.checked_add(u64::from(n - 1) * 32);
-            if n > crate::descriptor::host::DYNAMIC
+            self.scratch_used_k.clear();
+            for &idx in &self.scratch_entries {
+                self.scratch_used_k.push(used[idx].table_offset_dwords / 8);
+            }
+            self.scratch_used_k.extend_from_slice(&self.scratch_selected);
+            self.scratch_used_k.sort_unstable();
+            self.scratch_used_k.dedup();
+            let (Some(&min_k), Some(&max_k)) =
+                (self.scratch_used_k.first(), self.scratch_used_k.last())
+            else {
+                continue;
+            };
+            let trim = if host.count() >= min_k { min_k } else { 0 };
+            let span = max_k - trim + 1;
+            let last = table.checked_add(u64::from(max_k) * 32);
+            if span > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
-                once!(slot, n, "fresh descriptor table exceeds the available span");
+                once!(slot, span, "fresh descriptor table exceeds the available span");
                 continue;
             }
             let heap_id = std::ptr::from_ref(heap) as usize;
             let key = {
-                let mut h1 = 0xcbf2_9ce4_8422_2325_u64 ^ u64::from(n);
+                let mut h1 =
+                    0xcbf2_9ce4_8422_2325_u64 ^ (u64::from(span) | (u64::from(trim) << 32));
                 let mut h2 = 0x517c_c1b7_2722_0a95_u64 ^ (heap_id as u64);
-                for k in 0..n {
+                for &k in &self.scratch_used_k {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     let words = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                    h1 ^= u64::from(k).wrapping_mul(0x9e37_79b9_7f4a_7c15);
                     hash_table_words(&words, &mut h1, &mut h2);
                 }
-                (heap_id, n, finalize_table_hash(h1, h2))
+                (heap_id, span, finalize_table_hash(h1, h2))
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            if let Some(&offset) = self.fresh_tables.get(&key) {
                 for entry_i in 0..self.scratch_entries.len() {
                     let idx = self.scratch_entries[entry_i];
                     let u = &used[idx];
@@ -3281,18 +3296,19 @@ impl State {
                         readable(list, kind, &view);
                     }
                 }
-                self.scratch_made.push((slot, first * 32));
+                self.scratch_made.push((slot, offset));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = host.dynamic(span) else {
                 self.scratch_made.push((slot, u32::MAX));
                 continue;
             };
             let mut cacheable = true;
-            self.dynamic.push((heap_id, first, n));
-            let title_first = heap.index(table).filter(|first| first + n <= host.count());
-            for k in 0..n {
-                let index = first + k;
+            self.dynamic.push((heap_id, first, span));
+            let title_first = heap.index(table);
+            for used_i in 0..self.scratch_used_k.len() {
+                let k = self.scratch_used_k[used_i];
+                let index = first + (k - trim);
                 let used_entry = self
                     .scratch_entries
                     .iter()
@@ -3352,6 +3368,7 @@ impl State {
                             readable(list, kind, &view);
                         }
                         if let Some(title) = title_first
+                            && title.saturating_add(k) < host.count()
                             && crate::descriptor::host::is_texture_view(&view)
                         {
                             host.texture_slot_tabled(title + k, kind.is_some());
@@ -3368,10 +3385,11 @@ impl State {
                     }
                 }
             }
+            let offset = (first - trim) * 32;
             if cacheable {
-                self.fresh_tables.insert(key, first);
+                self.fresh_tables.insert(key, offset);
             }
-            self.scratch_made.push((slot, first * 32));
+            self.scratch_made.push((slot, offset));
         }
     }
 

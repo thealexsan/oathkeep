@@ -6628,6 +6628,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    SHADOW_GEN.fetch_add(1, Ordering::Release);
 }
 
 static SHADOW_GEN: AtomicU64 = AtomicU64::new(1);
