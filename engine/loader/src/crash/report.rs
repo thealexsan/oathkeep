@@ -139,7 +139,7 @@ pub(super) unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file
         append_to_log(&text);
     }
     #[cfg(feature = "diagnostics")]
-    for (address, len, file) in SAVE.get().into_iter().flatten() {
+    for (address, len, file) in super::SAVE.get().into_iter().flatten() {
         // SAFETY: the caller of `save_on_crash` named readable memory.
         let bytes = unsafe { std::slice::from_raw_parts(*address as *const u8, *len) };
         let saved = std::fs::write(file, bytes);

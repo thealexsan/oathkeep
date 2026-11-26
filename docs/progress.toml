@@ -1,6 +1,6 @@
 [meta]
 updated = "2026-11-27"
-commit = "01b0f10"
+commit = "e7c9424"
 branch = "main"
 target_fps = "20-30+ FPS (1:1 visuals)"
 current_fps = "5.4 fps peak in-world (185.5 ms/f; reached frame-1782 in 145s, +124 frames further than swarm2b; 0 crashes/TDRs/refusals, 1:1 console visuals)"
@@ -8,7 +8,7 @@ current_frame_ms = "185.5 ms/f unswapped in diag-fps-swarm3b (slots 30.6 ms -56%
 current_gpu_ms = "0.0-43.9 ms (145s clean; 0 crashes/TDRs/OOMs, 0 failed Wave64 shaders, 0 refused dynamic tables)"
 current_preparing_ms = "110.9 ms unswapped in diag-fps-swarm3b (copies 38.7 ms, textures 5.4 ms; late 16 GB pagefile spikes from 6.26 GB in 1,341 host command lists)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "PR #3 merged (Round 3 FPS + 16 GB RAM commit caps); next: monolith decomposition refactor & host command-list commit reduction (6.26 GB)"
+eta = "Codebase modularization complete (PRs #4-#7 merged: all Rust files <=500 lines, engine/* + 8 GPU domain dirs, post-reorg 3D capture verified); next: 30 FPS & host command-list commit reduction (6.26 GB)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]

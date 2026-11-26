@@ -28,6 +28,8 @@ mod tests;
 pub(crate) use amd_only::{CMP_FLAGS, cmp_flags};
 pub use report::report_unhandled;
 pub use unwind::locate;
+#[cfg(feature = "diagnostics")]
+pub(crate) use unwind::unwind_into;
 
 pub(super) const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.

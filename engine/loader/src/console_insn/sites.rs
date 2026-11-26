@@ -1,8 +1,5 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
-use super::{AtomicU64, Relaxed};
-use std::sync::atomic::AtomicUsize;
-
 /// Address, what is there (an index into [`NAMES`]), exceptions since the last line.
 static SITES: [(AtomicUsize, AtomicUsize, AtomicU64); 512] =
     [const { (AtomicUsize::new(0), AtomicUsize::new(0), AtomicU64::new(0)) }; 512];
