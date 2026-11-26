@@ -3,12 +3,12 @@ updated = "2026-11-26"
 commit = "perf/commit-reduction"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "11.7-16.8 fps heavy 3D steady / 18.8 fps peak (diag-run94: Fix AC1-AC4 clean 130.3s; sweep -85% to 0.08-0.60 ms, guards -55% to 4.6-15.3 ms, alias_apply -65% to 1.19-5.21 ms, make_at miss -50%, new low 27.5 ms preparing, 0 hangs/TDRs/refusals)"
-current_frame_ms = "59.4-85.3 ms heavy 3D (53.2 ms peak, 0 refused dynamic slots, 0 crashes/TDRs, 0.0-2.6 ms GPU wait)"
-current_gpu_ms = "0.0-2.6 ms wait (100% CPU-bound: preparing 27.5-45.5 ms + card copy-back 12.0-18.1 ms + post-present 10.8-13.7 ms)"
-current_preparing_ms = "27.5-45.5 ms NEW LOW (batch_flush 14.5-24.8 ms, guards 4.6-15.3 ms, stale 4.2-8.5 ms, sweep 0.08-0.60 ms)"
+current_fps = "11.9-17.5 fps heavy 3D steady (13.4 median / 17.5 peak, diag-run98: Fix AF1-AF2 clean 130.8s; reverted AD/AE regressions, kept AVX2/parallel wins, make_at -14-19% on heavy scenes, stale 5.8 ms, guards 8.6 ms, cfu -38% to 0.8 ms, 0 hangs/TDRs/refusals)"
+current_frame_ms = "57.2-84.2 ms heavy 3D (75.4 ms median, 57.2 ms peak, 0 refused dynamic slots, 0 crashes/TDRs, 0.0 ms median GPU wait)"
+current_gpu_ms = "0.0 ms median wait (80-93% busy; 100% CPU-bound: preparing 31.2-53.4 ms + between-submissions 27.6-43.3 ms)"
+current_preparing_ms = "31.2-53.4 ms (43.9 ms median: batch_flush 22.9 ms, stale 5.8 ms, prelude 3.6 ms, ask_once 3.4 ms, card 3.7 ms)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~10-15 min (Fix AD: optimize 13-18 ms card copy-back + batch_flush/pre_guard + post-present gap -> 20-30+ FPS)"
+eta = "~10-15 min (Fix AG: cut 22.9 ms batch_flush + 12.3 ms post-present + 65.9 ms recording tables -> 20-30+ FPS)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -325,3 +325,12 @@ frame_ms = 59.4
 gpu_ms = "0.0-2.6 ms wait (0 hangs/TDRs/refusals in 130.3s at default 512 KiB)"
 preparing_ms = "27.5-45.5 ms NEW LOW (batch_flush 14.5-24.8 ms, guards 4.6-15.3 ms, stale 4.2-8.5 ms, sweep 0.08-0.60 ms)"
 status = "Fix AC1-AC4 verified clean: pre_prep sweep -85% (0.08-0.60 ms), guards -55% (4.6-15.3 ms), alias_apply -65% (1.19-5.21 ms), watches -50% (6.72-17.84 ms), make_at miss -50% (3.16-11.17 ms), true indirect 4.56-11.39 ms, NEW ALL-TIME LOW 27.5 ms preparing & 79.1 ms rec (11.7-16.8 fps steady); exposed next 3 blockers: 13.2-18.1 ms card copy-back (20.8 MB), 14.5-24.8 ms batch_flush, and 10.8-13.7 ms post-present gap -> next: Fix AD"
+
+[[runs]]
+label = "diag-run98"
+commit = "c059f27"
+fps = 17.5
+frame_ms = 57.2
+gpu_ms = "0.0 ms median wait (80-93% busy, 0 hangs/TDRs/refusals in 130.8s)"
+preparing_ms = "31.2-53.4 ms (43.9 ms median: batch_flush 22.9 ms, stale 5.8 ms, guards 8.6 ms, cfu 0.8 ms)"
+status = "Fix AF1-AF2 verified clean (AD/AE regressions reverted + fence wake + recording caches): 17.5 fps peak (57.2 ms/f, vs 16.8 in run94), make_at -14-19% on heavy scenes, cfu -38%, stale -7%; critical path confirmed = prep (43.9 ms, half in batch_flush) + between-submissions (30 ms: 12.3 ms post-present + 5 rec threads 30-36 ms each in bind/tables/make_at) -> next: Fix AG"

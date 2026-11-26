@@ -182,13 +182,13 @@
   <rect x="474" y="296" width="382" height="62" rx="6" fill="#161b22" stroke="#30363d"/>
   <text x="486" y="314" fill="#8b949e" font-size="10.5" font-weight="600">LATEST WORLD TELEMETRY (RTX 3070 8 GB, 1080P)</text>
   <text x="486" y="330" fill="#8b949e" font-size="10" class="mono">FPS</text>
-  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">11.7-16.8 fps heavy 3D steady / 18.8 fps peak (diag-run94: Fix AC1-AC4 clean 130.3s; sweep -85% to 0.08-0.60 ms, guards -55% to 4.6-15.3 ms, alias_apply -65% to 1.19-5.21 ms, make_at miss -50%, new low 27.5 ms preparing, 0 hangs/TDRs/refusals)</text>
+  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">11.9-17.5 fps heavy 3D steady (13.4 median / 17.5 peak, diag-run98: Fix AF1-AF2 clean 130.8s; reverted AD/AE regressions, kept AVX2/parallel wins, make_at -14-19% on heavy scenes, stale 5.8 ms, guards 8.6 ms, cfu -38% to 0.8 ms, 0 hangs/TDRs/refusals)</text>
   <text x="575" y="330" fill="#8b949e" font-size="10" class="mono">FRAME</text>
-  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">59.4-85.3 ms heavy 3D (53.2 ms peak, 0 refused dynamic slots, 0 crashes/TDRs, 0.0-2.6 ms GPU wait)</text>
+  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">57.2-84.2 ms heavy 3D (75.4 ms median, 57.2 ms peak, 0 refused dynamic slots, 0 crashes/TDRs, 0.0 ms median GPU wait)</text>
   <text x="664" y="330" fill="#8b949e" font-size="10" class="mono">GPU</text>
-  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">0.0-2.6 ms wait (100% CPU-bound: preparing 27.5-45.5 ms + card copy-back 12.0-18.1 ms + post-present 10.8-13.7 ms)</text>
+  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">0.0 ms median wait (80-93% busy; 100% CPU-bound: preparing 31.2-53.4 ms + between-submissions 27.6-43.3 ms)</text>
   <text x="753" y="330" fill="#8b949e" font-size="10" class="mono">PREP</text>
-  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">27.5-45.5 ms NEW LOW (batch_flush 14.5-24.8 ms, guards 4.6-15.3 ms, stale 4.2-8.5 ms, sweep 0.08-0.60 ms)</text>
+  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">31.2-53.4 ms (43.9 ms median: batch_flush 22.9 ms, stale 5.8 ms, prelude 3.6 ms, ask_once 3.4 ms, card 3.7 ms)</text>
   <line x1="24" y1="374" x2="856" y2="374" stroke="#21262d"/>
   <text x="24" y="390" fill="#8b949e" font-size="11">Target: 20-30+ FPS (1:1 visuals) • Clean-room Xbox Series X|S (GDK) layer</text>
   <text x="704" y="390" text-anchor="end" fill="#8b949e" font-size="11">Less</text>
