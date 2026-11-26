@@ -3717,6 +3717,11 @@ fn buffer_srv_with_shadow(
             once!(
                 offset,
                 element,
+                format = desc.Format.0,
+                stride = structured.StructureByteStride,
+                first = structured.FirstElement,
+                count = structured.NumElements,
+                address = format_args!("{address:#x}"),
                 "buffer view not on an element of its host copy"
             );
             return None;
@@ -4151,6 +4156,8 @@ fn make_detailed_with_shadow(
             if resource[0] != BUFFER {
                 once!(
                     dimension = resource[0],
+                    ?resource,
+                    ?desc,
                     "placed unordered texture view not mirrored"
                 );
                 return (None, None, None);

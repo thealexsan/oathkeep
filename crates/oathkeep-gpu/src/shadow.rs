@@ -3746,6 +3746,59 @@ impl Shadow {
             && self.left(address) >= size_u64
             && self.host_width.saturating_sub(self.offset(address)) >= aligned
     }
+}
+
+const UNALIGNED_SLOTS: usize = 8;
+static UNALIGNED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static UNALIGNED_RANGES: [(AtomicU64, AtomicU64); UNALIGNED_SLOTS] =
+    [const { (AtomicU64::new(0), AtomicU64::new(0)) }; UNALIGNED_SLOTS];
+
+fn record_unaligned_buffer_range(start: u64, end: u64) {
+    let idx = UNALIGNED_COUNT.load(Ordering::Acquire);
+    if idx > UNALIGNED_SLOTS {
+        return;
+    }
+    for i in 0..idx.min(UNALIGNED_SLOTS) {
+        if UNALIGNED_RANGES[i].0.load(Ordering::Relaxed) == start
+            && UNALIGNED_RANGES[i].1.load(Ordering::Relaxed) >= end
+        {
+            return;
+        }
+    }
+    let slot = UNALIGNED_COUNT.fetch_add(1, Ordering::AcqRel);
+    if slot < UNALIGNED_SLOTS {
+        UNALIGNED_RANGES[slot].0.store(start, Ordering::Release);
+        UNALIGNED_RANGES[slot].1.store(end, Ordering::Release);
+    }
+}
+
+/// Fast lock-free check for whether a non-256B-aligned title `address` could possibly
+/// land on a 256B-aligned host GPU VA (only possible inside a non-in-place `BUFFERS`
+/// shadow whose own `start` had the same `mod 256`).
+#[inline]
+pub(crate) fn may_align_unaligned_cbv(address: u64) -> bool {
+    let count = UNALIGNED_COUNT.load(Ordering::Acquire);
+    if count == 0 {
+        return false;
+    }
+    if count > UNALIGNED_SLOTS {
+        return true;
+    }
+    for i in 0..count {
+        let end = UNALIGNED_RANGES[i].1.load(Ordering::Acquire);
+        if end == 0 {
+            // Slot write still in progress; fall back conservatively.
+            return true;
+        }
+        let start = UNALIGNED_RANGES[i].0.load(Ordering::Acquire);
+        if address >= start && address < end && (address - start).is_multiple_of(256) {
+            return true;
+        }
+    }
+    false
+}
+
+impl Shadow {
 
     pub(crate) fn allow_uav(&self) -> bool {
         self.allow_uav
@@ -7984,6 +8037,9 @@ fn lookup_with_range(address: u64, len: u64, any: bool) -> Option<(Arc<Shadow>, 
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        if !key.0.is_multiple_of(256) {
+            record_unaligned_buffer_range(key.0, entry.end);
+        }
         if len >= 16 << 20 {
             tracing::info!(
                 start = format_args!("{:#x}", key.0),

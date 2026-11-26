@@ -1033,6 +1033,132 @@ fn take_prelude(host: &Host) -> Option<PooledPrelude> {
     popped.or_else(|| host.make_prelude().map(|p| PooledPrelude(Some(p))))
 }
 
+struct PreludeWorkers {
+    jobs: Mutex<std::collections::VecDeque<Box<dyn FnOnce() + Send>>>,
+    more: std::sync::Condvar,
+}
+
+fn prelude_workers() -> &'static PreludeWorkers {
+    static WORKERS: OnceLock<PreludeWorkers> = OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let workers = WORKERS.get_or_init(|| PreludeWorkers {
+        jobs: Mutex::new(std::collections::VecDeque::new()),
+        more: std::sync::Condvar::new(),
+    });
+    STARTED.call_once(|| {
+        for i in 0..2 {
+            let _ = std::thread::Builder::new()
+                .name(format!("oathkeep-prelude-{i}"))
+                .spawn(move || {
+                    let workers = prelude_workers();
+                    loop {
+                        let job = {
+                            let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if let Some(job) = jobs.pop_front() {
+                                    break job;
+                                }
+                                jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                            }
+                        };
+                        job();
+                    }
+                });
+        }
+    });
+    workers
+}
+
+struct PreludeJoinState {
+    rem: Mutex<usize>,
+    done: std::sync::Condvar,
+    results: Mutex<Vec<(usize, SendCmdList)>>,
+}
+
+struct PreludeJoin {
+    state: std::sync::Arc<PreludeJoinState>,
+    joined: bool,
+}
+
+impl PreludeJoin {
+    fn wait_and_take(mut self) -> Vec<(usize, SendCmdList)> {
+        self.wait();
+        std::mem::take(
+            &mut *self
+                .state
+                .results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+
+    fn wait(&mut self) {
+        if self.joined {
+            return;
+        }
+        let mut rem = self.state.rem.lock().unwrap_or_else(|e| e.into_inner());
+        while *rem > 0 {
+            rem = self.state.done.wait(rem).unwrap_or_else(|e| e.into_inner());
+        }
+        self.joined = true;
+    }
+}
+
+impl Drop for PreludeJoin {
+    fn drop(&mut self) {
+        self.wait();
+    }
+}
+
+fn spawn_preludes(host: &Host, plans: Vec<(usize, SendPreludePlan)>) -> PreludeJoin {
+    let worker_count = if plans.len() >= 4 { 2 } else { 1 };
+    let mut buckets: Vec<Vec<(usize, SendPreludePlan)>> =
+        (0..worker_count).map(|_| Vec::new()).collect();
+    for (i, item) in plans.into_iter().enumerate() {
+        buckets[i % worker_count].push(item);
+    }
+    let state = std::sync::Arc::new(PreludeJoinState {
+        rem: Mutex::new(worker_count),
+        done: std::sync::Condvar::new(),
+        results: Mutex::new(Vec::with_capacity(buckets.iter().map(Vec::len).sum())),
+    });
+    let host_ptr = std::ptr::from_ref(host) as usize;
+    let workers = prelude_workers();
+    {
+        let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        for part in buckets {
+            let state = state.clone();
+            queue.push_back(Box::new(move || {
+                // SAFETY: `PreludeJoin`'s Drop guard joins before `Host::submit` can return,
+                // and `Host` lives for `'static` in `HOST`.
+                let host = unsafe { &*(host_ptr as *const Host) };
+                let mut local = Vec::with_capacity(part.len());
+                for (idx, plan) in part {
+                    local.push((idx, SendCmdList(record_prelude(host, plan))));
+                }
+                {
+                    let mut out = state.results.lock().unwrap_or_else(|e| e.into_inner());
+                    out.extend(local);
+                }
+                let mut rem = state.rem.lock().unwrap_or_else(|e| e.into_inner());
+                *rem = rem.saturating_sub(1);
+                if *rem == 0 {
+                    state.done.notify_all();
+                }
+            }));
+        }
+    }
+    if worker_count > 1 {
+        workers.more.notify_all();
+    } else {
+        workers.more.notify_one();
+    }
+    PreludeJoin {
+        state,
+        joined: false,
+    }
+}
+
 fn trim_prelude_pool(keep: usize) {
     let dropped: Vec<StoredPrelude> = {
         let mut pool = PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner());
@@ -2689,6 +2815,21 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         join_ranges(&mut merged, std::mem::take(ranges));
         *ranges = merged;
     }
+    // Coalesce `VirtualProtect` + sibling-view `alias_apply` ONCE across all guarded
+    // shadows in `spans` before `merge_under_writes*`, so subsequent checks (and
+    // `Batch::flush` right after) hit the read-only/clean fast path instead of
+    // re-guarding one shadow at a time.
+    {
+        let mut guarded_ranges: Vec<(usize, usize)> = Vec::new();
+        for (shadow, ranges) in &spans {
+            if shadow.guarded() && !shadow.is_in_place() {
+                guarded_ranges.extend_from_slice(ranges);
+            }
+        }
+        if !guarded_ranges.is_empty() {
+            crate::watch::pre_guard_batch(&guarded_ranges);
+        }
+    }
     if late_exact() {
         let allow_wide = wide_refresh();
         let mut large: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
@@ -2701,6 +2842,36 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
             }
         }
         let mut runs_left = 256;
+        if allow_wide && large.len() >= 2 {
+            // Multiple large shadows: run all large + small shadows concurrently on
+            // `wide_stale_run` (largest first, `allow_wide = false` inside workers so
+            // `wide_stale_run` never nests).
+            let mut all = large;
+            all.extend(small);
+            all.sort_unstable_by(|a, b| b.0.byte_len().cmp(&a.0.byte_len()));
+            let any_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let per_budget = (runs_left / all.len()).max(32);
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = all
+                .into_iter()
+                .map(|(shadow, ranges)| {
+                    let any_stale = any_stale.clone();
+                    Box::new(move || {
+                        let mut runs_left = per_budget;
+                        for (from, to) in ranges {
+                            if any_stale.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            if shadow.merge_under_writes(from, to - from, &mut runs_left) {
+                                any_stale.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_stale_run(jobs);
+            return any_stale.load(Ordering::Relaxed);
+        }
         for (shadow, ranges) in &large {
             for &(from, to) in ranges {
                 if shadow.merge_under_writes_wide(from, to - from, &mut runs_left, true) {
@@ -6301,62 +6472,9 @@ impl Host {
         }
         let mut recorded_preludes: Vec<SendCmdList> =
             (0..runs.len()).map(|_| SendCmdList(None)).collect();
-        if !plans.is_empty() {
-            #[cfg(feature = "diagnostics")]
-            let t_pre = std::time::Instant::now();
-            if plans.len() >= 4 {
-                let workers = plans.len().min(4);
-                let mut buckets: Vec<Vec<(usize, SendPreludePlan)>> =
-                    (0..workers).map(|_| Vec::new()).collect();
-                for (i, item) in plans.into_iter().enumerate() {
-                    buckets[i % workers].push(item);
-                }
-                let host_ptr = std::ptr::from_ref(self) as usize;
-                let outs: Vec<std::sync::Arc<Mutex<Vec<(usize, SendCmdList)>>>> = (0..workers)
-                    .map(|_| std::sync::Arc::new(Mutex::new(Vec::new())))
-                    .collect();
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
-                    .into_iter()
-                    .zip(outs.iter().cloned())
-                    .map(|(part, out)| {
-                        Box::new(move || {
-                            // SAFETY: `self` (`Host`) is `'static`/live for the entire `wide_run`,
-                            // and `wide_run` joins all workers before returning.
-                            let host = unsafe { &*(host_ptr as *const Host) };
-                            let mut local = Vec::with_capacity(part.len());
-                            for (idx, plan) in part {
-                                local.push((idx, SendCmdList(record_prelude(host, plan))));
-                            }
-                            *out.lock().unwrap_or_else(|e| e.into_inner()) = local;
-                        }) as Box<dyn FnOnce() + Send>
-                    })
-                    .collect();
-                crate::shadow::wide_run(jobs);
-                for out in outs {
-                    for (idx, rec) in
-                        std::mem::take(&mut *out.lock().unwrap_or_else(|e| e.into_inner()))
-                    {
-                        recorded_preludes[idx] = rec;
-                    }
-                }
-            } else {
-                for (idx, plan) in plans {
-                    recorded_preludes[idx] = SendCmdList(record_prelude(self, plan));
-                }
-            }
-            #[cfg(feature = "diagnostics")]
-            {
-                prep_prelude += t_pre.elapsed().as_micros() as u64;
-            }
-        }
-        for (list, rec) in runs.iter().zip(recorded_preludes) {
-            firsts.push(lists.len());
-            if let Some((prelude_cmd, pooled)) = rec.0 {
-                lists.push(Some(prelude_cmd));
-                preludes.push(pooled);
-            }
-            lists.push(list.list.cast().ok());
-        }
+        // Overlap `record_prelude` (dedicated 2-thread pool, zero shared state with
+        // `batch.flush` / `take_snapshots` / `card_before`) across the rest of submit prep.
+        let prelude_join = (!plans.is_empty()).then(|| spawn_preludes(self, plans));
         {
             #[cfg(feature = "diagnostics")]
             let t_flush = std::time::Instant::now();
@@ -6388,6 +6506,25 @@ impl Host {
         let mut card = self.card_before(runs, flown, &mut prep_card);
         #[cfg(not(feature = "diagnostics"))]
         let mut card = self.card_before(runs, flown);
+        if let Some(join) = prelude_join {
+            #[cfg(feature = "diagnostics")]
+            let t_pre = std::time::Instant::now();
+            for (idx, rec) in join.wait_and_take() {
+                recorded_preludes[idx] = rec;
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                prep_prelude += t_pre.elapsed().as_micros() as u64;
+            }
+        }
+        for (list, rec) in runs.iter().zip(recorded_preludes) {
+            firsts.push(lists.len());
+            if let Some((prelude_cmd, pooled)) = rec.0 {
+                lists.push(Some(prelude_cmd));
+                preludes.push(pooled);
+            }
+            lists.push(list.list.cast().ok());
+        }
         let sync_cmd = card.as_mut().and_then(|c| c.sync.take());
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));

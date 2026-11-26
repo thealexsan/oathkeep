@@ -630,7 +630,24 @@ impl HostPipeline {
             ) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    let rtv_formats: Vec<i32> = g.targets.RTFormats
+                        [..(g.targets.NumRenderTargets as usize).min(8)]
+                        .iter()
+                        .map(|f| f.0)
+                        .collect();
+                    tracing::warn!(
+                        error = %e,
+                        ?shaders,
+                        num_rtv = g.targets.NumRenderTargets,
+                        ?rtv_formats,
+                        dsv = g.depth_format.0,
+                        samples = g.samples.Count,
+                        quality = g.samples.Quality,
+                        depth_bounds,
+                        ms_bytes = code(0).BytecodeLength,
+                        ps_bytes = code(1).BytecodeLength,
+                        "host mesh pipeline refused"
+                    );
                     host.log_messages();
                     return None;
                 }

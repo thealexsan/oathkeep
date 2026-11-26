@@ -3617,6 +3617,11 @@ impl State {
     }
 
     fn can_direct_cbv_addr(&mut self, address: u64, size: u32) -> bool {
+        if !address.is_multiple_of(256) && !crate::shadow::may_align_unaligned_cbv(address) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TablesCbvUnaligned, 1);
+            return false;
+        }
         let size_u64 = u64::from(size);
         let Some(shadow) = self.find_shadow(address, size_u64) else {
             #[cfg(feature = "diagnostics")]
@@ -4215,7 +4220,9 @@ impl State {
                     let gpu_active = existing
                         .as_ref()
                         .is_some_and(|s| s.is_gpu_active(list, address, size_u64));
-                    if (direct_cbv() || gpu_active)
+                    let can_align = address.is_multiple_of(256)
+                        || crate::shadow::may_align_unaligned_cbv(address);
+                    if ((direct_cbv() && can_align) || gpu_active)
                         && let Some(shadow) =
                             existing.or_else(|| self.find_shadow(address, size_u64))
                     {
