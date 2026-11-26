@@ -770,6 +770,17 @@ pub(crate) fn page_written(at: usize, len: usize) {
 }
 
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+static BAKE_PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+fn record_key(handle: u64) -> u64 {
+    // SAFETY: the handle is a descriptor slot in title memory.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag == VIEW_TAG {
+        u64::from(generation) << 32 | u64::from(i)
+    } else {
+        0
+    }
+}
 
 static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -1892,6 +1903,43 @@ impl HostHeap {
         textures.due_batch_into(frame, max, out);
     }
 
+    pub(crate) fn texture_news(&self) -> (u64, bool) {
+        let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
+        let noted =
+            |m: &Mutex<Vec<(u64, u64)>>| !m.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        (
+            writes,
+            noted(&REMAPPED) || noted(&PAGE_WRITTEN) || noted(&BAKE_PAGE_WRITTEN),
+        )
+    }
+
+    pub(crate) fn texture_slots_due_for_bake(
+        &self,
+        frame: u64,
+        ahead_frame: u64,
+        max: usize,
+        out: &mut Vec<DueSlot>,
+    ) -> [u64; 5] {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.promote(frame);
+        let census = textures.census(frame);
+        textures.due_batch_into(frame, max, out);
+        if ahead_frame > frame && out.len() < max {
+            let known: std::collections::HashSet<u32> = out.iter().map(|s| s.index).collect();
+            let mut ahead = Vec::new();
+            textures.due_batch_into(ahead_frame, max, &mut ahead);
+            for s in ahead {
+                if out.len() >= max {
+                    break;
+                }
+                if !known.contains(&s.index) {
+                    out.push(s);
+                }
+            }
+        }
+        census
+    }
+
     pub(crate) fn texture_slots_due_batch(
         &self,
         frame: u64,
@@ -1981,7 +2029,63 @@ impl HostHeap {
         if ranges.is_empty() {
             return 0;
         }
-        self.slots_written_under(&ranges, frame, crate::watch::page_writes() & 2 != 0)[2]
+        let due = crate::watch::page_writes() & 2 != 0;
+        let made_due = self.slots_written_under(&ranges, frame, due)[2];
+        if !due {
+            let mut kept = BAKE_PAGE_WRITTEN
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            kept.extend(ranges);
+            if kept.len() > 256 {
+                coalesce_u64_ranges(&mut kept);
+                const MOST: usize = 1 << 14;
+                if kept.len() > MOST {
+                    let drop_n = kept.len() - MOST;
+                    kept.drain(..drop_n);
+                }
+            }
+        }
+        made_due
+    }
+
+    pub(crate) fn texture_slots_bake_written(&self, frame: u64) -> usize {
+        let mut ranges = std::mem::take(
+            &mut *BAKE_PAGE_WRITTEN
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        if ranges.is_empty() {
+            return 0;
+        }
+        coalesce_u64_ranges(&mut ranges);
+        if ranges.is_empty() {
+            return 0;
+        }
+        let mut slots = Vec::new();
+        {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            for &(start, end) in &ranges {
+                placed.extend_slots_holding(start, end, &mut slots);
+            }
+        }
+        if slots.is_empty() {
+            return 0;
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        slots.retain(|slot| {
+            textures
+                .slots
+                .get(slot)
+                .is_none_or(|w| w.mapped > 0 || w.checked.2 != 0)
+        });
+        for &slot in &slots {
+            textures.changed(slot, frame, frame);
+            bit_set(&self.in_texture_queue, slot, true);
+        }
+        slots.len()
     }
 
     fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64, due: bool) -> [usize; 3] {
@@ -2170,6 +2274,85 @@ impl HostHeap {
         self.unmake(index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
+    }
+
+    pub(crate) fn prepare_bake_slot(&self, index: u32, handle: u64) -> Option<(View, u64)> {
+        if index >= self.count {
+            return None;
+        }
+        let key = record_key(handle);
+        let view = (key != 0)
+            .then(|| view_at(key as u32, (key >> 32) as u32))
+            .flatten()?;
+        Some((view, key))
+    }
+
+    pub(crate) fn publish_uploaded_slot(&self, index: u32, handle: u64, key: u64) -> bool {
+        if index >= self.count || key == 0 {
+            return false;
+        }
+        let (published, stale) = {
+            let mut deferred = self
+                .made_lock(index)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.made_keys[index as usize].load(std::sync::atomic::Ordering::Relaxed) == key {
+                return false;
+            }
+            if record_key(handle) != key {
+                return false;
+            }
+            let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+                return false;
+            };
+            deferred.remove(&index);
+            let stale = self.note_buffer_inner(index, Some(&view), true, true);
+            let (kept, _, _) = make_detailed(&view, self.cpu(index));
+            if let Some(kept) = kept {
+                self.keep(index, kept);
+                self.made_keys[index as usize].store(key, std::sync::atomic::Ordering::Release);
+                (true, stale)
+            } else {
+                (false, stale)
+            }
+        };
+        if !stale.is_empty() {
+            self.unmake_stale(index, stale);
+        }
+        published
+    }
+
+    pub(crate) fn sweep_unmapped_slots(&self, max_scan: usize) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        static CURSOR: AtomicUsize = AtomicUsize::new(0);
+        let count = self.count as usize;
+        if count == 0 || max_scan == 0 {
+            return 0;
+        }
+        let scan = max_scan.min(count);
+        let start = CURSOR.fetch_add(scan, Relaxed) % count;
+        let mut swept = 0usize;
+        for step in 0..scan {
+            let index = ((start + step) % count) as u32;
+            if !bit_get(&self.has_kept, index) {
+                continue;
+            }
+            let key = self.made_keys[index as usize].load(std::sync::atomic::Ordering::Acquire);
+            if key == 0 {
+                continue;
+            }
+            if let Some(View::Placed(false, resource, desc)) =
+                view_at(key as u32, (key >> 32) as u32)
+                && resource[0] != 1
+            {
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                if crate::texture::mapped_bytes(address as *const u8, 1) == 0 {
+                    self.unmake_slot(index);
+                    swept += 1;
+                }
+            }
+        }
+        swept
     }
 
     pub(crate) fn unmake_slot(&self, index: u32) {

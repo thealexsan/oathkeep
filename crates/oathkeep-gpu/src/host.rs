@@ -871,6 +871,7 @@ pub(crate) struct HostList {
     indirect_pool: Mutex<IndirectPool>,
     gpu_scratch_pool: Mutex<GpuScratchRing>,
     prelude_scratch_pool: Mutex<GpuScratchPool>,
+    copy_bounce: Mutex<Option<(ID3D12Resource, u64)>>,
     shadow_writes: Mutex<ShadowWrites>,
     bindless_write_seq: std::sync::atomic::AtomicU64,
     copy_seq: std::sync::atomic::AtomicU64,
@@ -4219,6 +4220,7 @@ impl Host {
                 indirect_pool: Mutex::default(),
                 gpu_scratch_pool: Mutex::default(),
                 prelude_scratch_pool: Mutex::default(),
+                copy_bounce: Mutex::new(None),
                 shadow_writes: Mutex::default(),
                 bindless_write_seq: std::sync::atomic::AtomicU64::new(0),
                 copy_seq: std::sync::atomic::AtomicU64::new(0),
@@ -5943,13 +5945,16 @@ impl Host {
         let mut landed = Vec::new();
         for item in items {
             match item {
-                Late::Run(flight) => {
+                Late::Run(mut flight) => {
                     last = flight.number;
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
+                    }
+                    for detached in &mut flight.lists {
+                        detached.release_tables();
                     }
                     landed.push((flight.lists, flight.order));
                 }
@@ -6259,6 +6264,10 @@ impl Host {
         let _ = self.submit(runs, false);
     }
 
+    pub(crate) fn execute_sync_internal(&self, list: &HostList) {
+        let _ = self.submit(&[list], false);
+    }
+
     pub(crate) fn execute_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
         if order.is_empty() {
             crate::list::recycle(lists, &order);
@@ -6478,13 +6487,16 @@ impl Host {
             let mut landed = Vec::new();
             for item in items {
                 match item {
-                    Late::Run(flight) => {
+                    Late::Run(mut flight) => {
                         last = flight.number;
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
+                        }
+                        for detached in &mut flight.lists {
+                            detached.release_tables();
                         }
                         landed.push((flight.lists, flight.order));
                     }
@@ -8159,6 +8171,35 @@ impl HostList {
         }
     }
 
+    pub(crate) fn has_recorded_work(&self) -> bool {
+        !self.deferred().copies.is_empty()
+            || !self
+                .states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+    }
+
+    pub(crate) fn copy_bounce_buffer(&self, host: &Host, bytes: u64) -> Option<ID3D12Resource> {
+        let need = bytes.max(256).next_multiple_of(512);
+        let mut slot = self.copy_bounce.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buf, cap)) = slot.as_ref()
+            && *cap >= need
+        {
+            let res = buf.clone();
+            drop(slot);
+            self.keep(&res);
+            return Some(res);
+        }
+        let cap = need.next_power_of_two().max(64 << 10);
+        let buf = host.uav_buffer(cap)?;
+        let res = buf.clone();
+        *slot = Some((buf, cap));
+        drop(slot);
+        self.keep(&res);
+        Some(res)
+    }
+
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -8171,6 +8212,7 @@ impl HostList {
             deferred
                 .copies
                 .push(Step::GpuWrite(shadow.clone(), address, len));
+            self.gpu_write_seq.fetch_add(1, Ordering::Relaxed);
         }
     }
 

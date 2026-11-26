@@ -228,6 +228,7 @@ pub(crate) struct Staging {
     watch_mode: std::sync::atomic::AtomicU8,
     judged: [std::sync::atomic::AtomicU64; 2],
     waiting: std::sync::atomic::AtomicU64,
+    exact: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -751,6 +752,23 @@ static HOST_WRITTEN_AT: RwLock<std::collections::BTreeMap<u64, (u64, u32, u32, u
     RwLock::new(std::collections::BTreeMap::new());
 static HOST_WRITTEN_AT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+pub(crate) fn host_written_match(address: u64, desc: &[u32; 14]) -> Option<This> {
+    if HOST_WRITTEN_AT_COUNT.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let map = HOST_WRITTEN_AT.read().unwrap_or_else(|e| e.into_inner());
+    let &(_, width, height, layers_levels, format, key) = map.get(&address)?;
+    if width == desc[4]
+        && height == desc[6]
+        && layers_levels == desc[7]
+        && crate::resource::family(format) == crate::resource::family(desc[8])
+    {
+        Some(key as This)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
     if HOST_WRITTEN_AT_COUNT.load(Ordering::Relaxed) == 0 {
         return;
@@ -860,6 +878,10 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
+thread_local! {
+    pub(crate) static BAKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
     if host_wrote(resource as usize) || !list.first_use(resource as usize) {
         return;
@@ -868,6 +890,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
+    let baking = BAKING.get();
+    if baking {
+        staging.exact.store(true, Relaxed);
+    }
     staging.used.store(crate::host::moment(), Relaxed);
     if staging.on_demand && staging.judgement() != staging.judged() {
         staging.forget();
@@ -885,7 +911,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             }
         }
     }
-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+    if !baking && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
@@ -1208,6 +1234,7 @@ impl Staging {
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
         use std::sync::atomic::Ordering::Relaxed;
+        let exact = self.exact.swap(false, Relaxed);
         let mode = self.watch_mode.load(Relaxed);
         if mode == 0 || mode == 1 {
             if let Some((now, written)) =
@@ -1216,7 +1243,7 @@ impl Staging {
                 if mode == 0 {
                     self.watch_mode.store(1, Relaxed);
                 }
-                if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                if !exact && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                     return 0;
                 }
                 last.asked = now;
@@ -1255,14 +1282,14 @@ impl Staging {
                 let turn = crate::frame::current()
                     .wrapping_add((start >> 16) as u64)
                     .is_multiple_of(hash_every);
-                if unwritten && !turn {
+                if !exact && unwritten && !turn {
                     return 0;
                 }
             } else if mode == 0 {
                 self.watch_mode.store(3, Relaxed);
             }
         }
-        let _mapped = if no_wait() {
+        let _mapped = if !exact && no_wait() {
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
                 return self.refresh_unlocked(last, size);
             };
@@ -1272,7 +1299,7 @@ impl Staging {
         };
         if !committed(self.memory, size) {
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if !exact && last.partial.is_some_and(|at| frame < at + 30) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -1969,6 +1996,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         watch_mode: std::sync::atomic::AtomicU8::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
     });
     let (chosen, surplus) = {
         let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());

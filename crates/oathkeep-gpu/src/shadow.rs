@@ -3749,7 +3749,8 @@ fn let_go_idle_with(urgent: bool) {
                             idle_ms,
                             idle_frames,
                         )
-                        && (s.cbv_slab.is_some() || crate::host::references(&s.buffer) == 1)
+                        && s.cbv_slab.is_none()
+                        && crate::host::references(&s.buffer) == 1
                 })
                 .map(|(key, _)| *key)
                 .collect();

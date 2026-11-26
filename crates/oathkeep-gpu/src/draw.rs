@@ -95,7 +95,7 @@ fn early_budgets() -> (u64, u64) {
         };
         (
             ms("OATHKEEP_EARLY_TEXTURES_MS", texture_stage_ms()),
-            ms("OATHKEEP_BAKE_TEXTURES_MS", 32),
+            ms("OATHKEEP_BAKE_TEXTURES_MS", 1500),
         )
     })
 }
@@ -134,12 +134,32 @@ impl FrameTextureBudget {
 
 static FRAME_TEX_BUDGET: FrameTextureBudget = FrameTextureBudget::new();
 
-const BAKE_PIXEL_SHADERS: [&str; 4] = [
+struct BakeList(HostList);
+
+// SAFETY: accessed exclusively under `BAKE_UPLOAD`'s mutex; D3D12 command
+// allocators, lists, and retained COM resources are free-threaded when
+// externally synchronized.
+unsafe impl Send for BakeList {}
+
+static BAKE_UPLOAD: std::sync::Mutex<Option<BakeList>> = std::sync::Mutex::new(None);
+static BAKE_SERVED: AtomicU64 = AtomicU64::new(0);
+const BAKE_AHEAD: [u64; 2] = [12, 2];
+
+struct BakeSync {
+    publish: Vec<(u32, u64, u64)>,
+}
+
+const BAKE_PIXEL_SHADERS: [&str; 7] = [
     "c0a7fe77b1862e10",
     "0d1575a396dfe513",
     "b7cfd8dda91ebb6b",
     "280967ad158cee0b",
+    "fa455c8a3c32577b",
+    "d126bcae5d5d8d26",
+    "fcee612943c008e0",
 ];
+
+const BAKE_GEOMETRY_SHADERS: [&str; 2] = ["089d6271be6650ef", "d4111a6e6ea49d91"];
 
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
@@ -277,7 +297,7 @@ pub(crate) struct State {
     local_tex_copy_seq: u64,
     cbv_scratch_cache: DrawFastMap<(u64, u64, u64), (u64, u64, ID3D12Resource, u64)>,
     cbv_fill_cache: DrawFastMap<(u64, u32), u64>,
-    cbv_fill_epoch: [u64; 3],
+    cbv_fill_epoch: [u64; 4],
     kept_ptrs: DrawFastSet<usize>,
     kept_list_gen: u64,
     dynamic: Vec<(usize, u32, u32)>,
@@ -310,7 +330,7 @@ impl State {
     pub(crate) fn tables_done(&mut self) {
         self.cbv_scratch_cache.clear();
         self.cbv_fill_cache.clear();
-        self.cbv_fill_epoch = [0; 3];
+        self.cbv_fill_epoch = [0; 4];
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }
@@ -359,7 +379,7 @@ impl State {
             self.local_tex_state_seq = 0;
             self.local_tex_copy_seq = 0;
             self.cbv_fill_cache.clear();
-            self.cbv_fill_epoch = [0; 3];
+            self.cbv_fill_epoch = [0; 4];
             self.windows.clear();
             self.windows_epoch = 0;
             self.kept_list_gen = list_gen;
@@ -2356,7 +2376,7 @@ impl State {
         drop(kept);
         let buffer_us = started.elapsed().as_micros() as u64;
         let tex_started = std::time::Instant::now();
-        self.heap_textures(list, heap, host);
+        let _ = self.heap_textures(list, heap, host, None);
         let tex_us = tex_started.elapsed().as_micros() as u64;
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(buffer_us, Ordering::Relaxed);
@@ -2389,6 +2409,22 @@ impl State {
         Some(gpu)
     }
 
+    fn is_bake_draw(&self, p: &HostPipeline) -> bool {
+        if p.stages.iter().any(|s| {
+            let h = s.shader.hash.as_str();
+            BAKE_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
+        }) {
+            return true;
+        }
+        self.depth == 0
+            && self.targets.len() >= 4
+            && self
+                .targets
+                .first()
+                .and_then(|&t| crate::resource::texture_kind(t as This))
+                .is_some_and(|(w, h, _)| w >= 512 && w == u64::from(h))
+    }
+
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         let (early_ms, bake_ms) = early_budgets();
         if compute || (early_ms == 0 && bake_ms == 0) {
@@ -2396,25 +2432,111 @@ impl State {
         }
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static BAKED_US: AtomicU64 = AtomicU64::new(0);
-        static BAKED_PASSES: AtomicU64 = AtomicU64::new(0);
         static IN_FLIGHT: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
-        const MAX_BAKE_PASSES_PER_FRAME: u64 = 16;
         let frame = crate::frame::current();
         let first = FRAME.load(Ordering::Relaxed) != frame
             && FRAME.swap(frame, Ordering::Relaxed) != frame;
         if first {
             BAKED_US.store(0, Ordering::Relaxed);
-            BAKED_PASSES.store(0, Ordering::Relaxed);
         }
-        let left_us = bake_ms
-            .saturating_mul(1000)
-            .saturating_sub(BAKED_US.load(Ordering::Relaxed));
-        let bake = left_us > 0
-            && BAKED_PASSES.load(Ordering::Relaxed) < MAX_BAKE_PASSES_PER_FRAME
-            && p.stages
+        let is_bake = bake_ms > 0 && self.is_bake_draw(p);
+        if is_bake {
+            let Some(heap) = self
+                .heaps
                 .iter()
-                .any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+                .filter(|&&h| h != 0)
+                .map(|&h| crate::descriptor::heap(h as This))
+                .find(|h| !h.samplers())
+            else {
+                return;
+            };
+            let Some(host) = heap.host() else {
+                return;
+            };
+            let began = std::time::Instant::now();
+            let mut bake_slot = BAKE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+            let gpu = crate::host::host();
+            if bake_slot.is_none()
+                && let Some(gpu) = gpu
+            {
+                match gpu.new_list() {
+                    Ok(upload_list) => *bake_slot = Some(BakeList(upload_list)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no host list for synchronous bake uploads");
+                    }
+                }
+            }
+            let left_us = bake_ms
+                .saturating_mul(1000)
+                .saturating_sub(BAKED_US.load(Ordering::Relaxed));
+            let run_pass = left_us > 0
+                && (first || {
+                    let (writes, noted) = host.texture_news();
+                    noted || BAKE_SERVED.load(Ordering::Relaxed) != writes + 1
+                });
+            if !run_pass {
+                return;
+            }
+            let n = EARLY_TEXTURE_PASSES[1].fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                let [slots, due, ..] = HEAP_TEXTURES_QUEUE
+                    .each_ref()
+                    .map(|c| c.load(Ordering::Relaxed));
+                tracing::info!(
+                    frame,
+                    bakes = n,
+                    queued_at_the_last_pass = slots,
+                    due_at_the_last_pass = due,
+                    uploaded_so_far = HEAP_TEXTURES.load(Ordering::Relaxed),
+                    "a draw of the title's decoration bake: textures picked by index are uploaded synchronously first (OATHKEEP_BAKE_TEXTURES_MS=0: not)"
+                );
+            }
+            if let (Some(gpu), Some(BakeList(bake_list))) = (gpu, bake_slot.as_ref()) {
+                let mut sync = BakeSync {
+                    publish: Vec::new(),
+                };
+                BAKE_SERVED.store(0, Ordering::Relaxed);
+                PASS_BUDGET.set(Some(PassBudget {
+                    ms: left_us.div_ceil(1000),
+                    bytes: 2 << 30,
+                    bake: true,
+                }));
+                crate::texture::BAKING.set(true);
+                let served = self.heap_textures(bake_list, heap, host, Some(&mut sync));
+                crate::texture::BAKING.set(false);
+                PASS_BUDGET.set(None);
+                if bake_list.has_recorded_work() {
+                    bake_list.close();
+                    gpu.execute_sync_internal(bake_list);
+                    bake_list.reset();
+                } else if !sync.publish.is_empty() {
+                    crate::host::settle_for_fence();
+                }
+                for (index, handle, key) in sync.publish {
+                    let _ = host.publish_uploaded_slot(index, handle, key);
+                }
+                host.texture_views_remade();
+                if served {
+                    BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
+                }
+            } else {
+                PASS_BUDGET.set(Some(PassBudget {
+                    ms: left_us.div_ceil(1000),
+                    bytes: 2 << 30,
+                    bake: true,
+                }));
+                crate::texture::BAKING.set(true);
+                let _ = self.heap_textures(list, heap, host, None);
+                crate::texture::BAKING.set(false);
+                PASS_BUDGET.set(None);
+            }
+            let elapsed_us = began.elapsed().as_micros() as u64;
+            LOG_EARLY_PASSES.fetch_add(1, Ordering::Relaxed);
+            LOG_EARLY_US.fetch_add(elapsed_us, Ordering::Relaxed);
+            BAKED_US.fetch_add(elapsed_us, Ordering::Relaxed);
+            return;
+        }
         let loading_2d = HEAP_BUFFER_PASSES.load(Ordering::Relaxed) == 0
             || frame.saturating_sub(HEAP_BUFFER_LAST_FRAME.load(Ordering::Relaxed)) > 2;
         let eff_early_ms = if loading_2d && early_ms > 0 {
@@ -2422,13 +2544,7 @@ impl State {
         } else {
             early_ms
         };
-        let budget = if bake {
-            PassBudget {
-                ms: left_us.div_ceil(1000),
-                bytes: 64 << 20,
-                bake: true,
-            }
-        } else if first
+        let budget = if first
             && eff_early_ms > 0
             && FRAME_TEX_BUDGET.remaining_us(frame, eff_early_ms.saturating_mul(1000)) > 0
         {
@@ -2453,9 +2569,6 @@ impl State {
             }
         }
         let _in_flight = InFlightGuard;
-        if bake && BAKED_PASSES.fetch_add(1, Ordering::Relaxed) >= MAX_BAKE_PASSES_PER_FRAME {
-            return;
-        }
         let Some(heap) = self
             .heaps
             .iter()
@@ -2468,30 +2581,14 @@ impl State {
         let Some(host) = heap.host() else {
             return;
         };
-        let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
-        if bake && n.is_power_of_two() {
-            let [slots, due, ..] = HEAP_TEXTURES_QUEUE
-                .each_ref()
-                .map(|c| c.load(Ordering::Relaxed));
-            tracing::info!(
-                frame,
-                bakes = n,
-                queued_at_the_last_pass = slots,
-                due_at_the_last_pass = due,
-                uploaded_so_far = HEAP_TEXTURES.load(Ordering::Relaxed),
-                "a draw of the title's decoration bake: textures picked by index are uploaded first (OATHKEEP_BAKE_TEXTURES_MS=0: not)"
-            );
-        }
+        EARLY_TEXTURE_PASSES[0].fetch_add(1, Ordering::Relaxed);
         let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
-        self.heap_textures(list, heap, host);
+        let _ = self.heap_textures(list, heap, host, None);
         PASS_BUDGET.set(None);
         let elapsed_us = began.elapsed().as_micros() as u64;
         LOG_EARLY_PASSES.fetch_add(1, Ordering::Relaxed);
         LOG_EARLY_US.fetch_add(elapsed_us, Ordering::Relaxed);
-        if bake {
-            BAKED_US.fetch_add(elapsed_us, Ordering::Relaxed);
-        }
     }
 
     fn card_accounting(
@@ -2569,12 +2666,13 @@ impl State {
         list: &HostList,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
-    ) {
+        mut sync: Option<&mut BakeSync>,
+    ) -> bool {
         use crate::descriptor::host::TextureSlotUpdate;
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("OATHKEEP_HEAP_TEXTURES").is_none_or(|v| v != "0"))
         {
-            return;
+            return true;
         }
         let frame = crate::frame::current();
         let base_ms = texture_stage_ms();
@@ -2590,7 +2688,7 @@ impl State {
                 None => base_ms.saturating_mul(1000),
             };
             if FRAME_TEX_BUDGET.remaining_us(frame, max_budget_us) == 0 {
-                return;
+                return false;
             }
         }
         let total_started = std::time::Instant::now();
@@ -2606,18 +2704,32 @@ impl State {
         if FRAME.load(Ordering::Relaxed) != frame && FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
         }
-        let mut room = speculative_room_cached(false);
+        let mut room = if is_bake {
+            crate::resource::room()
+        } else {
+            speculative_room_cached(false)
+        };
+        if !room && !is_bake {
+            if host.sweep_unmapped_slots(4096) > 0 {
+                crate::resource::let_go_idle_urgent();
+                room = speculative_room_cached(true);
+            }
+        }
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
-        if room {
+        if room || is_bake {
             host.texture_slots_room(frame);
         }
         host.texture_slots_remapped(frame);
+        let baking = crate::texture::BAKING.get();
+        if baking {
+            host.texture_slots_bake_written(frame);
+        }
         host.texture_views_remade();
-        if room {
+        if room || is_bake {
             host.texture_slots_waiting(frame);
         }
         static PASSED: AtomicU64 = AtomicU64::new(0);
@@ -2632,22 +2744,32 @@ impl State {
             None if catchup => per_frame * 3,
             None => per_frame,
         };
-        const MAX_PER_PASS: usize = 4096;
+        let max_per_pass: usize = if baking { 1 << 16 } else { 4096 };
         const BATCH_SIZE: usize = 64;
-        let unheld_mode = !room && !full_card_pass();
+        let unheld_mode = !room && !is_bake && !full_card_pass();
         let first_batch_cap = if spent_initial >= max_possible_bytes {
             0
-        } else if unheld_mode {
-            MAX_PER_PASS
+        } else if baking || unheld_mode {
+            max_per_pass
         } else {
             BATCH_SIZE
         };
         let prep_us = total_started.elapsed().as_micros() as u64;
         let due_started = std::time::Instant::now();
         let mut batch = Vec::with_capacity(first_batch_cap.min(BATCH_SIZE));
-        let census = host
-            .texture_slots_due_batch(frame, first_batch_cap, true, &mut batch)
-            .unwrap_or([0; 5]);
+        let census = if baking {
+            static AHEAD: AtomicU64 = AtomicU64::new(u64::MAX);
+            let again = AHEAD.swap(frame, Ordering::Relaxed) == frame;
+            host.texture_slots_due_for_bake(
+                frame,
+                frame + BAKE_AHEAD[usize::from(again)],
+                first_batch_cap,
+                &mut batch,
+            )
+        } else {
+            host.texture_slots_due_batch(frame, first_batch_cap, true, &mut batch)
+                .unwrap_or([0; 5])
+        };
         let first_due_us = due_started.elapsed().as_micros() as u64;
         let mut extra_due_us = 0u64;
         let mut batches_taken = 1u64;
@@ -2690,11 +2812,15 @@ impl State {
             slot: 0,
         };
         let began = std::time::Instant::now();
+        if sync.is_none() {
+            BAKE_SERVED.store(0, Ordering::Relaxed);
+        }
         let mut checked_spent = spent_initial;
         let mut seen = 0usize;
         let mut mirrored = 0usize;
         let mut last_mirrored: Option<(u32, Option<View>)> = None;
         let mut stop = batch.is_empty() || total_started.elapsed() >= pass_span;
+        let mut served = !stop || batch.is_empty();
         let mut updates: Vec<TextureSlotUpdate> = Vec::with_capacity(BATCH_SIZE);
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         while !stop {
@@ -2703,13 +2829,18 @@ impl State {
                 let (index, write) = (slot.index, slot.write);
                 let spent_now = SPENT.load(Ordering::Relaxed);
                 if spent_now >= bytes_at_most || total_started.elapsed() >= pass_span {
+                    served = false;
                     stop = true;
                     break;
                 }
                 seen += 1;
                 if room && spent_now.saturating_sub(checked_spent) >= (16 << 20) {
                     checked_spent = spent_now;
-                    room = speculative_room_cached(true);
+                    room = if is_bake {
+                        crate::resource::room()
+                    } else {
+                        speculative_room_cached(true)
+                    };
                     if !room {
                         HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
                         once!("textures picked by index: the card has no room for more; they wait");
@@ -2798,7 +2929,7 @@ impl State {
                     }
                     _ => {}
                 }
-                if !room {
+                if !room && !is_bake {
                     let has_its_texture = reupload_when_full()
                         && handle
                             .is_some_and(|handle| host.texture_slot_made_from(index, handle));
@@ -2811,10 +2942,12 @@ impl State {
                                 due: frame + most,
                             });
                             if refused > 1024 {
+                                served = false;
                                 stop = true;
                                 break;
                             }
                         } else if refused > 256 {
+                            served = false;
                             stop = true;
                             break;
                         }
@@ -2830,18 +2963,32 @@ impl State {
                     }
                 }
                 if total_started.elapsed() >= pass_span {
+                    served = false;
                     stop = true;
                     break;
                 }
-                let mirrored_tex = handle.and_then(|handle| host.mirror_texture(index, handle));
-                let (view, placed) = match mirrored_tex {
-                    Some((v, p)) => (Some(v), p),
-                    None => (None, None),
+                let sync_bake = sync.is_some();
+                let (view, placed, bake_key) = if sync_bake {
+                    match handle.and_then(|h| host.prepare_bake_slot(index, h)) {
+                        Some((v, key)) => {
+                            let p = crate::descriptor::host::placed_texture(&v);
+                            (Some(v), p, Some(key))
+                        }
+                        None => (None, None, None),
+                    }
+                } else {
+                    match handle.and_then(|handle| host.mirror_texture(index, handle)) {
+                        Some((v, p)) => (Some(v), p, None),
+                        None => (None, None, None),
+                    }
                 };
                 let resolved = placed.as_ref().or(view.as_ref());
                 let resource = match resolved {
                     Some(&View::Shader(resource, _)) => resource as This,
                     _ => {
+                        if let (Some(h), Some(key)) = (handle, bake_key) {
+                            let _ = host.publish_uploaded_slot(index, h, key);
+                        }
                         updates.push(TextureSlotUpdate::Done {
                             index,
                             write,
@@ -2853,6 +3000,9 @@ impl State {
                 let title_fills =
                     crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
                 if !title_fills {
+                    if let (Some(h), Some(key)) = (handle, bake_key) {
+                        let _ = host.publish_uploaded_slot(index, h, key);
+                    }
                     updates.push(TextureSlotUpdate::Done {
                         index,
                         write,
@@ -2863,6 +3013,11 @@ impl State {
                 let tabled = crate::texture::is_staged(resource);
                 if let Some(resolved_view) = resolved {
                     readable(list, sampled.kind, resolved_view);
+                }
+                if let (Some(bake_sync), Some(h), Some(key)) =
+                    (sync.as_deref_mut(), handle, bake_key)
+                {
+                    bake_sync.publish.push((index, h, key));
                 }
                 mirrored += 1;
                 if !GONE.load(Ordering::Relaxed) {
@@ -2879,7 +3034,7 @@ impl State {
                             host.texture_apply_updates(&mut updates);
                             FRAME_TEX_BUDGET
                                 .record(frame, total_started.elapsed().as_micros() as u64);
-                            return;
+                            return false;
                         }
                         last_mirrored = None;
                     } else {
@@ -2943,16 +3098,17 @@ impl State {
                 }
             }
             if stop
+                || baking
                 || unheld_mode
-                || (!room && !full_card_pass())
-                || seen >= MAX_PER_PASS
+                || (!room && !is_bake && !full_card_pass())
+                || seen >= max_per_pass
                 || batch_len < BATCH_SIZE
                 || SPENT.load(Ordering::Relaxed) >= bytes_at_most
                 || total_started.elapsed() >= pass_span
             {
                 break;
             }
-            let next_cap = BATCH_SIZE.min(MAX_PER_PASS - seen);
+            let next_cap = BATCH_SIZE.min(max_per_pass - seen);
             let next_due = std::time::Instant::now();
             host.texture_batch_step(frame, next_cap, &mut updates, &mut batch);
             extra_due_us += next_due.elapsed().as_micros() as u64;
@@ -2977,7 +3133,9 @@ impl State {
         }
         let loop_us = began.elapsed().as_micros() as u64;
         let total_us = total_started.elapsed().as_micros() as u64;
-        FRAME_TEX_BUDGET.record(frame, total_us);
+        if !is_bake {
+            FRAME_TEX_BUDGET.record(frame, total_us);
+        }
         LOG_TEX_PASSES.fetch_add(1, Ordering::Relaxed);
         LOG_TEX_US.fetch_add(total_us, Ordering::Relaxed);
         LOG_TEX_PREP_US.fetch_add(prep_us, Ordering::Relaxed);
@@ -2985,6 +3143,7 @@ impl State {
         LOG_TEX_LOOP_US.fetch_add(loop_us.saturating_sub(extra_due_us), Ordering::Relaxed);
         LOG_TEX_BATCHES.fetch_add(batches_taken, Ordering::Relaxed);
         LOG_TEX_SEEN.fetch_add(seen as u64, Ordering::Relaxed);
+        served
     }
 
     #[cfg(feature = "diagnostics")]
@@ -4410,7 +4569,12 @@ impl State {
                             continue;
                         }
                     }
-                    let cur_epoch = [list.copy_seq(), list.gpu_write_seq(), list.fill_seq()];
+                    let cur_epoch = [
+                        list.copy_seq(),
+                        list.gpu_write_seq(),
+                        list.fill_seq(),
+                        list.bindless_write_seq(),
+                    ];
                     if self.cbv_fill_epoch != cur_epoch {
                         self.cbv_fill_cache.clear();
                         self.cbv_fill_epoch = cur_epoch;
@@ -5708,7 +5872,7 @@ mod tests {
 
         let mut state = State::default();
         state.cbv_fill_cache.insert((0x1000_0000, 256), 0x8000_0000);
-        state.cbv_fill_epoch = [1, 2, 3];
+        state.cbv_fill_epoch = [1, 2, 3, 4];
         state.fresh_tables.insert(
             (1, 4, 42),
             FreshTable {
@@ -5726,7 +5890,7 @@ mod tests {
         );
         state.tables_done();
         assert!(state.cbv_fill_cache.is_empty());
-        assert_eq!(state.cbv_fill_epoch, [0; 3]);
+        assert_eq!(state.cbv_fill_epoch, [0; 4]);
         assert!(state.fresh_tables.is_empty());
         assert_eq!(state.fresh_pool.len(), 1);
         assert!(state.fresh_pool[0].deps.is_empty());
