@@ -409,7 +409,7 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 static IDLE_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (128, 128 << 20);
+const IDLE_MOST: (usize, u64) = (256, 256 << 20);
 
 #[cfg(windows)]
 pub(crate) fn trim_idle() {

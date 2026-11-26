@@ -2279,7 +2279,7 @@ fn late_most() -> usize {
         std::env::var("OATHKEEP_LATE_WAIT_LISTS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(256)
+            .unwrap_or(512)
             .max(1)
     })
 }

@@ -3935,10 +3935,6 @@ impl Shadow {
         }
     }
 
-    pub(crate) fn is_window(&self) -> bool {
-        self.window
-    }
-
     pub(crate) fn merge_under_writes(
         &self,
         address: usize,

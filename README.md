@@ -9,7 +9,7 @@ It runs unmodified x86-64 console executables directly on a Windows host by prov
 > **Legal & Clean-Room Notice:** This repository contains **zero** copyrighted software, executables, keys, shaders, textures, audio, archives, or extracted data. You must supply your own legally obtained console software. Oathkeep is an independent open-source interoperability project and is not affiliated with, endorsed by, or connected to any console manufacturer, game developer, or publisher. See [docs/asset-policy.md](docs/asset-policy.md).
 
 <!-- oathkeep:progress:start -->
-## Compatibility & Performance Progress (94%)
+## Compatibility & Performance Progress (95%)
 
 Live dashboard: [thealexsan.github.io/oathkeep](https://thealexsan.github.io/oathkeep/) • Auto-generated from [docs/progress.toml](docs/progress.toml) via `cargo xtask progress`.
 
@@ -17,12 +17,12 @@ Live dashboard: [thealexsan.github.io/oathkeep](https://thealexsan.github.io/oat
 
 | Run | Commit | FPS | Frame | GPU | Preparing | Status |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
+| diag-run74 | `9dcae23` | 10.9 | 91.7 ms | 0.0 ms wait (LATE_WAIT=3 + RELAY=2, 72-75% busy, 13.3-16.6 ms async copy-back) | 44.2-53.9 ms (batch_flush 21.5-27.3 ms, heap_buffers 7.1-9.6 ms) | New peak 10.9 fps! Fixes M1+M2 verified: WHY_READ=0, WHY_STALE=0, 0.0 ms GPU wait; next: eliminate dynamic descriptor exhaustion (128-1359 refused) & cut recording (176-232 ms) + batch_flush (21.5 ms) |
+| diag-run72 | `42be757` | 8.5 | 117.8 ms | 50.6-67.8 ms WHY_READ wait (2751 draws) | 36.6-68.5 ms (batch_flush 29.1 ms, moves 33.3 ms) | Fixes L1-L4 verified: WHY_STALE=0, page faults -75% (2887/f), private commit 12.4-12.56 GB; diagnosed LOOSE shadow_cache aliasing (WHY_READ) & dynamic descriptor refusals |
 | diag-run67 | `2912eee` | 9.2 | 109.0 ms | 27.4 ms wait (3615 draws, 68-78% busy, 0.0 ms present stall) | 69.6 ms (batch_flush 37.3-43.6 ms, heap_buffers 5.3-7.3 ms) | LATE_WAIT=3 + RELAY=2 + GUARD_HOT=0 + BAKE_TEXTURES_MS=4: scan_card 81.3->3.6 ms (0xae00000 28.5->5.3 ms); next: barrier_groups (842/f), GetWriteWatch (31.5 ms) + 211 MB copies, WHY_READ relay stall (28 ms) |
 | diag-run66 | `2912eee` | 7.9 | 126.9 ms | 34.3 ms (2984 draws, 54% busy, uav_emitted 3) | 82.1 ms (batch_flush 53.7 ms, read_fast 10.3 ms) | Fixes D/E/F verified: 64-shard GUARDS (read_fast -85%), dispatch indirect windowing (uav_emitted 1079->3, GPU -20 ms), copy_hot 147->11 ms |
 | diag-run63-warm | `bc99622` | 5.4 | 183.9 ms | 49.3 ms (3467 draws, 54-59% busy) | 125.3 ms (0 PSOs left, run_deferred 10.4 ms) | run_deferred -43%, copy queue -51% (19.3 ms), copy-back -33% (42.3 ms), fallbacks -85% (35); remaining: GUARDS 55.9 ms (0xae00000 29.5 ms), mirror 18.6 ms, 1519 indirect clamps on GPU |
 | diag-run62 | `eb5ce1e` | 6.1 | 162.8 ms | 47.9 ms (4772 draws, 55% busy) | 106.7 ms (warm 5 PSOs left) | Uninstrumented 4772 draws/frame (12x more draws); host-pipelines.bin 258.8 MB; heap_buffers 18.1 ms; next: guard churn + copy-queue stall |
-| diag-run61 | `15e6154` | 3.7 | 270.7 ms | 35.2 ms timed (ML <=0.63 ms) | 103.3 ms (cold) | ML VRAM fix verified (4.8x GPU speedup, GPU 33% busy); CPU-bound now |
-| diag-run60 | `4a14eaa` | 2.7 | 376.1 ms | 168.7 ms (135.6 ms ML) | 108.2 ms (cold) | Zero TDR; all 9/9 ML shaders dumped for DP4A diff |
 <!-- oathkeep:progress:end -->
 
 ## Requirements

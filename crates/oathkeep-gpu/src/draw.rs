@@ -1279,13 +1279,42 @@ impl State {
         }
         true
     }
+}
 
+#[cfg(feature = "diagnostics")]
+struct ScopeUs(Option<crate::copystat::C>, std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl ScopeUs {
+    #[inline]
+    fn start(counter: crate::copystat::C) -> Self {
+        Self(Some(counter), std::time::Instant::now())
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for ScopeUs {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(c) = self.0.take() {
+            crate::copystat::add(c, self.1.elapsed().as_micros() as u64);
+        }
+    }
+}
+
+impl State {
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let _bind_scope = ScopeUs::start(crate::copystat::C::RecBindUs);
         let l = &list.list;
         if compute || p.stages.iter().any(|s| s.translated().stores) {
             list.mark_uav_dirty();
         }
-        self.early_textures(list, p, compute);
+        {
+            #[cfg(feature = "diagnostics")]
+            let _early_scope = ScopeUs::start(crate::copystat::C::RecEarlyTexUs);
+            self.early_textures(list, p, compute);
+        }
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1335,7 +1364,11 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            self.tables_into(list, &t.used, &t.host.root_indexed_views, compute);
+            {
+                #[cfg(feature = "diagnostics")]
+                let _tables_scope = ScopeUs::start(crate::copystat::C::RecTablesUs);
+                self.tables_into(list, &t.used, &t.host.root_indexed_views, compute);
+            }
             STORES.set(true);
             if self.scratch_made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1348,6 +1381,8 @@ impl State {
                 .root_srvs
                 .contains(&oathkeep_shader::emit::SLOT_MEMORY)
             {
+                #[cfg(feature = "diagnostics")]
+                let _mem_scope = ScopeUs::start(crate::copystat::C::RecMemoryReadyUs);
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!(
                         "a shader that reads title memory by address without a view heap to hold its views: the draw is dropped"
@@ -3086,10 +3121,14 @@ impl State {
                 continue;
             };
             if index >= host.count() {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TablesFreshOver, 1);
                 self.scratch_fresh.push(u.slot);
                 continue;
             }
             if u.kind == ResourceType::Cbv && !self.can_direct_cbv(end) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TablesFreshCbv, 1);
                 self.scratch_fresh.push(u.slot);
             }
         }
@@ -3119,10 +3158,15 @@ impl State {
             let Some(index) = heap.index(handle) else {
                 continue;
             };
-            if index >= host.count()
-                || (matches!(crate::descriptor::view(handle), Some(View::Constant(..)))
-                    && !self.can_direct_cbv(handle))
+            if index >= host.count() {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TablesFreshOver, 1);
+                self.scratch_fresh.push(ix.table_slot);
+            } else if matches!(crate::descriptor::view(handle), Some(View::Constant(..)))
+                && !self.can_direct_cbv(handle)
             {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TablesFreshCbv, 1);
                 self.scratch_fresh.push(ix.table_slot);
             }
         }
@@ -3176,6 +3220,7 @@ impl State {
                 }
             }
         }
+        let mut retired = Vec::new();
         for fresh_i in 0..self.scratch_fresh.len() {
             let slot = self.scratch_fresh[fresh_i];
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
@@ -3248,6 +3293,8 @@ impl State {
                 (heap_id, span, finalize_table_hash(h1, h2))
             };
             if let Some(&offset) = self.fresh_tables.get(&key) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TablesFreshHit, 1);
                 for entry_i in 0..self.scratch_entries.len() {
                     let idx = self.scratch_entries[entry_i];
                     let u = &used[idx];
@@ -3303,9 +3350,19 @@ impl State {
                 self.scratch_made.push((slot, u32::MAX));
                 continue;
             };
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::TablesFreshSpanSum, u64::from(span));
+                crate::copystat::add(
+                    crate::copystat::C::TablesFreshUsedSum,
+                    self.scratch_used_k.len() as u64,
+                );
+            }
             let mut cacheable = true;
             self.dynamic.push((heap_id, first, span));
             let title_first = heap.index(table);
+            #[cfg(feature = "diagnostics")]
+            let t_make = std::time::Instant::now();
             for used_i in 0..self.scratch_used_k.len() {
                 let k = self.scratch_used_k[used_i];
                 let index = first + (k - trim);
@@ -3332,7 +3389,13 @@ impl State {
                                 if gpu_active {
                                     list.uav_barrier_if_dirty();
                                 }
-                                host.constant_at_kept(index, gpu, size, shadow.buffer.clone());
+                                host.constant_at_kept_into(
+                                    index,
+                                    gpu,
+                                    size,
+                                    shadow.buffer.clone(),
+                                    &mut retired,
+                                );
                                 continue;
                             }
                             if gpu_active && shadow.left(address) >= size_u64 {
@@ -3344,20 +3407,26 @@ impl State {
                                     256,
                                 ) {
                                     cacheable = false;
-                                    host.constant_at_kept(index, scratch_gpu, size, scratch);
+                                    host.constant_at_kept_into(
+                                        index,
+                                        scratch_gpu,
+                                        size,
+                                        scratch,
+                                        &mut retired,
+                                    );
                                     continue;
                                 }
                             }
                         }
                         let Some((gpu, to)) = list.scratch(size_u64) else {
-                            host.make_null(index);
+                            host.make_null_into(index, &mut retired);
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at(index, gpu, size);
+                        host.constant_at_into(index, gpu, size, &mut retired);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        host.make_at_into(index, &view, &mut retired);
                         let kind = used_entry.map(|u| u.kind).or_else(|| {
                             self.scratch_selected
                                 .binary_search(&k)
@@ -3378,18 +3447,29 @@ impl State {
                         }
                     }
                     None => {
-                        host.make_null(index);
+                        host.make_null_into(index, &mut retired);
                         if used_entry.is_some() {
                             once!(slot, "a table entry without a view");
                         }
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::RecTablesMakeAtUs,
+                t_make.elapsed().as_micros() as u64,
+            );
             let offset = (first - trim) * 32;
             if cacheable {
                 self.fresh_tables.insert(key, offset);
+            } else {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TablesFreshUncacheable, 1);
             }
             self.scratch_made.push((slot, offset));
+        }
+        if !retired.is_empty() {
+            crate::host::retire_batch(retired);
         }
     }
 
@@ -3590,6 +3670,8 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let _ind_scope = ScopeUs::start(crate::copystat::C::RecIndirectUs);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
