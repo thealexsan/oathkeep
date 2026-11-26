@@ -353,8 +353,35 @@ fn journal_write() -> std::sync::RwLockWriteGuard<'static, Journal> {
     JOURNAL.write().unwrap_or_else(|e| e.into_inner())
 }
 
-const AHEAD_GAP: usize = (8 << 20) / PAGE;
-const AHEAD_MAX: usize = (1 << 30) / PAGE;
+const AHEAD_GAP: usize = (512 << 10) / PAGE;
+const AHEAD_MAX: usize = (16 << 20) / PAGE;
+
+fn ask_ahead_locked(j: &mut Journal, pieces: &[(usize, usize)], allow_single: bool) {
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len()
+            && pieces[k].0 <= last + AHEAD_GAP
+            && last.max(pieces[k].1) - first <= AHEAD_MAX
+        {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        if k - i == 1 {
+            if allow_single
+                && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+                && ask_kernel(j, first, last)
+            {
+                j.ahead.push((first, last));
+            }
+        } else {
+            ask_run(j, &pieces[i..k], allow_single);
+        }
+        i = k;
+    }
+}
 
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     let mut pieces: Vec<(usize, usize)> = ranges
@@ -374,21 +401,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     let now = bump_journal_asked(j, 1);
     j.ahead_asked = now;
     j.ahead.clear();
-    let mut i = 0;
-    while i < pieces.len() {
-        let first = pieces[i].0;
-        let mut last = pieces[i].1;
-        let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
-            last = last.max(pieces[k].1);
-            k += 1;
-        }
-        ask_run(j, &pieces[i..k]);
-        i = k;
-    }
+    ask_ahead_locked(j, &pieces, false);
 }
 
 #[cfg(feature = "diagnostics")]
@@ -427,22 +440,29 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
-    ask_ahead(ranges);
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.0 < r.1)
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    if pieces.is_empty() {
+        return;
+    }
+    pieces.sort_unstable();
+    // Collapse strictly overlapping/adjacent page ranges before coalescing.
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
+    for (a, b) in pieces {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
     let mut j = journal_write();
     let j = &mut *j;
-    if j.ahead.is_empty() {
-        let now = bump_journal_asked(j, 1);
-        j.ahead_asked = now;
-    }
-    for &(start, end) in ranges {
-        if start >= end {
-            continue;
-        }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
-        }
-    }
+    let now = bump_journal_asked(j, 1);
+    j.ahead_asked = now;
+    j.ahead.clear();
+    ask_ahead_locked(j, &merged, true);
     j.kept = !j.ahead.is_empty();
     JOURNAL_KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
 }
@@ -509,8 +529,17 @@ fn wrote_journal_only(at: usize, len: usize) {
     }
 }
 
-fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
-    if pieces.len() < 2 {
+fn ask_run(j: &mut Journal, pieces: &[(usize, usize)], allow_single: bool) {
+    if pieces.is_empty() {
+        return;
+    }
+    if pieces.len() == 1 {
+        if allow_single {
+            let (first, last) = pieces[0];
+            if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+                j.ahead.push((first, last));
+            }
+        }
         return;
     }
     let first = pieces[0].0;
@@ -520,8 +549,8 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
-    ask_run(j, a);
-    ask_run(j, b);
+    ask_run(j, a, allow_single);
+    ask_run(j, b, allow_single);
 }
 
 fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
@@ -554,9 +583,13 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
+    let mut prev_page = usize::MAX;
     for k in 0..count {
         let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
+        if page != prev_page {
+            j.written.insert(page, now);
+            prev_page = page;
+        }
     }
     true
 }
@@ -641,9 +674,13 @@ pub(crate) fn writes_kind(
                 slow(started.elapsed().as_micros() as u64);
             }
             let now = bump_journal_asked(j, 1);
+            let mut prev_page = usize::MAX;
             for k in 0..count {
                 let page = j.found[k] / PAGE;
-                j.written.insert(page, now);
+                if page != prev_page {
+                    j.written.insert(page, now);
+                    prev_page = page;
+                }
             }
             return Some((
                 now,
@@ -1336,6 +1373,7 @@ fn guard_with_hot_fast(
     let mut hot_pages: Vec<usize> = fast_hot_pairs.into_iter().map(|(p, _)| p).collect();
     let mut written = Vec::new();
     let mut protected_runs = Vec::new();
+    let mut already_aliased = Vec::new();
     for &(slot, shard, a, b) in &slow_spans {
         #[cfg(feature = "diagnostics")]
         let t_wlock = std::time::Instant::now();
@@ -1457,8 +1495,13 @@ fn guard_with_hot_fast(
                     protect_here(&mut g, pa, pb, &mut protected_runs);
                 }
                 for (pa, pb) in already {
-                    g.clean.insert_range(pa, pb);
-                    g.accounted.insert_range(pa, pb);
+                    if view_guard() && g.aliased.range(pa..pb).next().is_some() {
+                        protected_runs.push((pa, pb));
+                        already_aliased.push((pa, pb));
+                    } else {
+                        g.clean.insert_range(pa, pb);
+                        g.accounted.insert_range(pa, pb);
+                    }
                 }
             }
         }
@@ -1526,6 +1569,21 @@ fn guard_with_hot_fast(
             crate::copystat::C::GuardAliasApplyUs,
             t_alias.elapsed().as_micros() as u64,
         );
+    }
+    if !already_aliased.is_empty() {
+        for (aa, ab) in already_aliased {
+            for_each_shard_span(aa, ab, |shard, sa, sb| {
+                let mut g = guards_write_shard(shard);
+                let mut still_prot = Vec::new();
+                g.protected.for_each_overlap(sa, sb, |pa, pb| {
+                    still_prot.push((pa, pb));
+                });
+                for (pa, pb) in still_prot {
+                    g.clean.insert_range(pa, pb);
+                    g.accounted.insert_range(pa, pb);
+                }
+            });
+        }
     }
     let epochs =
         (clean_ok && (use_sub || span_count <= CLEAN_EPOCH_SHARDS)).then_some(clean_epochs);
@@ -1936,54 +1994,56 @@ fn open_and_aliases_block_spans_sharded(
     let mut aliased = Vec::new();
     for_each_shard_span(first, last, |shard, a, b| {
         let mut g = guards_write_shard(shard);
-        opened.extend(open_here_block_spans(shard, &mut g, a, b));
-        if !g.aliased.is_empty() {
-            let found: Vec<usize> = g.aliased.range(a..b).copied().collect();
-            for &block in &found {
-                g.aliased.remove(&block);
+        let opened_here = open_here_block_spans(shard, &mut g, a, b);
+        if !opened_here.is_empty() && !g.aliased.is_empty() {
+            for &(oa, ob) in &opened_here {
+                aliased.extend(g.aliased.range(oa..ob).copied());
             }
-            aliased.extend(found);
         }
+        opened.extend(opened_here);
     });
     if aliased.is_empty() {
         return (opened, Vec::new());
     }
     let (all, other_runs) = crate::inplace::alias_spans_of_blocks(&aliased);
-    if !all.is_empty() {
-        let mut sorted = all.clone();
-        if sorted.len() > 1 {
-            sorted.sort_unstable();
-            sorted.dedup();
-        }
-        let mut i = 0;
-        while i < sorted.len() {
-            let shard = shard_of(sorted[i]);
-            let mut k = i + 1;
-            while k < sorted.len() && shard_of(sorted[k]) == shard {
-                k += 1;
-            }
-            let mut g = guards_write_shard(shard);
-            for &alias in &sorted[i..k] {
-                g.aliased.remove(&alias);
-            }
-            i = k;
-        }
-    }
     for (a, b) in other_runs {
         for_each_shard_span(a, b, |shard, sa, sb| {
             let mut g = guards_write_shard(shard);
-            let alias_opened = open_here_block_spans(shard, &mut g, sa, sb);
+            let _alias_dirtied = dirty_alias_block_spans(shard, &mut g, sa, sb);
             #[cfg(feature = "diagnostics")]
             {
-                let count: u64 = alias_opened.iter().map(|&(lo, hi)| (hi - lo) as u64).sum();
+                let count: u64 = _alias_dirtied.iter().map(|&(lo, hi)| (hi - lo) as u64).sum();
                 if count > 0 {
                     ALIASES[1].fetch_add(count, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            opened.extend(alias_opened);
         });
     }
     (opened, all)
+}
+
+/// Marks alias blocks dirty (`clean` and `accounted` removed, sub-clean epochs bumped)
+/// while leaving their `PAGE_READONLY` hardware protection (`g.protected`) intact.
+/// Because the write occurred through a different virtual alias, untouched aliases stay
+/// read-only so neither the fault nor the next `apply_alias_protection_sharded` needs
+/// `VirtualProtect` TLB shootdowns on them.
+fn dirty_alias_block_spans(
+    shard: usize,
+    g: &mut Guards,
+    first: usize,
+    last: usize,
+) -> Vec<(usize, usize)> {
+    let clean_removed = g.clean.remove_range(first, last);
+    if !clean_removed.is_empty() {
+        for &(a, b) in &clean_removed {
+            bump_sub_clean_range(a, b);
+        }
+        bump_shard_clean_epoch(shard);
+        for &(a, b) in &clean_removed {
+            g.accounted.remove_range(a, b);
+        }
+    }
+    clean_removed
 }
 
 fn open_fault_sharded(at: usize) -> bool {
@@ -2046,6 +2106,9 @@ fn open_fault_sharded(at: usize) -> bool {
                         && !g.clean.contains(alias)
                         && !g.partly.contains(alias)
                     {
+                        if g.protected.contains(alias) {
+                            let _ = open_here_block_spans(alias_shard, &mut g, alias, alias + 1);
+                        }
                         let alias_shift = g
                             .cool_count
                             .get(&alias)
@@ -2214,7 +2277,7 @@ fn range_needs_open(first: usize, last: usize) -> bool {
             return;
         }
         let g = guards_read_shard(shard);
-        if g.protected.overlaps(a, b) || g.aliased.range(a..b).next().is_some() {
+        if g.protected.overlaps(a, b) {
             needs = true;
         }
     });
@@ -3731,8 +3794,11 @@ mod mapping_tests {
         unsafe { UnmapViewOfFile(view) };
     }
 
+    static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn sub_clean_epoch_isolates_1mb_buckets_within_same_64mb_shard() {
+        let _guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use super::{
             BLOCK, guarded_clean_epochs_match, title_memory_remapped,
             writes_guarded_since_with_clean,
@@ -3796,5 +3862,84 @@ mod mapping_tests {
 
         title_memory_remapped(base, BLOCK * 32);
         unsafe { UnmapViewOfFile(view) };
+    }
+
+    #[test]
+    fn lazy_alias_unlock_keeps_untouched_alias_protected_and_catches_alias_reads() {
+        let _guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use super::{
+            BLOCK, guards_read_shard, shard_of, title_memory_remapped,
+            writes_guarded_since_with_clean,
+        };
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+        };
+        let mapping = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!mapping.is_null());
+        let v1 = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, BLOCK) };
+        let v2 = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, BLOCK) };
+        assert!(!v1.Value.is_null() && !v2.Value.is_null());
+        let a = v1.Value as usize;
+        let b = v2.Value as usize;
+        let sec = mapping as usize;
+        crate::inplace::title_memory_view(a, BLOCK, sec, 0);
+        crate::inplace::title_memory_view(b, BLOCK, sec, 0);
+
+        // Guard view A: both A and its alias B must become PAGE_READONLY (`protected`).
+        let (ts_a0, _, _) = writes_guarded_since_with_clean(a, a + BLOCK, u64::MAX).unwrap();
+        let (ts_b0, _, _) = writes_guarded_since_with_clean(b, b + BLOCK, u64::MAX).unwrap();
+        assert!(guards_read_shard(shard_of(a / BLOCK)).protected.contains(a / BLOCK));
+        assert!(guards_read_shard(shard_of(b / BLOCK)).protected.contains(b / BLOCK));
+
+        // Write through A: A faults & unlocks, while untouched alias B STAYS protected
+        // (zero VirtualProtect on B!) yet is removed from clean/accounted.
+        unsafe { (a as *mut u8).write_volatile(0x42) };
+        assert!(!guards_read_shard(shard_of(a / BLOCK)).protected.contains(a / BLOCK));
+        assert!(
+            guards_read_shard(shard_of(b / BLOCK)).protected.contains(b / BLOCK),
+            "untouched alias B must remain PAGE_READONLY after write fault on A"
+        );
+        assert!(!guards_read_shard(shard_of(b / BLOCK)).clean.contains(b / BLOCK));
+
+        // Shadow reading B must see the write and re-arm A back to PAGE_READONLY!
+        let (ts_b1, written_b, _) = writes_guarded_since_with_clean(b, b + BLOCK, ts_b0).unwrap();
+        assert!(
+            written_b.iter().any(|&(p, t)| p == b / BLOCK && t > ts_b0),
+            "alias B must report dirty after write through A"
+        );
+        assert!(
+            guards_read_shard(shard_of(a / BLOCK)).protected.contains(a / BLOCK),
+            "guarding alias B must re-arm A back to PAGE_READONLY"
+        );
+        assert!(guards_read_shard(shard_of(b / BLOCK)).clean.contains(b / BLOCK));
+
+        // A second write through A must fault again and dirty B again.
+        unsafe { (a as *mut u8).write_volatile(0x43) };
+        let (_, written_b2, _) = writes_guarded_since_with_clean(b, b + BLOCK, ts_b1).unwrap();
+        assert!(
+            written_b2.iter().any(|&(p, t)| p == b / BLOCK && t > ts_b1),
+            "second write through A must be caught after alias B re-armed A"
+        );
+        let _ = ts_a0;
+
+        title_memory_remapped(a, BLOCK);
+        title_memory_remapped(b, BLOCK);
+        crate::inplace::views_gone(a, BLOCK);
+        crate::inplace::views_gone(b, BLOCK);
+        unsafe {
+            UnmapViewOfFile(v1);
+            UnmapViewOfFile(v2);
+            CloseHandle(mapping);
+        }
     }
 }

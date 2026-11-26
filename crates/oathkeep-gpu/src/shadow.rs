@@ -2422,6 +2422,48 @@ pub(crate) fn wide_heap_run(jobs: Vec<Job>) {
     wide_leaf_on(heap_workers(), jobs);
 }
 
+fn stale_workers() -> &'static Workers {
+    static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let workers = WORKERS.get_or_init(|| Workers {
+        jobs: Mutex::new(std::collections::VecDeque::new()),
+        more: std::sync::Condvar::new(),
+    });
+    STARTED.call_once(|| {
+        let count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .clamp(2, 4);
+        for i in 0..count {
+            let _ = std::thread::Builder::new()
+                .name(format!("oathkeep-stale-{i}"))
+                .spawn(move || {
+                    let workers = stale_workers();
+                    loop {
+                        let job = {
+                            let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if let Some(job) = jobs.pop_front() {
+                                    break job;
+                                }
+                                jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                            }
+                        };
+                        job();
+                    }
+                });
+        }
+    });
+    workers
+}
+
+/// Runs `stale_under_flights` checks on a dedicated non-stealing pool isolated from
+/// `workers()`, preventing thread-pool starvation deadlocks when the relay thread holds
+/// `Shadow::before`/`card.old` while waiting on `workers()`.
+pub(crate) fn wide_stale_run(jobs: Vec<Job>) {
+    wide_leaf_on(stale_workers(), jobs);
+}
+
 /// Runs pure leaf jobs in parallel on the shared `workers()` pool without ever popping
 /// unrelated jobs on the calling thread, preventing re-entrant lock deadlocks when called
 /// from inside an outer `wide_run` or while holding per-shadow locks.

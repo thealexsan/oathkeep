@@ -2535,6 +2535,30 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         *ranges = merged;
     }
     if late_exact() {
+        if spans.len() >= 2 && wide_refresh() {
+            let any_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let per_budget = (256 / spans.len()).max(16);
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = spans
+                .into_iter()
+                .map(|(shadow, ranges)| {
+                    let any_stale = any_stale.clone();
+                    Box::new(move || {
+                        let mut runs_left = per_budget;
+                        for (from, to) in ranges {
+                            if any_stale.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            if shadow.merge_under_writes(from, to - from, &mut runs_left) {
+                                any_stale.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_stale_run(jobs);
+            return any_stale.load(Ordering::Relaxed);
+        }
         let mut runs_left = 256;
         return spans.iter().any(|(shadow, ranges)| {
             ranges
@@ -6003,7 +6027,7 @@ impl Host {
         if crate::watch::once() {
             #[cfg(feature = "diagnostics")]
             let t = std::time::Instant::now();
-            let mut spans: Vec<(usize, (usize, usize))> = Vec::new();
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
             for list in runs {
                 let deferred = list.deferred();
                 if !deferred.has_kernel_watch {
@@ -6014,29 +6038,17 @@ impl Host {
                         Step::Refresh(shadow, address, len)
                             if !shadow.unwatched() && !shadow.guarded() =>
                         {
-                            let key = std::sync::Arc::as_ptr(shadow) as usize;
-                            let end = *address + *len;
-                            if let Some((_, span)) = spans.iter_mut().find(|(k, _)| *k == key) {
-                                *span = (span.0.min(*address), span.1.max(end));
-                            } else {
-                                spans.push((key, (*address, end)));
-                            }
+                            ranges.push((*address, *address + *len));
                         }
                         Step::Texture(staging) => {
                             if let Some((from, to)) = staging.watch_range() {
-                                let key = std::sync::Arc::as_ptr(staging) as usize;
-                                if let Some((_, span)) = spans.iter_mut().find(|(k, _)| *k == key) {
-                                    *span = (span.0.min(from), span.1.max(to));
-                                } else {
-                                    spans.push((key, (from, to)));
-                                }
+                                ranges.push((from, to));
                             }
                         }
                         _ => {}
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_iter().map(|(_, r)| r).collect();
             if !ranges.is_empty() {
                 crate::watch::ask_once(&ranges);
             }
