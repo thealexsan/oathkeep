@@ -131,6 +131,14 @@ pub(crate) fn limited_host_ram() -> bool {
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
 }
 
+/// True on `<= 20 GiB` hosts (e.g., 16 GB RAM machines) where commit and
+/// working-set headroom are tight enough that oversized 2 MiB loose windows
+/// and large snapshot caches trigger OS page-file thrashing.
+pub(crate) fn tight_host_ram() -> bool {
+    static TIGHT: OnceLock<bool> = OnceLock::new();
+    *TIGHT.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 20 * GIB))
+}
+
 /// Physical and commit pressure thresholds scaled to total host RAM so
 /// 16 GiB hosts do not trip permanently into pressure when Windows retains
 /// ~2-3 GiB free physical RAM alongside ample pagefile commit headroom.

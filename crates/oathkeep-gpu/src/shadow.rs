@@ -53,7 +53,7 @@ impl CopiedState {
     }
 
     fn record_range(&mut self, from: usize, to: usize, now: u64) {
-        if self.exact.len() < 16384 || self.exact.contains_key(&(from, to)) {
+        if self.exact.len() < 256 || self.exact.contains_key(&(from, to)) {
             self.exact.insert((from, to), now);
         }
         let len = to - from;
@@ -1653,10 +1653,11 @@ static PINNED_SNAP_BYTES: AtomicU64 = AtomicU64::new(0);
 fn pinned_snap_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
+        let default_mb = if crate::residency::tight_host_ram() { 32 } else { 64 };
         std::env::var("OATHKEEP_PINNED_SNAPSHOT_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(384)
+            .unwrap_or(default_mb)
             << 20
     })
 }
@@ -1701,26 +1702,73 @@ fn snapshots_kept() -> usize {
     *MOST.get_or_init(|| std::env::var("OATHKEEP_SNAPSHOT_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024))
 }
 
+fn snapshot_pool_budget() -> usize {
+    if crate::residency::critical_commit() {
+        0
+    } else if crate::residency::pressured() {
+        16 << 20
+    } else if crate::residency::tight_host_ram() {
+        64 << 20
+    } else {
+        192 << 20
+    }
+}
+
+/// Drops pooled snapshot buffers down to `snapshot_pool_budget()` under host
+/// RAM / commit pressure, releasing committed pages back to Windows outside
+/// the pool lock.
+fn trim_snapshot_pool() {
+    let budget = snapshot_pool_budget();
+    let gone = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.bytes <= budget {
+            return;
+        }
+        if budget == 0 {
+            pool.bytes = 0;
+            std::mem::take(&mut pool.bufs)
+        } else {
+            pool.bufs.sort_unstable_by_key(|v| std::cmp::Reverse(v.capacity()));
+            let (mut kept, mut total) = (0, 0usize);
+            for v in &pool.bufs {
+                let next = total.saturating_add(v.capacity());
+                if next > budget {
+                    break;
+                }
+                total = next;
+                kept += 1;
+            }
+            pool.bytes = total;
+            pool.bufs.split_off(kept)
+        }
+    };
+    drop(gone);
+}
+
 /// Returns a snapshot buffer to the pool: O(1) push in steady state, sorting
 /// and trimming only when count or total capacity exceeds the pool budget.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
     let cap = v.capacity();
     if cap == 0 {
+        return;
+    }
+    let kept_budget = snapshot_pool_budget();
+    if kept_budget == 0 {
+        drop(v);
         return;
     }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.bytes = pool.bytes.saturating_add(cap);
     pool.bufs.push(v);
     let limit = snapshots_kept();
-    if pool.bufs.len() <= limit && (pool.bytes <= KEPT || pool.bufs.len() == 1) {
+    if pool.bufs.len() <= limit && (pool.bytes <= kept_budget || pool.bufs.len() == 1) {
         return;
     }
     pool.bufs.sort_unstable_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.bufs.iter().take(limit) {
         let next = total.saturating_add(v.capacity());
-        if kept > 0 && next > KEPT {
+        if kept > 0 && next > kept_budget {
             break;
         }
         total = next;
@@ -3515,6 +3563,7 @@ fn superseded_window_flags(keys: &[(u64, u64)]) -> Vec<bool> {
 }
 
 pub(crate) fn let_go_idle() {
+    trim_snapshot_pool();
     let (idle_ms, idle_frames) = if crate::residency::critical_commit() {
         (crate::host::ram_idle_ms(crate::host::available_physical_ram()).min(500), 2)
     } else if crate::residency::pressured() {
@@ -4186,7 +4235,7 @@ impl Shadow {
             // on the pieces ends here: `copy_back` takes it while it holds
             // the snapshot's.)
             kept.0.clear();
-        } else if !crate::residency::critical_commit() {
+        } else if !crate::residency::pressured() && !crate::residency::critical_commit() {
             if self.before_pinned.load(Ordering::Relaxed) {
                 return;
             }
@@ -4910,6 +4959,16 @@ impl Shadow {
                 // SAFETY: inside the mapping, as above.
                 crate::host::copy_mapped(unsafe { self.data.add(a) }, (start + a) as *const u8, b - a, false);
                 crate::host::upcheck::note(self.id, a, &was, &self.card_held(a, b - a));
+            });
+        } else if to - from >= (1 << 20) && crate::watch::light() {
+            const PART: usize = 256 << 10;
+            let len = to - from;
+            let parts = len.div_ceil(PART);
+            let dst_base = at as usize;
+            wide_each(parts, move |i| {
+                let off = i * PART;
+                let n = PART.min(len - off);
+                crate::host::copy_mapped((dst_base + off) as *mut u8, (from + off) as *const u8, n, false);
             });
         } else {
             crate::host::copy_mapped(at, from as *const u8, to - from, false);
@@ -5913,29 +5972,41 @@ fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
         let kb = std::env::var("OATHKEEP_WINDOW_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        grid_for(kb, crate::residency::limited_host_ram())
+        grid_for_ram(kb, crate::residency::tight_host_ram(), crate::residency::limited_host_ram())
     })
 }
 
 /// Default sized-window grid in bytes when `OATHKEEP_WINDOW_KB` is unset or
-/// invalid: 2 MiB (`2048 KiB`) across host RAM tiers so sized window count
-/// stays ~4x lower than 512 KiB while unsized asks keep `tails()` + VAD clamping.
-fn default_grid(_limited_host_ram: bool) -> u64 {
-    2 << 20
+/// invalid: 512 KiB on `<= 20 GiB` hosts (16 GB RAM machines, preventing >3 GB
+/// of loose-window commit slack and OS page-file thrashing), 1 MiB on
+/// `20..=32 GiB` hosts, and 2 MiB on `> 32 GiB` hosts.
+fn default_grid_for(tight_host_ram: bool, limited_host_ram: bool) -> u64 {
+    if tight_host_ram {
+        512 << 10
+    } else if limited_host_ram {
+        1 << 20
+    } else {
+        2 << 20
+    }
 }
 
 /// The window grid in bytes for a setting in KiB: a power of two from
-/// 64 KiB to 4 MiB, or [`default_grid`] for anything else.
-fn grid_for(kb: Option<u64>, limited_host_ram: bool) -> u64 {
+/// 64 KiB to 4 MiB, or [`default_grid_for`] for anything else.
+fn grid_for_ram(kb: Option<u64>, tight_host_ram: bool, limited_host_ram: bool) -> u64 {
     match kb {
         Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
-        _ => default_grid(limited_host_ram),
+        _ => default_grid_for(tight_host_ram, limited_host_ram),
     }
 }
 
 #[cfg(test)]
+fn grid_for(kb: Option<u64>, limited_host_ram: bool) -> u64 {
+    grid_for_ram(kb, false, limited_host_ram)
+}
+
+#[cfg(test)]
 fn grid(kb: Option<u64>) -> u64 {
-    grid_for(kb, true)
+    grid_for_ram(kb, true, true)
 }
 
 /// The window (start, bytes) of title memory for an ask of `[address,
@@ -6894,12 +6965,14 @@ mod window_tests {
     }
 
     /// The setting takes powers of two from 64 KiB to 4 MiB; anything else
-    /// falls back to the 2 MiB (`2048 KiB`) default grid.
+    /// falls back to the RAM-tiered default grid (512 KiB on <= 20 GiB,
+    /// 1 MiB on <= 32 GiB, 2 MiB on > 32 GiB).
     #[test]
     fn the_grid_is_a_power_of_two_or_the_default() {
-        use super::{grid_for, longest_tail_to, superseded_window_flags, tail_bounds};
-        assert_eq!(grid(None), 2 << 20);
-        assert_eq!(grid_for(None, true), 2 << 20);
+        use super::{grid_for, grid_for_ram, longest_tail_to, superseded_window_flags, tail_bounds};
+        assert_eq!(grid(None), 512 << 10);
+        assert_eq!(grid_for_ram(None, true, true), 512 << 10);
+        assert_eq!(grid_for(None, true), 1 << 20);
         assert_eq!(grid_for(None, false), 2 << 20);
         assert_eq!(grid_for(Some(4096), true), WINDOW);
         assert_eq!(grid_for(Some(1024), true), 1 << 20);
@@ -6907,7 +6980,8 @@ mod window_tests {
         assert_eq!(grid_for(Some(256), true), 256 << 10);
         assert_eq!(grid_for(Some(64), true), 64 << 10);
         for bad in [0, 32, 100, 1000, 8192] {
-            assert_eq!(grid_for(Some(bad), true), 2 << 20, "{bad}");
+            assert_eq!(grid_for_ram(Some(bad), true, true), 512 << 10, "{bad}");
+            assert_eq!(grid_for(Some(bad), true), 1 << 20, "{bad}");
             assert_eq!(grid_for(Some(bad), false), 2 << 20, "{bad}");
         }
 

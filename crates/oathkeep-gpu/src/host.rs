@@ -8822,7 +8822,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     #[cfg(feature = "diagnostics")]
     let sparse = std::time::Instant::now();
-    if !title_dst && len >= 64 << 10 {
+    if !title_dst && len >= 16 << 10 {
         read_sparse(src, dst, len);
     } else {
         read_pieces(src, dst, len);

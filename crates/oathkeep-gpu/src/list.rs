@@ -1771,17 +1771,28 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
+        && len != 0
+        && dst != src
     {
         let len = len as usize;
         if list.place_copy(dst as usize, src as usize, len) {
             with_state(this, |_, state| state.copied());
             return;
         }
+        let non_overlapping = (dst as usize).saturating_add(len) <= src as usize
+            || (src as usize).saturating_add(len) <= dst as usize;
+        if non_overlapping {
+            // Use `Step::Copy` so `card_steps` can offload it and CPU fallback
+            // preserves `watch::ask_once` via range-scoped `watch::wrote`
+            // instead of nuking the submission journal via `Step::Run`.
+            list.defer_copy(dst as *mut u8, src as *const u8, len);
+            return;
+        }
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {
-                // SAFETY: both ranges are committed title memory.
+                // SAFETY: both ranges are committed title memory (overlapping `memmove`).
                 unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
             }
         });
