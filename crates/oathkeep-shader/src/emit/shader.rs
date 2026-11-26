@@ -6,6 +6,10 @@ pub const SAMPLER_SPACE: u32 = 0;
 pub const ROOT_CBV_SPACE: u32 = 1;
 
 pub const SLOT_STRIDES: u8 = 255;
+pub const SLOT_TABLE_STRIDES: u8 = 252;
+pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+pub const VIEW_INTEGER: u32 = 1 << 31;
+pub const VIEW_SIGNED: u32 = 1 << 30;
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
 pub const SLOT_MEMORY: u8 = 254;

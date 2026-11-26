@@ -352,6 +352,7 @@ struct StageEntry {
     is_buffer: bool,
     is_texture: bool,
     tex_bucket: u8,
+    stride_word: u32,
     view_kind: Option<oathkeep_shader::ResourceType>,
     kept_raw: usize,
     kept: Option<ID3D12Resource>,
@@ -1470,15 +1471,19 @@ pub(crate) static PLACED_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 =
 pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-fn view_stride(view: &View) -> Option<u32> {
+fn view_stride_and_kind(view: &View) -> (Option<u32>, u32) {
+    use oathkeep_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
         View::Unordered(_, _, Some(d)) if d[1] == BUFFER => (d, true),
         View::Placed(unordered, resource, d) if resource[0] == BUFFER => {
-            (d[..10].try_into().ok()?, *unordered)
+            let Some(arr) = d[..10].try_into().ok() else {
+                return (None, 0);
+            };
+            (arr, *unordered)
         }
-        _ => return None,
+        _ => return (None, 0),
     };
     // SAFETY: buffer views' union members.
     let (stride, raw, format) = unsafe {
@@ -1488,7 +1493,7 @@ fn view_stride(view: &View) -> Option<u32> {
             (
                 b.StructureByteStride,
                 b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0,
-                d.Format,
+                d.Format.0 as u32,
             )
         } else {
             let d = srv_desc(words);
@@ -1496,17 +1501,38 @@ fn view_stride(view: &View) -> Option<u32> {
             (
                 b.StructureByteStride,
                 b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0,
-                d.Format,
+                d.Format.0 as u32,
             )
         }
     };
-    Some(if stride > 0 {
+    let bytes = if stride > 0 {
         stride
     } else if raw {
         1
     } else {
-        crate::resource::element(format.0 as u32).map_or(0, |(bytes, _)| bytes as u32)
-    })
+        crate::resource::element(format).map_or(0, |(bytes, _)| bytes as u32)
+    };
+    let kind = if stride == 0 && !raw {
+        match format {
+            3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => VIEW_INTEGER,
+            4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => VIEW_INTEGER | VIEW_SIGNED,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    (Some(bytes), kind)
+}
+
+fn view_stride_word(view: &View) -> u32 {
+    let (stride, kind) = view_stride_and_kind(view);
+    stride.unwrap_or(0) | kind
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn view_stride(view: &View) -> Option<u32> {
+    view_stride_and_kind(view).0
 }
 
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -2543,18 +2569,8 @@ impl HostHeap {
                 }
             }
         }
-        let stride = view.and_then(view_stride);
-        if let Some((_, _, data)) = &self.strides
-            && index < oathkeep_shader::emit::SLOT_STRIDES_COUNT
-        {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe {
-                (*data as *mut u32)
-                    .add(index as usize)
-                    .write_volatile(stride.unwrap_or(0))
-            };
-        }
+        let (stride, kind) = view.map(view_stride_and_kind).unwrap_or((None, 0));
+        self.write_stride(index, stride.unwrap_or(0) | kind);
         let was_buffer = bit_get(&self.is_buffer, index);
         let was = if stride.is_some() {
             if !was_buffer {
@@ -2642,6 +2658,22 @@ impl HostHeap {
     /// Writes a descriptor directly into a dynamic slot owned by the caller's command list,
     /// bypassing `self.kept` locking/retirement. Returns `(kept_resource, made_shadow, made_placed)`
     /// so the caller can keep the resource on the command list (deduplicated) and reuse
+    #[inline]
+    fn write_stride(&self, index: u32, word: u32) {
+        if let Some((_, _, data)) = &self.strides
+            && index < oathkeep_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping; shaders read it while we write (a
+            // single aligned dword: either value is one the slot had, and
+            // dynamic slots are exclusively owned until submission finishes).
+            unsafe {
+                (*data as *mut u32)
+                    .add(index as usize)
+                    .write_volatile(word)
+            };
+        }
+    }
+
     /// `made_shadow` / `made_placed` without a second global lookup.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn make_at_dynamic(
@@ -2657,6 +2689,7 @@ impl HostHeap {
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
+        self.write_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
         (kept.flatten(), shadow, placed)
     }
 
@@ -2798,6 +2831,7 @@ impl HostHeap {
                             dsts[n_copy] = self.cpu(dst_idx);
                             srcs[n_copy] = stage.cpu(entry.slot);
                             n_copy += 1;
+                            self.write_stride(dst_idx, entry.stride_word);
                             let kept = if entry.kept_raw != 0 && !already_kept(entry.kept_raw) {
                                 entry.kept.clone()
                             } else {
@@ -2896,6 +2930,14 @@ impl HostHeap {
             if kept.is_none() {
                 null_for(&view, self.cpu(index));
             }
+            self.write_stride(
+                index,
+                if kept.is_some() {
+                    view_stride_word(&view)
+                } else {
+                    0
+                },
+            );
             let kept = kept.flatten();
             let resolved = placed.as_ref().unwrap_or(&view);
             let action = if let Some((shadow, address, len)) =
@@ -2936,6 +2978,14 @@ impl HostHeap {
             if kept.is_none() {
                 null_for(&view, self.cpu(index));
             }
+            self.write_stride(
+                index,
+                if kept.is_some() {
+                    view_stride_word(&view)
+                } else {
+                    0
+                },
+            );
             let kept = kept.flatten();
             let resolved = placed.as_ref().unwrap_or(&view);
             let action = if let Some((shadow, address, len)) =
@@ -2984,6 +3034,7 @@ impl HostHeap {
                             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                         );
                     }
+                    self.write_stride(index, entry.stride_word);
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::StageCacheHits, 1);
                     let kept = if entry.kept_raw != 0 && !already_kept(entry.kept_raw) {
@@ -3031,6 +3082,7 @@ impl HostHeap {
                     make_detailed_with_shadow(&view, dst, None, &mut find_shadow);
                 let Some(kept_res) = kept else {
                     null_for(&view, dst);
+                    self.write_stride(index, 0);
                     return DynamicMade {
                         found: true,
                         kept: None,
@@ -3039,6 +3091,7 @@ impl HostHeap {
                         is_texture,
                     };
                 };
+                self.write_stride(index, view_stride_word(&view));
                 let resolved = made_placed.as_ref().unwrap_or(&view);
                 let action = if let Some((shadow, address, len)) =
                     buffer_copy_with_hint(resolved, made_shadow)
@@ -3153,6 +3206,7 @@ impl HostHeap {
                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                 );
             }
+            self.write_stride(index, entry.stride_word);
             let kept = if entry.kept_raw != 0 && !already_kept(entry.kept_raw) {
                 entry.kept.clone()
             } else {
@@ -3179,6 +3233,7 @@ impl HostHeap {
         let Some(kept_res) = kept else {
             drop(guard);
             null_for(&view, dst);
+            self.write_stride(index, 0);
             return DynamicMade {
                 found: true,
                 kept: None,
@@ -3187,6 +3242,7 @@ impl HostHeap {
                 is_texture,
             };
         };
+        let stride_word = view_stride_word(&view);
         // SAFETY: dst is our dynamic slot; src was just populated in our CPU staging heap.
         unsafe {
             host.device.CopyDescriptorsSimple(
@@ -3196,6 +3252,7 @@ impl HostHeap {
                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             );
         }
+        self.write_stride(index, stride_word);
         let resolved = made_placed.as_ref().unwrap_or(&view);
         let (action, is_buffer, tex_bucket, epoch) = if let Some((shadow, address, len)) =
             buffer_copy_with_hint(resolved, made_shadow)
@@ -3254,6 +3311,7 @@ impl HostHeap {
             is_buffer,
             is_texture,
             tex_bucket,
+            stride_word,
             view_kind,
             kept_raw,
             kept: kept_res.clone(),
@@ -3278,6 +3336,7 @@ impl HostHeap {
             self.null_sampler(index);
         } else {
             null_view(self.cpu(index));
+            self.write_stride(index, 0);
         }
     }
 
@@ -3292,6 +3351,7 @@ impl HostHeap {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
         };
+        self.write_stride(index, 0);
     }
 
     pub(crate) fn make_null(&self, index: u32) {
@@ -3299,6 +3359,7 @@ impl HostHeap {
             self.null_sampler(index);
         } else {
             null_view(self.cpu(index));
+            self.write_stride(index, 0);
         }
         self.keep(index, None);
     }

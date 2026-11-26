@@ -453,6 +453,7 @@ impl HostPipeline {
                         slot == oathkeep_shader::emit::SLOT_FAULTS
                     } else {
                         slot == oathkeep_shader::emit::SLOT_STRIDES
+                            || slot == oathkeep_shader::emit::SLOT_TABLE_STRIDES
                             || slot == oathkeep_shader::emit::SLOT_MEMORY
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV)
