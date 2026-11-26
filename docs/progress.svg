@@ -182,13 +182,13 @@
   <rect x="474" y="296" width="382" height="62" rx="6" fill="#161b22" stroke="#30363d"/>
   <text x="486" y="314" fill="#8b949e" font-size="10.5" font-weight="600">LATEST WORLD TELEMETRY (RTX 3070 8 GB, 1080P)</text>
   <text x="486" y="330" fill="#8b949e" font-size="10" class="mono">FPS</text>
-  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">1.9-3.0 fps in diag-visual-merged (all 4 visual-artifact swarm workers merged at b6b9b0e; 0 TDRs/crashes, 0 depth-plane misses, 0 CBV/buffer-view/0x1c8/0x218/0x1a8 warnings, 6b82bc7d22016cb5 translated)</text>
+  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">3.4 fps in diag-visual-vramfix2 (301d66f verified 146.1s TIMEOUT_CLEAN; peak VRAM 6,874/7,164 MB, 0 crashes/TDRs, 02384a60fda6f2d0 translated &amp; bound with 0 dropped)</text>
   <text x="575" y="330" fill="#8b949e" font-size="10" class="mono">FRAME</text>
-  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">335.3-527.7 ms in diag-visual-merged (lead character/hair/eyes/DOF/outdoor vehicles crisp; fixing 3 remaining visual blockers before FPS optimization swarm)</text>
+  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">295.1 ms in diag-visual-vramfix2 (70.8 ms preparing, 54.8 ms GPU, 32.4 ms copy-back; crisp lead character/hair/eyes/posters/outdoor vehicles; secondary NPC faces &amp; dark interiors left before FPS swarm)</text>
   <text x="664" y="330" fill="#8b949e" font-size="10" class="mono">GPU</text>
-  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">0.0-110.5 ms (149.1s TIMEOUT_CLEAN; depth planes 1.3/f synced 0/0, 10330 aligned view copies)</text>
+  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">54.8 ms (146.1s TIMEOUT_CLEAN; pool::TEXTURES 4,928-&gt;4,224 MB, tiles 512-&gt;256 MB, 18,785 idle textures freed, 0 depth-plane misses, 12,648 aligned view copies)</text>
   <text x="753" y="330" fill="#8b949e" font-size="10" class="mono">PREP</text>
-  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">135.1-210.5 ms in diag-visual-merged (35132 waiting textures + 1M heap cap + 1 wave64 shader 02384a60fda6f2d0 left to polish before 20-30+ FPS swarm)</text>
+  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">70.8 ms in diag-visual-vramfix2 (3062 draws/f, 0 non-RT dropped shaders, 0 capped-view-heap hits)</text>
   <line x1="24" y1="374" x2="856" y2="374" stroke="#21262d"/>
   <text x="24" y="390" fill="#8b949e" font-size="11">Target: 20-30+ FPS (1:1 visuals) • Clean-room Xbox Series X|S (GDK) layer</text>
   <text x="704" y="390" text-anchor="end" fill="#8b949e" font-size="11">Less</text>
