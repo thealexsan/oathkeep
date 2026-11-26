@@ -216,6 +216,7 @@ pub(crate) struct Translated {
     cache_path: Option<std::path::PathBuf>,
     pub(crate) used: Vec<oathkeep_shader::UsedResource>,
     pub(crate) stores: bool,
+    pub(crate) bindless_stores: bool,
 }
 
 #[cfg(windows)]
@@ -364,6 +365,12 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     let (mut host, cache_path) = crate::shader_cache::host_shader_with_path(container)?;
     let dxil = std::mem::take(&mut host.dxil);
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let has_strides = host
+        .root_srvs
+        .contains(&oathkeep_shader::emit::SLOT_STRIDES);
+    let bindless_stores = stores
+        && has_strides
+        && (programs.is_empty() || programs.iter().any(bindless_stores));
     let used = programs
         .into_iter()
         .find(|p| {
@@ -380,6 +387,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         cache_path,
         used,
         stores,
+        bindless_stores,
     })
 }
 
@@ -494,6 +502,114 @@ fn stores(program: &oathkeep_shader::NativeProgram) -> bool {
             _ => false,
         }
     })
+}
+
+#[cfg(windows)]
+fn bindless_stores(program: &oathkeep_shader::NativeProgram) -> bool {
+    use oathkeep_shader::RootType;
+    use oathkeep_shader::gfx10::{Encoding, decode};
+    use oathkeep_shader::resource::{Role, Source};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    let mut has_buf_store = false;
+    for i in &code {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Flat | Encoding::Global => {
+                if name.is_none_or(|n| {
+                    (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+                }) {
+                    return true;
+                }
+            }
+            Encoding::Sop1 => {
+                if name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")) {
+                    return true;
+                }
+            }
+            Encoding::Mubuf | Encoding::Mtbuf | Encoding::Smem => {
+                if name.is_none_or(|n| {
+                    (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+                }) {
+                    has_buf_store = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !has_buf_store {
+        return false;
+    }
+    let Ok(ir) = oathkeep_shader::spill::build(program) else {
+        return true;
+    };
+    let st = oathkeep_shader::structure::structure(&ir);
+    let Ok(res) =
+        oathkeep_shader::resource::track(&ir, &program.layout, program.stage, st.as_ref().ok())
+    else {
+        return true;
+    };
+    let scalar: HashMap<_, _> = res.scalar.iter().map(|&(site, addr)| (site, addr)).collect();
+    let descs: HashMap<_, _> = res
+        .descriptors
+        .iter()
+        .filter(|d| d.role == Role::Resource)
+        .map(|d| (d.site, &d.source))
+        .collect();
+    for (b, block) in ir.blocks.iter().enumerate() {
+        for (idx, inst) in block.insts.iter().enumerate() {
+            if !matches!(
+                inst.machine.encoding,
+                Encoding::Mubuf | Encoding::Mtbuf | Encoding::Smem
+            ) {
+                continue;
+            }
+            let name = inst.machine.name();
+            if !name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }) {
+                continue;
+            }
+            let Some(source) = descs.get(&(b, idx)) else {
+                return true;
+            };
+            for leaf in source.leaves() {
+                match leaf {
+                    Source::Loaded { load, .. } => {
+                        let Some(addr) = scalar.get(load) else {
+                            return true;
+                        };
+                        let Some(param) = program.layout.get(addr.param) else {
+                            return true;
+                        };
+                        if param.root != RootType::Table {
+                            return true;
+                        }
+                        if addr.dynamic.is_some()
+                            && !res
+                                .root_indexed_views
+                                .iter()
+                                .any(|ix| ix.table_slot == param.slot)
+                        {
+                            return true;
+                        }
+                    }
+                    Source::Built { address, .. } => {
+                        let Some(param) = program.layout.get(address.param) else {
+                            return true;
+                        };
+                        if !matches!(param.root, RootType::Descriptor | RootType::Table) {
+                            return true;
+                        }
+                    }
+                    Source::Constant(..) | Source::ImmediateSampler { .. } => {}
+                    _ => return true,
+                }
+            }
+        }
+    }
+    false
 }
 
 #[repr(C)]

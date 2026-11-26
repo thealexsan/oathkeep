@@ -1,14 +1,14 @@
 [meta]
 updated = "2026-11-26"
-commit = "45708fb"
+commit = "perf/commit-reduction"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "8.3-10.6 fps steady (diag-run76, 0 refused slots, 0 dropped indirects, 0.0 ms GPU wait)"
-current_frame_ms = "94.4-120.7 ms (0 refused dynamic slots, 0 dropped indirects, 5273 draws/f max)"
-current_gpu_ms = "0.0 ms wait (GPU 82-94% busy due to 2.8k-4.7k mid-list gpu_copy_scratch barriers/f)"
-current_preparing_ms = "45.7-66.0 ms (batch_flush 23.8-36.9 ms, guards 20.7-34.1 ms, moves shadow 29.7-45.8 ms)"
+current_fps = "8.7-11.9 fps steady (diag-run78 peak 11.9 fps / 83.8 ms; heavy scene +48% to 7.4 fps; 0.0 ms GPU wait)"
+current_frame_ms = "83.8-115.3 ms (0 refused dynamic slots, 0 dropped indirects, 95-98% cbv_scratch hoisted)"
+current_gpu_ms = "0.0 ms wait (GPU busy cut 93-97% -> 50-74%; now 100% CPU-bound!)"
+current_preparing_ms = "46.5-72.4 ms (batch_flush 25.3-42.7 ms, guards 23.8-45.8 ms CPU sum, moves shadow 33.2-72.2 ms)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~20-35 min (hoist pre-write gpu_copy_scratch to prelude + multi-buffer scratch ring + cut batch_flush -> 20-30+ FPS)"
+eta = "~20-30 min (now 100% CPU-bound at 50-74% GPU; cut guards/batch_flush + recording make_at -> 20-30+ FPS)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -235,3 +235,12 @@ frame_ms = 94.4
 gpu_ms = "0.0 ms wait (82-94% busy; 2.8k-4.7k mid-list gpu_copy_scratch barriers/f)"
 preparing_ms = "45.7-66.0 ms (batch_flush 23.8-36.9 ms, guards 20.7-34.1 ms)"
 status = "Fix O1+O2 verified: dynamic slot refusals 576->0, dropped indirects 1313->0, uncacheable 9161->0, fresh_tables hits 6-8x (1656-4438), cbv_scratch hits 1519-5517; next: prelude-hoist gpu_copy_scratch + multi-buffer scratch ring + batch_flush"
+
+[[runs]]
+label = "diag-run78"
+commit = "perf/commit-reduction"
+fps = 11.9
+frame_ms = 83.8
+gpu_ms = "0.0 ms wait (50-74% busy, down from 93-97%; 95-98% cbv_scratch hoisted to prelude)"
+preparing_ms = "46.5-72.4 ms (batch_flush 25.3-42.7 ms, guards 23.8-45.8 ms, moves shadow 33.2-72.2 ms)"
+status = "New peak 11.9 fps (heavy scene +48% to 7.4 fps)! Fix P1a/P1b/P1c/P2b verified: bindless_wr -96% (1526->52-97), inline barriers -98% (2622->57-97), GPU busy 93-97%->50-74%; now 100% CPU-bound -> next: cut guards/alias_apply + batch_flush + recording make_at"

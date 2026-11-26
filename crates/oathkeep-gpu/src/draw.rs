@@ -784,8 +784,19 @@ impl State {
             return Some((res.clone(), *gpu, write_seq, bindless_seq));
         }
         shadow.refresh(list, address, len);
-        let (scratch, _, scratch_gpu) =
-            list.gpu_copy_scratch(&shadow.buffer, src_offset, len, 256)?;
+        let (scratch, _, scratch_gpu) = if write_seq == 0 && bindless_seq == 0 {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::CbvScratchHoisted, 1);
+            list.prelude_gpu_copy_scratch(&shadow.buffer, src_offset, len, 256)?
+        } else {
+            #[cfg(feature = "diagnostics")]
+            if write_seq > 0 {
+                crate::copystat::add(crate::copystat::C::CbvScratchInlineWrite, 1);
+            } else {
+                crate::copystat::add(crate::copystat::C::CbvScratchInlineBindless, 1);
+            }
+            list.gpu_copy_scratch(&shadow.buffer, src_offset, len, 256)?
+        };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::CbvScratchMisses, 1);
         self.cbv_scratch_cache
@@ -1441,11 +1452,7 @@ impl State {
             }
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
-            if writes
-                && t.host
-                    .root_srvs
-                    .contains(&oathkeep_shader::emit::SLOT_STRIDES)
-            {
+            if writes && t.bindless_stores {
                 bindless_writes = true;
             }
             let memory = if t
@@ -1608,6 +1615,8 @@ impl State {
         list.twins_written();
         draw_writes.commit();
         if bindless_writes {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::BindlessWrites, 1);
             list.note_bindless_gpu_write();
         }
         if compute || p.stages.iter().any(|s| s.translated().stores) {
@@ -3232,7 +3241,16 @@ impl State {
             };
             if index >= host.count() {
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TablesFreshOver, 1);
+                {
+                    crate::copystat::add(crate::copystat::C::TablesFreshOver, 1);
+                    if index < 868_927 {
+                        crate::copystat::add(crate::copystat::C::TablesOverLt868k, 1);
+                    } else if index < 1_000_000 {
+                        crate::copystat::add(crate::copystat::C::TablesOver868kTo1M, 1);
+                    } else {
+                        crate::copystat::add(crate::copystat::C::TablesOverGe1M, 1);
+                    }
+                }
                 self.scratch_fresh.push(u.slot);
                 continue;
             }
@@ -3270,7 +3288,16 @@ impl State {
             };
             if index >= host.count() {
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TablesFreshOver, 1);
+                {
+                    crate::copystat::add(crate::copystat::C::TablesFreshOver, 1);
+                    if index < 868_927 {
+                        crate::copystat::add(crate::copystat::C::TablesOverLt868k, 1);
+                    } else if index < 1_000_000 {
+                        crate::copystat::add(crate::copystat::C::TablesOver868kTo1M, 1);
+                    } else {
+                        crate::copystat::add(crate::copystat::C::TablesOverGe1M, 1);
+                    }
+                }
                 self.scratch_fresh.push(ix.table_slot);
             } else if matches!(crate::descriptor::view(handle), Some(View::Constant(..)))
                 && !self.can_direct_cbv(handle)

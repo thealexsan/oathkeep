@@ -835,6 +835,22 @@ struct GpuScratchPool {
     in_read: bool,
 }
 
+const GPU_SCRATCH_RING: usize = 16;
+
+struct GpuScratchRing {
+    slots: [GpuScratchPool; GPU_SCRATCH_RING],
+    next: usize,
+}
+
+impl Default for GpuScratchRing {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| GpuScratchPool::default()),
+            next: 0,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ShadowWrites {
     seqs: Vec<(u64, u64)>,
@@ -853,7 +869,8 @@ pub(crate) struct HostList {
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     budget: OnceLock<Option<ID3D12Resource>>,
     indirect_pool: Mutex<IndirectPool>,
-    gpu_scratch_pool: Mutex<GpuScratchPool>,
+    gpu_scratch_pool: Mutex<GpuScratchRing>,
+    prelude_scratch_pool: Mutex<GpuScratchPool>,
     shadow_writes: Mutex<ShadowWrites>,
     bindless_write_seq: std::sync::atomic::AtomicU64,
     uav_dirty: std::sync::atomic::AtomicBool,
@@ -888,7 +905,7 @@ impl Drop for PooledPrelude {
         if let Some(prelude) = self.0.take() {
             let overflow = {
                 let mut pool = PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner());
-                if pool.len() < 16 {
+                if pool.len() < 64 {
                     pool.push(StoredPrelude(prelude));
                     None
                 } else {
@@ -1708,6 +1725,7 @@ struct Deferred {
     textures: std::collections::HashSet<usize>,
     writes: Vec<(usize, crate::queue::Written, usize)>,
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    prelude_gpu_copies: Vec<(ID3D12Resource, u64, ID3D12Resource, u64, u64)>,
     budget_zeroed: bool,
 }
 
@@ -3598,6 +3616,7 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_pool: Mutex::default(),
                 gpu_scratch_pool: Mutex::default(),
+                prelude_scratch_pool: Mutex::default(),
                 shadow_writes: Mutex::default(),
                 bindless_write_seq: std::sync::atomic::AtomicU64::new(0),
                 uav_dirty: std::sync::atomic::AtomicBool::new(true),
@@ -6723,6 +6742,56 @@ impl HostList {
         }
     }
 
+    pub(crate) fn prelude_gpu_copy_scratch(
+        &self,
+        src: &ID3D12Resource,
+        src_offset: u64,
+        len: u64,
+        align: u64,
+    ) -> Option<(ID3D12Resource, u64, u64)> {
+        let align = align.max(256);
+        let alloc_bytes = len.max(align).next_multiple_of(align);
+        let (scratch, dst_off, gpu_va, old_buf) = {
+            let mut pool = self
+                .prelude_scratch_pool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let start = pool.used.next_multiple_of(align);
+            if let Some(buf) = pool.buffer.clone()
+                && start.saturating_add(alloc_bytes) <= pool.cap
+            {
+                pool.used = start + alloc_bytes;
+                (buf, start, pool.gpu + start, None)
+            } else {
+                let new_cap = pool
+                    .cap
+                    .saturating_mul(2)
+                    .max(alloc_bytes)
+                    .max(64 << 10)
+                    .next_multiple_of(64 << 10);
+                let buffer = host()?.uav_buffer(new_cap)?;
+                name(&buffer, || format!("prelude gpu scratch {new_cap:#x}"));
+                // SAFETY: a live DEFAULT-heap buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                let old_buf = pool.buffer.replace(buffer.clone());
+                pool.gpu = gpu;
+                pool.cap = new_cap;
+                pool.used = alloc_bytes;
+                (buffer, 0, gpu, old_buf)
+            }
+        };
+        if let Some(old_buf) = old_buf {
+            self.keep(&old_buf);
+        }
+        self.keep(src);
+        if len > 0 {
+            self.deferred()
+                .prelude_gpu_copies
+                .push((src.clone(), src_offset, scratch.clone(), dst_off, len));
+        }
+        Some((scratch, dst_off, gpu_va))
+    }
+
     pub(crate) fn gpu_copy_scratch(
         &self,
         src: &ID3D12Resource,
@@ -6733,10 +6802,13 @@ impl HostList {
         let align = align.max(256);
         let alloc_bytes = len.max(align).next_multiple_of(align);
         let (scratch, dst_off, gpu_va, was_in_read, old_buf) = {
-            let mut pool = self
+            let mut ring = self
                 .gpu_scratch_pool
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            let idx = ring.next % GPU_SCRATCH_RING;
+            ring.next = ring.next.wrapping_add(1);
+            let pool = &mut ring.slots[idx];
             let start = pool.used.next_multiple_of(align);
             if let Some(buf) = pool.buffer.clone()
                 && start.saturating_add(alloc_bytes) <= pool.cap
@@ -6755,7 +6827,7 @@ impl HostList {
                     .max(64 << 10)
                     .next_multiple_of(64 << 10);
                 let buffer = host()?.uav_buffer(new_cap)?;
-                name(&buffer, || format!("gpu scratch {new_cap:#x}"));
+                name(&buffer, || format!("gpu scratch {idx} {new_cap:#x}"));
                 // SAFETY: a live DEFAULT-heap buffer.
                 let gpu = unsafe { buffer.GetGPUVirtualAddress() };
                 let old_buf = pool.buffer.replace(buffer.clone());
@@ -6808,8 +6880,19 @@ impl HostList {
             pool.in_indirect = false;
         }
         {
-            let mut pool = self
+            let mut ring = self
                 .gpu_scratch_pool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ring.next = 0;
+            for pool in &mut ring.slots {
+                pool.used = 0;
+                pool.in_read = false;
+            }
+        }
+        {
+            let mut pool = self
+                .prelude_scratch_pool
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             pool.used = 0;
@@ -6841,6 +6924,7 @@ impl HostList {
             || !old_deferred.uploads.is_empty()
             || !old_deferred.kept.is_empty()
             || !old_deferred.backs.is_empty()
+            || !old_deferred.prelude_gpu_copies.is_empty()
             || !old_deferred.refreshed.is_empty()
             || !old_deferred.textures.is_empty()
             || !old_deferred.writes.is_empty();
@@ -7059,6 +7143,14 @@ impl HostList {
     fn prelude(&self, host: &Host) -> Option<(ID3D12CommandList, PooledPrelude)> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
+        let prelude_copies = {
+            let deferred = self.deferred();
+            if deferred.prelude_gpu_copies.is_empty() {
+                Vec::new()
+            } else {
+                deferred.prelude_gpu_copies.clone()
+            }
+        };
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let mut syncs = Vec::new();
@@ -7113,7 +7205,7 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && prelude_copies.is_empty() {
             return None;
         }
         let Some(pooled) = take_prelude(host) else {
@@ -7121,7 +7213,8 @@ impl HostList {
         };
         let (allocator, list) = pooled.0.as_ref().expect("pooled prelude");
         // SAFETY: the pooled prelude is not executing (returned to the pool
-        // only after its submission's GPU fence completed); the textures are live.
+        // only after its submission's GPU fence completed); the textures and
+        // scratch buffers are live for the duration of the submission.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
@@ -7130,6 +7223,34 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                if !prelude_copies.is_empty() {
+                    // One all-resource UAV barrier ensures prior command lists' UAV writes
+                    // in the same ExecuteCommandLists are visible to our hoisted CBV copies.
+                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                pResource: std::mem::ManuallyDrop::new(None),
+                            }),
+                        },
+                    }]);
+                    let mut dsts: Vec<&ID3D12Resource> = Vec::new();
+                    for (src, src_off, dst, dst_off, len) in &prelude_copies {
+                        list.CopyBufferRegion(dst, *dst_off, src, *src_off, *len);
+                        let raw = dst.as_raw();
+                        if !dsts.iter().any(|d| d.as_raw() == raw) {
+                            dsts.push(dst);
+                        }
+                    }
+                    for dst in dsts {
+                        barriers.push(transition(
+                            dst,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_GENERIC_READ,
+                        ));
+                    }
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -7877,24 +7998,45 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        if wide_refresh() && self.refreshes.len() >= 2 {
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
-            let mut all: Vec<_> = self.refreshes.drain(..).collect();
-            let chunks = all.len().min(6);
-            let chunk_size = all.len().div_ceil(chunks);
-            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(chunks);
-            while !all.is_empty() {
-                let take = chunk_size.min(all.len());
-                let part: Vec<_> = all.drain(..take).collect();
-                jobs.push(Box::new(move || {
-                    for (shadow, spans) in part {
-                        for (from, to) in spans {
-                            Self::update(&shadow, from, to);
-                        }
-                    }
-                }));
+            let mut all: Vec<_> = self
+                .refreshes
+                .drain(..)
+                .map(|(shadow, spans)| {
+                    let bytes: usize = spans.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
+                    (bytes, shadow, spans)
+                })
+                .collect();
+            all.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.2.len().cmp(&a.2.len())));
+            let chunks = all.len().min(24);
+            let mut buckets: Vec<(usize, Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>)> =
+                (0..chunks).map(|_| (0, Vec::new())).collect();
+            for (bytes, shadow, spans) in all {
+                let target = buckets
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(_, &(w, ref v))| (w, v.len()))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                buckets[target].0 = buckets[target].0.saturating_add(bytes);
+                buckets[target].1.push((shadow, spans));
             }
+            buckets.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                .into_iter()
+                .filter(|(_, part)| !part.is_empty())
+                .map(|(_, part)| {
+                    Box::new(move || {
+                        for (shadow, spans) in part {
+                            for (from, to) in spans {
+                                Self::update(&shadow, from, to);
+                            }
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(
