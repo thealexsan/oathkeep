@@ -2421,6 +2421,91 @@ struct Workers {
     more: std::sync::Condvar,
 }
 
+#[cfg(windows)]
+fn physical_core_count() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    let mut len = 0u32;
+    // SAFETY: query required buffer size with null pointer.
+    unsafe {
+        GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len);
+    }
+    if len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: `buf` is `len` writable bytes; walks `Size`-delimited records inside `buf[..len]`.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            buf.as_mut_ptr().cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let mut cores = 0usize;
+    let mut offset = 0usize;
+    let valid_len = (len as usize).min(buf.len());
+    while offset + size_of::<u32>() * 2 <= valid_len {
+        // SAFETY: `offset` is within `valid_len` and aligned via `read_unaligned`.
+        let rec = unsafe {
+            buf.as_ptr()
+                .add(offset)
+                .cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()
+                .read_unaligned()
+        };
+        let step = rec.Size as usize;
+        if step == 0 || offset + step > valid_len {
+            break;
+        }
+        if rec.Relationship == RelationProcessorCore {
+            cores += 1;
+        }
+        offset += step;
+    }
+    (cores > 0).then_some(cores)
+}
+
+#[cfg(not(windows))]
+fn physical_core_count() -> Option<usize> {
+    None
+}
+
+fn resolve_pool_workers(
+    env_override: Option<usize>,
+    physical_cores: Option<usize>,
+    logical_threads: usize,
+    min_w: usize,
+    max_w: usize,
+) -> usize {
+    if let Some(n) = env_override {
+        return n.clamp(1, 16);
+    }
+    let base = match physical_cores {
+        Some(phys) => phys.saturating_sub(1),
+        None if logical_threads >= 8 => (logical_threads / 2).saturating_sub(1),
+        None => logical_threads.saturating_sub(2),
+    };
+    base.clamp(min_w, max_w)
+}
+
+pub(crate) fn wide_worker_count() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let env_n = std::env::var("OATHKEEP_WIDE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        let avail = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(6);
+        resolve_pool_workers(env_n, physical_core_count(), avail, 2, 6)
+    })
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -2429,9 +2514,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism()
-            .map_or(4, |n| n.get().saturating_sub(2))
-            .clamp(2, 8);
+        let n = wide_worker_count();
         for i in 0..n {
             let _ = std::thread::Builder::new()
                 .name(format!("oathkeep-wide-{i}"))
@@ -2513,10 +2596,13 @@ fn heap_workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let count = std::thread::available_parallelism()
+        let env_n = std::env::var("OATHKEEP_HEAP_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        let avail = std::thread::available_parallelism()
             .map(usize::from)
-            .unwrap_or(4)
-            .clamp(2, 8);
+            .unwrap_or(6);
+        let count = resolve_pool_workers(env_n, physical_core_count(), avail, 2, 6);
         for i in 0..count {
             let _ = std::thread::Builder::new()
                 .name(format!("oathkeep-heap-{i}"))
@@ -2549,10 +2635,13 @@ pub(crate) fn wide_heap_run(jobs: Vec<Job>) {
 fn stale_worker_count() -> usize {
     static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *COUNT.get_or_init(|| {
-        std::thread::available_parallelism()
+        let env_n = std::env::var("OATHKEEP_STALE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        let avail = std::thread::available_parallelism()
             .map(usize::from)
-            .unwrap_or(4)
-            .clamp(2, 4)
+            .unwrap_or(6);
+        resolve_pool_workers(env_n, physical_core_count(), avail, 2, 4)
     })
 }
 
@@ -9370,6 +9459,29 @@ mod window_tests {
         }
         assert_eq!(old_piece, new_piece);
         let _ = PAGE;
+    }
+
+    #[test]
+    fn resolve_pool_workers_matches_physical_cores_and_overrides() {
+        use super::{physical_core_count, resolve_pool_workers};
+
+        // 6 physical / 12 logical CPU: wide = 5 (+ caller = 6), stale = 4 (+ caller = 5).
+        assert_eq!(resolve_pool_workers(None, Some(6), 12, 2, 6), 5);
+        assert_eq!(resolve_pool_workers(None, Some(6), 12, 2, 4), 4);
+        // Fallback when physical core count is unavailable on SMT host.
+        assert_eq!(resolve_pool_workers(None, None, 12, 2, 6), 5);
+        // Smaller and larger hosts stay within [min_w, max_w].
+        assert_eq!(resolve_pool_workers(None, Some(2), 4, 2, 6), 2);
+        assert_eq!(resolve_pool_workers(None, Some(16), 32, 2, 6), 6);
+        // Explicit env overrides clamp to [1, 16].
+        assert_eq!(resolve_pool_workers(Some(3), Some(6), 12, 2, 6), 3);
+        assert_eq!(resolve_pool_workers(Some(0), Some(6), 12, 2, 6), 1);
+        assert_eq!(resolve_pool_workers(Some(32), Some(6), 12, 2, 6), 16);
+
+        if cfg!(windows) {
+            let phys = physical_core_count();
+            assert!(phys.is_some_and(|n| n >= 1));
+        }
     }
 }
 

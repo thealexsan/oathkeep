@@ -267,6 +267,7 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     fresh_tables: DrawFastMap<(usize, u32, u128), FreshTable>,
+    fresh_pool: Vec<FreshTable>,
     mirrored_done: DrawFastMap<(usize, u32), MirroredDone>,
     local_copy_seq: u64,
     local_refreshed: DrawFastSet<(usize, u64, u64)>,
@@ -274,6 +275,8 @@ pub(crate) struct State {
     local_tex_state_seq: u64,
     local_tex_copy_seq: u64,
     cbv_scratch_cache: DrawFastMap<(u64, u64, u64), (u64, u64, ID3D12Resource, u64)>,
+    cbv_fill_cache: DrawFastMap<(u64, u32), u64>,
+    cbv_fill_epoch: [u64; 3],
     kept_ptrs: DrawFastSet<usize>,
     kept_list_gen: u64,
     dynamic: Vec<(usize, u32, u32)>,
@@ -305,6 +308,8 @@ impl Drop for State {
 impl State {
     pub(crate) fn tables_done(&mut self) {
         self.cbv_scratch_cache.clear();
+        self.cbv_fill_cache.clear();
+        self.cbv_fill_epoch = [0; 3];
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }
@@ -316,6 +321,16 @@ impl State {
         }
         for (heap, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, first, n);
+        }
+        for (_, mut entry) in self.fresh_tables.drain() {
+            if self.fresh_pool.len() >= 512 {
+                break;
+            }
+            entry.deps.clear();
+            entry.refresh_buffers.clear();
+            entry.uav_buffers.clear();
+            entry.textures.clear();
+            self.fresh_pool.push(entry);
         }
         self.fresh_tables.clear();
         self.mirrored_done.clear();
@@ -341,6 +356,8 @@ impl State {
             self.local_tex_ready.clear();
             self.local_tex_state_seq = 0;
             self.local_tex_copy_seq = 0;
+            self.cbv_fill_cache.clear();
+            self.cbv_fill_epoch = [0; 3];
             self.windows.clear();
             self.windows_epoch = 0;
             self.kept_list_gen = list_gen;
@@ -3447,11 +3464,27 @@ impl State {
             {
                 return false;
             }
-            if done.seq != list.state_seq() {
-                return false;
+            if done.seq == list.state_seq()
+                && !(!have_uav && TESTED_DEPTH.get().0 == done.aux as usize && done.aux != 0)
+            {
+                return true;
             }
-            if !have_uav && TESTED_DEPTH.get().0 == done.aux as usize && done.aux != 0 {
-                return false;
+            let resource = done.aux as usize;
+            let kind = if have_uav {
+                ResourceType::Uav
+            } else {
+                ResourceType::Srv
+            };
+            let was_twin = readable_texture_in(
+                &mut self.local_tex_ready,
+                &mut self.local_tex_state_seq,
+                &mut self.local_tex_copy_seq,
+                list,
+                resource,
+                kind,
+            );
+            if !was_twin && let Some(entry) = self.mirrored_done.get_mut(&(heap_id, index)) {
+                entry.seq = list.state_seq();
             }
             return true;
         }
@@ -3706,6 +3739,7 @@ impl State {
         if plans.is_empty() && indexed.is_empty() {
             return;
         }
+        self.sync_list_gen(list.reset_gen());
         let mut slot_heaps: [Option<(u64, Option<&'static crate::descriptor::Heap>)>; 32] =
             [None; 32];
         let resolve_slot = |state: &State,
@@ -4195,13 +4229,21 @@ impl State {
                     used_k.len() as u64,
                 );
             }
-            let mut deps: Vec<(u64, u64)> = Vec::new();
+            let mut recycled = self.fresh_pool.pop();
+            let mut deps: Vec<(u64, u64)> = recycled
+                .as_mut()
+                .map_or_else(Vec::new, |r| std::mem::take(&mut r.deps));
             let mut has_gpu_active_cbv = false;
             let mut refresh_buffers: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-                Vec::new();
-            let mut uav_buffers: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-                Vec::new();
-            let mut textures: Vec<(usize, ResourceType)> = Vec::new();
+                recycled
+                    .as_mut()
+                    .map_or_else(Vec::new, |r| std::mem::take(&mut r.refresh_buffers));
+            let mut uav_buffers: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = recycled
+                .as_mut()
+                .map_or_else(Vec::new, |r| std::mem::take(&mut r.uav_buffers));
+            let mut textures: Vec<(usize, ResourceType)> = recycled
+                .as_mut()
+                .map_or_else(Vec::new, |r| std::mem::take(&mut r.textures));
             let mut any_twin_tex = false;
             let record_uav_writes = STORES.get() || !write_skip();
             self.dynamic.push((heap_id, first, span));
@@ -4210,7 +4252,6 @@ impl State {
             let mut entry_cursor = 0usize;
             #[cfg(feature = "diagnostics")]
             let t_make = std::time::Instant::now();
-            self.sync_list_gen(list.reset_gen());
             let mut premade = std::mem::take(&mut self.scratch_dyn_made);
             let kept_ptrs = &self.kept_ptrs;
             #[cfg(feature = "diagnostics")]
@@ -4285,15 +4326,29 @@ impl State {
                             continue;
                         }
                     }
-                    let Some((gpu, to)) = list.scratch(size_u64) else {
-                        host.make_null_dynamic(index);
-                        #[cfg(feature = "diagnostics")]
-                        {
-                            cbv_ns += t_cbv.elapsed().as_nanos() as u64;
+                    let cur_epoch = [list.copy_seq(), list.gpu_write_seq(), list.fill_seq()];
+                    if self.cbv_fill_epoch != cur_epoch {
+                        self.cbv_fill_cache.clear();
+                        self.cbv_fill_epoch = cur_epoch;
+                    }
+                    let gpu = if let Some(&cached_gpu) = self.cbv_fill_cache.get(&(address, size)) {
+                        cached_gpu
+                    } else {
+                        let Some(allocated_gpu) =
+                            list.scratch_and_defer_fill(address as *const u8, size_u64)
+                        else {
+                            host.make_null_dynamic(index);
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                cbv_ns += t_cbv.elapsed().as_nanos() as u64;
+                            }
+                            continue;
+                        };
+                        if self.cbv_fill_cache.len() < 4096 {
+                            self.cbv_fill_cache.insert((address, size), allocated_gpu);
                         }
-                        continue;
+                        allocated_gpu
                     };
-                    list.defer_fill(to, address as *const u8, size as usize);
                     host.constant_at_dynamic(index, gpu, size);
                     #[cfg(feature = "diagnostics")]
                     {
@@ -4342,9 +4397,9 @@ impl State {
                     self.keep_dynamic(list, &res);
                 }
                 let kind = used_kind.or_else(|| {
-                    self.scratch_selected
-                        .binary_search(&k)
-                        .ok()
+                    (!self.scratch_selected.is_empty())
+                        .then(|| self.scratch_selected.binary_search(&k).ok())
+                        .flatten()
                         .and_then(|_| made.view_kind)
                 });
                 if let Some(kind) = kind {
@@ -4405,9 +4460,6 @@ impl State {
                     && made.is_texture
                 {
                     host.texture_slot_tabled(title + k, kind.is_some());
-                    if kind.is_some() && !host.made_key_matches_words(title + k, words) {
-                        host.mirror(title + k, table + u64::from(k) * 32, true);
-                    }
                 }
                 #[cfg(feature = "diagnostics")]
                 {
@@ -5564,5 +5616,36 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_eq!(a, hash(&[[1, 2, 3], [4, 5, 6]]));
+    }
+
+    #[test]
+    fn state_tables_done_recycles_fresh_tables_and_clears_cbv_fill_cache() {
+        use super::{FreshTable, State};
+
+        let mut state = State::default();
+        state.cbv_fill_cache.insert((0x1000_0000, 256), 0x8000_0000);
+        state.cbv_fill_epoch = [1, 2, 3];
+        state.fresh_tables.insert(
+            (1, 4, 42),
+            FreshTable {
+                offset: 64,
+                bindless_seq: 1,
+                copy_seq: 1,
+                uav_done_seq: 1,
+                tex_state_seq: 1,
+                deps: vec![(10, 2)],
+                has_gpu_active_cbv: false,
+                refresh_buffers: Vec::new(),
+                uav_buffers: Vec::new(),
+                textures: vec![(0x2000, oathkeep_shader::ResourceType::Srv)],
+            },
+        );
+        state.tables_done();
+        assert!(state.cbv_fill_cache.is_empty());
+        assert_eq!(state.cbv_fill_epoch, [0; 3]);
+        assert!(state.fresh_tables.is_empty());
+        assert_eq!(state.fresh_pool.len(), 1);
+        assert!(state.fresh_pool[0].deps.is_empty());
+        assert!(state.fresh_pool[0].textures.is_empty());
     }
 }

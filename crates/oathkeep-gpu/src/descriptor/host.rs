@@ -2601,7 +2601,11 @@ impl HostHeap {
                 let mut srcs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); CHUNK];
                 let mut n_copy = 0usize;
                 for &(out_i, dst_idx, key, stripe_idx) in &candidates[..n_cand] {
-                    let pos = stripes[..uniq].binary_search(&stripe_idx).unwrap();
+                    let pos = if uniq == 1 {
+                        0
+                    } else {
+                        stripes[..uniq].binary_search(&stripe_idx).unwrap()
+                    };
                     let guard = guards[pos].as_ref().unwrap();
                     if let Some(&local) = guard.map.get(&key)
                         && let Some(entry) = guard.entries[local].as_ref()
@@ -3410,6 +3414,7 @@ impl HostHeap {
             .map(|(view, ..)| view)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn made_key_matches_words(&self, index: u32, words: [u32; 3]) -> bool {
         if words[0] != VIEW_TAG || index >= self.count {
             return false;

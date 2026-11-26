@@ -876,6 +876,7 @@ pub(crate) struct HostList {
     copy_seq: std::sync::atomic::AtomicU64,
     state_seq: std::sync::atomic::AtomicU64,
     gpu_write_seq: std::sync::atomic::AtomicU64,
+    fill_seq: std::sync::atomic::AtomicU64,
     reset_gen: std::sync::atomic::AtomicU64,
     uav_dirty: std::sync::atomic::AtomicBool,
     indirect_uav_dirty: std::sync::atomic::AtomicBool,
@@ -1082,6 +1083,16 @@ struct PreludeWorkers {
     more: std::sync::Condvar,
 }
 
+fn prelude_worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::env::var("OATHKEEP_PRELUDE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(2, |n| n.clamp(1, 4))
+    })
+}
+
 fn prelude_workers() -> &'static PreludeWorkers {
     static WORKERS: OnceLock<PreludeWorkers> = OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1090,7 +1101,8 @@ fn prelude_workers() -> &'static PreludeWorkers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        for i in 0..2 {
+        let count = prelude_worker_count();
+        for i in 0..count {
             let _ = std::thread::Builder::new()
                 .name(format!("oathkeep-prelude-{i}"))
                 .spawn(move || {
@@ -1155,7 +1167,8 @@ impl Drop for PreludeJoin {
 }
 
 fn spawn_preludes(host: &Host, plans: Vec<(usize, SendPreludePlan)>) -> PreludeJoin {
-    let worker_count = if plans.len() >= 4 { 2 } else { 1 };
+    let max_workers = prelude_worker_count();
+    let worker_count = if plans.len() >= 4 { max_workers } else { 1 };
     let mut buckets: Vec<Vec<(usize, SendPreludePlan)>> =
         (0..worker_count).map(|_| Vec::new()).collect();
     for (i, item) in plans.into_iter().enumerate() {
@@ -4211,6 +4224,7 @@ impl Host {
                 copy_seq: std::sync::atomic::AtomicU64::new(0),
                 state_seq: std::sync::atomic::AtomicU64::new(0),
                 gpu_write_seq: std::sync::atomic::AtomicU64::new(0),
+                fill_seq: std::sync::atomic::AtomicU64::new(0),
                 reset_gen: std::sync::atomic::AtomicU64::new(1),
                 uav_dirty: std::sync::atomic::AtomicBool::new(true),
                 indirect_uav_dirty: std::sync::atomic::AtomicBool::new(true),
@@ -7360,6 +7374,10 @@ impl HostList {
         self.gpu_write_seq.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn fill_seq(&self) -> u64 {
+        self.fill_seq.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn reset_gen(&self) -> u64 {
         self.reset_gen.load(Ordering::Relaxed)
     }
@@ -7585,6 +7603,7 @@ impl HostList {
         self.state_seq.store(0, Ordering::Relaxed);
         self.gpu_write_seq.store(0, Ordering::Relaxed);
         self.state_clobbered.store(false, Ordering::Relaxed);
+        self.fill_seq.store(0, Ordering::Relaxed);
         self.reset_gen.fetch_add(1, Ordering::Relaxed);
         let old_deferred = std::mem::take(&mut *self.deferred());
         let old_states =
@@ -8054,6 +8073,13 @@ impl HostList {
             .push(Step::Fill(dst as usize, src as usize, len));
     }
 
+    /// Allocates 256-byte-aligned scratch upload memory and queues `Step::Fill` from `src`.
+    pub(crate) fn scratch_and_defer_fill(&self, src: *const u8, len: u64) -> Option<u64> {
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        Some(gpu)
+    }
+
     pub(crate) fn defer_refresh(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -8354,6 +8380,7 @@ impl HostList {
         self.copy_seq.fetch_add(1, Ordering::Relaxed);
         self.state_seq.fetch_add(1, Ordering::Relaxed);
         self.gpu_write_seq.fetch_add(1, Ordering::Relaxed);
+        self.fill_seq.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
@@ -8361,6 +8388,7 @@ impl HostList {
     }
 
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
+        self.fill_seq.fetch_add(1, Ordering::Relaxed);
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
@@ -8807,27 +8835,25 @@ impl Batch {
         }
     }
 
-    fn push_refresh_jobs(
-        refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
-        jobs: &mut Vec<Box<dyn FnOnce() + Send>>,
-    ) {
-        if refreshes.is_empty() {
-            return;
+    fn partition_refresh_buckets<T>(
+        items: Vec<(T, Vec<(usize, usize)>)>,
+        max_chunks: usize,
+    ) -> Vec<(usize, Vec<(T, Vec<(usize, usize)>)>)> {
+        if items.is_empty() {
+            return Vec::new();
         }
-        let mut all: Vec<_> = refreshes
+        let mut all: Vec<_> = items
             .into_iter()
-            .map(|(shadow, spans)| {
+            .map(|(item, spans)| {
                 let bytes: usize = spans.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
-                (bytes, shadow, spans)
+                (bytes, item, spans)
             })
             .collect();
         all.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.2.len().cmp(&a.2.len())));
-        let chunks = all.len().min(24);
-        let mut buckets: Vec<(
-            usize,
-            Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
-        )> = (0..chunks).map(|_| (0, Vec::new())).collect();
-        for (bytes, shadow, spans) in all {
+        let chunks = all.len().min(max_chunks.max(1));
+        let mut buckets: Vec<(usize, Vec<(T, Vec<(usize, usize)>)>)> =
+            (0..chunks).map(|_| (0, Vec::new())).collect();
+        for (bytes, item, spans) in all {
             let target = buckets
                 .iter()
                 .enumerate()
@@ -8835,10 +8861,20 @@ impl Batch {
                 .map(|(i, _)| i)
                 .unwrap_or(0);
             buckets[target].0 = buckets[target].0.saturating_add(bytes);
-            buckets[target].1.push((shadow, spans));
+            buckets[target].1.push((item, spans));
         }
         buckets.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        for (_, part) in buckets {
+        buckets
+    }
+
+    fn push_refresh_jobs(
+        refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
+        jobs: &mut Vec<Box<dyn FnOnce() + Send>>,
+    ) {
+        let max_chunks = crate::shadow::wide_worker_count()
+            .saturating_mul(2)
+            .clamp(4, 12);
+        for (_, part) in Self::partition_refresh_buckets(refreshes, max_chunks) {
             if !part.is_empty() {
                 jobs.push(Box::new(move || {
                     for (shadow, spans) in part {
@@ -8889,7 +8925,11 @@ impl Batch {
         if self.refreshes.len() >= 2 {
             let mut guarded_ranges: Vec<(usize, usize)> = Vec::new();
             for (shadow, spans) in &self.refreshes {
-                if shadow.guarded() && !shadow.writes_pending() && !shadow.is_in_place() {
+                if shadow.guarded()
+                    && !shadow.writes_pending()
+                    && !shadow.is_in_place()
+                    && !shadow.is_guarded_clean()
+                {
                     guarded_ranges.extend_from_slice(spans);
                 }
             }
@@ -8901,7 +8941,7 @@ impl Batch {
             let started = std::time::Instant::now();
             let before_buf = PREPARING[0].load(Ordering::Relaxed);
             let before_tex = PREPARING[2].load(Ordering::Relaxed);
-            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(32);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(24);
             let all_refreshes: Vec<_> = self.refreshes.drain(..).collect();
             Self::push_refresh_jobs(all_refreshes, &mut jobs);
             if !self.pending_textures.is_empty() {
@@ -8909,15 +8949,18 @@ impl Batch {
                 texs.sort_unstable_by(|a, b| {
                     b.1.saturating_sub(b.0).cmp(&a.1.saturating_sub(a.0))
                 });
-                if texs.len() <= 16 {
+                let max_tex_buckets = crate::shadow::wide_worker_count()
+                    .saturating_mul(2)
+                    .clamp(4, 12);
+                if texs.len() <= max_tex_buckets {
                     for (_, _, staging) in texs {
                         jobs.push(Box::new(move || staging.refresh()));
                     }
                 } else {
                     let mut tex_buckets: Vec<Vec<std::sync::Arc<crate::texture::Staging>>> =
-                        (0..16).map(|_| Vec::new()).collect();
+                        (0..max_tex_buckets).map(|_| Vec::new()).collect();
                     for (i, (_, _, staging)) in texs.into_iter().enumerate() {
-                        tex_buckets[i % 16].push(staging);
+                        tex_buckets[i % max_tex_buckets].push(staging);
                     }
                     for part in tex_buckets {
                         if !part.is_empty() {
@@ -11170,5 +11213,25 @@ mod batch {
         assert_eq!(commit_idle_frames(Some(3000 * mib)), 4);
         assert_eq!(commit_idle_frames(Some(2000 * mib)), 2);
         assert_eq!(commit_idle_frames(Some(1000 * mib)), 1);
+    }
+
+    #[test]
+    fn batch_partition_refresh_buckets_caps_and_balances_items() {
+        let items: Vec<(usize, Vec<(usize, usize)>)> = (0..30usize)
+            .map(|i| (i, vec![(0x1000, 0x1000 + (i + 1) * 4096)]))
+            .collect();
+        let max_chunks = crate::shadow::wide_worker_count()
+            .saturating_mul(2)
+            .clamp(4, 12);
+        let buckets = Batch::partition_refresh_buckets(items, max_chunks);
+        assert_eq!(buckets.len(), max_chunks);
+        assert_eq!(
+            buckets.iter().map(|(_, v)| v.len()).sum::<usize>(),
+            30
+        );
+        // LPT balances total bytes across buckets and orders largest-first.
+        for pair in buckets.windows(2) {
+            assert!(pair[0].0 >= pair[1].0);
+        }
     }
 }
