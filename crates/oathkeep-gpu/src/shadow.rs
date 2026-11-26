@@ -3607,7 +3607,7 @@ fn let_go_idle_with(urgent: bool) {
         if let Some(mut map) = map
             && !map.is_empty()
         {
-            let idle: Vec<(u64, u64)> = map
+            let idle: Vec<u64> = map
                 .iter()
                 .filter(|(_, s)| {
                     Arc::strong_count(s) == 1
@@ -8222,8 +8222,10 @@ fn longest_tail(
     longest_tail_grid(windows, address, end, window())
 }
 
+pub(crate) const ALIGNED_WINDOW: u64 = 64 << 10;
+
 static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
-static ALIGNED: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
+static ALIGNED: RwLock<BTreeMap<u64, Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 static ALIGNED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[inline]
@@ -8231,52 +8233,192 @@ pub(crate) fn has_aligned() -> bool {
     ALIGNED_LEN.load(Ordering::Relaxed) != 0
 }
 
-pub(crate) fn find_aligned_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    if !has_aligned() {
-        return None;
+fn aligned_window_bounds(
+    view_start: u64,
+    view_len: u64,
+    align: u64,
+    region_start: u64,
+    region_end: u64,
+) -> Option<(u64, u64)> {
+    let align = align.max(1);
+    let need = view_len.max(1);
+    let view_end = view_start.checked_add(need)?;
+    let region_start = region_start.min(view_start);
+    let region_end = region_end.max(view_end);
+
+    let page = view_start & !(ALIGNED_WINDOW - 1);
+    let phase = (view_start - page) % align;
+    let mut win_start = page + phase;
+    if win_start < region_start {
+        let steps = (region_start - win_start).div_ceil(align);
+        win_start += steps * align;
     }
-    let need = len.max(1);
-    let map = ALIGNED.read().unwrap_or_else(|e| e.into_inner());
-    map.range((address, need)..=(address, u64::MAX))
-        .next()
-        .map(|(_, s)| {
-            s.used.store(crate::host::moment(), Ordering::Relaxed);
-            s.clone()
-        })
+
+    let page_end = page.saturating_add(ALIGNED_WINDOW);
+    let rem = view_end % ALIGNED_WINDOW;
+    let aligned_end = if rem == 0 {
+        view_end
+    } else {
+        view_end.saturating_add(ALIGNED_WINDOW - rem)
+    };
+    let win_end = aligned_end.max(page_end).min(region_end).max(view_end);
+    Some((win_start, win_end))
 }
 
-/// Returns or creates a small dedicated host shadow whose start equals `address`,
-/// giving `offset(address) == 0` (divisible by any typed buffer element stride,
-/// e.g. `12` for `DXGI_FORMAT_R32G32B32_FLOAT`) and a 64 KiB-aligned host GPU VA
-/// (256-byte aligned for CBVs).
-pub(crate) fn find_aligned(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let need = len.max(1);
-    if let Some(s) = find_aligned_existing(address, need) {
-        return Some(s);
+fn is_committed_readable(
+    info: &windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION,
+) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
+    info.State == MEM_COMMIT
+        && info.Protect != 0
+        && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0
+}
+
+fn committed_region_bounds(
+    view_start: u64,
+    view_end: u64,
+    min_start: u64,
+    max_end: u64,
+) -> (u64, u64) {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: queries virtual memory attributes for `view_start`; does not dereference memory.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let n = unsafe { VirtualQuery(view_start as *const _, &mut info, size_of_val(&info)) };
+    if n != size_of_val(&info) || info.RegionSize == 0 || !is_committed_readable(&info) {
+        return (view_start, view_end);
     }
-    let mut map = ALIGNED.write().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = map.range((address, need)..=(address, u64::MAX)).next() {
+    let mut reg_start = info.BaseAddress as u64;
+    let mut reg_end = reg_start.saturating_add(info.RegionSize as u64);
+    while reg_end < max_end {
+        // SAFETY: as above.
+        let mut next: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(reg_end as *const _, &mut next, size_of_val(&next)) };
+        if n != size_of_val(&next) || next.RegionSize == 0 || !is_committed_readable(&next) {
+            break;
+        }
+        let next_end = (next.BaseAddress as u64).saturating_add(next.RegionSize as u64);
+        if next_end <= reg_end {
+            break;
+        }
+        reg_end = next_end;
+    }
+    while reg_start > min_start {
+        let probe = reg_start - 1;
+        // SAFETY: `reg_start > min_start >= 0`, so `probe` does not underflow.
+        let mut prev: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(probe as *const _, &mut prev, size_of_val(&prev)) };
+        if n != size_of_val(&prev) || prev.RegionSize == 0 || !is_committed_readable(&prev) {
+            break;
+        }
+        let prev_base = prev.BaseAddress as u64;
+        if prev_base >= reg_start {
+            break;
+        }
+        reg_start = prev_base;
+    }
+    (reg_start.min(view_start), reg_end.max(view_end))
+}
+
+fn guest_aligned_window(view_start: u64, view_len: u64, align: u64) -> Option<(u64, u64)> {
+    let align = align.max(1);
+    let need = view_len.max(1);
+    let view_end = view_start.checked_add(need)?;
+    let (raw_start, raw_end) = aligned_window_bounds(view_start, need, align, 0, u64::MAX)?;
+    let (buf_start, buf_end) = {
+        let map = buffers_read();
+        map.range(..=(view_start, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= view_end)
+            .map_or((raw_start, raw_end), |(k, e)| (k.0, e.end))
+    };
+    let min_start = raw_start.max(buf_start).min(view_start);
+    let max_end = raw_end.min(buf_end).max(view_end);
+    let (vq_start, vq_end) = committed_region_bounds(view_start, view_end, min_start, max_end);
+    let region_start = min_start.max(vq_start).min(view_start);
+    let region_end = max_end.min(vq_end).max(view_end);
+    aligned_window_bounds(view_start, need, align, region_start, region_end)
+}
+
+fn lookup_aligned_in(
+    map: &BTreeMap<u64, Arc<Shadow>>,
+    address: u64,
+    view_end: u64,
+    align: u64,
+) -> Option<Arc<Shadow>> {
+    let page = address & !(ALIGNED_WINDOW - 1);
+    let phase = (address - page) % align;
+    let fast_start = page + phase;
+    if let Some(s) = map.get(&fast_start)
+        && s.start + s.len >= view_end
+        && (address - s.start).is_multiple_of(align)
+    {
         s.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(s.clone());
     }
-    let size = need.checked_next_multiple_of(256)?;
+    for (_, s) in map.range(..=address).rev().take(64) {
+        if s.start + s.len >= view_end && (address - s.start).is_multiple_of(align) {
+            s.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(s.clone());
+        }
+    }
+    None
+}
+
+pub(crate) fn find_aligned_existing(address: u64, len: u64, align: u64) -> Option<Arc<Shadow>> {
+    if !has_aligned() {
+        return None;
+    }
+    let align = align.max(1);
+    let need = len.max(1);
+    let view_end = address.checked_add(need)?;
+    let map = ALIGNED.read().unwrap_or_else(|e| e.into_inner());
+    lookup_aligned_in(&map, address, view_end, align)
+}
+
+/// Returns or creates a phase-windowed 64 KiB aligned host shadow covering
+/// `[address, address + len)` such that `(address - shadow.start) % align == 0`.
+/// Multiple unaligned views on the same 64 KiB page and alignment phase share one
+/// committed D3D12 resource, with bounds clamped safely to the mapped guest region.
+pub(crate) fn find_aligned(address: u64, len: u64, align: u64) -> Option<Arc<Shadow>> {
+    let align = align.max(1);
+    let need = len.max(1);
+    let view_end = address.checked_add(need)?;
+    if let Some(s) = find_aligned_existing(address, need, align) {
+        return Some(s);
+    }
+    let (win_start, win_end) = guest_aligned_window(address, need, align)?;
+    let win_len = win_end - win_start;
+    let size = win_len.checked_next_multiple_of(256)?;
+    let mut map = ALIGNED.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = lookup_aligned_in(&map, address, view_end, align) {
+        return Some(s);
+    }
     let (buffer, data) = host()?.shared_buffer(size)?;
     crate::host::name(&buffer, || {
-        format!("aligned title view {address:#x}+{need:#x}")
+        format!("aligned title window {win_start:#x}+{win_len:#x}")
     });
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, need));
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, win_start, win_len));
     shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-    map.insert((address, need), shadow.clone());
+    if let Some(old) = map.insert(win_start, shadow.clone()) {
+        old.mark_dead();
+        bump_shadow_epochs(old.start, old.len);
+        SHADOW_GEN.fetch_add(1, Ordering::Release);
+        crate::host::retire(old);
+    }
     let total = map.len();
     ALIGNED_LEN.store(total, Ordering::Release);
     if total <= 16 || total.is_power_of_two() {
         tracing::info!(
-            start = format_args!("{address:#x}"),
-            len = need,
+            win_start = format_args!("{win_start:#x}"),
+            win_len,
+            align,
+            view_start = format_args!("{address:#x}"),
+            view_len = need,
             aligned_shadows = total,
-            "aligned sub-shadow created for unaligned view"
+            "phase-windowed aligned shadow created"
         );
     }
     Some(shadow)
@@ -8569,6 +8711,114 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    #[test]
+    fn phase_windowed_aligned_bounds_share_page_windows_and_clamp_to_regions() {
+        use super::{ALIGNED_WINDOW, aligned_window_bounds, committed_region_bounds, guest_aligned_window};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+
+        // 1. Multiple views in the same 64 KiB page with align = 12 (R32G32B32_FLOAT)
+        //    share ONE window per phase and yield exact FirstElement offsets.
+        let page = 0x2000_0000u64;
+        let reg_start = page - (128 << 10);
+        let reg_end = page + (256 << 10);
+
+        let v1_start = page + 0x100; // 256 % 12 == 4
+        let v2_start = page + 0x1000; // 4096 % 12 == 4 (same phase!)
+        let v3_start = page + 0x1004; // 4100 % 12 == 8 (different phase)
+        let w1 = aligned_window_bounds(v1_start, 120, 12, reg_start, reg_end).unwrap();
+        let w2 = aligned_window_bounds(v2_start, 240, 12, reg_start, reg_end).unwrap();
+        let w3 = aligned_window_bounds(v3_start, 120, 12, reg_start, reg_end).unwrap();
+        assert_eq!(w1, (page + 4, page + ALIGNED_WINDOW));
+        assert_eq!(w2, w1);
+        assert_eq!(w3, (page + 8, page + ALIGNED_WINDOW));
+        assert_eq!((v1_start - w1.0) % 12, 0);
+        assert_eq!((v2_start - w1.0) % 12, 0);
+        assert_eq!((v2_start - w1.0) / 12, (0x1000 - 4) / 12);
+        assert_eq!((v3_start - w3.0) % 12, 0);
+
+        // 2. Multiple static CBVs in the same 64 KiB page with align = 256.
+        let c1 = page + 0x140; // phase 0x40
+        let c2 = page + 0x2340; // phase 0x40 (same phase!)
+        let c3 = page + 0x2380; // phase 0x80
+        let cw1 = aligned_window_bounds(c1, 192, 256, reg_start, reg_end).unwrap();
+        let cw2 = aligned_window_bounds(c2, 320, 256, reg_start, reg_end).unwrap();
+        let cw3 = aligned_window_bounds(c3, 64, 256, reg_start, reg_end).unwrap();
+        assert_eq!(cw1, (page + 0x40, page + ALIGNED_WINDOW));
+        assert_eq!(cw2, cw1);
+        assert_eq!(cw3, (page + 0x80, page + ALIGNED_WINDOW));
+        assert_eq!((c1 - cw1.0) % 256, 0);
+        assert_eq!((c2 - cw1.0) % 256, 0);
+        assert_eq!((c3 - cw3.0) % 256, 0);
+
+        // 3. View spanning a 64 KiB page boundary extends win_end cleanly to the next 64 KiB boundary.
+        let cross_start = page + ALIGNED_WINDOW - 0x100 + 4; // 0x2000_ff04, phase = (65284 % 12) = 4
+        let cross_len = 0x400; // ends at 0x2001_0304 in next page
+        let cw_cross = aligned_window_bounds(cross_start, cross_len, 12, reg_start, reg_end).unwrap();
+        assert_eq!(cw_cross, (page + 4, page + 2 * ALIGNED_WINDOW));
+        assert!(cw_cross.0 <= cross_start);
+        assert!(cw_cross.1 >= cross_start + cross_len);
+        assert_eq!((cross_start - cw_cross.0) % 12, 0);
+
+        // 4. Clamping near guest region start and end (including regions < 64 KiB).
+        let tight_start = page + 0x1000;
+        let tight_end = page + 0x3000;
+        for &(vs, vl, align) in &[
+            (tight_start + 4, 120u64, 12u64),
+            (tight_start + 8, 240, 12),
+            (tight_start + 0x80, 192, 256),
+            (tight_end - 0x40, 0x40, 256),
+        ] {
+            let (ws, we) = aligned_window_bounds(vs, vl, align, tight_start, tight_end).unwrap();
+            assert!(ws >= tight_start, "ws={ws:#x} < tight_start={tight_start:#x}");
+            assert!(we <= tight_end, "we={we:#x} > tight_end={tight_end:#x}");
+            assert!(ws <= vs && we >= vs + vl);
+            assert_eq!((vs - ws) % align, 0);
+        }
+
+        // 5. Real VirtualAlloc reserve + partial commit verifies committed_region_bounds
+        //    and guest_aligned_window never extend into uncommitted pages.
+        // SAFETY: reserves a 256 KiB test range owned by this test and freed below.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * (ALIGNED_WINDOW as usize),
+                MEM_RESERVE,
+                PAGE_NOACCESS,
+            ) as u64
+        };
+        assert_ne!(base, 0);
+        let commit_start = base + ALIGNED_WINDOW + 0x2000;
+        let commit_len = 0x4000usize;
+        // SAFETY: committing a sub-range inside our reserved region.
+        let committed = unsafe {
+            VirtualAlloc(
+                commit_start as *const _,
+                commit_len,
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            ) as u64
+        };
+        assert_eq!(committed, commit_start);
+        let v_in_commit = commit_start + 4;
+        let (cr_start, cr_end) = committed_region_bounds(
+            v_in_commit,
+            v_in_commit + 120,
+            base + ALIGNED_WINDOW,
+            base + 2 * ALIGNED_WINDOW,
+        );
+        assert_eq!((cr_start, cr_end), (commit_start, commit_start + commit_len as u64));
+        let (gw_start, gw_end) = guest_aligned_window(v_in_commit, 120, 12).unwrap();
+        assert!(gw_start >= commit_start);
+        assert!(gw_end <= commit_start + commit_len as u64);
+        assert!(gw_start <= v_in_commit && gw_end >= v_in_commit + 120);
+        assert_eq!((v_in_commit - gw_start) % 12, 0);
+        // SAFETY: freeing our test allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 
     #[test]

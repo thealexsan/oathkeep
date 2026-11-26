@@ -3573,7 +3573,7 @@ impl State {
                 let size_u64 = u64::from(size);
                 let shadow = self.find_shadow(address, size_u64).and_then(|s| {
                     if !s.can_bind_cbv(address, size) && crate::shadow::has_aligned() {
-                        crate::shadow::find_aligned_existing(address, size_u64).or(Some(s))
+                        crate::shadow::find_aligned_existing(address, size_u64, 256).or(Some(s))
                     } else {
                         Some(s)
                     }
@@ -3953,7 +3953,7 @@ impl State {
                     let size_u64 = u64::from(size);
                     let shadow = self.find_shadow(address, size_u64).and_then(|s| {
                         if !s.can_bind_cbv(address, size) && crate::shadow::has_aligned() {
-                            crate::shadow::find_aligned_existing(address, size_u64).or(Some(s))
+                            crate::shadow::find_aligned_existing(address, size_u64, 256).or(Some(s))
                         } else {
                             Some(s)
                         }
