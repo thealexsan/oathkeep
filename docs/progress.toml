@@ -3,12 +3,12 @@ updated = "2026-11-26"
 commit = "perf/commit-reduction"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "11.9-17.5 fps heavy 3D steady (13.4 median / 17.5 peak, diag-run98: Fix AF1-AF2 clean 130.8s; reverted AD/AE regressions, kept AVX2/parallel wins, make_at -14-19% on heavy scenes, stale 5.8 ms, guards 8.6 ms, cfu -38% to 0.8 ms, 0 hangs/TDRs/refusals)"
-current_frame_ms = "57.2-84.2 ms heavy 3D (75.4 ms median, 57.2 ms peak, 0 refused dynamic slots, 0 crashes/TDRs, 0.0 ms median GPU wait)"
-current_gpu_ms = "0.0 ms median wait (80-93% busy; 100% CPU-bound: preparing 31.2-53.4 ms + between-submissions 27.6-43.3 ms)"
-current_preparing_ms = "31.2-53.4 ms (43.9 ms median: batch_flush 22.9 ms, stale 5.8 ms, prelude 3.6 ms, ask_once 3.4 ms, card 3.7 ms)"
+current_fps = "7.7-16.6 fps heavy 3D steady (12.8 median / 16.6 peak, diag-run105 at 61ccefc: 100% clean 130.2s, 0 exceptions, 0 GPU hangs/TDRs, 0 refusals; fixed VEH guard-page TOCTOU + relay hot-hash race)"
+current_frame_ms = "60.3-130.2 ms heavy 3D (77.4 ms median, 60.3 ms peak, 0 refused dynamic slots, 0 crashes/TDRs, 0.0 ms median GPU wait)"
+current_gpu_ms = "0.0 ms median wait (100% CPU-bound: preparing 31.3-56.3 ms + recording 106.8-174.1 ms across threads)"
+current_preparing_ms = "31.3-56.3 ms (46.2 ms median: batch_flush 17.9-29.4 ms, stale 4.5-7.6 ms, prelude 3.2-5.3 ms, ask_once 3.1-3.9 ms, card 3.0-4.3 ms)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~10-15 min (Fix AG: cut 22.9 ms batch_flush + 12.3 ms post-present + 65.9 ms recording tables -> 20-30+ FPS)"
+eta = "~20-30 min (cut batch_flush 18-29 ms + stale/ask_once 8-11 ms + recording bind/tables 107-174 ms -> steady 20-30+ FPS)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -331,6 +331,15 @@ label = "diag-run98"
 commit = "c059f27"
 fps = 17.5
 frame_ms = 57.2
-gpu_ms = "0.0 ms median wait (80-93% busy, 0 hangs/TDRs/refusals in 130.8s)"
+gpu_ms = "0.0 ms median wait (80-93% busy; hit unhandled 0xc0000005 at ~125s)"
 preparing_ms = "31.2-53.4 ms (43.9 ms median: batch_flush 22.9 ms, stale 5.8 ms, guards 8.6 ms, cfu 0.8 ms)"
-status = "Fix AF1-AF2 verified clean (AD/AE regressions reverted + fence wake + recording caches): 17.5 fps peak (57.2 ms/f, vs 16.8 in run94), make_at -14-19% on heavy scenes, cfu -38%, stale -7%; critical path confirmed = prep (43.9 ms, half in batch_flush) + between-submissions (30 ms: 12.3 ms post-present + 5 rec threads 30-36 ms each in bind/tables/make_at) -> next: Fix AG"
+status = "Fix AF1-AF2 peak 17.5 fps (57.2 ms/f), but late crash at ~125s traced to AF1/AF2/AG2 races (subsequently reverted & fixed in f73fd1a + 61ccefc)"
+
+[[runs]]
+label = "diag-run105"
+commit = "61ccefc"
+fps = 16.6
+frame_ms = 60.3
+gpu_ms = "0.0 ms median wait (0 hangs/TDRs/exceptions/refusals in 130.2s)"
+preparing_ms = "31.3-56.3 ms (46.2 ms median: batch_flush 17.9-29.4 ms, stale 4.5-7.6 ms, prelude 3.2-5.3 ms, ask_once 3.1-3.9 ms)"
+status = "100% CLEAN 130.2s baseline! Fixed relay hot-hash race (f73fd1a) + VEH guard-page TOCTOU in watch.rs::handle_write_fault (61ccefc). Zero CPU exceptions, zero GPU hangs, zero refusals, 7.7-16.6 fps steady 3D (12.8 median / 16.6 peak) -> next: safe CPU optimizations for batch_flush, stale/ask_once, and recording bind/tables to hit 20-30+ FPS"
