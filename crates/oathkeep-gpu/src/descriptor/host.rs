@@ -1517,13 +1517,11 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
-/// Dynamic-slot budget on a [`PORTABLE_VIEWS`] (1,000,000) capped heap when the
-/// title's heap exceeds `null - DYNAMIC`: `State::tables_done` reclaims dynamic
-/// slots at every submission fence and `State::fresh_tables` deduplicates tables
-/// within each list, so `2^17` (131,072) dynamic slots leaves `868,927` direct
-/// 1:1 bindless slots (`~148,000` slots of headroom above the `~721,000` peak
-/// bindless index instead of `16,931`).
-pub(crate) const CAPPED_DYNAMIC: u32 = 1 << 17;
+/// Dynamic-slot budget on a [`PORTABLE_VIEWS`] (1,000,000) capped heap.
+/// Measured in `diag-fps-swarm2`: `1 << 17` (131,072) saturates
+/// (`peak_dynamic=131072`, `290` tables refused -> corrupted geometry), whereas
+/// `DYNAMIC` (`1 << 18`, 262,144) keeps dynamic table refusals at `0`.
+pub(crate) const CAPPED_DYNAMIC: u32 = DYNAMIC;
 
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
@@ -5555,13 +5553,13 @@ mod tests {
     #[test]
     fn capped_view_heap_dynamic_budget_and_telemetry() {
         // NVIDIA 1,000,000 cap (null = 999,999) with 1,245,184 title slots:
-        // uses CAPPED_DYNAMIC (131,072) so direct_slots widens to 868,927.
+        // keeps CAPPED_DYNAMIC (262,144) so dynamic table refusals stay at 0.
         assert_eq!(dynamic_slots_for(1_245_184, 999_999, None), CAPPED_DYNAMIC);
-        assert_eq!(999_999u32.saturating_sub(CAPPED_DYNAMIC), 868_927);
+        assert_eq!(999_999u32.saturating_sub(CAPPED_DYNAMIC), 737_855);
         // A title heap that fits alongside DYNAMIC on a 1,000,000 cap keeps DYNAMIC.
         assert_eq!(dynamic_slots_for(500_000, 999_999, None), DYNAMIC);
         // Explicit OATHKEEP_DYNAMIC_SLOTS override works on capped heaps and clamps safely.
-        assert_eq!(dynamic_slots_for(1_245_184, 999_999, Some(1 << 18)), 1 << 18);
+        assert_eq!(dynamic_slots_for(1_245_184, 999_999, Some(1 << 17)), 1 << 17);
         assert_eq!(dynamic_slots_for(1_245_184, 999_999, Some(1024)), 1 << 16);
         assert_eq!(dynamic_slots_for(1_245_184, 999_999, Some(900_000)), 999_999 / 2);
         // AMD uncapped (null = 2^21 - 1) leaves room for up to 4x DYNAMIC.

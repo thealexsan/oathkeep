@@ -3,12 +3,12 @@ updated = "2026-11-26"
 commit = "perf/commit-reduction"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "2.9-3.9 fps peak (256.1-339.4 ms/f) in diag-fps-swarm1 (145.3s TIMEOUT_CLEAN; peak VRAM 6,838/7,161 MB, 0 crashes/TDRs/OOMs)"
-current_frame_ms = "256.1-339.4 ms in diag-fps-swarm1 (preparing 157.4->99.2 ms, GPU 100.1->43.1 ms, copy-back 57.4->35.0 ms, land::rest 25.6->0.92 ms)"
-current_gpu_ms = "17.2-43.1 ms (145.3s TIMEOUT_CLEAN; peak VRAM 6,838/7,161 MB, -310 MB headroom, 0 depth-plane misses)"
-current_preparing_ms = "99.2 ms in diag-fps-swarm1 (-37% vs 157.4 ms; snapshots 24.7->13.6 ms, heap spans 3.9->0.5 ms, 0 refused buffer views)"
+current_fps = "0.9-3.1 fps in diag-fps-swarm2 (145.2s TIMEOUT_CLEAN; exposed & reverted 5d52155 card_steps/thin regression + CAPPED_DYNAMIC=131072 exhaustion; Wave64 5dc3b259/6f225b64 + async sweep + watch.rs verified)"
+current_frame_ms = "320.1-1057.9 ms in diag-fps-swarm2 (waiting for flights 52.7->0.1 ms, sweep 41-54->0.1 ms, guards 91.1->16.6-42.9 ms; reverted 5d52155 41-107 ms card-plan & 3.4s thin regression)"
+current_gpu_ms = "1.8-64.3 ms (145.2s TIMEOUT_CLEAN; 0 crashes/TDRs/OOMs, 0 failed Wave64 shaders, 0 refused PSOs)"
+current_preparing_ms = "128.2-443.9 ms in diag-fps-swarm2 (prior baseline 99.2 ms restored by reverting 5d52155 while keeping async sweep 0.1 ms + race-free watch.rs)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~20-35 min (Round 1 FPS swarm cut preparing -37%, copy-back -39%, VRAM -310 MB; Round 2 targets 91 ms GUARDS lock, 52 ms BEHIND_PLACED, and recording gap)"
+eta = "~20-35 min (Round 2 verified Wave64 fixes + async sweep + watch.rs + added oathkeep launch preloader; next: re-benchmark clean Round 2 & optimize card_steps/refreshes)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -406,3 +406,12 @@ frame_ms = 256.1
 gpu_ms = "17.2-43.1 ms (145.3s TIMEOUT_CLEAN, peak VRAM 6,838/7,161 MB, 0 crashes/TDRs/OOMs)"
 preparing_ms = "99.2 ms (-37% vs 157.4 ms; snapshots 13.6 ms, copy-back 35.0 ms, land::rest 0.92 ms, heap buffers 2.0-16.2 ms)"
 status = "Round 1 4-worker FPS swarm verified clean (95ccbe8..d1e5000): peak 3.9 fps (256.1 ms/f), steady 2.9-3.9 fps, preparing -37%, copy-back -39%, land::rest -96% (25.6->0.92 ms via bury recycler), snapshots -45%, DXGI VRAM -310 MB (6,838/7,161 MB), windows commit -586 MB (no-length -1,124 MB, 0 slot mismatches), crisp 1:1 in-world visuals (frame-1915..1939); exposed Round 2 blockers: 91.1 ms GUARDS lock wait from batched yields, 52.6 ms BEHIND_PLACED stall, ~200 ms CPU recording/thin-list gap, and 512 KiB window-count growth (3,810 windows)"
+
+[[runs]]
+label = "diag-fps-swarm2"
+commit = "289d0ea"
+fps = 3.1
+frame_ms = 320.1
+gpu_ms = "1.8-64.3 ms (145.2s TIMEOUT_CLEAN, 0 crashes/TDRs/OOMs, 0 failed Wave64 shaders)"
+preparing_ms = "128.2-443.9 ms (sweep 41-54->0.1 ms, guards 91.1->16.6-42.9 ms, waiting-for-flights 52.7->0.1 ms; regressed by 5d52155 41-107 ms card-plan + 3.4s thin)"
+status = "Round 2 capture verified Wave64 LDS fixes (5dc3b25986622949 & 6f225b641c5b0708 compiled/bound cleanly), async sweep (41-54->0.1 ms), and race-free watch.rs (guards 91->16-43 ms), with 1:1 late frames (frame-1661..1677); caught & immediately reverted 5d52155 card-plan/thin regression and CAPPED_DYNAMIC=131072 table exhaustion (290 refused -> early-frame stretched tris), and shipped oathkeep launch + scripts/launch.ps1 shader-warming preloader"

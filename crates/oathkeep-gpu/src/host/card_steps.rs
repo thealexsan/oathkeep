@@ -217,9 +217,7 @@ enum Does {
     /// A refresh of a host copy (named by its address).
     Refresh { shadow: usize, from: usize, to: usize },
     /// A copy that its list does on the card ([`place`]).
-    /// `cpu_src`: the list copies from upload scratch filled on the CPU.
-    /// `waits`: flights in the air write that CPU source.
-    Placed { dst: usize, src: usize, len: usize, cpu_src: bool, waits: bool },
+    Placed { dst: usize, src: usize, len: usize },
     /// Anything, anywhere.
     Run,
 }
@@ -238,86 +236,6 @@ fn reads_writes(d: &Does) -> Option<((usize, usize), (usize, usize))> {
     }
 }
 
-/// The sub-ranges `(offset_in_step, src_address, bytes)` that step `at` reads
-/// from initial/card-copied memory once earlier [`Does::Placed`] copies in the
-/// same submission are forwarded (`forward`), paired with the range step `at`
-/// writes. Intervening [`Does::Copy`] writes lock their sub-range so [`plan`]
-/// pulls that copy in instead of forwarding past it.
-fn placed_segments(does: &[Does], at: usize, forward: bool) -> Option<(Vec<(usize, usize, usize)>, (usize, usize))> {
-    let (r, w) = reads_writes(&does[at])?;
-    let total = r.1.saturating_sub(r.0);
-    if !forward || total == 0 {
-        return Some((vec![(0, r.0, total)], w));
-    }
-    let mut segs: Vec<(usize, usize, usize, bool)> = vec![(0, r.0, total, false)];
-    for k in (0..at).rev() {
-        if segs.iter().all(|s| s.3) {
-            break;
-        }
-        match does[k] {
-            Does::Copy { dst, len, .. } if len > 0 => {
-                let c = (dst, dst + len);
-                if !segs.iter().any(|&(_, a, n, locked)| !locked && meet((a, a + n), c)) {
-                    continue;
-                }
-                let mut next = Vec::with_capacity(segs.len() + 2);
-                for (off, a, n, locked) in segs {
-                    let b = a + n;
-                    if locked || !meet((a, b), c) {
-                        next.push((off, a, n, locked));
-                        continue;
-                    }
-                    if a < c.0 {
-                        next.push((off, a, c.0 - a, false));
-                    }
-                    let (lo, hi) = (a.max(c.0), b.min(c.1));
-                    next.push((off + (lo - a), lo, hi - lo, true));
-                    if b > c.1 {
-                        next.push((off + (c.1 - a), c.1, b - c.1, false));
-                    }
-                }
-                segs = next;
-            }
-            Does::Placed { dst, src, len, .. } if len > 0 => {
-                let p = (dst, dst + len);
-                if !segs.iter().any(|&(_, a, n, locked)| !locked && meet((a, a + n), p)) {
-                    continue;
-                }
-                let mut next = Vec::with_capacity(segs.len() + 2);
-                for (off, a, n, locked) in segs {
-                    let b = a + n;
-                    if locked || !meet((a, b), p) {
-                        next.push((off, a, n, locked));
-                        continue;
-                    }
-                    if a < p.0 {
-                        next.push((off, a, p.0 - a, false));
-                    }
-                    let (lo, hi) = (a.max(p.0), b.min(p.1));
-                    next.push((off + (lo - a), src + (lo - dst), hi - lo, false));
-                    if b > p.1 {
-                        next.push((off + (p.1 - a), p.1, b - p.1, false));
-                    }
-                }
-                segs = next;
-            }
-            _ => {}
-        }
-    }
-    let mut out: Vec<(usize, usize, usize)> = Vec::with_capacity(segs.len());
-    for (off, a, n, _) in segs {
-        if let Some(last) = out.last_mut()
-            && last.0 + last.2 == off
-            && last.1 + last.2 == a
-        {
-            last.2 += n;
-        } else {
-            out.push((off, a, n));
-        }
-    }
-    Some((out, w))
-}
-
 fn touched(ranges: &[(usize, usize)], r: (usize, usize)) -> bool {
     touches(ranges, r.0, r.1)
 }
@@ -330,44 +248,18 @@ fn touched(ranges: &[(usize, usize)], r: (usize, usize)) -> bool {
 /// only what a taken copy has not been told to write yet: bytes a step
 /// ahead of it reads, in title memory as it is.
 ///
-/// `forward`: when `by_order` is on and cross-list cuts have already been
-/// taken, steps behind a [`Does::Placed`] forward the overlapped sub-ranges of
-/// their reads to that placed copy's source instead of forcing a CPU flight
-/// wait, while leaving the placed copy's destination buffer untouched ahead of
-/// the list.
-///
-/// `behind`: for [`BEHIND_PLACED`], every `(placed, step_behind)` conflict.
+/// `behind`: for [`BEHIND_PLACED`], the copy at its place and the first step
+/// behind it that is in its way.
 ///
 /// Steps of a level are done together, every read before every write; a
 /// step that writes what an earlier one reads or writes, or reads what it
 /// writes, is of a higher level. Our list does them level by level.
-fn plan_with(
-    does: &[Does],
-    stage: u32,
-    by_order: bool,
-    forward: bool,
-    behind: &mut Vec<(usize, usize)>,
-) -> Result<Vec<(usize, u32)>, &'static str> {
-    behind.clear();
-    let forward = by_order && forward;
+fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
     let takes = |d: &Does| match *d {
         Does::Copy { .. } if stage < 2 => Err("a buffer copy (OATHKEEP_CARD_STEPS=2 does it on the card)"),
         Does::Fill { to: false, .. } => Err("a fill of memory the card cannot be given the bytes of"),
         _ => Ok(()),
     };
-    for (p, d) in does.iter().enumerate() {
-        if let Does::Placed { dst, src, len, waits, .. } = *d {
-            if waits {
-                return Err(BEHIND_PLACED);
-            }
-            if forward && dst != src && len > 0 && meet((dst, dst + len), (src, src + len)) {
-                return Err(BEHIND_PLACED);
-            }
-            let _ = p;
-        }
-    }
-    let resolved: Vec<Option<(Vec<(usize, usize, usize)>, (usize, usize))>> =
-        (0..does.len()).map(|i| placed_segments(does, i, forward)).collect();
     let mut taken = vec![false; does.len()];
     let (mut read, mut written) = (Vec::new(), Vec::new());
     let mut more = Vec::new();
@@ -386,17 +278,12 @@ fn plan_with(
         for i in std::mem::take(&mut more) {
             takes(&does[i])?;
             taken[i] = true;
-            if let Some((segs, w)) = &resolved[i] {
-                for &(_, a, n) in segs {
-                    let r = (a, a + n);
-                    if w.0 < w.1 && meet(r, *w) {
-                        return Err("a copy onto itself");
-                    }
-                    if r.0 < r.1 {
-                        reads.push(r);
-                    }
+            if let Some((r, w)) = reads_writes(&does[i]) {
+                if w.0 < w.1 && meet(r, w) {
+                    return Err("a copy onto itself");
                 }
-                writes.push(*w);
+                reads.push(r);
+                writes.push(w);
             }
         }
         join_ranges(&mut read, reads);
@@ -406,86 +293,54 @@ fn plan_with(
         if taken.iter().filter(|t| **t).count() > MOST {
             return Err("too many steps depend on it");
         }
-        let mut stale_cpu = written.clone();
         for (i, d) in does.iter().enumerate() {
-            if let Does::Placed { dst, src, len, .. } = *d
-                && len > 0
-                && (touched(&stale_cpu, (src, src + len)) || touched(&stale_cpu, (dst, dst + len)))
-            {
-                join_ranges(&mut stale_cpu, [(dst, dst + len)]);
-                continue;
-            }
             // A fill that cannot be taken is looked at below.
             if taken[i] || matches!(d, Does::Fill { to: false, .. }) {
                 continue;
             }
-            if let Some((segs, w)) = &resolved[i] {
-                let raw_r = reads_writes(d).map(|(r, _)| r).unwrap_or((0, 0));
-                if segs.iter().any(|&(_, a, n)| touched(&written, (a, a + n)))
-                    || touched(&stale_cpu, raw_r)
-                    || touched(&written, *w)
-                    || touched(&read, *w)
-                {
-                    more.push(i);
-                }
+            if let Some((r, w)) = reads_writes(d)
+                && (touched(&written, r) || touched(&written, w) || touched(&read, w))
+            {
+                more.push(i);
             }
         }
     }
     // A copy at its place in a list comes after what is done in front of all
-    // of them: without forwarding, any taken step behind it that reads its
-    // destination or writes its source or destination stands in its way; with
-    // forwarding, reads of its destination have been remapped to its source, so
-    // only taken writes behind it that touch its source or destination do.
+    // of them: as it should after the steps ahead of it, but not after those
+    // behind it that read or write its bytes.
     for (p, d) in does.iter().enumerate() {
-        if let Does::Placed { dst, src, len, .. } = *d
-            && ((!forward && touched(&read, (dst, dst + len)))
-                || touched(&written, (dst, dst + len))
-                || touched(&written, (src, src + len)))
+        if let Does::Placed { dst, src, len } = *d
+            && (touched(&read, (dst, dst + len)) || touched(&written, (dst, dst + len)) || touched(&written, (src, src + len)))
         {
             let (to, from) = ((dst, dst + len), (src, src + len));
             let in_the_way = |i: usize| {
-                resolved[i].as_ref().is_some_and(|(segs, w)| {
-                    (!forward && segs.iter().any(|&(_, a, n)| meet((a, a + n), to)))
-                        || (w.0 < w.1 && (meet(*w, to) || meet(*w, from)))
-                })
+                reads_writes(&does[i]).is_some_and(|(r, w)| meet(r, to) || w.0 < w.1 && (meet(w, to) || meet(w, from)))
             };
-            if !by_order {
+            let found = (p + 1..does.len()).find(|&i| taken[i] && in_the_way(i));
+            *behind = found.map(|i| (p, i));
+            if !by_order || found.is_some() {
                 return Err(BEHIND_PLACED);
             }
-            for i in (p + 1..does.len()).filter(|&i| taken[i] && in_the_way(i)) {
-                behind.push((p, i));
-            }
         }
-    }
-    if !behind.is_empty() {
-        return Err(BEHIND_PLACED);
     }
     let order: Vec<usize> = (0..does.len()).filter(|&i| taken[i]).collect();
     // What stays on the CPU and reads what an earlier taken copy writes
     // would read it too early.
-    let mut cpu_stale: Vec<(usize, usize)> = Vec::new();
+    let mut behind: Vec<(usize, usize)> = Vec::new();
     for (i, d) in does.iter().enumerate() {
         if taken[i] {
-            if let Some((_, w)) = &resolved[i]
+            if let Some((_, w)) = reads_writes(d)
                 && w.0 < w.1
             {
-                join_ranges(&mut cpu_stale, [*w]);
+                join_ranges(&mut behind, [w]);
             }
             continue;
         }
         match *d {
-            Does::Placed { dst, src, len, cpu_src, .. }
-                if touched(&cpu_stale, (src, src + len)) || touched(&cpu_stale, (dst, dst + len)) =>
-            {
-                if cpu_src && touched(&cpu_stale, (src, src + len)) {
-                    return Err(BEHIND_PLACED);
-                }
-                join_ranges(&mut cpu_stale, [(dst, dst + len)]);
-            }
-            Does::Read { from, to, .. } if touched(&cpu_stale, (from, to)) => {
+            Does::Read { from, to, .. } if touched(&behind, (from, to)) => {
                 return Err("a texture or expanded vertices read what it writes");
             }
-            Does::Fill { src, len, .. } if touched(&cpu_stale, (src, src + len)) => {
+            Does::Fill { src, len, .. } if touched(&behind, (src, src + len)) => {
                 return Err("a fill of memory the card cannot be given the bytes of reads what it writes");
             }
             _ => {}
@@ -496,7 +351,7 @@ fn plan_with(
     // stand behind others.
     let mut copies: Vec<usize> = Vec::new();
     for &i in &order {
-        let Some((segs, w)) = &resolved[i] else {
+        let Some((r, w)) = reads_writes(&does[i]) else {
             continue;
         };
         let writes = w.0 < w.1;
@@ -507,13 +362,10 @@ fn plan_with(
             if writes { Box::new(0..out.len()) } else { Box::new(copies.iter().copied()) };
         for k in ahead {
             let (j, at): (usize, u32) = out[k];
-            let Some((j_segs, jw)) = &resolved[j] else {
+            let Some((jr, jw)) = reads_writes(&does[j]) else {
                 continue;
             };
-            let dep = (jw.0 < jw.1 && segs.iter().any(|&(_, a, n)| meet(*jw, (a, a + n))))
-                || (writes && jw.0 < jw.1 && meet(*jw, *w))
-                || (writes && j_segs.iter().any(|&(_, a, n)| meet((a, a + n), *w)));
-            if at >= level && dep {
+            if at >= level && (meet(jw, r) || meet(jw, w) || meet(jr, w)) {
                 level = at + 1;
             }
         }
@@ -523,14 +375,6 @@ fn plan_with(
         out.push((i, level));
     }
     Ok(out)
-}
-
-#[cfg(test)]
-fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
-    let mut all = Vec::new();
-    let res = plan_with(does, stage, by_order, false, &mut all);
-    *behind = all.first().copied();
-    res
 }
 
 /// Whether a refresh of `does` brings a host copy other than `shadow` up to
@@ -565,34 +409,26 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
     Ok(shadow)
 }
 
-/// What the steps of `runs` do, and which step each is (its run index, its
-/// list by address, its place in it). `written`: what flights may write.
-fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize, usize)>) {
+/// What the steps of `runs` do, and which step each is (its list by address,
+/// its place in it). `written`: what flights may write.
+fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
     let mut does = Vec::new();
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
     let mut steps = Vec::new();
-    // Destinations of placed copies whose source or destination flights write:
-    // steps behind them cannot read stale title memory on the CPU either.
-    let mut placed_blocked: Vec<(usize, usize)> = Vec::new();
-    for (run_idx, list) in runs.iter().enumerate() {
+    for list in runs {
         for (i, step) in list.deferred().copies.iter().enumerate() {
             does.push(match step {
-                &Step::Copy(dst, src, len) => {
-                    let via_placed = touched(&placed_blocked, (src, src + len));
-                    if via_placed || copy_blocked(written, dst, src, len).is_some() {
-                        if via_placed {
-                            join_ranges(&mut placed_blocked, [(dst, dst + len)]);
-                        }
-                        Does::Copy { dst, src, len, asked: true }
-                    } else {
-                        Does::Copy { dst, src, len, asked: false }
-                    }
-                }
+                &Step::Copy(dst, src, len) => Does::Copy {
+                    dst,
+                    src,
+                    len,
+                    asked: copy_blocked(written, dst, src, len).is_some(),
+                },
                 Step::Fill(_, src, len, to) => Does::Fill {
                     src: *src,
                     len: *len,
-                    asked: read_blocked(written, *src, *len) || touched(&placed_blocked, (*src, *src + *len)),
+                    asked: read_blocked(written, *src, *len),
                     to: to.is_some(),
                 },
                 Step::Texture(staging) => {
@@ -600,57 +436,25 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     Does::Read {
                         from: at,
                         to: at + len,
-                        asked: touches(written, at, at + len) || touched(&placed_blocked, (at, at + len)),
+                        asked: touches(written, at, at + len),
                     }
                 }
-                &Step::Plane((at, len), _) => {
-                    let end = at.saturating_add(len);
-                    Does::Read {
-                        from: at,
-                        to: end,
-                        asked: touches(written, at, end) || touched(&placed_blocked, (at, end)),
-                    }
-                }
-                &Step::Host(_, (from, to)) if from < to => Does::Read {
-                    from,
-                    to,
-                    asked: touched(&placed_blocked, (from, to)),
+                &Step::Plane((at, len), _) => Does::Read {
+                    from: at,
+                    to: at.saturating_add(len),
+                    asked: touches(written, at, at.saturating_add(len)),
                 },
+                &Step::Host(_, (from, to)) if from < to => Does::Read { from, to, asked: false },
                 Step::Refresh(shadow, at, len) => Does::Refresh {
                     shadow: Arc::as_ptr(shadow) as usize,
                     from: *at,
                     to: *at + *len,
                 },
                 Step::Run(_) => Does::Run,
-                Step::Placed(p) => {
-                    let cpu_src = !crate::shadow::peek(p.src as u64, p.len as u64)
-                        .is_some_and(|s| s.written() && !s.in_place());
-                    let waits = match p.waits(written) {
-                        place::Waits::Yes => true,
-                        place::Waits::ForReaders => {
-                            join_ranges(&mut placed_blocked, [(p.dst, p.dst + p.len)]);
-                            false
-                        }
-                        place::Waits::No => {
-                            if touched(&placed_blocked, (p.src, p.src + p.len)) {
-                                join_ranges(&mut placed_blocked, [(p.dst, p.dst + p.len)]);
-                                cpu_src
-                            } else {
-                                false
-                            }
-                        }
-                    };
-                    Does::Placed {
-                        dst: p.dst,
-                        src: p.src,
-                        len: p.len,
-                        cpu_src,
-                        waits,
-                    }
-                }
+                Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
                 Step::GpuWrite(..) | Step::Host(..) => continue,
             });
-            steps.push((run_idx, std::ptr::from_ref::<HostList>(list) as usize, i));
+            steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
         }
     }
     (does, steps)
@@ -672,24 +476,14 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
     let (does, steps) = does_of(&written, runs);
-    let mut behind = Vec::new();
-    if plan_with(&does, stage(), true, false, &mut behind) != Err(BEHIND_PLACED) {
+    let mut behind = None;
+    if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
         return None;
     }
-    let splittable = |cut: usize| {
-        cut > 0
-            && cut < runs.len()
-            && !runs[..cut]
-                .iter()
-                .any(|a| runs[cut..].iter().any(|b| std::ptr::eq(*a, *b)))
-    };
-    behind
-        .into_iter()
-        .filter_map(|(placed, reader)| {
-            let cut = steps[placed].0 + 1;
-            (steps[reader].0 >= cut && splittable(cut)).then_some(cut)
-        })
-        .min()
+    let (placed, reader) = behind?;
+    let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
+    let cut = place(placed)? + 1;
+    (place(reader)? >= cut).then_some(cut)
 }
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
@@ -712,33 +506,19 @@ fn mapped(from: usize, to: usize, known: &mut HashMap<usize, ()>) -> bool {
 /// A table by addresses and numbers of ours.
 type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<AddressHash>>;
 
-/// Where the bytes of the fill that is `step` (its run index, its list by
-/// address, its place in it) go.
-fn fill_to(runs: &[&HostList], step: (usize, usize, usize)) -> Option<FillTo> {
-    let list = runs.get(step.0)?;
-    match list.deferred().copies.get(step.2)? {
+/// Where the bytes of the fill that is `step` (its list by address, its place
+/// in it) go.
+fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
+    let list = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == step.0)?;
+    match list.deferred().copies.get(step.1)? {
         Step::Fill(_, _, _, to) => to.clone(),
         _ => None,
     }
 }
 
-enum Source {
-    /// A host copy and the title address read from it.
-    Shadow(Arc<Shadow>, usize),
-    /// Bytes read from CPU title memory into `Own::staged` (`staged_offset`, `title_src`).
-    Staged(u64, usize),
-}
-
-struct ReadPiece {
-    source: Source,
-    /// Offset within the step's slice in `between`.
-    offset: u64,
-    len: usize,
-}
-
 /// A step done on the card.
 struct Op {
-    reads: Vec<ReadPiece>,
+    from: (Arc<Shadow>, usize),
     len: usize,
     /// Its place in the buffer between.
     at: u64,
@@ -815,13 +595,10 @@ fn record(
     }
 }
 
-/// The list in front of a submission's, its buffer ([`BETWEEN`] bytes), and
-/// optional reusable CPU-staged buffer for forwarded placed-copy sources that
-/// have no host shadow.
+/// The list in front of a submission's, and its buffer ([`BETWEEN`] bytes).
 struct Own {
     list: HostList,
     between: ID3D12Resource,
-    staged: Option<(ID3D12Resource, usize, u64)>,
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the list is touched by one
@@ -910,9 +687,7 @@ impl Host {
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (does, steps) = does_of(written, runs);
-        let forward = placed_order();
-        let mut behind = Vec::new();
-        let chosen = plan_with(&does, stage(), placed_order(), forward, &mut behind)?;
+        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -935,9 +710,8 @@ impl Host {
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
         let mut room = HashMap::default();
         let mut end = 0u64;
-        let mut staged_end = 0u64;
         for &(i, level) in &chosen {
-            let Some((segs, _)) = placed_segments(&does, i, forward) else {
+            let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
                 continue;
             };
             let (Does::Copy { len, .. } | Does::Fill { len, .. }) = does[i] else {
@@ -946,72 +720,32 @@ impl Host {
             if len == 0 {
                 return Err("nothing to read");
             }
-            let mut pieces: Vec<ReadPiece> = Vec::with_capacity(segs.len());
-            for &(seg_off, seg_src, seg_len) in &segs {
-                let source = match held.get(&(seg_src, seg_len)) {
-                    Some(from) => Source::Shadow(from.clone(), seg_src),
-                    None => match holder(&writers, seg_src, seg_src + seg_len) {
-                        Ok(from) => {
-                            held.insert((seg_src, seg_len), from.clone());
-                            Source::Shadow(from, seg_src)
-                        }
-                        Err(why) => {
-                            if touches(written, seg_src, seg_src + seg_len)
-                                || writers.iter().any(|w| meet((w.from, w.to), (seg_src, seg_src + seg_len)))
-                            {
-                                return Err(why);
-                            }
-                            if !mapped(seg_src, seg_src + seg_len, &mut room) {
-                                return Err("not all of what it reads is mapped");
-                            }
-                            let staged_at = staged_end;
-                            staged_end = (staged_end + seg_len as u64).next_multiple_of(16);
-                            Source::Staged(staged_at, seg_src)
-                        }
-                    },
-                };
-                pieces.push(ReadPiece {
-                    source,
-                    offset: seg_off as u64,
-                    len: seg_len,
-                });
-            }
-            let at = if pieces.len() == 1
-                && let Source::Shadow(from, seg_src) = &pieces[0].source
-            {
-                let place = (Arc::as_ptr(from) as usize, *seg_src, len, level);
-                match places.get(&place) {
-                    Some(&at) => at,
-                    None => {
-                        if end + len as u64 > BETWEEN {
-                            return Err("too much at once");
-                        }
-                        if !mapped(*seg_src, *seg_src + len, &mut room) {
-                            return Err("not all of what it reads is mapped");
-                        }
-                        let at = end;
-                        end = (end + len as u64).next_multiple_of(256);
-                        places.insert(place, at);
-                        at
+            let from = match held.get(&(src, len)) {
+                Some(from) => from.clone(),
+                None => {
+                    let from = holder(&writers, src, src + len)?;
+                    held.insert((src, len), from.clone());
+                    from
+                }
+            };
+            let place = (Arc::as_ptr(&from) as usize, src, len, level);
+            let at = match places.get(&place) {
+                Some(&at) => at,
+                None => {
+                    if end + len as u64 > BETWEEN {
+                        return Err("too much at once");
                     }
-                }
-            } else {
-                if end + len as u64 > BETWEEN {
-                    return Err("too much at once");
-                }
-                for piece in &pieces {
-                    if let Source::Shadow(_, seg_src) = &piece.source
-                        && !mapped(*seg_src, *seg_src + piece.len, &mut room)
-                    {
+                    if !mapped(src, src + len, &mut room) {
                         return Err("not all of what it reads is mapped");
                     }
+                    let at = end;
+                    end = (end + len as u64).next_multiple_of(256);
+                    places.insert(place, at);
+                    at
                 }
-                let at = end;
-                end = (end + len as u64).next_multiple_of(256);
-                at
             };
             let to = match does[i] {
-                Does::Copy { dst, .. } => {
+                Does::Copy { .. } => {
                     let to = holder(&writers, dst, dst + len)?;
                     if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
@@ -1037,7 +771,7 @@ impl Host {
                 },
             };
             ops.push(Op {
-                reads: pieces,
+                from: (from, src),
                 len,
                 at,
                 level,
@@ -1045,46 +779,22 @@ impl Host {
             });
         }
         spent.next("steps on the card: the list");
-        let Some(mut own) = self.own_list() else {
+        let Some(own) = self.own_list() else {
             return Err("no host list or buffer for it");
         };
-        if staged_end > 0 {
-            let Some(staged_ptr) = self.ensure_staged(&mut own, staged_end) else {
-                return Err("no staging buffer for it");
-            };
-            for op in &ops {
-                for piece in &op.reads {
-                    if let Source::Staged(staged_at, seg_src) = piece.source {
-                        // SAFETY: `staged` has at least `staged_end` mapped bytes.
-                        let out = unsafe {
-                            std::slice::from_raw_parts_mut((staged_ptr + staged_at as usize) as *mut u8, piece.len)
-                        };
-                        if !read_into(seg_src as *const u8, out) {
-                            return Err("not all of what it reads is mapped");
-                        }
-                    }
-                }
-            }
-        }
         // First every refresh, then the writes: the bytes compared with are
         // the title's. (One step for each host copy, over all that is read of
         // it: a flush brings a copy up to date from the first range asked for
         // to the last, whatever the steps.)
         let mut spans: ByCopy<(Arc<Shadow>, usize, usize)> = ByCopy::default();
         for op in &ops {
-            for piece in &op.reads {
-                if let Source::Shadow(shadow, at) = &piece.source {
-                    let span = spans
-                        .entry(Arc::as_ptr(shadow) as usize)
-                        .or_insert_with(|| (shadow.clone(), *at, *at + piece.len));
-                    (span.1, span.2) = (span.1.min(*at), span.2.max(*at + piece.len));
-                }
-            }
-            if let To::Copy(to, dst) = &op.to {
-                let span = spans
-                    .entry(Arc::as_ptr(to) as usize)
-                    .or_insert_with(|| (to.clone(), *dst, *dst + op.len));
-                (span.1, span.2) = (span.1.min(*dst), span.2.max(*dst + op.len));
+            let to = match &op.to {
+                To::Copy(to, dst) => Some((to, *dst)),
+                _ => None,
+            };
+            for (shadow, at) in std::iter::once((&op.from.0, op.from.1)).chain(to) {
+                let span = spans.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| (shadow.clone(), at, at + op.len));
+                (span.1, span.2) = (span.1.min(at), span.2.max(at + op.len));
             }
         }
         for (shadow, from, to) in spans.into_values() {
@@ -1099,41 +809,16 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (OATHKEEP_CARD_STEPS)", ops.len()));
-        let staged_buf = own.staged.as_ref().map(|(b, _, _)| b.clone());
         let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
         for level in 0..=levels {
             let mut reads = Vec::new();
             let mut writes = Vec::new();
             for op in ops.iter().filter(|op| op.level == level) {
                 let len = op.len as u64;
-                if op.reads.len() == 1
-                    && let Source::Shadow(from, seg_src) = &op.reads[0].source
-                {
-                    // (Each place once.)
-                    if places
-                        .remove(&(Arc::as_ptr(from) as usize, *seg_src, op.len, level))
-                        .is_some()
-                    {
-                        reads.push((&from.buffer, from.offset(*seg_src as u64), op.at, len));
-                    }
-                } else {
-                    for piece in &op.reads {
-                        match &piece.source {
-                            Source::Shadow(from, seg_src) => {
-                                reads.push((
-                                    &from.buffer,
-                                    from.offset(*seg_src as u64),
-                                    op.at + piece.offset,
-                                    piece.len as u64,
-                                ));
-                            }
-                            Source::Staged(staged_at, _) => {
-                                if let Some(buf) = &staged_buf {
-                                    reads.push((buf, *staged_at, op.at + piece.offset, piece.len as u64));
-                                }
-                            }
-                        }
-                    }
+                let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
+                // (Each place once.)
+                if places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some() {
+                    reads.push(read);
                 }
                 match &op.to {
                     To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
@@ -1170,7 +855,7 @@ impl Host {
         spent.end();
         Ok(Some(Taken {
             own,
-            steps: chosen.iter().map(|&(i, _)| (steps[i].1, steps[i].2)).collect(),
+            steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
             copied,
         }))
     }
@@ -1185,27 +870,7 @@ impl Host {
         let between = self.uav_buffer(BETWEEN)?;
         name(&between, || "copies of title memory on the card".into());
         let list = self.new_list().ok()?;
-        Some(Own {
-            list,
-            between,
-            staged: None,
-        })
-    }
-
-    /// Ensures `own.staged` holds at least `needed` mapped bytes.
-    fn ensure_staged(&self, own: &mut Own, needed: u64) -> Option<usize> {
-        if let Some((_, ptr, cap)) = &own.staged
-            && *cap >= needed
-        {
-            return Some(*ptr);
-        }
-        let size = needed.max(64 << 10).next_multiple_of(64 << 10);
-        let (buffer, data) = self.shared_buffer(size)?;
-        name(&buffer, || "staged CPU bytes for card steps".into());
-        if let Some((old, _, _)) = own.staged.replace((buffer, data as usize, size)) {
-            own.list.keep(&old);
-        }
-        Some(data as usize)
+        Some(Own { list, between })
     }
 }
 
@@ -1222,17 +887,12 @@ fn noted(ops: &[Op]) {
     let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
     let noted = noted.get_or_insert_with(Default::default);
     for op in ops {
-        let (from_span, src) = match op.reads.first().map(|p| &p.source) {
-            Some(Source::Shadow(s, src)) => (s.span(), *src),
-            Some(Source::Staged(_, src)) => ((0, 0), *src),
-            None => ((0, 0), 0),
-        };
         let (to, dst) = match &op.to {
             To::Copy(to, dst) => (to.span(), *dst),
             To::Slot(..) | To::Buffer(_) => ((0, 0), 0),
         };
-        let e = noted.entry((op.len, from_span, to)).or_default();
-        *e = (e.0 + 1, src, dst);
+        let e = noted.entry((op.len, op.from.0.span(), to)).or_default();
+        *e = (e.0 + 1, op.from.1, dst);
     }
 }
 
@@ -1357,11 +1017,10 @@ mod tests {
     }
 
     /// A copy at its place in a list is in the way of what reads or writes its
-    /// bytes behind it when cross-list cutting looks (`forward = false`), not
-    /// of what did ahead of it.
+    /// bytes behind it, not of what did ahead of it.
     #[test]
     fn copies_at_their_place_stand_in_the_way_of_what_is_behind_them() {
-        let placed = Does::Placed { dst: 2000, src: 3000, len: 64, cpu_src: false, waits: false };
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };
         let behind = |does: &[Does]| {
             let mut found = None;
             let refused = plan(does, 2, true, &mut found);
@@ -1378,170 +1037,6 @@ mod tests {
         assert_eq!(behind(&[placed, copy(3000, 5000, 8, true)]), Some((0, 1)));
         assert_eq!(behind(&[copy(2060, 5000, 8, true), placed]), None);
         assert_eq!(behind(&[placed, copy(2060, 5000, 8, true)]), Some((0, 1)));
-    }
-
-    /// Same-list fills (and read-only copies) behind a placed copy forward
-    /// overlapped bytes to the placed copy's source instead of stalling for
-    /// flights, while writes onto the placed copy's source or destination
-    /// behind it still refuse.
-    #[test]
-    fn same_list_reads_behind_placed_forward_cleanly() {
-        let placed = |dst, src, len| Does::Placed { dst, src, len, cpu_src: false, waits: false };
-        let mut behind = Vec::new();
-        // Exact telemetry case: 0xf0 fill at 0x992738280 after placed copy to 0x992738280+0xbd0.
-        let p = placed(0x9_9273_8280, 0x9_6071_0400, 0xbd0);
-        let f = fill(0x9_9273_8280, 0xf0, true);
-        assert_eq!(plan_with(&[p, f], 2, true, true, &mut behind), Ok(vec![(1, 0)]));
-        assert_eq!(placed_segments(&[p, f], 1, true).unwrap().0, vec![(0, 0x9_6071_0400, 0xf0)]);
-
-        // Partial overlap on both sides and chained placed copies.
-        let chain = [placed(4000, 5000, 64), placed(2000, 4016, 32), fill(2008, 48, true)];
-        assert_eq!(plan_with(&chain, 2, true, true, &mut behind), Ok(vec![(2, 0)]));
-        assert_eq!(
-            placed_segments(&chain, 2, true).unwrap().0,
-            vec![(0, 5024, 24), (24, 2032, 24)]
-        );
-
-        // Taken copy ahead of placed copy puts forwarded fill on level 1.
-        let dep = [copy(3000, 7000, 64, true), placed(2000, 3000, 64), fill(2000, 64, false)];
-        assert_eq!(plan_with(&dep, 2, true, true, &mut behind), Ok(vec![(0, 0), (2, 1)]));
-
-        // Writes behind a placed copy onto its dst or src still refuse.
-        assert_eq!(plan_with(&[placed(2000, 3000, 64), copy(2000, 7000, 8, true)], 2, true, true, &mut behind), Err(BEHIND_PLACED));
-        assert_eq!(plan_with(&[placed(2000, 3000, 64), copy(3000, 7000, 8, true)], 2, true, true, &mut behind), Err(BEHIND_PLACED));
-        // Intervening untaken copy onto placed dst is pulled in and refused.
-        let intervening = [placed(2000, 3000, 64), copy(2000, 7000, 8, false), fill(2000, 64, true)];
-        assert_eq!(plan_with(&intervening, 2, true, true, &mut behind), Err(BEHIND_PLACED));
-        // CPU-sourced placed copy behind a taken copy onto its source refuses.
-        let cpu_placed = Does::Placed { dst: 2000, src: 3000, len: 64, cpu_src: true, waits: false };
-        assert_eq!(plan_with(&[copy(3000, 7000, 8, true), cpu_placed, fill(2000, 64, true)], 2, true, true, &mut behind), Err(BEHIND_PLACED));
-    }
-
-    #[test]
-    fn forwarded_placed_levels_preserve_exact_sequential_semantics() {
-        let mut seed = 54321u32;
-        let mut random = move |n: u32| {
-            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
-            (seed >> 16) % n
-        };
-        let (mut done, mut forwarded) = (0, 0);
-        for _ in 0..4000 {
-            let does: Vec<Does> = (0..2 + random(8))
-                .map(|_| {
-                    let (at, other, len) = (random(60) as usize, random(60) as usize, 1 + random(8) as usize);
-                    let asked = random(4) == 0;
-                    match random(10) {
-                        0..3 => copy(at, other, len, asked),
-                        3..5 => Does::Placed { dst: at, src: other, len, cpu_src: false, waits: false },
-                        5..8 => fill(at, len, asked),
-                        8 => stuck(at, len),
-                        _ => Does::Read { from: at, to: at + len, asked: false },
-                    }
-                })
-                .collect();
-            let mut behind = Vec::new();
-            let Ok(chosen) = plan_with(&does, 2, true, true, &mut behind) else {
-                continue;
-            };
-            done += 1;
-            let start: Vec<u32> = (0..80).collect();
-            let mut memory = start.clone();
-            let mut wanted = Vec::new();
-            for d in &does {
-                let (from, to) = match *d {
-                    Does::Read { from, to, .. } => (from, to),
-                    Does::Placed { src, len, .. } => (src, src + len),
-                    _ => reads_writes(d).unwrap().0,
-                };
-                wanted.push(memory[from..to].to_vec());
-                match *d {
-                    Does::Copy { dst, src, len, .. } | Does::Placed { dst, src, len, .. } => {
-                        memory.copy_within(src..src + len, dst);
-                    }
-                    _ => {}
-                }
-            }
-            // CPU untaken steps run ahead (with `prepare` mirroring free
-            // `Placed` copies in recording order), then `own.list` levels run
-            // on the card, then `L.list`'s placed copies run in recording order.
-            // Skip synthetic cases where an untaken CPU copy writes over a
-            // placed copy's source or destination behind it (which `place`
-            // never pairs with an un-waited CPU copy).
-            let is_taken = |i: usize| chosen.iter().any(|c| c.0 == i);
-            let untaken_races_placed = does.iter().enumerate().any(|(p, d)| {
-                let Does::Placed { dst, src, len, .. } = *d else { return false };
-                does[p + 1..].iter().enumerate().any(|(o, later)| {
-                    !is_taken(p + 1 + o)
-                        && matches!(*later, Does::Copy { dst: cd, len: cl, .. }
-                            if meet((cd, cd + cl), (dst, dst + len)) || meet((cd, cd + cl), (src, src + len)))
-                })
-            });
-            if untaken_races_placed {
-                continue;
-            }
-            let mut cpu = start.clone();
-            let mut card = start.clone();
-            let mut cpu_stale: Vec<(usize, usize)> = Vec::new();
-            for (i, d) in does.iter().enumerate() {
-                if is_taken(i) {
-                    if let Some((_, w)) = reads_writes(d)
-                        && w.0 < w.1
-                    {
-                        join_ranges(&mut cpu_stale, [w]);
-                    }
-                    continue;
-                }
-                match *d {
-                    Does::Placed { dst, src, len, .. } => {
-                        if touched(&cpu_stale, (src, src + len)) {
-                            join_ranges(&mut cpu_stale, [(dst, dst + len)]);
-                        } else if !touched(&cpu_stale, (dst, dst + len)) {
-                            cpu.copy_within(src..src + len, dst);
-                        }
-                    }
-                    Does::Read { from, to, .. } => {
-                        let _ = (i, from, to);
-                    }
-                    Does::Copy { dst, src, len, .. } => {
-                        assert_eq!(cpu[src..src + len], wanted[i][..]);
-                        cpu.copy_within(src..src + len, dst);
-                        card[dst..dst + len].copy_from_slice(&wanted[i]);
-                    }
-                    Does::Fill { src, len, .. } => {
-                        let _ = (src, len);
-                    }
-                    _ => {}
-                }
-            }
-            let mut got_fills: std::collections::HashMap<usize, Vec<u32>> = std::collections::HashMap::new();
-            for level in 0..=chosen.iter().map(|c| c.1).max().unwrap_or(0) {
-                let of: Vec<usize> = chosen.iter().filter(|c| c.1 == level).map(|c| c.0).collect();
-                let before = card.clone();
-                for i in of {
-                    let (segs, (dst, dst_end)) = placed_segments(&does, i, true).unwrap();
-                    if segs.len() > 1 || segs[0].1 != reads_writes(&does[i]).unwrap().0.0 {
-                        forwarded += 1;
-                    }
-                    let total = reads_writes(&does[i]).unwrap().0.1 - reads_writes(&does[i]).unwrap().0.0;
-                    let mut assembled = vec![0u32; total];
-                    for (off, a, n) in segs {
-                        assembled[off..off + n].copy_from_slice(&before[a..a + n]);
-                    }
-                    assert_eq!(assembled, wanted[i], "step {i} of {does:?}: {chosen:?}");
-                    if dst < dst_end {
-                        card[dst..dst_end].copy_from_slice(&assembled);
-                    }
-                    got_fills.insert(i, assembled);
-                }
-            }
-            for d in &does {
-                if let Does::Placed { dst, src, len, .. } = *d {
-                    card.copy_within(src..src + len, dst);
-                }
-            }
-            assert_eq!(card, memory, "{does:?}: {chosen:?}");
-        }
-        assert!(done > 500 && forwarded > 50, "{done} {forwarded}");
     }
 
     #[test]

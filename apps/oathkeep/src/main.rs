@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod launch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -145,6 +146,36 @@ enum Command {
         #[arg(long, hide = true)]
         these: Option<String>,
     },
+    /// Pre-translate shaders, pre-warm known D3D12 host pipelines, apply a
+    /// tuned profile (`pareto` by default), and launch the title.
+    Launch {
+        /// Path to the title executable (defaults to largest `.exe` in configured `game_dir`).
+        exe: Option<PathBuf>,
+        /// Runtime performance preset.
+        #[arg(long, value_enum, default_value_t = launch::Profile::Pareto)]
+        profile: launch::Profile,
+        /// The console model the title sees (device type, memory).
+        #[arg(long, value_enum, default_value_t = Console::SeriesS)]
+        console: Console,
+        /// Worker threads / child processes for shader & pipeline warming (default: 4).
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+        /// Skip shader & pipeline pre-warming and launch immediately.
+        #[arg(long)]
+        skip_warm: bool,
+        /// Warm every pipeline in `known-pipelines.bin` instead of only previously used ones.
+        #[arg(long)]
+        warm_all: bool,
+        /// Force re-running shader precompilation and pipeline warming even when cached.
+        #[arg(long)]
+        force_warm: bool,
+        /// Warm caches only without starting the title.
+        #[arg(long)]
+        no_launch: bool,
+        /// Arguments for the title, after `--`.
+        #[arg(last = true)]
+        title_args: Vec<String>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -234,6 +265,27 @@ fn main() -> Result<()> {
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Launch {
+            exe,
+            profile,
+            console,
+            jobs,
+            skip_warm,
+            warm_all,
+            force_warm,
+            no_launch,
+            title_args,
+        } => launch::run(launch::LaunchOptions {
+            exe,
+            profile,
+            console,
+            jobs,
+            skip_warm,
+            warm_all,
+            force_warm,
+            no_launch,
+            title_args,
+        }),
         Command::Run {
             exe,
             unimplemented,

@@ -182,13 +182,13 @@
   <rect x="474" y="296" width="382" height="62" rx="6" fill="#161b22" stroke="#30363d"/>
   <text x="486" y="314" fill="#8b949e" font-size="10.5" font-weight="600">LATEST WORLD TELEMETRY (RTX 3070 8 GB, 1080P)</text>
   <text x="486" y="330" fill="#8b949e" font-size="10" class="mono">FPS</text>
-  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">2.9-3.9 fps peak (256.1-339.4 ms/f) in diag-fps-swarm1 (145.3s TIMEOUT_CLEAN; peak VRAM 6,838/7,161 MB, 0 crashes/TDRs/OOMs)</text>
+  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">0.9-3.1 fps in diag-fps-swarm2 (145.2s TIMEOUT_CLEAN; exposed &amp; reverted 5d52155 card_steps/thin regression + CAPPED_DYNAMIC=131072 exhaustion; Wave64 5dc3b259/6f225b64 + async sweep + watch.rs verified)</text>
   <text x="575" y="330" fill="#8b949e" font-size="10" class="mono">FRAME</text>
-  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">256.1-339.4 ms in diag-fps-swarm1 (preparing 157.4-&gt;99.2 ms, GPU 100.1-&gt;43.1 ms, copy-back 57.4-&gt;35.0 ms, land::rest 25.6-&gt;0.92 ms)</text>
+  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">320.1-1057.9 ms in diag-fps-swarm2 (waiting for flights 52.7-&gt;0.1 ms, sweep 41-54-&gt;0.1 ms, guards 91.1-&gt;16.6-42.9 ms; reverted 5d52155 41-107 ms card-plan &amp; 3.4s thin regression)</text>
   <text x="664" y="330" fill="#8b949e" font-size="10" class="mono">GPU</text>
-  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">17.2-43.1 ms (145.3s TIMEOUT_CLEAN; peak VRAM 6,838/7,161 MB, -310 MB headroom, 0 depth-plane misses)</text>
+  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">1.8-64.3 ms (145.2s TIMEOUT_CLEAN; 0 crashes/TDRs/OOMs, 0 failed Wave64 shaders, 0 refused PSOs)</text>
   <text x="753" y="330" fill="#8b949e" font-size="10" class="mono">PREP</text>
-  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">99.2 ms in diag-fps-swarm1 (-37% vs 157.4 ms; snapshots 24.7-&gt;13.6 ms, heap spans 3.9-&gt;0.5 ms, 0 refused buffer views)</text>
+  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">128.2-443.9 ms in diag-fps-swarm2 (prior baseline 99.2 ms restored by reverting 5d52155 while keeping async sweep 0.1 ms + race-free watch.rs)</text>
   <line x1="24" y1="374" x2="856" y2="374" stroke="#21262d"/>
   <text x="24" y="390" fill="#8b949e" font-size="11">Target: 20-30+ FPS (1:1 visuals) • Clean-room Xbox Series X|S (GDK) layer</text>
   <text x="704" y="390" text-anchor="end" fill="#8b949e" font-size="11">Less</text>
