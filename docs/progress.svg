@@ -182,13 +182,13 @@
   <rect x="474" y="296" width="382" height="62" rx="6" fill="#161b22" stroke="#30363d"/>
   <text x="486" y="314" fill="#8b949e" font-size="10.5" font-weight="600">LATEST WORLD TELEMETRY (RTX 3070 8 GB, 1080P)</text>
   <text x="486" y="330" fill="#8b949e" font-size="10" class="mono">FPS</text>
-  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">11.6-16.6 fps heavy 3D steady / 18.3 fps peak (diag-run90: heavy 3D scenes +18-32%, drw=3958 9.8-&gt;11.6 fps, drw=3449 11.7-&gt;13.8 fps, drw=2473 10.4-&gt;13.7 fps)</text>
+  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">10.9-15.1 fps heavy 3D steady / 17.9 fps peak (diag-run92: Fix AA1-AA4 clean 130s at default 512 KiB; drw=5788 batch_flush -39%, stale -57%, make_at -45%, stage_cache 62% 1-shot bypass)</text>
   <text x="575" y="330" fill="#8b949e" font-size="10" class="mono">FRAME</text>
-  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">60.4-86.0 ms heavy 3D (54.5 ms peak, 0 refused dynamic slots, 0 crashes/TDRs, 0.0 ms GPU wait)</text>
+  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">66.2-93.5 ms heavy 3D (55.8 ms peak, 0 refused dynamic slots, 0 crashes/TDRs, 0.0 ms GPU wait)</text>
   <text x="664" y="330" fill="#8b949e" font-size="10" class="mono">GPU</text>
-  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">0.0 ms wait (GPU busy 67-86%; 100% CPU-bound across 5 recording threads + submit preparing)</text>
+  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">0.0 ms wait (100% CPU-bound across 5 recording threads + submit preparing)</text>
   <text x="753" y="330" fill="#8b949e" font-size="10" class="mono">PREP</text>
-  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">34.8-46.6 ms (run_deferred 1.5-1.9 ms [-68%], snapshots 1.3-1.6 ms [-53%], copy-back 13.6-18.4 ms [-30%])</text>
+  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">35.0-51.8 ms (batch_flush 18.2-27.6 ms, stale 4.8-6.0 ms, pre_prep sweep 1.7-5.2 ms exposed)</text>
   <line x1="24" y1="374" x2="856" y2="374" stroke="#21262d"/>
   <text x="24" y="390" fill="#8b949e" font-size="11">Target: 20-30+ FPS (1:1 visuals) • Clean-room Xbox Series X|S (GDK) layer</text>
   <text x="704" y="390" text-anchor="end" fill="#8b949e" font-size="11">Less</text>
