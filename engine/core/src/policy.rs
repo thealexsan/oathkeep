@@ -13,7 +13,7 @@ pub const ROOT_MARKER: &str = ".oathkeep-root";
 
 /// The source tree this binary was compiled from.
 fn compiled_workspace_root() -> PathBuf {
-    // crates/oathkeep-core -> workspace root
+    // engine/core -> workspace root
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 

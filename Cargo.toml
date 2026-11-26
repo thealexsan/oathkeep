@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "apps/*", "xtask"]
+members = ["engine/*", "apps/*", "xtask"]
 exclude = ["tests/fixtures"]
 
 [workspace.package]
@@ -11,15 +11,15 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [workspace.dependencies]
-oathkeep-core = { path = "crates/oathkeep-core" }
-oathkeep-pe = { path = "crates/oathkeep-pe" }
-oathkeep-loader = { path = "crates/oathkeep-loader" }
-oathkeep-hle = { path = "crates/oathkeep-hle" }
-oathkeep-gpu = { path = "crates/oathkeep-gpu" }
-oathkeep-shader = { path = "crates/oathkeep-shader" }
-oathkeep-formats = { path = "crates/oathkeep-formats" }
-oathkeep-pipeline = { path = "crates/oathkeep-pipeline" }
-oathkeep-game = { path = "crates/oathkeep-game" }
+oathkeep-core = { path = "engine/core" }
+oathkeep-pe = { path = "engine/pe" }
+oathkeep-loader = { path = "engine/loader" }
+oathkeep-hle = { path = "engine/hle" }
+oathkeep-gpu = { path = "engine/gpu" }
+oathkeep-shader = { path = "engine/shader" }
+oathkeep-formats = { path = "engine/formats" }
+oathkeep-pipeline = { path = "engine/pipeline" }
+oathkeep-game = { path = "engine/game" }
 
 anyhow = "1.0.104"
 thiserror = "2.0.21"

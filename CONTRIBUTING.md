@@ -26,7 +26,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup-agility-sdk.ps1
 
 ## 3. Code & Pull Request Standards
 
-- **Keep changes focused and modular:** Follow the `apps/oathkeep` and `crates/oathkeep-*` workspace structure. Keep comments concise and purposeful (`// SAFETY:` for unsafe invariants).
+- **Keep changes focused and modular:** Follow the `apps/oathkeep` and `engine/*` workspace structure. Keep comments concise and purposeful (`// SAFETY:` for unsafe invariants).
 - **Verify against tests:** New behavior or bug fixes should include a synthetic unit test that does not require external title files.
 - **No silent fake success:** Unimplemented APIs must log clearly and return the appropriate error code (e.g., `E_NOTIMPL`).
 - **Format & lint before opening a PR:**

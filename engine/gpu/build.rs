@@ -17,16 +17,16 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 fn main() {
     let here = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
-    let crates = here.join("..");
-    let root = crates.join("..");
+    let engine = here.join("..");
+    let root = engine.join("..");
     // The translator, what it is built from, and the form entries are kept in.
     let mut all = vec![
-        crates.join("oathkeep-shader/Cargo.toml"),
+        engine.join("shader/Cargo.toml"),
         here.join("src/shader_cache.rs"),
         root.join("Cargo.lock"),
         root.join("rust-toolchain.toml"),
     ];
-    let source = crates.join("oathkeep-shader/src");
+    let source = engine.join("shader/src");
     println!("cargo:rerun-if-changed={}", source.display());
     files(&source, &mut all);
     all.sort();
