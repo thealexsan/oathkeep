@@ -2645,6 +2645,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 
 fn stale_under_flights(runs: &[&HostList]) -> bool {
     use std::sync::Arc;
+    const CLEAN_SKIPPED: usize = usize::MAX;
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
     let mut by_shadow: FastHashMap<usize, usize> = FastHashMap::default();
     let mut last_ptr = 0usize;
@@ -2654,7 +2655,6 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
             {
-                let range = (*address, *address + *len);
                 let ptr = Arc::as_ptr(shadow) as usize;
                 let idx = if ptr == last_ptr {
                     last_idx
@@ -2662,6 +2662,11 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
                     last_ptr = ptr;
                     last_idx = existing;
                     existing
+                } else if shadow.is_guarded_clean() {
+                    by_shadow.insert(ptr, CLEAN_SKIPPED);
+                    last_ptr = ptr;
+                    last_idx = CLEAN_SKIPPED;
+                    CLEAN_SKIPPED
                 } else {
                     let idx = spans.len();
                     spans.push((shadow.clone(), Vec::with_capacity(8)));
@@ -2670,7 +2675,9 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
                     last_idx = idx;
                     idx
                 };
-                spans[idx].1.push(range);
+                if idx != CLEAN_SKIPPED {
+                    spans[idx].1.push((*address, *address + *len));
+                }
             }
         }
     }
@@ -5020,28 +5027,44 @@ impl Host {
         sorted_pieces.sort_unstable_by_key(|&((ptr, piece_idx), _)| (ptr, piece_idx));
 
         // Filter pieces outside `queue_sync()` so `VirtualQuery` and `card.dirty`/`sent`
-        // locks never stall 3D queue submissions; then lock `queue_sync()` briefly with a
-        // fresh `completed_3d` only to partition into `fast_now` vs `fast_wait`.
+        // locks never stall 3D queue submissions; group by shadow so `card.old`/`dirty`/`sent`
+        // are locked once per shadow instead of once per piece.
         let skip_uncommitted = relay_skip_uncommitted();
         let mut readable_cache = ReadableCache::default();
         let mut skipped_pieces = 0u64;
         let mut skipped_bytes = 0u64;
         let mut live_pieces: Vec<(usize, Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for ((ptr, _), (shadow, mut intervals)) in sorted_pieces {
-            merge_piece_intervals(&mut intervals);
+        let mut candidates: Vec<(usize, usize)> = Vec::new();
+        let mut group_idx = 0usize;
+        while group_idx < sorted_pieces.len() {
+            let ptr = sorted_pieces[group_idx].0.0;
+            let shadow = sorted_pieces[group_idx].1.0.clone();
             let s_start = shadow.span().0 as usize;
-            for (lo, hi) in intervals {
-                let len = hi - lo;
-                if (skip_uncommitted && !readable_cache.any_readable(s_start + lo, len))
-                    || !shadow.card_has_old_piece(lo, len)
-                    || shadow.card_piece_is_superseded(lo, hi, landed_seq)
-                {
-                    skipped_pieces += 1;
-                    skipped_bytes += len as u64;
-                    continue;
+            candidates.clear();
+            let mut end_idx = group_idx;
+            while end_idx < sorted_pieces.len() && sorted_pieces[end_idx].0.0 == ptr {
+                let intervals = &mut sorted_pieces[end_idx].1.1;
+                merge_piece_intervals(intervals);
+                for &(lo, hi) in intervals.iter() {
+                    let len = hi - lo;
+                    if skip_uncommitted && !readable_cache.any_readable(s_start + lo, len) {
+                        skipped_pieces += 1;
+                        skipped_bytes += len as u64;
+                        continue;
+                    }
+                    candidates.push((lo, hi));
                 }
-                live_pieces.push((ptr, shadow.clone(), lo, hi));
+                end_idx += 1;
             }
+            if !candidates.is_empty() {
+                let (live, sk_p, sk_b) = shadow.filter_live_card_pieces(&candidates, landed_seq);
+                skipped_pieces += sk_p;
+                skipped_bytes += sk_b;
+                for (lo, hi) in live {
+                    live_pieces.push((ptr, shadow.clone(), lo, hi));
+                }
+            }
+            group_idx = end_idx;
         }
         let mut fast_now: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
         let mut fast_wait: Vec<(Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
@@ -6307,54 +6330,22 @@ impl Host {
                 prep_prelude += t_pre.elapsed().as_micros() as u64;
             }
         }
-        let mut recorded_preludes: Vec<SendCmdList> =
-            (0..runs.len()).map(|_| SendCmdList(None)).collect();
-        if !plans.is_empty() {
+        let recorded_preludes = {
             #[cfg(feature = "diagnostics")]
-            let t_pre = std::time::Instant::now();
-            if plans.len() >= 4 {
-                let workers = plans.len().min(4);
-                let mut buckets: Vec<Vec<(usize, SendPreludePlan)>> =
-                    (0..workers).map(|_| Vec::new()).collect();
-                for (i, item) in plans.into_iter().enumerate() {
-                    buckets[i % workers].push(item);
-                }
-                let host_ptr = std::ptr::from_ref(self) as usize;
-                let outs: Vec<std::sync::Arc<Mutex<Vec<(usize, SendCmdList)>>>> = (0..workers)
-                    .map(|_| std::sync::Arc::new(Mutex::new(Vec::new())))
-                    .collect();
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
-                    .into_iter()
-                    .zip(outs.iter().cloned())
-                    .map(|(part, out)| {
-                        Box::new(move || {
-                            // SAFETY: `self` (`Host`) is `'static`/live for the entire `wide_run`,
-                            // and `wide_run` joins all workers before returning.
-                            let host = unsafe { &*(host_ptr as *const Host) };
-                            let mut local = Vec::with_capacity(part.len());
-                            for (idx, plan) in part {
-                                local.push((idx, SendCmdList(record_prelude(host, plan))));
-                            }
-                            *out.lock().unwrap_or_else(|e| e.into_inner()) = local;
-                        }) as Box<dyn FnOnce() + Send>
-                    })
-                    .collect();
-                crate::shadow::wide_run(jobs);
-                for out in outs {
-                    for (idx, rec) in std::mem::take(&mut *out.lock().unwrap_or_else(|e| e.into_inner())) {
-                        recorded_preludes[idx] = rec;
-                    }
-                }
-            } else {
-                for (idx, plan) in plans {
-                    recorded_preludes[idx] = SendCmdList(record_prelude(self, plan));
-                }
-            }
+            let t_flush = std::time::Instant::now();
+            let (recorded_preludes, prelude_only_us) =
+                batch.flush_with_preludes(Some(self), plans, runs.len());
+            crate::watch::ask_once_end();
             #[cfg(feature = "diagnostics")]
             {
-                prep_prelude += t_pre.elapsed().as_micros() as u64;
+                let flush_us = t_flush.elapsed().as_micros() as u64;
+                prep_prelude += prelude_only_us;
+                prep_batch_flush += flush_us.saturating_sub(prelude_only_us);
             }
-        }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = prelude_only_us;
+            recorded_preludes
+        };
         for (list, rec) in runs.iter().zip(recorded_preludes) {
             firsts.push(lists.len());
             if let Some((prelude_cmd, pooled)) = rec.0 {
@@ -6362,16 +6353,6 @@ impl Host {
                 preludes.push(pooled);
             }
             lists.push(list.list.cast().ok());
-        }
-        {
-            #[cfg(feature = "diagnostics")]
-            let t_flush = std::time::Instant::now();
-            batch.flush();
-            crate::watch::ask_once_end();
-            #[cfg(feature = "diagnostics")]
-            {
-                prep_batch_flush += t_flush.elapsed().as_micros() as u64;
-            }
         }
         {
             #[cfg(feature = "diagnostics")]
@@ -8422,7 +8403,87 @@ impl Batch {
         }
     }
 
+    fn push_refresh_jobs(
+        refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
+        jobs: &mut Vec<Box<dyn FnOnce() + Send>>,
+    ) {
+        if refreshes.is_empty() {
+            return;
+        }
+        let mut all: Vec<_> = refreshes
+            .into_iter()
+            .map(|(shadow, spans)| {
+                let bytes: usize = spans.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
+                (bytes, shadow, spans)
+            })
+            .collect();
+        all.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.2.len().cmp(&a.2.len())));
+        let chunks = all.len().min(24);
+        let mut buckets: Vec<(
+            usize,
+            Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
+        )> = (0..chunks).map(|_| (0, Vec::new())).collect();
+        for (bytes, shadow, spans) in all {
+            let target = buckets
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, &(w, ref v))| (w, v.len()))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            buckets[target].0 = buckets[target].0.saturating_add(bytes);
+            buckets[target].1.push((shadow, spans));
+        }
+        buckets.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        for (_, part) in buckets {
+            if !part.is_empty() {
+                jobs.push(Box::new(move || {
+                    for (shadow, spans) in part {
+                        for (from, to) in spans {
+                            Self::update(&shadow, from, to);
+                        }
+                    }
+                }));
+            }
+        }
+    }
+
+    fn run_wide_capped(jobs: Vec<Box<dyn FnOnce() + Send>>) {
+        if jobs.is_empty() {
+            return;
+        }
+        if !wide_refresh() || jobs.len() < 2 {
+            for job in jobs {
+                job();
+            }
+            return;
+        }
+        let started = std::time::Instant::now();
+        let before_buf = PREPARING[0].load(Ordering::Relaxed);
+        let before_tex = PREPARING[2].load(Ordering::Relaxed);
+        crate::shadow::wide_run(jobs);
+        let wall = started.elapsed().as_micros() as u64;
+        let sum_buf = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before_buf);
+        let sum_tex = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before_tex);
+        let total_sum = sum_buf.saturating_add(sum_tex);
+        if total_sum > wall {
+            let excess = total_sum - wall;
+            let cut_buf = (u128::from(excess) * u128::from(sum_buf) / u128::from(total_sum)) as u64;
+            let cut_tex = excess - cut_buf;
+            PREPARING[0].fetch_sub(cut_buf.min(sum_buf), Ordering::Relaxed);
+            PREPARING[2].fetch_sub(cut_tex.min(sum_tex), Ordering::Relaxed);
+        }
+    }
+
     fn flush(&mut self) {
+        let _ = self.flush_with_preludes(None, Vec::new(), 0);
+    }
+
+    fn flush_with_preludes(
+        &mut self,
+        host: Option<&Host>,
+        plans: Vec<(usize, SendPreludePlan)>,
+        run_count: usize,
+    ) -> (Vec<SendCmdList>, u64) {
         self.index.clear();
         self.last_refresh_key = 0;
         self.refresh_min = 0;
@@ -8452,113 +8513,127 @@ impl Batch {
                 false
             }
         };
+        let mut recorded_preludes: Vec<SendCmdList> =
+            (0..run_count).map(|_| SendCmdList(None)).collect();
         let total_units = self.refreshes.len() + self.pending_textures.len();
-        // Fix AC2: pre-guard all dirty watched-guarded refresh ranges in a single coalesced pass
-        // before spawning `wide_run`, so adjacent spans across shadows merge into maximal
-        // `VirtualProtect` calls and sibling-view `alias_apply` runs ONCE per flush instead of
-        // per-shadow across 8 competing worker threads.
-        if self.refreshes.len() >= 2 {
-            let mut guarded_ranges: Vec<(usize, usize)> = Vec::new();
-            for (shadow, spans) in &self.refreshes {
-                if shadow.guarded() && !shadow.writes_pending() && !shadow.is_in_place() {
-                    guarded_ranges.extend_from_slice(spans);
-                }
-            }
-            if !guarded_ranges.is_empty() {
-                crate::watch::pre_guard_batch(&guarded_ranges);
+        let prelude_only = total_units == 0 && !plans.is_empty();
+        let prelude_only_start = prelude_only.then(std::time::Instant::now);
+
+        // Fix AD1: partition refreshes into dirty guarded shadows (needing coalesced
+        // `pre_guard_batch`) vs already-clean/non-guarded refreshes, then overlap
+        // `pre_guard_batch` with prelude command-list recording, texture staging refreshes,
+        // and non-guarded/clean buffer refreshes in Phase A before fanning out `dirty_guarded`
+        // refreshes in Phase B.
+        let mut dirty_guarded: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
+            Vec::new();
+        let mut other_refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
+            Vec::new();
+        for (shadow, spans) in self.refreshes.drain(..) {
+            if shadow.guarded()
+                && !shadow.writes_pending()
+                && !shadow.is_in_place()
+                && !shadow.is_guarded_clean()
+            {
+                dirty_guarded.push((shadow, spans));
+            } else {
+                other_refreshes.push((shadow, spans));
             }
         }
-        if wide_refresh() && total_units >= 2 {
-            let started = std::time::Instant::now();
-            let before_buf = PREPARING[0].load(Ordering::Relaxed);
-            let before_tex = PREPARING[2].load(Ordering::Relaxed);
-            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(32);
-            if !self.refreshes.is_empty() {
-                let mut all: Vec<_> = self
-                    .refreshes
-                    .drain(..)
-                    .map(|(shadow, spans)| {
-                        let bytes: usize = spans.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
-                        (bytes, shadow, spans)
-                    })
-                    .collect();
-                all.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.2.len().cmp(&a.2.len())));
-                let chunks = all.len().min(24);
-                let mut buckets: Vec<(
-                    usize,
-                    Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
-                )> = (0..chunks).map(|_| (0, Vec::new())).collect();
-                for (bytes, shadow, spans) in all {
-                    let target = buckets
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|&(_, &(w, ref v))| (w, v.len()))
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    buckets[target].0 = buckets[target].0.saturating_add(bytes);
-                    buckets[target].1.push((shadow, spans));
+        let use_pre_guard = dirty_guarded.len() >= 2
+            || (wide_refresh()
+                && dirty_guarded.len() == 1
+                && (!plans.is_empty()
+                    || !self.pending_textures.is_empty()
+                    || !other_refreshes.is_empty()));
+        if !use_pre_guard {
+            other_refreshes.append(&mut dirty_guarded);
+        }
+
+        let mut phase_a_jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(40);
+        if use_pre_guard {
+            let mut guarded_ranges: Vec<(usize, usize)> = Vec::new();
+            for (_, spans) in &dirty_guarded {
+                guarded_ranges.extend_from_slice(spans);
+            }
+            if !guarded_ranges.is_empty() {
+                phase_a_jobs.push(Box::new(move || {
+                    crate::watch::pre_guard_batch(&guarded_ranges);
+                }));
+            }
+        }
+        let mut prelude_outs: Vec<std::sync::Arc<Mutex<Vec<(usize, SendCmdList)>>>> = Vec::new();
+        if let Some(host) = host
+            && !plans.is_empty()
+        {
+            let workers = plans.len().min(4);
+            let mut buckets: Vec<Vec<(usize, SendPreludePlan)>> =
+                (0..workers).map(|_| Vec::new()).collect();
+            for (i, item) in plans.into_iter().enumerate() {
+                buckets[i % workers].push(item);
+            }
+            let host_ptr = std::ptr::from_ref(host) as usize;
+            prelude_outs = (0..workers)
+                .map(|_| std::sync::Arc::new(Mutex::new(Vec::new())))
+                .collect();
+            for (part, out) in buckets.into_iter().zip(prelude_outs.iter().cloned()) {
+                phase_a_jobs.push(Box::new(move || {
+                    // SAFETY: `host` is live for the entire `flush_with_preludes` call, and
+                    // `run_wide_capped` joins all worker threads before returning.
+                    let host = unsafe { &*(host_ptr as *const Host) };
+                    let mut local = Vec::with_capacity(part.len());
+                    for (idx, plan) in part {
+                        local.push((idx, SendCmdList(record_prelude(host, plan))));
+                    }
+                    *out.lock().unwrap_or_else(|e| e.into_inner()) = local;
+                }));
+            }
+        }
+        Self::push_refresh_jobs(other_refreshes, &mut phase_a_jobs);
+        if !self.pending_textures.is_empty() {
+            let mut texs: Vec<_> = self.pending_textures.drain(..).collect();
+            texs.sort_unstable_by(|a, b| {
+                b.1.saturating_sub(b.0).cmp(&a.1.saturating_sub(a.0))
+            });
+            if texs.len() <= 16 {
+                for (_, _, staging) in texs {
+                    phase_a_jobs.push(Box::new(move || staging.refresh()));
                 }
-                buckets.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-                for (_, part) in buckets {
+            } else {
+                let mut tex_buckets: Vec<Vec<std::sync::Arc<crate::texture::Staging>>> =
+                    (0..16).map(|_| Vec::new()).collect();
+                for (i, (_, _, staging)) in texs.into_iter().enumerate() {
+                    tex_buckets[i % 16].push(staging);
+                }
+                for part in tex_buckets {
                     if !part.is_empty() {
-                        jobs.push(Box::new(move || {
-                            for (shadow, spans) in part {
-                                for (from, to) in spans {
-                                    Self::update(&shadow, from, to);
-                                }
+                        phase_a_jobs.push(Box::new(move || {
+                            for staging in part {
+                                staging.refresh();
                             }
                         }));
                     }
                 }
             }
-            if !self.pending_textures.is_empty() {
-                let mut texs: Vec<_> = self.pending_textures.drain(..).collect();
-                texs.sort_unstable_by(|a, b| {
-                    b.1.saturating_sub(b.0).cmp(&a.1.saturating_sub(a.0))
-                });
-                if texs.len() <= 16 {
-                    for (_, _, staging) in texs {
-                        jobs.push(Box::new(move || staging.refresh()));
-                    }
-                } else {
-                    let mut tex_buckets: Vec<Vec<std::sync::Arc<crate::texture::Staging>>> =
-                        (0..16).map(|_| Vec::new()).collect();
-                    for (i, (_, _, staging)) in texs.into_iter().enumerate() {
-                        tex_buckets[i % 16].push(staging);
-                    }
-                    for part in tex_buckets {
-                        if !part.is_empty() {
-                            jobs.push(Box::new(move || {
-                                for staging in part {
-                                    staging.refresh();
-                                }
-                            }));
-                        }
-                    }
+        }
+        Self::run_wide_capped(phase_a_jobs);
+        for out in prelude_outs {
+            for (idx, rec) in
+                std::mem::take(&mut *out.lock().unwrap_or_else(|e| e.into_inner()))
+            {
+                if let Some(slot) = recorded_preludes.get_mut(idx) {
+                    *slot = rec;
                 }
-            }
-            crate::shadow::wide_run(jobs);
-            let wall = started.elapsed().as_micros() as u64;
-            let sum_buf = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before_buf);
-            let sum_tex = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before_tex);
-            let total_sum = sum_buf.saturating_add(sum_tex);
-            if total_sum > wall {
-                let excess = total_sum - wall;
-                let cut_buf = (u128::from(excess) * u128::from(sum_buf) / u128::from(total_sum)) as u64;
-                let cut_tex = excess - cut_buf;
-                PREPARING[0].fetch_sub(cut_buf.min(sum_buf), Ordering::Relaxed);
-                PREPARING[2].fetch_sub(cut_tex.min(sum_tex), Ordering::Relaxed);
-            }
-        } else {
-            for (shadow, spans) in self.refreshes.drain(..) {
-                for (from, to) in spans {
-                    Self::update(&shadow, from, to);
-                }
-            }
-            for (_, _, staging) in self.pending_textures.drain(..) {
-                staging.refresh();
             }
         }
+        let prelude_only_us =
+            prelude_only_start.map_or(0, |t| t.elapsed().as_micros() as u64);
+
+        if !dirty_guarded.is_empty() {
+            let mut phase_b_jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(24);
+            Self::push_refresh_jobs(dirty_guarded, &mut phase_b_jobs);
+            Self::run_wide_capped(phase_b_jobs);
+        }
+
         if !self.pending_gpu_writes.is_empty() {
             self.pending_gpu_min = 0;
             self.pending_gpu_max = 0;
@@ -8579,6 +8654,7 @@ impl Batch {
         if ahead {
             crate::watch::ask_ahead_done();
         }
+        (recorded_preludes, prelude_only_us)
     }
 }
 

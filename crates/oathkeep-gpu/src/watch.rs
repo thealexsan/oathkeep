@@ -452,13 +452,13 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
-    ask_once_end();
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.is_empty() {
+        ask_once_end();
         return;
     }
     pieces.sort_unstable();
@@ -472,6 +472,12 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     let mut j = journal_write();
     let j = &mut *j;
+    let was_kept = j.kept;
+    if was_kept {
+        j.kept = false;
+        JOURNAL_KEPT.store(false, std::sync::atomic::Ordering::Release);
+        bump_global_write_epoch();
+    }
     let now = bump_journal_asked(j, 1);
     j.ahead_asked = now;
     j.ahead.clear();
@@ -4654,5 +4660,22 @@ mod mapping_tests {
             UnmapViewOfFile(v2);
             CloseHandle(mapping);
         }
+    }
+
+    #[test]
+    fn ask_once_skips_redundant_global_epoch_bump_when_not_kept() {
+        let _guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use super::{PAGE, ask_once, ask_once_end, is_journal_kept, write_stamp};
+
+        ask_once_end();
+        assert!(!is_journal_kept());
+        let before = write_stamp().global;
+        let dummy = vec![0u8; PAGE];
+        let base = dummy.as_ptr() as usize;
+        // Normal heap memory is not MEM_WRITE_WATCH, so `ask_once` does not keep a journal
+        // and must not redundantly bump `GLOBAL_WRITE_EPOCH` when `!was_kept`.
+        ask_once(&[(base, base + PAGE)]);
+        assert_eq!(write_stamp().global, before);
+        assert!(!is_journal_kept());
     }
 }

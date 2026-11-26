@@ -2421,7 +2421,7 @@ fn relay_workers() -> &'static Workers {
         let count = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(4)
-            .clamp(2, 4);
+            .clamp(2, 6);
         for i in 0..count {
             let _ = std::thread::Builder::new()
                 .name(format!("oathkeep-relay-w-{i}"))
@@ -3632,6 +3632,25 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == WATCHED_GUARDED
     }
 
+    /// Lock-free check for whether this shadow is fully copied under guarded watch and its
+    /// cached whole-shadow clean guard epochs still match the current guard epochs and `synced_at`.
+    pub(crate) fn is_guarded_clean(&self) -> bool {
+        if self.watched.load(Ordering::Relaxed) != WATCHED_GUARDED {
+            return false;
+        }
+        if self.uncopied.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        let since = self.synced_at.load(Ordering::Acquire);
+        if since == 0 {
+            return false;
+        }
+        let full_epochs =
+            std::array::from_fn(|i| self.clean_guard_epochs[i].load(Ordering::Acquire));
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        crate::watch::guarded_clean_epochs_match(start, end, full_epochs, since)
+    }
+
     pub(crate) fn ever_written(&self) -> bool {
         self.ever_written.load(Ordering::Relaxed)
     }
@@ -4209,6 +4228,9 @@ impl Shadow {
         runs_left: &mut usize,
         allow_wide: bool,
     ) -> bool {
+        if !self.writes_pending() || self.is_guarded_clean() {
+            return false;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4320,21 +4342,27 @@ impl Shadow {
                 Self::log_why_stale("writes_none", self, 0, a, e);
                 return true;
             };
-            if let Some(ep) = clean_epochs {
+            let record_sub_clean = if let Some(ep) = clean_epochs {
                 if full {
                     self.clean_guard_epochs[0].store(0, Ordering::Release);
                     for i in (1..crate::watch::CLEAN_EPOCH_SHARDS).rev() {
                         self.clean_guard_epochs[i].store(ep[i], Ordering::Release);
                     }
                     self.clean_guard_epochs[0].store(ep[0], Ordering::Release);
-                } else if let Some((shards, count)) = sub_shards {
+                    None
+                } else {
+                    sub_shards.map(|(shards, count)| (shards, count, ep))
+                }
+            } else {
+                None
+            };
+            if all_copied && written.is_empty() {
+                if let Some((shards, count, ep)) = record_sub_clean {
                     self.copied
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .record_clean_shards(shards, count, ep, lo_page, hi_page);
                 }
-            }
-            if all_copied && written.is_empty() {
                 continue;
             }
             let stale: Vec<usize> = {
@@ -4343,7 +4371,10 @@ impl Shadow {
                 } else {
                     0
                 };
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((shards, count, ep)) = record_sub_clean {
+                    copied.record_clean_shards(shards, count, ep, lo_page, hi_page);
+                }
                 copied.stale_pages_in(base, global_synced, a, e, &written)
             };
             if stale.is_empty() {
@@ -5831,6 +5862,7 @@ impl Shadow {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn card_has_old_piece(&self, at: usize, len: usize) -> bool {
         let Some(card) = &self.card else {
             return false;
@@ -5845,6 +5877,7 @@ impl Shadow {
         self.pieces(at, at + len).all(|p| old.contains_key(&p))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn card_piece_is_superseded(&self, lo: usize, hi: usize, after: u64) -> bool {
         let Some(card) = &self.card else {
             return false;
@@ -5855,6 +5888,53 @@ impl Shadow {
         let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
         let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
         card_range_is_superseded(&dirty, &sent, lo, hi, after)
+    }
+
+    /// Filters a batch of candidate `(lo, hi)` card intervals for this shadow while acquiring
+    /// `card.old`, `card.dirty`, and `card.sent` at most once per shadow.
+    /// Returns `(live_intervals, skipped_pieces, skipped_bytes)`.
+    pub(crate) fn filter_live_card_pieces(
+        &self,
+        intervals: &[(usize, usize)],
+        after: u64,
+    ) -> (Vec<(usize, usize)>, u64, u64) {
+        if intervals.is_empty() {
+            return (Vec::new(), 0, 0);
+        }
+        let Some(card) = &self.card else {
+            let skipped_bytes: u64 = intervals
+                .iter()
+                .map(|&(lo, hi)| hi.saturating_sub(lo) as u64)
+                .sum();
+            return (Vec::new(), intervals.len() as u64, skipped_bytes);
+        };
+        if !card.has_old.load(Ordering::Acquire) {
+            let skipped_bytes: u64 = intervals
+                .iter()
+                .map(|&(lo, hi)| hi.saturating_sub(lo) as u64)
+                .sum();
+            return (Vec::new(), intervals.len() as u64, skipped_bytes);
+        }
+        let old = card.old.lock().unwrap_or_else(|e| e.into_inner());
+        let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+        let buf_len = self.len as usize;
+        let mut live = Vec::with_capacity(intervals.len());
+        let mut skipped_pieces = 0u64;
+        let mut skipped_bytes = 0u64;
+        for &(lo, hi) in intervals {
+            let len = hi.saturating_sub(lo);
+            let has_old = len > 0
+                && hi <= buf_len
+                && self.pieces(lo, hi).all(|p| old.contains_key(&p));
+            if !has_old || card_range_is_superseded(&dirty, &sent, lo, hi, after) {
+                skipped_pieces += 1;
+                skipped_bytes += len as u64;
+            } else {
+                live.push((lo, hi));
+            }
+        }
+        (live, skipped_pieces, skipped_bytes)
     }
 
     pub(crate) fn card_fill_upload(&self, a: usize, len: usize, dst: *mut u8) {
@@ -6155,6 +6235,7 @@ impl Shadow {
         }
 
         let record_race = merge_race_on();
+        let clear_hashes = card.has_hot_hashes.load(Ordering::Acquire);
         let raw_buckets: Vec<RelayMergeBucket> = if parallel && works.len() >= 16 {
             let worker_count = (works.len() / 8).clamp(2, 6);
             let chunk_size = works.len().div_ceil(worker_count);
@@ -6171,7 +6252,7 @@ impl Shadow {
                 let slot = Arc::new(Mutex::new(None));
                 results.push(slot.clone());
                 jobs.push(Box::new(move || {
-                    let out = merge_relay_chunk(start, chunk, &skip, record_race);
+                    let out = merge_relay_chunk(start, chunk, &skip, record_race, clear_hashes);
                     *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
                 }));
             }
@@ -6181,7 +6262,7 @@ impl Shadow {
                 .filter_map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).take())
                 .collect()
         } else {
-            vec![merge_relay_chunk(start, works, &skip, record_race)]
+            vec![merge_relay_chunk(start, works, &skip, record_race, clear_hashes)]
         };
 
         let mut buckets: Vec<RelayMergeBucket> = Vec::with_capacity(raw_buckets.len());
@@ -6201,10 +6282,8 @@ impl Shadow {
         let total_writes: usize = buckets.iter().map(|b| b.writes.len()).sum();
         let mut spans: Vec<(usize, usize)> = Vec::with_capacity(total_writes);
         let mut total_written = 0usize;
-        let mut has_hash_updates = false;
         let mut has_hash_clears = false;
         for b in &buckets {
-            has_hash_updates |= !b.hash_updates.is_empty();
             has_hash_clears |= !b.hash_clears.is_empty();
             for w in &b.writes {
                 spans.push((w.at, w.at + w.len));
@@ -6212,15 +6291,9 @@ impl Shadow {
             }
         }
 
-        if has_hash_updates || (has_hash_clears && card.has_hot_hashes.load(Ordering::Acquire)) {
+        if has_hash_clears && card.has_hot_hashes.load(Ordering::Acquire) {
             let mut guard = card.hot_hashes.lock().unwrap_or_else(|e| e.into_inner());
-            if has_hash_updates {
-                let slots_needed = (self.len as usize).div_ceil(HOT_HASH_BLOCK);
-                if guard.slots.len() < slots_needed {
-                    guard.slots.resize(slots_needed, 0);
-                }
-            }
-            if has_hash_clears && !guard.slots.is_empty() {
+            if !guard.slots.is_empty() {
                 let mut clear_spans: Vec<(usize, usize)> = Vec::new();
                 for b in &buckets {
                     clear_spans.extend_from_slice(&b.hash_clears);
@@ -6233,31 +6306,21 @@ impl Shadow {
                     }
                 }
             }
-            if has_hash_updates {
-                for b in &buckets {
-                    for &(slot, hash) in &b.hash_updates {
-                        if let Some(dst) = guard.slots.get_mut(slot) {
-                            *dst = hash;
-                        }
+            if !guard.quiet.is_empty() {
+                let frame = crate::frame::current();
+                let base = start / PAGE;
+                for &(a, b) in &spans {
+                    let q_lo = ((start + a) / PAGE)
+                        .saturating_sub(base)
+                        .min(guard.quiet.len());
+                    let q_hi = (start + b)
+                        .div_ceil(PAGE)
+                        .saturating_sub(base)
+                        .min(guard.quiet.len());
+                    for q in &mut guard.quiet[q_lo..q_hi] {
+                        q.mark_changed(frame);
                     }
                 }
-                if !guard.quiet.is_empty() {
-                    let frame = crate::frame::current();
-                    let base = start / PAGE;
-                    for &(a, b) in &spans {
-                        let q_lo = ((start + a) / PAGE)
-                            .saturating_sub(base)
-                            .min(guard.quiet.len());
-                        let q_hi = (start + b)
-                            .div_ceil(PAGE)
-                            .saturating_sub(base)
-                            .min(guard.quiet.len());
-                        for q in &mut guard.quiet[q_lo..q_hi] {
-                            q.mark_changed(frame);
-                        }
-                    }
-                }
-                card.has_hot_hashes.store(true, Ordering::Release);
             }
         }
         for (a, b) in coalesce_watch_spans(start, &spans) {
@@ -6645,7 +6708,6 @@ fn card_range_is_superseded(
 struct RelayMergeBucket {
     arena: Vec<u8>,
     writes: Vec<RelayPendingWrite>,
-    hash_updates: Vec<(usize, u128)>,
     hash_clears: Vec<(usize, usize)>,
     stats: RelayMergeStats,
 }
@@ -6655,10 +6717,10 @@ fn merge_relay_chunk(
     works: Vec<RelayPieceWork>,
     skip: &RelaySkipSnapshot,
     record_race: bool,
+    clear_hashes: bool,
 ) -> RelayMergeBucket {
     let mut arena = Vec::new();
     let mut writes = Vec::new();
-    let mut hash_updates = Vec::new();
     let mut hash_clears = Vec::new();
     let mut scratch = Vec::new();
     let mut active = Vec::new();
@@ -6713,24 +6775,8 @@ fn merge_relay_chunk(
                     src: RelayWriteSrc::Gpu(held.as_ptr() as usize),
                     as_read,
                 });
-                let diff_end = diff_at + n;
-                let first_full = diff_at.next_multiple_of(HOT_HASH_BLOCK);
-                let last_full = (diff_end / HOT_HASH_BLOCK) * HOT_HASH_BLOCK;
-                if diff_at < first_full {
-                    hash_clears.push((diff_at, first_full.min(diff_end)));
-                }
-                if first_full < last_full {
-                    let mut b_at = first_full;
-                    while b_at < last_full {
-                        let h =
-                            hot_page_hash(&held[b_at - diff_at..b_at - diff_at + HOT_HASH_BLOCK])
-                                | 1;
-                        hash_updates.push((b_at / HOT_HASH_BLOCK, h));
-                        b_at += HOT_HASH_BLOCK;
-                    }
-                }
-                if last_full < diff_end {
-                    hash_clears.push((last_full.max(diff_at), diff_end));
+                if clear_hashes {
+                    hash_clears.push((diff_at, diff_at + n));
                 }
                 continue;
             }
@@ -6752,13 +6798,14 @@ fn merge_relay_chunk(
                 src: RelayWriteSrc::Arena(arena_off),
                 as_read,
             });
-            hash_clears.push((diff_at, diff_at + n));
+            if clear_hashes {
+                hash_clears.push((diff_at, diff_at + n));
+            }
         }
     }
     RelayMergeBucket {
         arena,
         writes,
-        hash_updates,
         hash_clears,
         stats,
     }
@@ -7005,7 +7052,7 @@ mod relay_batch_tests {
             },
         ];
         let start = title_mem.as_ptr() as usize;
-        let bucket = merge_relay_chunk(start, works, &skip, false);
+        let bucket = merge_relay_chunk(start, works, &skip, false, false);
         assert_eq!(bucket.writes.len(), 2);
         assert_eq!(bucket.stats.pieces[super::RELAY_OUT_WRITTEN], 2);
         for w in &bucket.writes {
@@ -7051,8 +7098,8 @@ mod relay_batch_tests {
     }
 
     #[test]
-    fn relay_merge_fast_path_skips_arena_copy_and_emits_hot_hash_updates() {
-        use super::{RelayWriteSrc, hot_page_hash};
+    fn relay_merge_fast_path_skips_arena_copy_and_only_clears_hot_hashes_when_enabled() {
+        use super::RelayWriteSrc;
 
         let title_mem: Vec<u8> = (0..PAGE).map(|i| (i * 7 + 1) as u8).collect();
         let mut old0 = title_mem.clone();
@@ -7080,17 +7127,31 @@ mod relay_batch_tests {
             old_len: old0.len(),
             items: vec![(0, gpu0.as_ptr() as usize, gpu0.len(), 1)],
         }];
-        let bucket = merge_relay_chunk(title_mem.as_ptr() as usize, works, &skip, false);
+        let bucket = merge_relay_chunk(title_mem.as_ptr() as usize, works, &skip, false, false);
         assert_eq!(bucket.writes.len(), 1);
         assert!(bucket.arena.is_empty(), "clean GPU write should borrow gpu slice directly");
         assert!(matches!(bucket.writes[0].src, RelayWriteSrc::Gpu(_)));
-        assert!(bucket.hash_clears.is_empty());
-        assert_eq!(bucket.hash_updates.len(), PAGE / HOT_HASH_BLOCK);
-        for &(slot, hash) in &bucket.hash_updates {
-            let off = slot * HOT_HASH_BLOCK;
-            assert_eq!(hash, hot_page_hash(&gpu0[off..off + HOT_HASH_BLOCK]) | 1);
-        }
+        assert!(
+            bucket.hash_clears.is_empty(),
+            "clear_hashes=false should skip hot_hashes work entirely"
+        );
         assert_eq!(old0, gpu0);
+
+        // When hot_hashes are active (`clear_hashes=true`), clean GPU write invalidates the span
+        // via `hash_clears` instead of hashing every 4 KiB page.
+        let mut old1 = title_mem.clone();
+        let works1 = vec![RelayPieceWork {
+            p_lo: 0,
+            old_ptr: old1.as_mut_ptr() as usize,
+            old_len: old1.len(),
+            items: vec![(0, gpu0.as_ptr() as usize, gpu0.len(), 1)],
+        }];
+        let bucket1 = merge_relay_chunk(title_mem.as_ptr() as usize, works1, &skip, false, true);
+        assert_eq!(bucket1.writes.len(), 1);
+        assert!(bucket1.arena.is_empty());
+        assert!(matches!(bucket1.writes[0].src, RelayWriteSrc::Gpu(_)));
+        assert_eq!(bucket1.hash_clears, vec![(0, PAGE)]);
+        assert_eq!(old1, gpu0);
     }
 
     #[test]
@@ -7170,7 +7231,7 @@ mod relay_batch_tests {
                 items: vec![(3 * PAGE, gpu3.as_ptr() as usize, gpu3.len(), 5)],
             },
         ];
-        let bucket = merge_relay_chunk(title_mem.as_ptr() as usize, works, &skip, false);
+        let bucket = merge_relay_chunk(title_mem.as_ptr() as usize, works, &skip, false, false);
         assert_eq!(bucket.writes.len(), 1);
         assert_eq!(bucket.stats.pieces[RELAY_OUT_EQUAL_OLD], 1);
         assert_eq!(bucket.stats.bytes[RELAY_OUT_EQUAL_OLD], PAGE as u64);
@@ -7203,6 +7264,7 @@ mod relay_batch_tests {
                 items: vec![(0, gpu_u.as_ptr() as usize, gpu_u.len(), 5)],
             }],
             &empty_skip,
+            false,
             false,
         );
         assert!(bucket_u.writes.is_empty());
