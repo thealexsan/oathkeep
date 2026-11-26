@@ -6,7 +6,7 @@
   <text x="24" y="32" fill="#f0f6fc" font-size="16" font-weight="600">Oathkeep Progress Matrix</text>
   <text x="24" y="52" fill="#8b949e" font-size="12">Clean-room Xbox Series X|S (GDK) compatibility &amp; RDNA 2-to-DXIL layer</text>
   <text x="856" y="32" text-anchor="end" fill="#39d353" font-size="16" font-weight="700" class="mono">95%</text>
-  <text x="856" y="52" text-anchor="end" fill="#8b949e" font-size="11" class="mono">9dcae23 (perf/commit-reduction) • 2026-11-26</text>
+  <text x="856" y="52" text-anchor="end" fill="#8b949e" font-size="11" class="mono">45708fb (perf/commit-reduction) • 2026-11-26</text>
   <line x1="24" y1="66" x2="856" y2="66" stroke="#21262d"/>
   <text x="24" y="80" fill="#c9d1d9" font-size="11" font-weight="600">SUBSYSTEM CAPABILITY MATRIX</text>
   <text x="24" y="106" fill="#c9d1d9" font-size="12">PE32+ Loader &amp; CPU</text>
@@ -182,13 +182,13 @@
   <rect x="474" y="296" width="382" height="62" rx="6" fill="#161b22" stroke="#30363d"/>
   <text x="486" y="314" fill="#8b949e" font-size="10.5" font-weight="600">LATEST WORLD TELEMETRY (RTX 3070 8 GB, 1080P)</text>
   <text x="486" y="330" fill="#8b949e" font-size="10" class="mono">FPS</text>
-  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">7.9-10.9 fps peak (diag-run74, 0.0 ms GPU wait, WHY_READ=0, WHY_STALE=0)</text>
+  <text x="486" y="347" fill="#39d353" font-size="12.5" font-weight="600" class="mono">8.3-10.6 fps steady (diag-run76, 0 refused slots, 0 dropped indirects, 0.0 ms GPU wait)</text>
   <text x="575" y="330" fill="#8b949e" font-size="10" class="mono">FRAME</text>
-  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">91.7-127.4 ms (peak 10.9 fps, 0.0 ms GPU wait, 12.4-13.3 GB private commit)</text>
+  <text x="575" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">94.4-120.7 ms (0 refused dynamic slots, 0 dropped indirects, 5273 draws/f max)</text>
   <text x="664" y="330" fill="#8b949e" font-size="10" class="mono">GPU</text>
-  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">0.0 ms wait (LATE_WAIT=3 + RELAY=2, GPU 72-75% busy, 13.3-16.6 ms async copy-back)</text>
+  <text x="664" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">0.0 ms wait (GPU 82-94% busy due to 2.8k-4.7k mid-list gpu_copy_scratch barriers/f)</text>
   <text x="753" y="330" fill="#8b949e" font-size="10" class="mono">PREP</text>
-  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">44.2-53.9 ms (batch_flush 21.5-27.3 ms, heap_buffers 7.1-9.6 ms; recording 176-232 ms across threads)</text>
+  <text x="753" y="347" fill="#f0f6fc" font-size="12.5" font-weight="600" class="mono">45.7-66.0 ms (batch_flush 23.8-36.9 ms, guards 20.7-34.1 ms, moves shadow 29.7-45.8 ms)</text>
   <line x1="24" y1="374" x2="856" y2="374" stroke="#21262d"/>
   <text x="24" y="390" fill="#8b949e" font-size="11">Target: 20-30+ FPS (1:1 visuals) • Clean-room Xbox Series X|S (GDK) layer</text>
   <text x="704" y="390" text-anchor="end" fill="#8b949e" font-size="11">Less</text>

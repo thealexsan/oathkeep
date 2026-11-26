@@ -1,14 +1,14 @@
 [meta]
 updated = "2026-11-26"
-commit = "9dcae23"
+commit = "45708fb"
 branch = "perf/commit-reduction"
 target_fps = "20-30+ FPS (1:1 visuals)"
-current_fps = "7.9-10.9 fps peak (diag-run74, 0.0 ms GPU wait, WHY_READ=0, WHY_STALE=0)"
-current_frame_ms = "91.7-127.4 ms (peak 10.9 fps, 0.0 ms GPU wait, 12.4-13.3 GB private commit)"
-current_gpu_ms = "0.0 ms wait (LATE_WAIT=3 + RELAY=2, GPU 72-75% busy, 13.3-16.6 ms async copy-back)"
-current_preparing_ms = "44.2-53.9 ms (batch_flush 21.5-27.3 ms, heap_buffers 7.1-9.6 ms; recording 176-232 ms across threads)"
+current_fps = "8.3-10.6 fps steady (diag-run76, 0 refused slots, 0 dropped indirects, 0.0 ms GPU wait)"
+current_frame_ms = "94.4-120.7 ms (0 refused dynamic slots, 0 dropped indirects, 5273 draws/f max)"
+current_gpu_ms = "0.0 ms wait (GPU 82-94% busy due to 2.8k-4.7k mid-list gpu_copy_scratch barriers/f)"
+current_preparing_ms = "45.7-66.0 ms (batch_flush 23.8-36.9 ms, guards 20.7-34.1 ms, moves shadow 29.7-45.8 ms)"
 headline = "Clean-room Xbox Series X|S (GDK) compatibility & RDNA 2-to-DXIL layer"
-eta = "~25-45 min (eliminate dynamic descriptor slot exhaustion & cut recording 176 ms + batch_flush 22 ms -> 20-30+ FPS)"
+eta = "~20-35 min (hoist pre-write gpu_copy_scratch to prelude + multi-buffer scratch ring + cut batch_flush -> 20-30+ FPS)"
 pages_url = "https://thealexsan.github.io/oathkeep/"
 
 [[subsystems]]
@@ -226,3 +226,12 @@ frame_ms = 91.7
 gpu_ms = "0.0 ms wait (LATE_WAIT=3 + RELAY=2, 72-75% busy, 13.3-16.6 ms async copy-back)"
 preparing_ms = "44.2-53.9 ms (batch_flush 21.5-27.3 ms, heap_buffers 7.1-9.6 ms)"
 status = "New peak 10.9 fps! Fixes M1+M2 verified: WHY_READ=0, WHY_STALE=0, 0.0 ms GPU wait; next: eliminate dynamic descriptor exhaustion (128-1359 refused) & cut recording (176-232 ms) + batch_flush (21.5 ms)"
+
+[[runs]]
+label = "diag-run76"
+commit = "45708fb"
+fps = 10.6
+frame_ms = 94.4
+gpu_ms = "0.0 ms wait (82-94% busy; 2.8k-4.7k mid-list gpu_copy_scratch barriers/f)"
+preparing_ms = "45.7-66.0 ms (batch_flush 23.8-36.9 ms, guards 20.7-34.1 ms)"
+status = "Fix O1+O2 verified: dynamic slot refusals 576->0, dropped indirects 1313->0, uncacheable 9161->0, fresh_tables hits 6-8x (1656-4438), cbv_scratch hits 1519-5517; next: prelude-hoist gpu_copy_scratch + multi-buffer scratch ring + batch_flush"
