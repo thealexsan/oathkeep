@@ -279,6 +279,9 @@ pub(crate) struct State {
     direct_cbv_cache: DrawFastMap<(u64, u32), (u64, std::sync::Arc<crate::shadow::Shadow>)>,
     direct_cbv_copy_seq: u64,
     direct_cbv_shadow_gen: u64,
+    scratch_cbv_cache: DrawFastMap<(u64, u32), u64>,
+    scratch_cbv_gpu_write_seq: u64,
+    mirrored_tex_seen: DrawFastSet<(usize, u32, u64)>,
     kept_ptrs: DrawFastSet<usize>,
     kept_list_gen: u64,
     dynamic: Vec<(usize, u32, u32)>,
@@ -342,6 +345,9 @@ impl State {
         self.direct_cbv_cache.clear();
         self.direct_cbv_copy_seq = 0;
         self.direct_cbv_shadow_gen = 0;
+        self.scratch_cbv_cache.clear();
+        self.scratch_cbv_gpu_write_seq = 0;
+        self.mirrored_tex_seen.clear();
         self.dyn_chunk = (0, 0, 0);
         if self.tables_gone && self.dynamic.is_empty() {
             return;
@@ -382,6 +388,9 @@ impl State {
             self.direct_cbv_cache.clear();
             self.direct_cbv_copy_seq = 0;
             self.direct_cbv_shadow_gen = 0;
+            self.scratch_cbv_cache.clear();
+            self.scratch_cbv_gpu_write_seq = 0;
+            self.mirrored_tex_seen.clear();
             self.windows.clear();
             self.windows_epoch = 0;
             self.kept_list_gen = list_gen;
@@ -4214,12 +4223,18 @@ impl State {
             let frame_now = crate::frame::current();
             let cur_copy_seq = list.copy_seq();
             let cur_shadow_gen = crate::shadow::generation();
+            let cur_gpu_write_seq = list.gpu_write_seq();
             if self.direct_cbv_copy_seq != cur_copy_seq
                 || self.direct_cbv_shadow_gen != cur_shadow_gen
             {
                 self.direct_cbv_cache.clear();
+                self.scratch_cbv_cache.clear();
                 self.direct_cbv_copy_seq = cur_copy_seq;
                 self.direct_cbv_shadow_gen = cur_shadow_gen;
+                self.scratch_cbv_gpu_write_seq = cur_gpu_write_seq;
+            } else if self.scratch_cbv_gpu_write_seq != cur_gpu_write_seq {
+                self.scratch_cbv_cache.clear();
+                self.scratch_cbv_gpu_write_seq = cur_gpu_write_seq;
             }
             let allow_direct_cbv = direct_cbv();
             let mut premade = std::mem::take(&mut self.scratch_dyn_made);
@@ -4252,7 +4267,19 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     let t_cbv = std::time::Instant::now();
                     let size_u64 = u64::from(size);
-                    if allow_direct_cbv
+                    let aligned_256 = (address & 255) == 0;
+                    if !aligned_256
+                        && let Some(&gpu) = self.scratch_cbv_cache.get(&(address, size))
+                    {
+                        host.constant_at_dynamic(index, gpu, size);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            cbv_ns += t_cbv.elapsed().as_nanos() as u64;
+                        }
+                        continue;
+                    }
+                    if aligned_256
+                        && allow_direct_cbv
                         && let Some((gpu, shadow)) = self.direct_cbv_cache.get(&(address, size))
                         && !shadow.is_dead()
                     {
@@ -4276,11 +4303,11 @@ impl State {
                     let gpu_active = existing
                         .as_ref()
                         .is_some_and(|s| s.is_gpu_active(list, address, size_u64));
-                    if (allow_direct_cbv || gpu_active)
+                    if ((aligned_256 && allow_direct_cbv) || gpu_active)
                         && let Some(shadow) =
                             existing.or_else(|| self.find_shadow(address, size_u64))
                     {
-                        if shadow.can_bind_cbv(address, size) {
+                        if aligned_256 && shadow.can_bind_cbv(address, size) {
                             let gpu = shadow.gpu(address);
                             refresh_shadow_in(
                                 &mut self.local_refreshed,
@@ -4343,6 +4370,9 @@ impl State {
                         continue;
                     };
                     list.defer_fill(to, address as *const u8, size as usize);
+                    if !aligned_256 && !gpu_active {
+                        self.scratch_cbv_cache.insert((address, size), gpu);
+                    }
                     host.constant_at_dynamic(index, gpu, size);
                     #[cfg(feature = "diagnostics")]
                     {
@@ -4471,7 +4501,14 @@ impl State {
                 {
                     host.texture_slot_tabled_at(title + k, kind.is_some(), frame_now);
                     if kind.is_some() && !host.made_key_matches_words(title + k, words) {
-                        host.mirror(title + k, table + u64::from(k) * 32, true);
+                        let wkey = if words[0] == crate::descriptor::VIEW_TAG {
+                            (u64::from(words[2]) << 32) | u64::from(words[1])
+                        } else {
+                            0
+                        };
+                        if wkey == 0 || self.mirrored_tex_seen.insert((heap_id, title + k, wkey)) {
+                            host.mirror(title + k, table + u64::from(k) * 32, true);
+                        }
                     }
                 }
                 #[cfg(feature = "diagnostics")]

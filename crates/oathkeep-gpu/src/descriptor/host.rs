@@ -2523,9 +2523,6 @@ impl HostHeap {
         if self.sampler || used_k.len() < 2 {
             return;
         }
-        let Some(host) = host() else {
-            return;
-        };
         let Some(stage) = cpu_stage_heap() else {
             return;
         };
@@ -2611,14 +2608,14 @@ impl HostHeap {
                     // protected from concurrent eviction by the held stripe read guards.
                     unsafe {
                         if n_copy == 1 {
-                            host.device.CopyDescriptorsSimple(
+                            self.device.CopyDescriptorsSimple(
                                 1,
                                 dsts[0],
                                 srcs[0],
                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                             );
                         } else {
-                            host.device.CopyDescriptors(
+                            self.device.CopyDescriptors(
                                 n_copy as u32,
                                 dsts.as_ptr(),
                                 None,

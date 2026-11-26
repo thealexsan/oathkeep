@@ -5408,7 +5408,7 @@ impl Shadow {
             }
             if let Some(card) = &self.card {
                 let mut recheck_pages: Vec<(usize, bool)> = Vec::new();
-                let mut dirty_chunk: Option<usize> = None;
+                let mut mark_indices: Vec<usize> = Vec::new();
                 for &(page, write) in written {
                     if page < base || page - base >= pages_len {
                         continue;
@@ -5421,6 +5421,33 @@ impl Shadow {
                         continue;
                     }
                     if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                        mark_indices.push(idx);
+                    }
+                    recheck_pages.push((page, is_hot));
+                }
+                if recheck_pages.is_empty() {
+                    if now != 0 {
+                        if full && uncopied_zero {
+                            drop(copied);
+                            self.synced_at.fetch_max(now, Ordering::Release);
+                        } else {
+                            copied.advance_synced(full_lo, full_hi, now);
+                            drop(copied);
+                        }
+                    } else {
+                        drop(copied);
+                    }
+                    return 0;
+                }
+                // Release `copied` lock before scanning/copying so disjoint spans of the
+                // same shadow execute concurrently across `wide_run` workers.
+                drop(copied);
+                let (changed_spans, cool_blocks) = self.scan_card_pages(card, from, to, &recheck_pages);
+                let bytes = self.copy_card_spans(card, &changed_spans, false);
+                if !mark_indices.is_empty() || (now != 0 && !(full && uncopied_zero)) {
+                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut dirty_chunk: Option<usize> = None;
+                    for idx in mark_indices {
                         copied.set_raw(idx, now);
                         let c = idx / COPIED_CHUNK;
                         if let Some(prev_c) = dirty_chunk
@@ -5430,38 +5457,26 @@ impl Shadow {
                         }
                         dirty_chunk = Some(c);
                     }
-                    recheck_pages.push((page, is_hot));
-                }
-                if let Some(c) = dirty_chunk {
-                    copied.recompute_chunk(c);
-                }
-                let mut bytes = 0;
-                let mut cool_blocks = Vec::new();
-                if !recheck_pages.is_empty() {
-                    let (changed_spans, cool) = self.scan_card_pages(card, from, to, &recheck_pages);
-                    cool_blocks = cool;
-                    bytes += self.copy_card_spans(card, &changed_spans, false);
-                }
-                if now != 0 {
-                    if full && uncopied_zero {
-                        drop(copied);
-                        self.synced_at.fetch_max(now, Ordering::Release);
-                    } else {
-                        copied.advance_synced(full_lo, full_hi, now);
-                        drop(copied);
+                    if let Some(c) = dirty_chunk {
+                        copied.recompute_chunk(c);
                     }
-                } else {
-                    drop(copied);
+                    if now != 0 && !(full && uncopied_zero) {
+                        copied.advance_synced(full_lo, full_hi, now);
+                    }
+                }
+                if now != 0 && full && uncopied_zero {
+                    self.synced_at.fetch_max(now, Ordering::Release);
                 }
                 if !cool_blocks.is_empty() {
                     crate::watch::cool_hot(&cool_blocks);
                 }
                 return bytes;
             }
-            let mut bytes = 0;
+            let mut copy_runs: Vec<(usize, usize)> = Vec::new();
+            let mut hot_pages: Vec<(usize, usize, usize, usize, bool)> = Vec::new();
+            let mut mark_indices: Vec<usize> = Vec::new();
+            let mut hot_changed_indices: Vec<usize> = Vec::new();
             let mut run: Option<(usize, usize)> = None;
-            let mut dirty_chunk: Option<usize> = None;
-            let mut cool_blocks: Vec<usize> = Vec::new();
             let frame = crate::frame::current();
             let cool_after = hot_cool_frames();
             for &(page, write) in written {
@@ -5476,6 +5491,70 @@ impl Shadow {
                     continue;
                 }
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    mark_indices.push(idx);
+                }
+                if is_hot {
+                    if let Some((first, prev)) = run.take() {
+                        copy_runs.push(((first * PAGE).max(from), ((prev + 1) * PAGE).min(to)));
+                    }
+                    let p_from = (page * PAGE).max(from);
+                    let p_to = ((page + 1) * PAGE).min(to);
+                    let full_page =
+                        p_from == (page * PAGE).max(start) && p_to == ((page + 1) * PAGE).min(end);
+                    hot_pages.push((page, idx, p_from, p_to, full_page));
+                } else {
+                    hot_changed_indices.push(idx);
+                    match run {
+                        Some((first, prev)) if page == prev + 1 => run = Some((first, page)),
+                        Some((first, prev)) => {
+                            copy_runs
+                                .push(((first * PAGE).max(from), ((prev + 1) * PAGE).min(to)));
+                            run = Some((page, page));
+                        }
+                        None => run = Some((page, page)),
+                    }
+                }
+            }
+            if let Some((first, prev)) = run {
+                copy_runs.push(((first * PAGE).max(from), ((prev + 1) * PAGE).min(to)));
+            }
+            if copy_runs.is_empty() && hot_pages.is_empty() {
+                if now != 0 {
+                    if full && uncopied_zero {
+                        drop(copied);
+                        self.synced_at.fetch_max(now, Ordering::Release);
+                    } else {
+                        copied.advance_synced(full_lo, full_hi, now);
+                        drop(copied);
+                    }
+                } else {
+                    drop(copied);
+                }
+                return 0;
+            }
+            // Drop `copied` lock before doing memory copies so disjoint spans of the same
+            // shadow copy in parallel without serializing on the mutex.
+            drop(copied);
+            let mut bytes = 0usize;
+            for (r_from, r_to) in copy_runs {
+                bytes += self.copy(r_from, r_to);
+            }
+            let mut hot_results: Vec<(usize, usize, bool, bool)> =
+                Vec::with_capacity(hot_pages.len());
+            for (page, idx, p_from, p_to, full_page) in hot_pages {
+                let changed = self.copy_hot(p_from, p_to);
+                bytes += changed;
+                hot_results.push((page, idx, changed > 0, full_page));
+            }
+            let mut cool_blocks: Vec<usize> = Vec::new();
+            if !mark_indices.is_empty()
+                || !hot_changed_indices.is_empty()
+                || !hot_results.is_empty()
+                || (now != 0 && !(full && uncopied_zero))
+            {
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let mut dirty_chunk: Option<usize> = None;
+                for idx in mark_indices {
                     copied.set_raw(idx, now);
                     let c = idx / COPIED_CHUNK;
                     if let Some(prev_c) = dirty_chunk
@@ -5485,49 +5564,23 @@ impl Shadow {
                     }
                     dirty_chunk = Some(c);
                 }
-                if is_hot {
-                    if let Some((first, prev)) = run.take() {
-                        bytes += self
-                            .copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
-                    }
-                    let p_from = (page * PAGE).max(from);
-                    let p_to = ((page + 1) * PAGE).min(to);
-                    let full_page =
-                        p_from == (page * PAGE).max(start) && p_to == ((page + 1) * PAGE).min(end);
-                    let changed = self.copy_hot(p_from, p_to);
-                    bytes += changed;
-                    if copied.record_hot_quiet(idx, frame, changed > 0, full_page, cool_after) {
+                if let Some(c) = dirty_chunk {
+                    copied.recompute_chunk(c);
+                }
+                for idx in hot_changed_indices {
+                    copied.mark_hot_changed(idx, frame);
+                }
+                for (page, idx, changed, full_page) in hot_results {
+                    if copied.record_hot_quiet(idx, frame, changed, full_page, cool_after) {
                         cool_blocks.push(page);
                     }
-                } else {
-                    copied.mark_hot_changed(idx, frame);
-                    match run {
-                        Some((first, prev)) if page == prev + 1 => run = Some((first, page)),
-                        Some((first, prev)) => {
-                            bytes += self
-                                .copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
-                            run = Some((page, page));
-                        }
-                        None => run = Some((page, page)),
-                    }
                 }
-            }
-            if let Some(c) = dirty_chunk {
-                copied.recompute_chunk(c);
-            }
-            if let Some((first, prev)) = run {
-                bytes += self.copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
-            }
-            if now != 0 {
-                if full && uncopied_zero {
-                    drop(copied);
-                    self.synced_at.fetch_max(now, Ordering::Release);
-                } else {
+                if now != 0 && !(full && uncopied_zero) {
                     copied.advance_synced(full_lo, full_hi, now);
-                    drop(copied);
                 }
-            } else {
-                drop(copied);
+            }
+            if now != 0 && full && uncopied_zero {
+                self.synced_at.fetch_max(now, Ordering::Release);
             }
             if !cool_blocks.is_empty() {
                 crate::watch::cool_hot(&cool_blocks);
@@ -5538,8 +5591,7 @@ impl Shadow {
             let mut writes = written.iter().peekable();
             let mut uncopied_runs: Vec<(usize, usize)> = Vec::new();
             let mut recheck_pages: Vec<(usize, bool)> = Vec::new();
-            let mut newly_copied = 0u64;
-            let mut dirty_chunk: Option<usize> = None;
+            let mut mark_indices: Vec<usize> = Vec::new();
             let last = (to - 1) / PAGE;
             for page in from / PAGE..=last {
                 let write = match writes.peek() {
@@ -5553,40 +5605,19 @@ impl Shadow {
                 let at = copied.get(idx, global_synced);
                 if at != 0 && (write == crate::watch::HOT_WRITE || write > at) {
                     if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                        copied.set_raw(idx, now);
-                        let c = idx / COPIED_CHUNK;
-                        if let Some(prev_c) = dirty_chunk
-                            && prev_c != c
-                        {
-                            copied.recompute_chunk(prev_c);
-                        }
-                        dirty_chunk = Some(c);
+                        mark_indices.push(idx);
                     }
                     recheck_pages.push((page, write == crate::watch::HOT_WRITE));
                 } else if at == 0 {
                     if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                        if copied.set_raw(idx, now) {
-                            newly_copied += 1;
-                        }
-                        let c = idx / COPIED_CHUNK;
-                        if let Some(prev_c) = dirty_chunk
-                            && prev_c != c
-                        {
-                            copied.recompute_chunk(prev_c);
-                        }
-                        dirty_chunk = Some(c);
+                        mark_indices.push(idx);
                     }
                     let p_from = (page * PAGE).max(from);
                     let p_to = ((page + 1) * PAGE).min(to);
                     push_coalesced_span(&mut uncopied_runs, p_from, p_to);
                 }
             }
-            if let Some(c) = dirty_chunk {
-                copied.recompute_chunk(c);
-            }
-            if newly_copied > 0 {
-                self.uncopied.fetch_sub(newly_copied, Ordering::Release);
-            }
+            drop(copied);
             let mut bytes = 0;
             for (r_from, r_to) in uncopied_runs {
                 bytes += self.copy(r_from, r_to);
@@ -5597,16 +5628,36 @@ impl Shadow {
                 cool_blocks = cool;
                 bytes += self.copy_card_spans(card, &changed_spans, false);
             }
-            if now != 0 {
-                if full && self.uncopied.load(Ordering::Acquire) == 0 {
-                    drop(copied);
-                    self.synced_at.fetch_max(now, Ordering::Release);
-                } else {
-                    copied.advance_synced(full_lo, full_hi, now);
-                    drop(copied);
+            let mut newly_copied = 0u64;
+            {
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let mut dirty_chunk: Option<usize> = None;
+                for idx in mark_indices {
+                    if copied.set_raw(idx, now) {
+                        newly_copied += 1;
+                    }
+                    let c = idx / COPIED_CHUNK;
+                    if let Some(prev_c) = dirty_chunk
+                        && prev_c != c
+                    {
+                        copied.recompute_chunk(prev_c);
+                    }
+                    dirty_chunk = Some(c);
                 }
-            } else {
-                drop(copied);
+                if let Some(c) = dirty_chunk {
+                    copied.recompute_chunk(c);
+                }
+                if newly_copied > 0 {
+                    self.uncopied.fetch_sub(newly_copied, Ordering::Release);
+                }
+                if now != 0 {
+                    if full && self.uncopied.load(Ordering::Acquire) == 0 {
+                        drop(copied);
+                        self.synced_at.fetch_max(now, Ordering::Release);
+                    } else {
+                        copied.advance_synced(full_lo, full_hi, now);
+                    }
+                }
             }
             if !cool_blocks.is_empty() {
                 crate::watch::cool_hot(&cool_blocks);
@@ -5614,10 +5665,11 @@ impl Shadow {
             return bytes;
         }
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run): (usize, Option<usize>) = (0, None);
-        let mut newly_copied = 0u64;
-        let mut dirty_chunk: Option<usize> = None;
-        let mut cool_blocks: Vec<usize> = Vec::new();
+        let mut copy_runs: Vec<(usize, usize)> = Vec::new();
+        let mut hot_pages: Vec<(usize, usize, usize, usize, bool)> = Vec::new();
+        let mut mark_indices: Vec<usize> = Vec::new();
+        let mut hot_changed_indices: Vec<usize> = Vec::new();
+        let mut run: Option<usize> = None;
         let frame = crate::frame::current();
         let cool_after = hot_cool_frames();
         let last = (to - 1) / PAGE;
@@ -5633,65 +5685,80 @@ impl Shadow {
             let at = copied.get(idx, global_synced);
             if write == crate::watch::HOT_WRITE && at != 0 {
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    copied.set_raw(idx, now);
-                    let c = idx / COPIED_CHUNK;
-                    if let Some(prev_c) = dirty_chunk
-                        && prev_c != c
-                    {
-                        copied.recompute_chunk(prev_c);
-                    }
-                    dirty_chunk = Some(c);
+                    mark_indices.push(idx);
                 }
                 if let Some(first) = run.take() {
-                    bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                    copy_runs.push(((first * PAGE).max(from), (page * PAGE).min(to)));
                 }
                 let p_from = (page * PAGE).max(from);
                 let p_to = ((page + 1) * PAGE).min(to);
                 let full_page =
                     p_from == (page * PAGE).max(start) && p_to == ((page + 1) * PAGE).min(end);
-                let changed = self.copy_hot(p_from, p_to);
-                bytes += changed;
-                if copied.record_hot_quiet(idx, frame, changed > 0, full_page, cool_after) {
-                    cool_blocks.push(page);
-                }
+                hot_pages.push((page, idx, p_from, p_to, full_page));
             } else if at == 0 || write > at {
-                copied.mark_hot_changed(idx, frame);
+                hot_changed_indices.push(idx);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    if copied.set_raw(idx, now) {
-                        newly_copied += 1;
-                    }
-                    let c = idx / COPIED_CHUNK;
-                    if let Some(prev_c) = dirty_chunk
-                        && prev_c != c
-                    {
-                        copied.recompute_chunk(prev_c);
-                    }
-                    dirty_chunk = Some(c);
+                    mark_indices.push(idx);
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                copy_runs.push(((first * PAGE).max(from), (page * PAGE).min(to)));
             }
-        }
-        if let Some(c) = dirty_chunk {
-            copied.recompute_chunk(c);
-        }
-        if newly_copied > 0 {
-            self.uncopied.fetch_sub(newly_copied, Ordering::Release);
         }
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            copy_runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to)));
         }
-        if now != 0 {
-            if full && self.uncopied.load(Ordering::Acquire) == 0 {
-                drop(copied);
-                self.synced_at.fetch_max(now, Ordering::Release);
-            } else {
-                copied.advance_synced(full_lo, full_hi, now);
-                drop(copied);
+        drop(copied);
+        let mut bytes = 0usize;
+        for (r_from, r_to) in copy_runs {
+            bytes += self.copy(r_from, r_to);
+        }
+        let mut hot_results: Vec<(usize, usize, bool, bool)> =
+            Vec::with_capacity(hot_pages.len());
+        for (page, idx, p_from, p_to, full_page) in hot_pages {
+            let changed = self.copy_hot(p_from, p_to);
+            bytes += changed;
+            hot_results.push((page, idx, changed > 0, full_page));
+        }
+        let mut cool_blocks: Vec<usize> = Vec::new();
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let mut newly_copied = 0u64;
+            let mut dirty_chunk: Option<usize> = None;
+            for idx in mark_indices {
+                if copied.set_raw(idx, now) {
+                    newly_copied += 1;
+                }
+                let c = idx / COPIED_CHUNK;
+                if let Some(prev_c) = dirty_chunk
+                    && prev_c != c
+                {
+                    copied.recompute_chunk(prev_c);
+                }
+                dirty_chunk = Some(c);
             }
-        } else {
-            drop(copied);
+            if let Some(c) = dirty_chunk {
+                copied.recompute_chunk(c);
+            }
+            for idx in hot_changed_indices {
+                copied.mark_hot_changed(idx, frame);
+            }
+            for (page, idx, changed, full_page) in hot_results {
+                if copied.record_hot_quiet(idx, frame, changed, full_page, cool_after) {
+                    cool_blocks.push(page);
+                }
+            }
+            if newly_copied > 0 {
+                self.uncopied.fetch_sub(newly_copied, Ordering::Release);
+            }
+            if now != 0 {
+                if full && self.uncopied.load(Ordering::Acquire) == 0 {
+                    drop(copied);
+                    self.synced_at.fetch_max(now, Ordering::Release);
+                } else {
+                    copied.advance_synced(full_lo, full_hi, now);
+                }
+            }
         }
         if !cool_blocks.is_empty() {
             crate::watch::cool_hot(&cool_blocks);

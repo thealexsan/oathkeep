@@ -1844,9 +1844,7 @@ pub(crate) fn pre_guard_batch(ranges: &[(usize, usize)]) {
     if slow_spans.len() > 1 {
         slow_spans.sort_unstable();
     }
-    let mut written: Vec<usize> = Vec::new();
-    let mut protected_runs: Vec<(usize, usize)> = Vec::new();
-    let mut already_aliased: Vec<(usize, usize)> = Vec::new();
+    let mut shard_groups: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
     let mut idx = 0usize;
     while idx < slow_spans.len() {
         let shard = slow_spans[idx].0;
@@ -1854,114 +1852,180 @@ pub(crate) fn pre_guard_batch(ranges: &[(usize, usize)]) {
         while end_idx < slow_spans.len() && slow_spans[end_idx].0 == shard {
             end_idx += 1;
         }
-        #[cfg(feature = "diagnostics")]
-        let t_wlock = std::time::Instant::now();
-        let mut g = guards_write_shard(shard);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(
-            crate::copystat::C::GuardWriteWaitUs,
-            t_wlock.elapsed().as_micros() as u64,
-        );
-        for &(_, a, b) in &slow_spans[idx..end_idx] {
-            if g.clean.contains_range(a, b) {
-                continue;
-            }
-            let mut expired_hot = Vec::new();
-            if !g.hot.is_empty() {
-                for (&block, &until) in g.hot.range(a..b) {
-                    if until <= frame {
-                        expired_hot.push(block);
-                    }
+        let spans: Vec<(usize, usize)> = slow_spans[idx..end_idx]
+            .iter()
+            .map(|&(_, a, b)| (a, b))
+            .collect();
+        shard_groups.push((shard, spans));
+        idx = end_idx;
+    }
+    let process_shard_group =
+        move |shard: usize,
+              spans: &[(usize, usize)],
+              written: &mut Vec<usize>,
+              protected_runs: &mut Vec<(usize, usize)>,
+              already_aliased: &mut Vec<(usize, usize)>| {
+            #[cfg(feature = "diagnostics")]
+            let t_wlock = std::time::Instant::now();
+            let mut g = guards_write_shard(shard);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::GuardWriteWaitUs,
+                t_wlock.elapsed().as_micros() as u64,
+            );
+            for &(a, b) in spans {
+                if g.clean.contains_range(a, b) {
+                    continue;
                 }
-            }
-            if !expired_hot.is_empty() {
-                for &block in &expired_hot {
-                    bump_sub_clean_block(block);
-                }
-                bump_shard_clean_epoch(shard);
-                for block in expired_hot {
-                    g.hot.remove(&block);
-                    g.accounted.remove(block);
-                    g.cool_count
-                        .entry(block)
-                        .and_modify(|c| *c = c.saturating_add(1).min(MAX_COOL_BACKOFF))
-                        .or_insert(1);
-                }
-            }
-            if probe_absent && g.absent.overlaps(a, b) {
-                let mut newly_committed: Vec<(usize, usize)> = Vec::new();
-                let mut uncommitted_until = a;
-                g.absent.for_each_overlap(a, b, |oa, ob| {
-                    let mut block = oa;
-                    while block < ob {
-                        if block >= uncommitted_until {
-                            uncommitted_until = uncommitted_end(block);
-                        }
-                        if block < uncommitted_until {
-                            block = uncommitted_until.min(ob);
-                        } else {
-                            match newly_committed.last_mut() {
-                                Some(last_run) if last_run.1 == block => last_run.1 = block + 1,
-                                _ => newly_committed.push((block, block + 1)),
-                            }
-                            block += 1;
+                let mut expired_hot = Vec::new();
+                if !g.hot.is_empty() {
+                    for (&block, &until) in g.hot.range(a..b) {
+                        if until <= frame {
+                            expired_hot.push(block);
                         }
                     }
-                });
-                if !newly_committed.is_empty() {
-                    for &(na, nb) in &newly_committed {
-                        bump_sub_clean_range(na, nb);
+                }
+                if !expired_hot.is_empty() {
+                    for &block in &expired_hot {
+                        bump_sub_clean_block(block);
                     }
                     bump_shard_clean_epoch(shard);
-                    for (na, nb) in newly_committed {
-                        g.absent.remove_range(na, nb);
-                        g.accounted.remove_range(na, nb);
+                    for block in expired_hot {
+                        g.hot.remove(&block);
+                        g.accounted.remove(block);
+                        g.cool_count
+                            .entry(block)
+                            .and_modify(|c| *c = c.saturating_add(1).min(MAX_COOL_BACKOFF))
+                            .or_insert(1);
                     }
                 }
-            }
-            if g.accounted.contains_range(a, b) {
-                continue;
-            }
-            #[cfg(feature = "diagnostics")]
-            let t_prot = std::time::Instant::now();
-            #[cfg(feature = "diagnostics")]
-            let written_before = written.len();
-            for (gap_first, gap_last) in g.accounted.gaps_in(a, b) {
-                written.extend(gap_first * BLOCK / PAGE..gap_last * BLOCK / PAGE);
-                if !g.protected.overlaps(gap_first, gap_last) {
-                    protect_here(&mut g, gap_first, gap_last, &mut protected_runs);
-                } else {
-                    let mut already = Vec::new();
-                    g.protected.for_each_overlap(gap_first, gap_last, |pa, pb| {
-                        already.push((pa, pb));
+                if probe_absent && g.absent.overlaps(a, b) {
+                    let mut newly_committed: Vec<(usize, usize)> = Vec::new();
+                    let mut uncommitted_until = a;
+                    g.absent.for_each_overlap(a, b, |oa, ob| {
+                        let mut block = oa;
+                        while block < ob {
+                            if block >= uncommitted_until {
+                                uncommitted_until = uncommitted_end(block);
+                            }
+                            if block < uncommitted_until {
+                                block = uncommitted_until.min(ob);
+                            } else {
+                                match newly_committed.last_mut() {
+                                    Some(last_run) if last_run.1 == block => last_run.1 = block + 1,
+                                    _ => newly_committed.push((block, block + 1)),
+                                }
+                                block += 1;
+                            }
+                        }
                     });
-                    for (pa, pb) in g.protected.gaps_in(gap_first, gap_last) {
-                        protect_here(&mut g, pa, pb, &mut protected_runs);
-                    }
-                    for (pa, pb) in already {
-                        if view_guard() && g.alias_dirty.overlaps(pa, pb) {
-                            protected_runs.push((pa, pb));
-                            already_aliased.push((pa, pb));
-                        } else {
-                            g.clean.insert_range(pa, pb);
-                            g.accounted.insert_range(pa, pb);
+                    if !newly_committed.is_empty() {
+                        for &(na, nb) in &newly_committed {
+                            bump_sub_clean_range(na, nb);
+                        }
+                        bump_shard_clean_epoch(shard);
+                        for (na, nb) in newly_committed {
+                            g.absent.remove_range(na, nb);
+                            g.accounted.remove_range(na, nb);
                         }
                     }
                 }
+                if g.accounted.contains_range(a, b) {
+                    continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                let t_prot = std::time::Instant::now();
+                #[cfg(feature = "diagnostics")]
+                let written_before = written.len();
+                for (gap_first, gap_last) in g.accounted.gaps_in(a, b) {
+                    written.extend(gap_first * BLOCK / PAGE..gap_last * BLOCK / PAGE);
+                    if !g.protected.overlaps(gap_first, gap_last) {
+                        protect_here(&mut g, gap_first, gap_last, protected_runs);
+                    } else {
+                        let mut already = Vec::new();
+                        g.protected.for_each_overlap(gap_first, gap_last, |pa, pb| {
+                            already.push((pa, pb));
+                        });
+                        for (pa, pb) in g.protected.gaps_in(gap_first, gap_last) {
+                            protect_here(&mut g, pa, pb, protected_runs);
+                        }
+                        for (pa, pb) in already {
+                            if view_guard() && g.alias_dirty.overlaps(pa, pb) {
+                                protected_runs.push((pa, pb));
+                                already_aliased.push((pa, pb));
+                            } else {
+                                g.clean.insert_range(pa, pb);
+                                g.accounted.insert_range(pa, pb);
+                            }
+                        }
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::copystat::add(
+                        crate::copystat::C::GuardProtectUs,
+                        t_prot.elapsed().as_micros() as u64,
+                    );
+                    crate::copystat::add(
+                        crate::copystat::C::GuardRetGuardedPages,
+                        (written.len() - written_before) as u64,
+                    );
+                }
             }
-            #[cfg(feature = "diagnostics")]
-            {
-                crate::copystat::add(
-                    crate::copystat::C::GuardProtectUs,
-                    t_prot.elapsed().as_micros() as u64,
-                );
-                crate::copystat::add(
-                    crate::copystat::C::GuardRetGuardedPages,
-                    (written.len() - written_before) as u64,
-                );
-            }
+        };
+    let mut written: Vec<usize> = Vec::new();
+    let mut protected_runs: Vec<(usize, usize)> = Vec::new();
+    let mut already_aliased: Vec<(usize, usize)> = Vec::new();
+    if shard_groups.len() >= 4 {
+        let workers = shard_groups.len().min(4);
+        let mut buckets: Vec<Vec<(usize, Vec<(usize, usize)>)>> =
+            (0..workers).map(|_| Vec::new()).collect();
+        for (i, grp) in shard_groups.into_iter().enumerate() {
+            buckets[i % workers].push(grp);
         }
-        idx = end_idx;
+        type ShardOut = (Vec<usize>, Vec<(usize, usize)>, Vec<(usize, usize)>);
+        let outs: Vec<std::sync::Arc<std::sync::Mutex<ShardOut>>> = (0..workers)
+            .map(|_| {
+                std::sync::Arc::new(std::sync::Mutex::new((
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )))
+            })
+            .collect();
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+            .into_iter()
+            .zip(outs.iter().cloned())
+            .map(|(part, out)| {
+                Box::new(move || {
+                    let mut w = Vec::new();
+                    let mut pr = Vec::new();
+                    let mut aa = Vec::new();
+                    for (shard, spans) in &part {
+                        process_shard_group(*shard, spans, &mut w, &mut pr, &mut aa);
+                    }
+                    *out.lock().unwrap_or_else(|e| e.into_inner()) = (w, pr, aa);
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+        for out in outs {
+            let (mut w, mut pr, mut aa) =
+                std::mem::take(&mut *out.lock().unwrap_or_else(|e| e.into_inner()));
+            written.append(&mut w);
+            protected_runs.append(&mut pr);
+            already_aliased.append(&mut aa);
+        }
+    } else {
+        for (shard, spans) in &shard_groups {
+            process_shard_group(
+                *shard,
+                spans,
+                &mut written,
+                &mut protected_runs,
+                &mut already_aliased,
+            );
+        }
     }
     let alias_ep_before = ALIAS_FAULT_EPOCH.load(std::sync::atomic::Ordering::Acquire);
     if !protected_runs.is_empty() {
@@ -1986,14 +2050,14 @@ pub(crate) fn pre_guard_batch(ranges: &[(usize, usize)]) {
                 .all(|&(a, b)| covered.iter().any(|&(ca, cb)| ca <= a && b <= cb))
         {
             if total_count > 0 {
-                apply_alias_protection_sharded(all_blocks, other_runs, total_count);
+                apply_alias_protection_sharded_mode(all_blocks, other_runs, total_count, true);
             }
             true
         } else {
             false
         };
         if !reused {
-            protect_aliases_sharded(&protected_runs);
+            protect_aliases_sharded_mode(&protected_runs, true);
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
@@ -2106,6 +2170,10 @@ fn is_view(start: usize, end: usize) -> bool {
 }
 
 fn protect_aliases_sharded(runs: &[(usize, usize)]) {
+    protect_aliases_sharded_mode(runs, false);
+}
+
+fn protect_aliases_sharded_mode(runs: &[(usize, usize)], parallel: bool) {
     if !view_guard() || runs.is_empty() {
         return;
     }
@@ -2128,13 +2196,22 @@ fn protect_aliases_sharded(runs: &[(usize, usize)]) {
     if total_count == 0 {
         return;
     }
-    apply_alias_protection_sharded(all_blocks, all_other_runs, total_count);
+    apply_alias_protection_sharded_mode(all_blocks, all_other_runs, total_count, parallel);
 }
 
 fn apply_alias_protection_sharded(
+    all_blocks: Vec<usize>,
+    all_other_runs: Vec<(usize, usize)>,
+    total_count: u64,
+) {
+    apply_alias_protection_sharded_mode(all_blocks, all_other_runs, total_count, false);
+}
+
+fn apply_alias_protection_sharded_mode(
     mut all_blocks: Vec<usize>,
     mut all_other_runs: Vec<(usize, usize)>,
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))] total_count: u64,
+    parallel: bool,
 ) {
     if !all_blocks.is_empty() {
         if all_blocks.len() > 1 {
@@ -2171,6 +2248,9 @@ fn apply_alias_protection_sharded(
     }
     #[cfg(feature = "diagnostics")]
     ALIASES[0].fetch_add(total_count, std::sync::atomic::Ordering::Relaxed);
+    if all_other_runs.is_empty() {
+        return;
+    }
     if all_other_runs.len() > 1 {
         all_other_runs.sort_unstable();
         let mut merged: Vec<(usize, usize)> = Vec::with_capacity(all_other_runs.len());
@@ -2184,35 +2264,84 @@ fn apply_alias_protection_sharded(
     }
     let frame = crate::frame::current();
     let skip_absent = COMMIT_TITLE_MEMORY.get().is_some();
+    let mut by_shard: Vec<(usize, usize, usize)> = Vec::with_capacity(all_other_runs.len());
     for (a, b) in all_other_runs {
         for_each_shard_span(a, b, |shard, sa, sb| {
-            let already_protected = {
-                let g = guards_read_shard(shard);
+            by_shard.push((shard, sa, sb));
+        });
+    }
+    if by_shard.len() > 1 {
+        by_shard.sort_unstable();
+    }
+    let mut shard_groups: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+    let mut i = 0usize;
+    while i < by_shard.len() {
+        let shard = by_shard[i].0;
+        let mut k = i + 1;
+        while k < by_shard.len() && by_shard[k].0 == shard {
+            k += 1;
+        }
+        let spans: Vec<(usize, usize)> = by_shard[i..k].iter().map(|&(_, a, b)| (a, b)).collect();
+        shard_groups.push((shard, spans));
+        i = k;
+    }
+    let run_group = move |shard: usize, spans: &[(usize, usize)]| {
+        let mut todo: Vec<(usize, usize)> = Vec::new();
+        {
+            let g = guards_read_shard(shard);
+            for &(sa, sb) in spans {
                 if g.protected.contains_range(sa, sb) {
-                    true
-                } else {
-                    let check_absent = skip_absent && g.absent.overlaps(sa, sb);
-                    let check_partly = g.partly.overlaps(sa, sb);
-                    let has_hot = !g.hot.is_empty();
-                    (check_absent || check_partly || has_hot)
-                        && g.protected.gaps_in(sa, sb).into_iter().all(|(ga, gb)| {
-                            alias_gap_skipped(
-                                &g,
-                                ga,
-                                gb,
-                                check_absent,
-                                check_partly,
-                                has_hot,
-                                frame,
-                            )
-                        })
+                    continue;
                 }
-            };
-            if !already_protected {
-                let mut g = guards_write_shard(shard);
+                let check_absent = skip_absent && g.absent.overlaps(sa, sb);
+                let check_partly = g.partly.overlaps(sa, sb);
+                let has_hot = !g.hot.is_empty();
+                let already_skipped = (check_absent || check_partly || has_hot)
+                    && g.protected.gaps_in(sa, sb).into_iter().all(|(ga, gb)| {
+                        alias_gap_skipped(
+                            &g,
+                            ga,
+                            gb,
+                            check_absent,
+                            check_partly,
+                            has_hot,
+                            frame,
+                        )
+                    });
+                if !already_skipped {
+                    todo.push((sa, sb));
+                }
+            }
+        }
+        if !todo.is_empty() {
+            let mut g = guards_write_shard(shard);
+            for (sa, sb) in todo {
                 protect_alias_range(&mut g, sa, sb);
             }
-        });
+        }
+    };
+    if parallel && shard_groups.len() >= 4 {
+        let workers = shard_groups.len().min(4);
+        let mut buckets: Vec<Vec<(usize, Vec<(usize, usize)>)>> =
+            (0..workers).map(|_| Vec::new()).collect();
+        for (idx, grp) in shard_groups.into_iter().enumerate() {
+            buckets[idx % workers].push(grp);
+        }
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+            .into_iter()
+            .map(|part| {
+                Box::new(move || {
+                    for (shard, spans) in part {
+                        run_group(shard, &spans);
+                    }
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+    } else {
+        for (shard, spans) in &shard_groups {
+            run_group(*shard, spans);
+        }
     }
 }
 

@@ -5465,7 +5465,7 @@ impl Host {
         // Otherwise, attach `Late::Write`/`Late::Signal` to the newest pending copy slot so
         // strict GPU-writeback-before-signal visibility is preserved without stalling the
         // relay thread on a later 3D flight.
-        let must_drain = has_waiters || crate::fence::has_waiters();
+        let must_drain = has_waiters;
         let had_flights;
         {
             let flights: Vec<&Flight> = items
@@ -5551,10 +5551,9 @@ impl Host {
         if let Some(f) = fetch.as_mut()
             && f.has_pending()
         {
-            let urgent_now = must_drain || crate::fence::has_waiters();
-            if urgent_now || !had_flights || has_sync {
+            if must_drain || !had_flights || has_sync || crate::fence::has_waiters() {
                 let n = f.pending_order.len();
-                self.drain_pending_slots(f, n, urgent_now, false);
+                self.drain_pending_slots(f, n, must_drain, false);
             }
         }
         let defer_sync_slot = fetch
@@ -8435,13 +8434,68 @@ impl Batch {
         if refreshes.is_empty() {
             return;
         }
-        let mut all: Vec<_> = refreshes
-            .into_iter()
-            .map(|(shadow, spans)| {
-                let bytes: usize = spans.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
-                (bytes, shadow, spans)
-            })
-            .collect();
+        const PAGE: usize = 64 << 10;
+        const SPLIT_SPAN_MIN: usize = 1 << 20;
+        const SPLIT_CHUNK: usize = 512 << 10;
+        // Split page-disjoint span groups (and multi-MiB contiguous spans on 64 KiB page
+        // boundaries) into independent work units so giant shadows fan out across workers.
+        let mut all: Vec<(
+            usize,
+            std::sync::Arc<crate::shadow::Shadow>,
+            Vec<(usize, usize)>,
+        )> = Vec::with_capacity(refreshes.len());
+        for (shadow, spans) in refreshes {
+            let total_bytes: usize = spans.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
+            if spans.len() <= 1 && total_bytes < SPLIT_SPAN_MIN {
+                all.push((total_bytes, shadow, spans));
+                continue;
+            }
+            // Group spans whose 64 KiB page ranges touch or overlap so split units are
+            // strictly page-disjoint (safe to run concurrently after `copied` is unlocked).
+            let mut page_groups: Vec<Vec<(usize, usize)>> = Vec::new();
+            let mut cur_end_page = 0usize;
+            for (a, b) in spans {
+                if a >= b {
+                    continue;
+                }
+                let p_lo = a / PAGE;
+                let p_hi = b.div_ceil(PAGE);
+                if let Some(last) = page_groups.last_mut()
+                    && p_lo < cur_end_page
+                {
+                    last.push((a, b));
+                    cur_end_page = cur_end_page.max(p_hi);
+                } else {
+                    page_groups.push(vec![(a, b)]);
+                    cur_end_page = p_hi;
+                }
+            }
+            for group in page_groups {
+                if group.len() == 1 {
+                    let (a, b) = group[0];
+                    if b.saturating_sub(a) >= SPLIT_SPAN_MIN {
+                        let mut at = a;
+                        while at < b {
+                            let next = if b - at <= SPLIT_CHUNK {
+                                b
+                            } else {
+                                let aligned = (at + SPLIT_CHUNK) & !(PAGE - 1);
+                                if aligned <= at || aligned >= b {
+                                    b
+                                } else {
+                                    aligned
+                                }
+                            };
+                            all.push((next - at, shadow.clone(), vec![(at, next)]));
+                            at = next;
+                        }
+                        continue;
+                    }
+                }
+                let bytes: usize = group.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
+                all.push((bytes, shadow.clone(), group));
+            }
+        }
         all.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.2.len().cmp(&a.2.len())));
         let chunks = all.len().min(24);
         let mut buckets: Vec<(
@@ -9257,7 +9311,7 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-const BUFFERS: u32 = 2;
+const BUFFERS: u32 = 3;
 const COMPOSITE_SLOTS: usize = 64;
 
 const PRESENT_VS: &str = r#"
@@ -9394,6 +9448,7 @@ impl PresentCompositor {
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
+    allow_tearing: bool,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -9694,10 +9749,15 @@ impl Host {
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
             settle_now(WHY_SYNC);
+            let resize_flags = if p.allow_tearing {
+                DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+            } else {
+                DXGI_SWAP_CHAIN_FLAG(0)
+            };
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(BUFFERS, width, height, format, resize_flags)
             };
             match resized {
                 Ok(()) => {
@@ -9789,7 +9849,12 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let present_flags = if p.allow_tearing {
+                DXGI_PRESENT_ALLOW_TEARING
+            } else {
+                DXGI_PRESENT(0)
+            };
+            let _ = p.swap_chain.Present(0, present_flags);
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -9845,10 +9910,15 @@ impl Host {
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
             settle_now(WHY_SYNC);
+            let resize_flags = if p.allow_tearing {
+                DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+            } else {
+                DXGI_SWAP_CHAIN_FLAG(0)
+            };
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(BUFFERS, width, height, format, resize_flags)
             };
             match resized {
                 Ok(()) => {
@@ -10062,7 +10132,12 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let present_flags = if p.allow_tearing {
+                DXGI_PRESENT_ALLOW_TEARING
+            } else {
+                DXGI_PRESENT(0)
+            };
+            let _ = p.swap_chain.Present(0, present_flags);
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -10085,6 +10160,16 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let allow_tearing = factory.cast::<IDXGIFactory5>().is_ok_and(|f5| {
+                let mut tearing: u32 = 0;
+                f5.CheckFeatureSupport(
+                    DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                    (&raw mut tearing).cast(),
+                    std::mem::size_of::<u32>() as u32,
+                )
+                .is_ok()
+                    && tearing != 0
+            });
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -10096,6 +10181,11 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: if allow_tearing {
+                    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+                } else {
+                    0
+                },
                 ..Default::default()
             };
             let swap_chain = factory
@@ -10103,10 +10193,18 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(
+                width,
+                height,
+                format = format.0,
+                buffers = BUFFERS,
+                allow_tearing,
+                "presenting to a window"
+            );
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
+                allow_tearing,
                 width,
                 height,
                 format,
