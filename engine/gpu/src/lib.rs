@@ -6,114 +6,70 @@
 //! every command arrives here as a call, to be run on host D3D12. The
 //! title's GPU addresses are CPU addresses (console memory is unified).
 //!
-//! [`device`] is the device object titles create, [`dxgi`] its adapter side,
-//! [`resource`] heaps and resources, [`fence`] fences, [`queue`] command
-//! queues, [`list`] command allocators and lists, [`descriptor`]
-//! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
-//! [`signature`] command signatures, [`pipeline`] pipeline states,
-//! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Planned:
-//! `present` (swap chain).
+//! Organized by domain:
+//! - [`d3d12`]: console D3D12.X and DXGI COM objects (`device`, `dxgi`,
+//!   `resource`, `fence`, `command_queue`, `command_list`, `root`, `query`,
+//!   `signature`, `pipeline`, `frame`, `object`, `sampler`).
+//! - `backend`: host D3D12 device, submission, swapchain present, and DRED.
+//! - [`descriptors`]: console descriptor heaps and host heap mirroring.
+//! - `execution`: draw/dispatch recording, indirect batching, and composition.
+//! - `textures`: texture staging, detiling, prefetch, and readback.
+//! - `memory`: buffer shadowing, page write-watching, tiling, and pools.
+//! - `replay`: frame capture and offline host D3D12 replay (`diagnostics`).
+//! - [`diagnostics`]: timelines, copy stats, memory ledgers, and toggles.
+//! - [`console`]: console hardware identity seen by the title.
+//! - `shader_cache`: persistent translated shader cache.
 
 #[cfg(windows)]
-mod ambient;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod capture;
-#[cfg(windows)]
-mod compose;
+pub(crate) mod backend;
 pub mod console;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod copystat;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod faultbook;
+pub mod d3d12;
+pub mod descriptors;
+pub mod diagnostics;
 #[cfg(windows)]
-mod cores;
-pub mod descriptor;
-pub mod device;
+pub(crate) mod execution;
 #[cfg(windows)]
-mod draw;
-pub mod dxgi;
-pub mod fence;
-pub mod frame;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod book;
-#[cfg(windows)]
-mod host;
-#[cfg(windows)]
-mod indirect;
-#[cfg(windows)]
-mod inplace;
-#[cfg(windows)]
-mod land;
-pub mod list;
-pub mod object;
-pub mod pipeline;
-#[cfg(windows)]
-mod picked;
-#[cfg(windows)]
-mod pool;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod popwatch;
-#[cfg(windows)]
-mod primitive;
-pub mod query;
-pub mod queue;
+pub mod memory;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod replay;
 #[cfg(windows)]
-mod residency;
-pub mod resource;
-pub mod root;
-#[cfg(windows)]
-mod safecopy;
-#[cfg(windows)]
-mod sampler;
-#[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
-mod memory;
+pub(crate) mod textures;
+
+// External API compatibility re-exports (`oathkeep_gpu::*`).
+pub use d3d12::{
+    command_list as list, command_queue as queue, device, dxgi, fence, frame, object, pipeline,
+    query, resource, root, signature,
+};
+pub use descriptors as descriptor;
+pub use diagnostics::timeline;
 #[cfg(windows)]
-mod shadow;
-#[cfg(windows)]
-mod tiles;
-pub mod signature;
-mod switch;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod ab;
-#[cfg(windows)]
-mod tdr;
-#[cfg(windows)]
-mod texture;
-pub mod timeline;
-#[cfg(windows)]
-pub mod titlewrite;
-#[cfg(windows)]
-mod upload;
-#[cfg(windows)]
-mod watch;
-#[cfg(windows)]
-mod texback;
+pub use memory::title_write as titlewrite;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use backend::on_failure;
 
 /// Whether `switch` is on now, if it is one of those `OATHKEEP_AB` turns on and
-/// off while the title runs (`ab`).
+/// off while the title runs (`ab_toggle`).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub fn switched(switch: &str) -> Option<bool> {
-    ab::pick(switch)
+    diagnostics::ab_toggle::pick(switch)
 }
 
-/// What the frame is at (`copystat::phase`), for the sampling profiler.
+/// What the frame is at (`copy_stats::phase`), for the sampling profiler.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub fn frame_phase() -> u32 {
-    copystat::phase()
+    diagnostics::copy_stats::phase()
 }
+
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+pub use memory::inplace::{
+    title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view,
+};
 #[cfg(windows)]
-pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
-    writing as kernel_will_write,
+pub use memory::watch::{
+    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading,
+    title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
+    title_memory_written, writing as kernel_will_write,
 };

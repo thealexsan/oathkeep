@@ -4,7 +4,7 @@ use super::super::wire::{ALL, Barrier, Cmd, NONE, Va, slot};
 use super::{INDIRECT_ARGUMENT, UNORDERED_ACCESS, find_clamps};
 
 /// The root signature, pipeline and table of the batched clamp
-/// (`crate::indirect::batch`), and the scratch buffer it writes in the
+/// (`crate::execution::indirect::batch`), and the scratch buffer it writes in the
 /// first list of the frame (the next lists' are the ids before it), in lists
 /// edited by [`batch_clamps`].
 pub const BATCH_ROOT: u32 = u32::MAX - 2;
@@ -35,7 +35,7 @@ struct Batch {
     base: u64,
 }
 
-/// The list with its clamps done in batches, as `crate::draw` does with
+/// The list with its clamps done in batches, as `crate::execution::draw` does with
 /// `OATHKEEP_INDIRECT_BATCH`: one pass at the first execution after a
 /// point where arguments may have changed (a wait for shader writes, with
 /// dispatches since the batch before it; or a draw, with dispatches since
@@ -50,7 +50,7 @@ pub fn batch_clamps(
     careful: bool,
     jobs: &mut Vec<u8>,
 ) -> (Vec<Cmd>, Batched) {
-    use crate::indirect::batch::{JOBS, SLOT, SOURCES, TIMES, job};
+    use crate::execution::indirect::batch::{JOBS, SLOT, SOURCES, TIMES, job};
     const DISPATCH: u32 = 2;
     let mut done = Batched::default();
     let scratches: HashSet<u32> = {

@@ -13,22 +13,22 @@ use super::{AreaCount, FormatBar, LibraryEntry};
 pub(super) fn scan_gpu_com_interfaces(root: &Path) -> Result<Vec<LibraryEntry>> {
     let gpu_dir = root.join("engine/gpu/src");
     let specs: &[(&str, &str, &str)] = &[
-        ("device.rs", "ID3D12Device", "static FUNCTIONS: Table<"),
-        ("list.rs", "ID3D12CommandList", "const fn list_table("),
-        ("list.rs", "ID3D12Allocator", "static ALLOCATOR_FUNCTIONS: Table<"),
-        ("queue.rs", "ID3D12CommandQueue", "const fn queue_table("),
-        ("resource.rs", "ID3D12Resource", "static RESOURCE_FUNCTIONS: Table<"),
-        ("resource.rs", "ID3D12Heap", "static HEAP_FUNCTIONS: Table<"),
-        ("fence.rs", "ID3D12Fence", "static FUNCTIONS: Table<"),
-        ("descriptor.rs", "ID3D12DescHeap", "static FUNCTIONS: Table<"),
-        ("root.rs", "ID3D12RootSig", "static FUNCTIONS: Table<"),
-        ("query.rs", "ID3D12QueryHeap", "static FUNCTIONS: Table<"),
-        ("signature.rs", "ID3D12CmdSig", "static FUNCTIONS: Table<"),
-        ("pipeline.rs", "ID3D12Pipeline", "static FUNCTIONS: Table<"),
-        ("dxgi.rs", "IDXGIDevice", "static DEVICE_FUNCTIONS: Table<"),
-        ("dxgi.rs", "IDXGIAdapter", "static ADAPTER_FUNCTIONS: Table<"),
-        ("dxgi.rs", "IDXGIFactory", "static FACTORY_FUNCTIONS: Table<"),
-        ("dxgi.rs", "IDXGIOutput", "static OUTPUT_FUNCTIONS: Table<"),
+        ("d3d12/device", "ID3D12Device", "static FUNCTIONS: Table<"),
+        ("d3d12/command_list", "ID3D12CommandList", "const fn list_table("),
+        ("d3d12/command_list", "ID3D12Allocator", "static ALLOCATOR_FUNCTIONS: Table<"),
+        ("d3d12/command_queue", "ID3D12CommandQueue", "const fn queue_table("),
+        ("d3d12/resource", "ID3D12Resource", "static RESOURCE_FUNCTIONS: Table<"),
+        ("d3d12/resource", "ID3D12Heap", "static HEAP_FUNCTIONS: Table<"),
+        ("d3d12/fence.rs", "ID3D12Fence", "static FUNCTIONS: Table<"),
+        ("descriptors", "ID3D12DescHeap", "static FUNCTIONS: Table<"),
+        ("d3d12/root", "ID3D12RootSig", "static FUNCTIONS: Table<"),
+        ("d3d12/query.rs", "ID3D12QueryHeap", "static FUNCTIONS: Table<"),
+        ("d3d12/signature.rs", "ID3D12CmdSig", "static FUNCTIONS: Table<"),
+        ("d3d12/pipeline", "ID3D12Pipeline", "static FUNCTIONS: Table<"),
+        ("d3d12/dxgi.rs", "IDXGIDevice", "static DEVICE_FUNCTIONS: Table<"),
+        ("d3d12/dxgi.rs", "IDXGIAdapter", "static ADAPTER_FUNCTIONS: Table<"),
+        ("d3d12/dxgi.rs", "IDXGIFactory", "static FACTORY_FUNCTIONS: Table<"),
+        ("d3d12/dxgi.rs", "IDXGIOutput", "static OUTPUT_FUNCTIONS: Table<"),
     ];
 
     let mut file_cache: BTreeMap<&str, String> = BTreeMap::new();
@@ -197,9 +197,9 @@ pub(super) fn scan_dxgi_formats(root: &Path) -> Result<Vec<FormatBar>> {
     // Full DXGI console format catalog: standard 1..=115 (115) + console extensions 116..=120 (5) + 189..=191 (3) = 123.
     const TOTAL_DXGI: usize = 123;
 
-    let res_raw = read_module_sources(&root.join("engine/gpu/src/resource"))?;
+    let res_raw = read_module_sources(&root.join("engine/gpu/src/d3d12/resource"))?;
     let tex_raw = read_module_sources(&root.join("engine/formats/src/texture"))?;
-    let host_raw = read_module_sources_raw(&root.join("engine/gpu/src/host"))?;
+    let host_raw = read_module_sources_raw(&root.join("engine/gpu/src/backend"))?;
 
     let (elem_all, elem_uncompressed) = parse_resource_element_formats(&res_raw);
     let tex_tiling = parse_match_u32_set(&tex_raw, "pub fn format(dxgi: u32)");

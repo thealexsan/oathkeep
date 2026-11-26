@@ -203,7 +203,7 @@ fn clamps_are_found_kept_and_skipped() {
 
 #[test]
 fn clamps_are_batched() {
-    use crate::indirect::batch::job;
+    use crate::execution::indirect::batch::job;
     let clamp = |kind, offset, records, source| {
         let view = |param, res| Cmd::RootView {
             graphics: false,
