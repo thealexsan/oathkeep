@@ -3615,14 +3615,7 @@ impl State {
         if let Some(view) = host.mirror(index, handle, true) {
             if let View::Constant(address, size) = view {
                 let size_u64 = u64::from(size);
-                let shadow = self.find_shadow(address, size_u64).and_then(|s| {
-                    if !s.can_bind_cbv(address, size) && crate::shadow::has_aligned() {
-                        crate::shadow::find_aligned_existing(address, size_u64, 256).or(Some(s))
-                    } else {
-                        Some(s)
-                    }
-                });
-                if let Some(shadow) = shadow {
+                if let Some(shadow) = self.find_shadow(address, size_u64) {
                     self.refresh_shadow(list, &shadow, address, size_u64);
                     let ever_written = shadow.ever_written();
                     if ever_written {
@@ -3996,14 +3989,7 @@ impl State {
             if let Some(view) = host.mirror(index, handle, true) {
                 if let View::Constant(address, size) = view {
                     let size_u64 = u64::from(size);
-                    let shadow = self.find_shadow(address, size_u64).and_then(|s| {
-                        if !s.can_bind_cbv(address, size) && crate::shadow::has_aligned() {
-                            crate::shadow::find_aligned_existing(address, size_u64, 256).or(Some(s))
-                        } else {
-                            Some(s)
-                        }
-                    });
-                    if let Some(shadow) = shadow {
+                    if let Some(shadow) = self.find_shadow(address, size_u64) {
                         self.refresh_shadow(list, &shadow, address, size_u64);
                         let ever_written = shadow.ever_written();
                         if ever_written {

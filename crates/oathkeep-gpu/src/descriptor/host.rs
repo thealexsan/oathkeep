@@ -4217,23 +4217,20 @@ fn make_detailed_with_shadow(
     match view {
         &View::Constant(address, size) => {
             let aligned = size.next_multiple_of(256);
-            let Some(mut shadow) = find_shadow(address, u64::from(size)) else {
+            let Some(shadow) = find_shadow(address, u64::from(size)) else {
                 return (None, None, None);
             };
+            // Unaligned CBVs in descriptor tables are handled dynamically via
+            // `draw.rs`'s `cbv_scratch` / `scratch_and_defer_fill` ring. Do NOT
+            // allocate 64 KiB `align=256` phase-windowed aligned shadows here:
+            // 16-byte-aligned ring buffers spawn up to 16 overlapping 64 KiB
+            // shadows per page (2,048+ shadows), multiplying mirror/copy work.
             if !shadow.can_bind_cbv(address, size) {
-                if size > 0
-                    && let Some(aligned_shadow) =
-                        crate::shadow::find_aligned(address, u64::from(size), 256)
-                    && aligned_shadow.can_bind_cbv(address, size)
-                {
-                    shadow = aligned_shadow;
-                } else {
-                    once!(
-                        address = format_args!("{address:#x}"),
-                        "constant buffer not 256-byte aligned on the host"
-                    );
-                    return (None, None, None);
-                }
+                once!(
+                    address = format_args!("{address:#x}"),
+                    "constant buffer not 256-byte aligned on the host"
+                );
+                return (None, None, None);
             }
             let gpu = shadow.gpu(address);
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
