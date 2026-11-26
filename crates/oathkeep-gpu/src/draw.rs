@@ -239,7 +239,7 @@ type DrawFastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault
 
 type ShadowCacheEntry = (u64, u64, u64, u64, std::sync::Arc<crate::shadow::Shadow>);
 
-const DYN_CHUNK_SLOTS: u32 = 256;
+const DYN_CHUNK_SLOTS: u32 = 32;
 
 #[derive(Default)]
 pub(crate) struct State {
@@ -279,8 +279,6 @@ pub(crate) struct State {
     direct_cbv_cache: DrawFastMap<(u64, u32), (u64, std::sync::Arc<crate::shadow::Shadow>)>,
     direct_cbv_copy_seq: u64,
     direct_cbv_shadow_gen: u64,
-    scratch_cbv_cache: DrawFastMap<(u64, u32), u64>,
-    scratch_cbv_gpu_write_seq: u64,
     mirrored_tex_seen: DrawFastSet<(usize, u32, u64)>,
     kept_ptrs: DrawFastSet<usize>,
     kept_list_gen: u64,
@@ -329,7 +327,7 @@ impl State {
             return Some(first);
         }
         if n <= DYN_CHUNK_SLOTS / 2
-            && let Some(chunk_start) = host.dynamic(DYN_CHUNK_SLOTS)
+            && let Some(chunk_start) = host.try_dynamic_chunk(DYN_CHUNK_SLOTS)
         {
             self.dynamic.push((heap_id, chunk_start, DYN_CHUNK_SLOTS));
             self.dyn_chunk = (heap_id, chunk_start + n, DYN_CHUNK_SLOTS - n);
@@ -345,8 +343,6 @@ impl State {
         self.direct_cbv_cache.clear();
         self.direct_cbv_copy_seq = 0;
         self.direct_cbv_shadow_gen = 0;
-        self.scratch_cbv_cache.clear();
-        self.scratch_cbv_gpu_write_seq = 0;
         self.mirrored_tex_seen.clear();
         self.dyn_chunk = (0, 0, 0);
         if self.tables_gone && self.dynamic.is_empty() {
@@ -388,9 +384,8 @@ impl State {
             self.direct_cbv_cache.clear();
             self.direct_cbv_copy_seq = 0;
             self.direct_cbv_shadow_gen = 0;
-            self.scratch_cbv_cache.clear();
-            self.scratch_cbv_gpu_write_seq = 0;
             self.mirrored_tex_seen.clear();
+            self.dyn_chunk = (0, 0, 0);
             self.windows.clear();
             self.windows_epoch = 0;
             self.kept_list_gen = list_gen;
@@ -4223,18 +4218,12 @@ impl State {
             let frame_now = crate::frame::current();
             let cur_copy_seq = list.copy_seq();
             let cur_shadow_gen = crate::shadow::generation();
-            let cur_gpu_write_seq = list.gpu_write_seq();
             if self.direct_cbv_copy_seq != cur_copy_seq
                 || self.direct_cbv_shadow_gen != cur_shadow_gen
             {
                 self.direct_cbv_cache.clear();
-                self.scratch_cbv_cache.clear();
                 self.direct_cbv_copy_seq = cur_copy_seq;
                 self.direct_cbv_shadow_gen = cur_shadow_gen;
-                self.scratch_cbv_gpu_write_seq = cur_gpu_write_seq;
-            } else if self.scratch_cbv_gpu_write_seq != cur_gpu_write_seq {
-                self.scratch_cbv_cache.clear();
-                self.scratch_cbv_gpu_write_seq = cur_gpu_write_seq;
             }
             let allow_direct_cbv = direct_cbv();
             let mut premade = std::mem::take(&mut self.scratch_dyn_made);
@@ -4268,16 +4257,6 @@ impl State {
                     let t_cbv = std::time::Instant::now();
                     let size_u64 = u64::from(size);
                     let aligned_256 = (address & 255) == 0;
-                    if !aligned_256
-                        && let Some(&gpu) = self.scratch_cbv_cache.get(&(address, size))
-                    {
-                        host.constant_at_dynamic(index, gpu, size);
-                        #[cfg(feature = "diagnostics")]
-                        {
-                            cbv_ns += t_cbv.elapsed().as_nanos() as u64;
-                        }
-                        continue;
-                    }
                     if aligned_256
                         && allow_direct_cbv
                         && let Some((gpu, shadow)) = self.direct_cbv_cache.get(&(address, size))
@@ -4370,9 +4349,6 @@ impl State {
                         continue;
                     };
                     list.defer_fill(to, address as *const u8, size as usize);
-                    if !aligned_256 && !gpu_active {
-                        self.scratch_cbv_cache.insert((address, size), gpu);
-                    }
                     host.constant_at_dynamic(index, gpu, size);
                     #[cfg(feature = "diagnostics")]
                     {

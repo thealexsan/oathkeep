@@ -2826,11 +2826,6 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
-#[inline]
-pub(crate) fn wake_relay() {
-    RELAY_MOVED.notify_one();
-}
-
 fn land() {
     let landed = std::mem::take(&mut line().landed);
     for (lists, order) in landed {
@@ -3079,10 +3074,9 @@ fn relay_worker() {
         let action = {
             let mut line = line();
             loop {
-                let urgent_waiters = line.waiters > 0 || crate::fence::has_waiters();
                 if line.line.is_empty() {
                     if let Some((oldest_copy, isolated)) = oldest_pending {
-                        if urgent_waiters {
+                        if line.waiters > 0 {
                             break RelayAction::DrainAllPending;
                         }
                         break RelayAction::WaitCopyOnly(oldest_copy, isolated);
@@ -3102,7 +3096,7 @@ fn relay_worker() {
                 let n = landable(&fences, completed);
                 if n == 0 {
                     if let Some((oldest_copy, isolated)) = oldest_pending {
-                        if urgent_waiters {
+                        if line.waiters > 0 {
                             break RelayAction::DrainAllPending;
                         }
                         break RelayAction::Wait3dAndCopy(
@@ -3152,9 +3146,8 @@ fn relay_worker() {
                         .any(|&i| !flight.lists[i].host().deferred().backs.is_empty()),
                 });
                 let elapsed_ms = defer_since.map_or(0, |t| t.elapsed().as_millis() as u64);
-                let urgent_waiters = line.waiters > 0 || crate::fence::has_waiters();
                 if should_defer_landing(
-                    urgent_waiters,
+                    line.waiters > 0,
                     has_urgent,
                     max_busy_fence,
                     completed,
@@ -3175,7 +3168,7 @@ fn relay_worker() {
                 }
                 defer_count = 0;
                 defer_since = None;
-                let has_waiters = urgent_waiters;
+                let has_waiters = line.waiters > 0;
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
                 line.in_hand = items
@@ -5545,16 +5538,12 @@ impl Host {
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
-        let has_sync = items
-            .iter()
-            .any(|item| matches!(item, Late::Write(..) | Late::Signal(..)));
         if let Some(f) = fetch.as_mut()
             && f.has_pending()
+            && (must_drain || !had_flights)
         {
-            if must_drain || !had_flights || has_sync || crate::fence::has_waiters() {
-                let n = f.pending_order.len();
-                self.drain_pending_slots(f, n, must_drain, false);
-            }
+            let n = f.pending_order.len();
+            self.drain_pending_slots(f, n, must_drain, false);
         }
         let defer_sync_slot = fetch
             .as_ref()

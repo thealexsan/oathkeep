@@ -1770,6 +1770,22 @@ impl HostHeap {
         Some(self.count + first)
     }
 
+    /// Speculative chunk allocation for per-list dynamic sub-allocators: returns `None`
+    /// quietly (without logging a refusal warning or clamping `too_long`) when the heap
+    /// cannot spare a full chunk so the caller can fall back to an exact-size `dynamic(n)`.
+    pub(crate) fn try_dynamic_chunk(&self, n: u32) -> Option<u32> {
+        if self.sampler || n == 0 || n > self.dynamic {
+            return None;
+        }
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
+            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+        let first = if enough { guard.alloc(n)? } else { return None };
+        self.free
+            .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+        Some(self.count + first)
+    }
+
     pub(crate) fn count(&self) -> u32 {
         self.count
     }
