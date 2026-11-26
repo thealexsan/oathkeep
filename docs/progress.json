@@ -24,7 +24,7 @@
     "total": 123,
     "pct": 86.99
   },
-  "unsupported_sites": 230,
+  "unsupported_sites": 221,
   "performance": {
     "latest_run": "diag-fps-swarm3b",
     "commit": "09a807e",
